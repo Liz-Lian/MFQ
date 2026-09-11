@@ -23,6 +23,7 @@
 #include <vector>
 
 #include "moe_cache_transfer.h"
+#include "async_copy.cuh"
 #include "glu.cuh"
 
 namespace {
@@ -3118,33 +3119,6 @@ __global__ void __launch_bounds__(256) nint_moe_group32_mmq_kernel(
 constexpr int kMoeMmaBn = 64;
 constexpr int kMoeMmaMaxBkStride = 120;
 
-__device__ __forceinline__ void moe_copy_16_async(
-        __half * destination,
-        const __half * source) {
-#if __CUDA_ARCH__ >= 800
-    const uint32_t shared_address = static_cast<uint32_t>(
-        __cvta_generic_to_shared(destination));
-    asm volatile(
-        "cp.async.ca.shared.global [%0], [%1], 16;\n"
-        :: "r"(shared_address), "l"(source) : "memory");
-#else
-    *reinterpret_cast<int4 *>(destination) =
-        *reinterpret_cast<const int4 *>(source);
-#endif
-}
-
-__device__ __forceinline__ void moe_copy_async_commit() {
-#if __CUDA_ARCH__ >= 800
-    asm volatile("cp.async.commit_group;\n" ::: "memory");
-#endif
-}
-
-__device__ __forceinline__ void moe_copy_async_wait() {
-#if __CUDA_ARCH__ >= 800
-    asm volatile("cp.async.wait_group 0;\n" ::: "memory");
-#endif
-}
-
 template <int BM>
 constexpr int kMoeMmaBkStride = BM == 64 ? 120 : kMoeMmaMaxBkStride;
 
@@ -3174,7 +3148,7 @@ __device__ __forceinline__ void nint_moe_load_activation_tile(
             const __half * source =
                 x + static_cast<size_t>(source_row) * k_real + k;
             if constexpr (ASYNC_COPY) {
-                moe_copy_16_async(destination, source);
+                mfq::cuda_detail::copy_16_async(destination, source);
             } else {
                 *reinterpret_cast<int4 *>(destination) =
                     *reinterpret_cast<const int4 *>(source);
@@ -3260,7 +3234,7 @@ __device__ __forceinline__ void nint_moe_mma_profile(
         if constexpr (ASYNC_ACTIVATION) {
             nint_moe_load_activation_tile<true, BM, BK>(
                 x, source_rows_s, X_s, kb, k_real, tid);
-            moe_copy_async_commit();
+            mfq::cuda_detail::copy_async_commit();
         }
 
         const int weight_tasks = kMoeMmaBn * GROUPS_PER_CHUNK;
@@ -3346,7 +3320,7 @@ __device__ __forceinline__ void nint_moe_mma_profile(
         }
 
         if constexpr (ASYNC_ACTIVATION) {
-            moe_copy_async_wait();
+            mfq::cuda_detail::copy_async_wait();
         } else {
             nint_moe_load_activation_tile<false, BM, BK>(
                 x, source_rows_s, X_s, kb, k_real, tid);

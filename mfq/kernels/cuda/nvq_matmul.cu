@@ -20,6 +20,7 @@
 #include <type_traits>
 
 #include "packed_backward.cuh"
+#include "async_copy.cuh"
 
 using namespace nvcuda;
 
@@ -5716,7 +5717,60 @@ struct __align__(16) NvqMoeF16SharedStorage {
 static_assert(sizeof(NvqMoeF16SharedStorage<64, 128, 4>) <= 48 * 1024);
 static_assert(sizeof(NvqMoeF16SharedStorage<128, 128, 2>) <= 48 * 1024);
 
-template <int FORMAT, int BM, int BN, int GROUPS_PER_CHUNK>
+template <bool ASYNC_COPY, int BM, int GROUPS_PER_CHUNK>
+__device__ __forceinline__ void nvq_moe_load_activation_tile(
+    const __half * x,
+    const int32_t * source_rows,
+    __half * activation_tile,
+    int k_base,
+    int K,
+    int tid) {
+    constexpr int kStrideK =
+        NvqMoeF16KLayout<GROUPS_PER_CHUNK>::kStrideK;
+    constexpr int kTileK =
+        NvqMoeF16KLayout<GROUPS_PER_CHUNK>::kTileK;
+    constexpr int kThreads = (BM == 128 ? 16 : 8) * 32;
+    constexpr int kVectorWidth = 8;
+    static_assert(kTileK % kVectorWidth == 0);
+    static_assert(kThreads % BM == 0);
+    constexpr int kVectorsPerRow = kTileK / kVectorWidth;
+    constexpr int kLanesPerRow = kThreads / BM;
+    const int m_local = tid / kLanesPerRow;
+    const int vector_lane = tid - m_local * kLanesPerRow;
+    const int source_row = source_rows[m_local];
+#pragma unroll
+    for (int vector_local = vector_lane;
+         vector_local < kVectorsPerRow;
+         vector_local += kLanesPerRow) {
+        const int k_local = vector_local * kVectorWidth;
+        const int k = k_base + k_local;
+        __half * destination =
+            activation_tile + m_local * kStrideK + k_local;
+        if (source_row < 0 || k >= K) {
+            *reinterpret_cast<int4 *>(destination) =
+                make_int4(0, 0, 0, 0);
+        } else if ((K & 7) == 0 && k + 7 < K) {
+            const __half * source =
+                x + static_cast<int64_t>(source_row) * K + k;
+            if constexpr (ASYNC_COPY) {
+                mfq::cuda_detail::copy_16_async(destination, source);
+            } else {
+                *reinterpret_cast<int4 *>(destination) =
+                    *reinterpret_cast<const int4 *>(source);
+            }
+        } else {
+#pragma unroll
+            for (int element = 0; element < kVectorWidth; ++element) {
+                destination[element] = k + element < K
+                    ? x[static_cast<int64_t>(source_row) * K + k + element]
+                    : __float2half(0.0f);
+            }
+        }
+    }
+}
+
+template <int FORMAT, int BM, int BN, int GROUPS_PER_CHUNK,
+          bool ASYNC_ACTIVATION = false>
 __device__ __forceinline__ void nvq_moe_grouped_f16_task(
     const uint8_t * indices,
     int64_t indices_nbytes,
@@ -5791,6 +5845,11 @@ __device__ __forceinline__ void nvq_moe_grouped_f16_task(
     for (int chunk = 0; chunk < chunks; ++chunk) {
         const int group_base = chunk * GROUPS_PER_CHUNK;
         const int k_base = group_base * kGroupSize;
+        if constexpr (ASYNC_ACTIVATION) {
+            nvq_moe_load_activation_tile<true, BM, GROUPS_PER_CHUNK>(
+                x, source_rows, activation_tile, k_base, K, tid);
+            mfq::cuda_detail::copy_async_commit();
+        }
         constexpr int kWeightStates = BN * GROUPS_PER_CHUNK;
 #pragma unroll
         for (int weight_index = tid;
@@ -5896,42 +5955,11 @@ __device__ __forceinline__ void nvq_moe_grouped_f16_task(
             }
         }
 
-        constexpr int kActivationVectorWidth = 8;
-        static_assert(kTileK % kActivationVectorWidth == 0);
-        constexpr int kActivationVectorsPerRow =
-            kTileK / kActivationVectorWidth;
-        static_assert(kThreads % BM == 0);
-        constexpr int kActivationLanesPerRow = kThreads / BM;
-        const int m_local = tid / kActivationLanesPerRow;
-        const int vector_lane =
-            tid - m_local * kActivationLanesPerRow;
-        const int source_row = source_rows[m_local];
-#pragma unroll
-        for (int vector_local = vector_lane;
-             vector_local < kActivationVectorsPerRow;
-             vector_local += kActivationLanesPerRow) {
-            const int k_local = vector_local * kActivationVectorWidth;
-            const int k = k_base + k_local;
-            __half * destination =
-                activation_tile + m_local * kStrideK + k_local;
-            if (source_row < 0 || k >= K) {
-                *reinterpret_cast<int4 *>(destination) =
-                    make_int4(0, 0, 0, 0);
-            } else if ((K & 7) == 0 && k + 7 < K) {
-                *reinterpret_cast<int4 *>(destination) =
-                    *reinterpret_cast<const int4 *>(
-                        x + static_cast<int64_t>(source_row) * K + k);
-            } else {
-#pragma unroll
-                for (int element = 0;
-                     element < kActivationVectorWidth;
-                     ++element) {
-                    destination[element] = k + element < K
-                        ? x[static_cast<int64_t>(source_row) * K +
-                            k + element]
-                        : __float2half(0.0f);
-                }
-            }
+        if constexpr (ASYNC_ACTIVATION) {
+            mfq::cuda_detail::copy_async_wait();
+        } else {
+            nvq_moe_load_activation_tile<false, BM, GROUPS_PER_CHUNK>(
+                x, source_rows, activation_tile, k_base, K, tid);
         }
         __syncthreads();
 
@@ -6100,7 +6128,8 @@ __global__ void __launch_bounds__(256, 1) nvq_moe_grouped_f16_kernel(
     }
 }
 
-template <int BM, int ROUTE_TILE_M, int GROUPS_PER_CHUNK>
+template <int BM, int ROUTE_TILE_M, int GROUPS_PER_CHUNK,
+          bool ASYNC_ACTIVATION = false>
 __global__ void __launch_bounds__(BM == 128 ? 512 : 256, 1)
 nvq_moe_grouped_hetero_f16_kernel(
     const int64_t * weight_ptrs,
@@ -6178,7 +6207,7 @@ nvq_moe_grouped_hetero_f16_kernel(
 #define NVQ_MOE_HETERO_F16_CASE(FORMAT_VALUE)                                  \
         case FORMAT_VALUE:                                                      \
             nvq_moe_grouped_f16_task<                                           \
-                FORMAT_VALUE, BM, BN, GROUPS_PER_CHUNK>(                        \
+                FORMAT_VALUE, BM, BN, GROUPS_PER_CHUNK, ASYNC_ACTIVATION>(      \
                 indices, sizes[0], aux, sizes[1], sub_scale, sizes[2],          \
                 neuron_scale, codebook, x, ids_dst, output,                     \
                 weight_tile, activation_tile, output_tile,                     \
@@ -6597,14 +6626,14 @@ mfq_tensor_backend::Tensor nvq_moe_grouped_matmul_hetero_f16_cuda(
         if constexpr (kSharedBytes > 48 * 1024) {                               \
             static const cudaError_t attribute_status = cudaFuncSetAttribute(   \
                 nvq_moe_grouped_hetero_f16_kernel<                              \
-                    BM_VALUE, ROUTE_VALUE, GROUP_VALUE>,                        \
+                    BM_VALUE, ROUTE_VALUE, GROUP_VALUE, true>,                  \
                 cudaFuncAttributeMaxDynamicSharedMemorySize, kSharedBytes);     \
             MFQ_RUNTIME_CHECK(                                                   \
                 attribute_status == cudaSuccess,                                \
                 "failed to opt in to the NVQ MoE shared-memory size");          \
         }                                                                        \
         nvq_moe_grouped_hetero_f16_kernel<                                      \
-            BM_VALUE, ROUTE_VALUE, GROUP_VALUE><<<                              \
+            BM_VALUE, ROUTE_VALUE, GROUP_VALUE, true><<<                        \
             blocks, dim3(32, BM_VALUE == 128 ? 16 : 8), kSharedBytes,           \
             mfq_current_cuda_stream()>>>(                                       \
         weight_ptrs.data_ptr<int64_t>(), weight_sizes.data_ptr<int64_t>(),      \

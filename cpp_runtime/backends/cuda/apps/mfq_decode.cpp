@@ -7114,10 +7114,16 @@ struct MixedMoeRuntime {
         const bool use_nint_decode =
             !use_f16_mma && !use_kl_mmq && nint_dispatch &&
             nint_dispatch->hetero_supported;
+        const bool nvq_hetero_prefill_ready = nvq_dispatch &&
+            (nvq_dispatch->pool_count > 1 ||
+             (out_per_expert >= 128 &&
+              static_cast<int64_t>(tokens) * routes >
+                  static_cast<int64_t>(n_experts) * 16));
         const bool use_nvq_prefill =
-            use_f16_mma && !use_kl_mmq && nvq_dispatch;
+            use_f16_mma && !use_kl_mmq && nvq_hetero_prefill_ready;
         const bool use_nvq_decode =
             !use_f16_mma && !use_kl_mmq && nvq_dispatch &&
+            nvq_dispatch->pool_count > 1 &&
             tokens <= 8 && !g_force_moe_pool_path &&
             !disable_nvq_hetero_decode;
         if (input_prequantized && use_kl_mmq) {
@@ -7582,7 +7588,7 @@ static void initialize_mixed_nvq_dispatch(
     for (const auto & pool : runtime.pools) {
         if (pool.family == MixedMoeFamily::Nvq) ++nvq_pools;
     }
-    if (nvq_pools < 2) return;
+    if (nvq_pools == 0) return;
 
     std::vector<int64_t> weight_ptrs;
     std::vector<int64_t> weight_sizes;

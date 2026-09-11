@@ -3118,10 +3118,81 @@ __global__ void __launch_bounds__(256) nint_moe_group32_mmq_kernel(
 constexpr int kMoeMmaBn = 64;
 constexpr int kMoeMmaMaxBkStride = 120;
 
+__device__ __forceinline__ void moe_copy_16_async(
+        __half * destination,
+        const __half * source) {
+#if __CUDA_ARCH__ >= 800
+    const uint32_t shared_address = static_cast<uint32_t>(
+        __cvta_generic_to_shared(destination));
+    asm volatile(
+        "cp.async.ca.shared.global [%0], [%1], 16;\n"
+        :: "r"(shared_address), "l"(source) : "memory");
+#else
+    *reinterpret_cast<int4 *>(destination) =
+        *reinterpret_cast<const int4 *>(source);
+#endif
+}
+
+__device__ __forceinline__ void moe_copy_async_commit() {
+#if __CUDA_ARCH__ >= 800
+    asm volatile("cp.async.commit_group;\n" ::: "memory");
+#endif
+}
+
+__device__ __forceinline__ void moe_copy_async_wait() {
+#if __CUDA_ARCH__ >= 800
+    asm volatile("cp.async.wait_group 0;\n" ::: "memory");
+#endif
+}
+
 template <int BM>
 constexpr int kMoeMmaBkStride = BM == 64 ? 120 : kMoeMmaMaxBkStride;
 
-template <int BITS, int GS, int GROUPS_PER_CHUNK, int BM>
+template <bool ASYNC_COPY, int BM, int BK>
+__device__ __forceinline__ void nint_moe_load_activation_tile(
+        const __half * __restrict__ x,
+        const int32_t * __restrict__ source_rows,
+        __half (*X_s)[kMoeMmaBkStride<BM>],
+        int kb,
+        int k_real,
+        int tid) {
+    constexpr int kVectorWidth = 8;
+    static_assert(BK % kVectorWidth == 0);
+    constexpr int kVectorsPerRow = BK / kVectorWidth;
+    constexpr int kVectors = BM * kVectorsPerRow;
+    for (int index = tid; index < kVectors; index += 256) {
+        const int mm = index / kVectorsPerRow;
+        const int vector_local = index - mm * kVectorsPerRow;
+        const int k_local = vector_local * kVectorWidth;
+        const int k = kb + k_local;
+        const int source_row = source_rows[mm];
+        __half * destination = &X_s[mm][k_local];
+        if (source_row < 0 || k >= k_real) {
+            *reinterpret_cast<int4 *>(destination) =
+                make_int4(0, 0, 0, 0);
+        } else if ((k_real & 7) == 0 && k + 7 < k_real) {
+            const __half * source =
+                x + static_cast<size_t>(source_row) * k_real + k;
+            if constexpr (ASYNC_COPY) {
+                moe_copy_16_async(destination, source);
+            } else {
+                *reinterpret_cast<int4 *>(destination) =
+                    *reinterpret_cast<const int4 *>(source);
+            }
+        } else {
+#pragma unroll
+            for (int element = 0; element < kVectorWidth; ++element) {
+                destination[element] = k + element < k_real
+                    ? x[static_cast<size_t>(source_row) * k_real +
+                        k + element]
+                    : __float2half_rn(0.0f);
+            }
+        }
+    }
+}
+
+template <int BITS, int GS, int GROUPS_PER_CHUNK, int BM,
+          bool ASYNC_ACTIVATION = false>
 __device__ __forceinline__ void nint_moe_mma_profile(
         const uint8_t * __restrict__ q_packed,
         const uint8_t * __restrict__ sub_scale,
@@ -3186,6 +3257,12 @@ __device__ __forceinline__ void nint_moe_mma_profile(
     for (int chunk = 0; chunk < chunks; ++chunk) {
         const int gbase = chunk * GROUPS_PER_CHUNK;
         const int kb = gbase * GS;
+        if constexpr (ASYNC_ACTIVATION) {
+            nint_moe_load_activation_tile<true, BM, BK>(
+                x, source_rows_s, X_s, kb, k_real, tid);
+            moe_copy_async_commit();
+        }
+
         const int weight_tasks = kMoeMmaBn * GROUPS_PER_CHUNK;
         for (int task = tid; task < weight_tasks; task += 256) {
             const int nn = task / GROUPS_PER_CHUNK;
@@ -3268,38 +3345,11 @@ __device__ __forceinline__ void nint_moe_mma_profile(
             }
         }
 
-        constexpr int kActivationVectorWidth = 8;
-        static_assert(BK % kActivationVectorWidth == 0);
-        constexpr int kActivationVectorsPerRow =
-            BK / kActivationVectorWidth;
-        constexpr int kActivationVectors =
-            BM * kActivationVectorsPerRow;
-        for (int index = tid; index < kActivationVectors; index += 256) {
-            const int mm = index / kActivationVectorsPerRow;
-            const int vector_local =
-                index - mm * kActivationVectorsPerRow;
-            const int k_local = vector_local * kActivationVectorWidth;
-            const int k = kb + k_local;
-            const int source_row = source_rows_s[mm];
-            __half * destination = &X_s[mm][k_local];
-            if (source_row < 0 || k >= k_real) {
-                *reinterpret_cast<int4 *>(destination) =
-                    make_int4(0, 0, 0, 0);
-            } else if ((k_real & 7) == 0 && k + 7 < k_real) {
-                *reinterpret_cast<int4 *>(destination) =
-                    *reinterpret_cast<const int4 *>(
-                        x + static_cast<size_t>(source_row) * k_real + k);
-            } else {
-#pragma unroll
-                for (int element = 0;
-                     element < kActivationVectorWidth;
-                     ++element) {
-                    destination[element] = k + element < k_real
-                        ? x[static_cast<size_t>(source_row) * k_real +
-                            k + element]
-                        : __float2half_rn(0.0f);
-                }
-            }
+        if constexpr (ASYNC_ACTIVATION) {
+            moe_copy_async_wait();
+        } else {
+            nint_moe_load_activation_tile<false, BM, BK>(
+                x, source_rows_s, X_s, kb, k_real, tid);
         }
         __syncthreads();
 
@@ -3582,7 +3632,8 @@ __global__ void __launch_bounds__(256, 1) nint8_zero_moe_mma_kernel(
     }
 }
 
-template <int BM, bool COARSE_TILES = false>
+template <int BM, bool COARSE_TILES = false,
+          bool ASYNC_ACTIVATION = false>
 __global__ void __launch_bounds__(256, BM >= 32 ? 3 : 1) nint_moe_hetero_mma_kernel(
         const int64_t * __restrict__ weight_ptrs,
         const int32_t * __restrict__ pool_params,
@@ -3640,7 +3691,7 @@ __global__ void __launch_bounds__(256, BM >= 32 ? 3 : 1) nint_moe_hetero_mma_ker
         const int groups = params[1];
 
 #define MFQ_MOE_MMA_PROFILE(BITS_VALUE, GS_VALUE, GROUPS_VALUE) \
-        nint_moe_mma_profile<BITS_VALUE, GS_VALUE, GROUPS_VALUE, BM>( \
+        nint_moe_mma_profile<BITS_VALUE, GS_VALUE, GROUPS_VALUE, BM, ASYNC_ACTIVATION>( \
             q_packed, sub_scale, sub_min, neuron_scale, neuron_min, x, ids_dst, out, \
             W_s, X_s, C_s, source_rows_s, first, last, n0, local_expert, routes, out_per_expert, \
             weight_out_stride, weight_row_offset, groups, k_real, routed_input)
@@ -5252,9 +5303,14 @@ static mfq_tensor_backend::Tensor nint_moe_grouped_matmul_hetero_f16_impl(
     }
     const int blocks = static_cast<int>(
         std::max<int64_t>(1, std::min<int64_t>(block_cap, max_tasks)));
+    // Async copies overlap activation fetches with weight unpacking while a
+    // CTA handles only a few tasks.  Longer grid-stride loops retain the
+    // synchronous path, which benefits more from the repeated L1 accesses.
+    const bool async_activation = bm == 64 &&
+        max_tasks <= static_cast<int64_t>(blocks) * 5;
 
-#define MFQ_LAUNCH_MOE_MMA(BM_VALUE, COARSE_VALUE) \
-    nint_moe_hetero_mma_kernel<BM_VALUE, COARSE_VALUE><<<blocks, threads, 0, stream>>>( \
+#define MFQ_LAUNCH_MOE_MMA(BM_VALUE, COARSE_VALUE, ASYNC_VALUE) \
+    nint_moe_hetero_mma_kernel<BM_VALUE, COARSE_VALUE, ASYNC_VALUE><<<blocks, threads, 0, stream>>>( \
         weight_ptrs.data_ptr<int64_t>(), pool_params.data_ptr<int32_t>(), \
         expert_pool.data_ptr<int32_t>(), expert_local.data_ptr<int32_t>(), \
         reinterpret_cast<const __half *>(x.data_ptr<mfq_half>()), \
@@ -5267,21 +5323,27 @@ static mfq_tensor_backend::Tensor nint_moe_grouped_matmul_hetero_f16_impl(
 
     if (bm == 16) {
         if (coarse_tiles) {
-            MFQ_LAUNCH_MOE_MMA(16, true);
+            MFQ_LAUNCH_MOE_MMA(16, true, false);
         } else {
-            MFQ_LAUNCH_MOE_MMA(16, false);
+            MFQ_LAUNCH_MOE_MMA(16, false, false);
         }
     } else if (bm == 32) {
         if (coarse_tiles) {
-            MFQ_LAUNCH_MOE_MMA(32, true);
+            MFQ_LAUNCH_MOE_MMA(32, true, false);
         } else {
-            MFQ_LAUNCH_MOE_MMA(32, false);
+            MFQ_LAUNCH_MOE_MMA(32, false, false);
+        }
+    } else if (async_activation) {
+        if (coarse_tiles) {
+            MFQ_LAUNCH_MOE_MMA(64, true, true);
+        } else {
+            MFQ_LAUNCH_MOE_MMA(64, false, true);
         }
     } else {
         if (coarse_tiles) {
-            MFQ_LAUNCH_MOE_MMA(64, true);
+            MFQ_LAUNCH_MOE_MMA(64, true, false);
         } else {
-            MFQ_LAUNCH_MOE_MMA(64, false);
+            MFQ_LAUNCH_MOE_MMA(64, false, false);
         }
     }
 #undef MFQ_LAUNCH_MOE_MMA

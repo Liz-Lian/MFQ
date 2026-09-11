@@ -5704,7 +5704,7 @@ struct __align__(16) NvqMoeF16SharedStorage {
     static constexpr int kOperandBytes =
         (BN + BM) * kStrideK * sizeof(__half);
     static constexpr int kOutputBytes = BM == 128
-        ? BN * 16 * sizeof(float)
+        ? 2 * BN * 16 * sizeof(float)
         : (BN / 16) * BM * 16 * sizeof(float);
     static constexpr int kBytes =
         kOperandBytes > kOutputBytes ? kOperandBytes : kOutputBytes;
@@ -5761,6 +5761,12 @@ __device__ __forceinline__ void nvq_moe_grouped_f16_task(
     static_assert(GROUPS_PER_CHUNK == 2 || GROUPS_PER_CHUNK == 4);
     constexpr int kMFragments = BM / 16;
     constexpr int kNFragments = BN / 16;
+    constexpr int kWarps = BM == 128 ? 16 : 8;
+    constexpr int kComputeWarps = BM == 128
+        ? 2 * kNFragments : kNFragments;
+    constexpr int kAccumulatorFragments = BM == 128
+        ? kMFragments / 2 : kMFragments;
+    constexpr int kThreads = kWarps * 32;
     constexpr int kTileK =
         NvqMoeF16KLayout<GROUPS_PER_CHUNK>::kTileK;
     constexpr int kStrideK =
@@ -5773,10 +5779,12 @@ __device__ __forceinline__ void nvq_moe_grouped_f16_task(
             ? -1 : (routed_input ? pair_index : pair_index / routes);
     }
     __syncthreads();
-    FragmentC accumulators[kMFragments];
+    FragmentC accumulators[kAccumulatorFragments];
 #pragma unroll
-    for (int m_fragment = 0; m_fragment < kMFragments; ++m_fragment) {
-        wmma::fill_fragment(accumulators[m_fragment], 0.0f);
+    for (int fragment = 0;
+         fragment < kAccumulatorFragments;
+         ++fragment) {
+        wmma::fill_fragment(accumulators[fragment], 0.0f);
     }
     const int chunks =
         (ng + GROUPS_PER_CHUNK - 1) / GROUPS_PER_CHUNK;
@@ -5787,7 +5795,7 @@ __device__ __forceinline__ void nvq_moe_grouped_f16_task(
 #pragma unroll
         for (int weight_index = tid;
              weight_index < kWeightStates;
-            weight_index += 256) {
+            weight_index += kThreads) {
             const int row_local =
                 weight_index / GROUPS_PER_CHUNK;
             const int group_local = weight_index -
@@ -5894,7 +5902,9 @@ __device__ __forceinline__ void nvq_moe_grouped_f16_task(
             kTileK / kActivationVectorWidth;
         constexpr int kActivationVectors =
             BM * kActivationVectorsPerRow;
-        for (int index = tid; index < kActivationVectors; index += 256) {
+        for (int index = tid;
+             index < kActivationVectors;
+             index += kThreads) {
             const int m_local = index / kActivationVectorsPerRow;
             const int vector_local =
                 index - m_local * kActivationVectorsPerRow;
@@ -5924,7 +5934,10 @@ __device__ __forceinline__ void nvq_moe_grouped_f16_task(
         }
         __syncthreads();
 
-        if (warp < kNFragments) {
+        if (warp < kComputeWarps) {
+            const int warp_n = BM == 128 ? warp % kNFragments : warp;
+            const int m_fragment_base = BM == 128
+                ? warp / kNFragments : 0;
 #pragma unroll
             for (int k_local = 0;
                  k_local < kTileK;
@@ -5932,12 +5945,14 @@ __device__ __forceinline__ void nvq_moe_grouped_f16_task(
                 FragmentB weight_fragment;
                 wmma::load_matrix_sync(
                     weight_fragment,
-                    weight_tile + warp * 16 * kStrideK + k_local,
+                    weight_tile + warp_n * 16 * kStrideK + k_local,
                     kStrideK);
 #pragma unroll
-                for (int m_fragment = 0;
-                     m_fragment < kMFragments;
-                     ++m_fragment) {
+                for (int fragment = 0;
+                     fragment < kAccumulatorFragments;
+                     ++fragment) {
+                    const int m_fragment = m_fragment_base +
+                        fragment * (BM == 128 ? 2 : 1);
                     FragmentA activation_fragment;
                     wmma::load_matrix_sync(
                         activation_fragment,
@@ -5945,8 +5960,8 @@ __device__ __forceinline__ void nvq_moe_grouped_f16_task(
                             m_fragment * 16 * kStrideK + k_local,
                         kStrideK);
                     wmma::mma_sync(
-                        accumulators[m_fragment], activation_fragment,
-                        weight_fragment, accumulators[m_fragment]);
+                        accumulators[fragment], activation_fragment,
+                        weight_fragment, accumulators[fragment]);
                 }
             }
         }
@@ -5954,20 +5969,24 @@ __device__ __forceinline__ void nvq_moe_grouped_f16_task(
     }
 
     if constexpr (BM == 128) {
-        if (warp < kNFragments) {
+        if (warp < kComputeWarps) {
+            const int warp_n = warp % kNFragments;
+            const int m_fragment_base = warp / kNFragments;
 #pragma unroll
-            for (int m_fragment = 0;
-                 m_fragment < kMFragments;
-                 ++m_fragment) {
+            for (int fragment = 0;
+                 fragment < kAccumulatorFragments;
+                 ++fragment) {
+                const int m_fragment =
+                    m_fragment_base + fragment * 2;
                 wmma::store_matrix_sync(
                     output_tile + warp * 16 * 16,
-                    accumulators[m_fragment],
+                    accumulators[fragment],
                     16, wmma::mem_row_major);
                 __syncwarp();
                 for (int element = lane; element < 16 * 16; element += 32) {
                     const int m_local = m_fragment * 16 + element / 16;
                     const int n_local = element % 16;
-                    const int local_row = n0 + warp * 16 + n_local;
+                    const int local_row = n0 + warp_n * 16 + n_local;
                     const int pair_index = pair_rows[m_local];
                     if (pair_index >= 0 && local_row < out_per_expert) {
                         output[
@@ -6081,7 +6100,7 @@ __global__ void __launch_bounds__(256, 1) nvq_moe_grouped_f16_kernel(
 }
 
 template <int BM, int ROUTE_TILE_M, int GROUPS_PER_CHUNK>
-__global__ void __launch_bounds__(256, 1)
+__global__ void __launch_bounds__(BM == 128 ? 512 : 256, 1)
 nvq_moe_grouped_hetero_f16_kernel(
     const int64_t * weight_ptrs,
     const int64_t * weight_sizes,
@@ -6554,7 +6573,8 @@ mfq_tensor_backend::Tensor nvq_moe_grouped_matmul_hetero_f16_cuda(
 #define NVQ_MOE_HETERO_F16_LAUNCH(BM_VALUE, ROUTE_VALUE, GROUP_VALUE)           \
     nvq_moe_grouped_hetero_f16_kernel<                                          \
         BM_VALUE, ROUTE_VALUE, GROUP_VALUE><<<                                  \
-        blocks, dim3(32, 8), 0, mfq_current_cuda_stream()>>>(                   \
+        blocks, dim3(32, BM_VALUE == 128 ? 16 : 8), 0,                         \
+        mfq_current_cuda_stream()>>>(                                           \
         weight_ptrs.data_ptr<int64_t>(), weight_sizes.data_ptr<int64_t>(),      \
         pool_params.data_ptr<int32_t>(), expert_pool.data_ptr<int32_t>(),       \
         expert_local.data_ptr<int32_t>(),                                      \

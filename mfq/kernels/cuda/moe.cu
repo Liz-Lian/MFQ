@@ -5233,15 +5233,21 @@ static mfq_tensor_backend::Tensor nint_moe_grouped_matmul_hetero_f16_impl(
     const int64_t max_tasks = max_tiles * ntiles_n;
     int block_cap = forced_block_cap != 0 ? forced_block_cap :
         (pairs >= 32768 ? 8192 : 4096);
-    if (forced_block_cap == 0 && masked_experts && max_tasks > block_cap) {
+    if (forced_block_cap == 0 && max_tasks > block_cap) {
         const int average_route_tiles =
             (rows_per_expert + tile_m - 1) / tile_m;
         const int task_period = average_route_tiles * ntiles_n;
         // A grid stride spanning an integer number of experts can leave the
         // same CTAs on masked experts every iteration. Advance by one expert
-        // period so useful work rotates across the resident CTAs.
+        // period so useful work rotates across the resident CTAs. For a fully
+        // covered multi-pool tensor, one extra CTA is enough to break repeated
+        // pool phases without changing any single-format launch.
         if (task_period > 0 && block_cap % task_period == 0) {
-            block_cap += task_period;
+            if (masked_experts) {
+                block_cap += task_period;
+            } else if (pools > 1 && task_period >= 256) {
+                ++block_cap;
+            }
         }
     }
     const int blocks = static_cast<int>(

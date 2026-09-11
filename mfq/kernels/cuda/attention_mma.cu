@@ -281,8 +281,14 @@ static mfq_tensor_backend::Tensor mfq_attention_mma_launch(
     const int nstages = ggml_cuda_fattn_mma_get_nstages(DKQ, DV, ncols1, ncols2, cc);
     const bool q_in_reg = ggml_cuda_fattn_mma_get_Q_in_reg(DKQ, DV, ncols, cc);
     const int cols_per_warp = std::min(ncols, get_cols_per_warp(cc));
-    const size_t shared_kv_1 = nbatch_fa * std::max(nbatch_K2 + 4, nbatch_V2 + 4) * sizeof(half2);
-    const size_t shared_kv_2 = nbatch_fa * (nbatch_K2 + 4 + nbatch_V2 + 4) * sizeof(half2);
+    const int stride_k =
+        ggml_cuda_fattn_smem_swizzle::tile_stride(nbatch_K2, cc);
+    const int stride_v =
+        ggml_cuda_fattn_smem_swizzle::tile_stride(nbatch_V2, cc);
+    const size_t shared_kv_1 =
+        nbatch_fa * std::max(stride_k, stride_v) * sizeof(half2);
+    const size_t shared_kv_2 =
+        nbatch_fa * (stride_k + stride_v) * sizeof(half2);
     const size_t shared_q = ncols * (DKQ / 2 + 4) * sizeof(half2);
     const size_t shared_mask = ncols1 * (nbatch_fa / 2 + 4) * sizeof(half2);
     const size_t shared_combine = nwarps * cols_per_warp *
@@ -514,10 +520,14 @@ static mfq_tensor_backend::Tensor attention_glm_mla576_cached_impl(
     const int nstages = ggml_cuda_fattn_mma_get_nstages(DKQ, DV, ncols1, ncols2, cc);
     const bool q_in_reg = ggml_cuda_fattn_mma_get_Q_in_reg(DKQ, DV, ncols, cc);
     const int cols_per_warp = std::min(ncols, get_cols_per_warp(cc));
+    const int stride_k =
+        ggml_cuda_fattn_smem_swizzle::tile_stride(nbatch_K2, cc);
+    const int stride_v =
+        ggml_cuda_fattn_smem_swizzle::tile_stride(nbatch_V2, cc);
     const size_t shared_kv_1 = static_cast<size_t>(nbatch_fa) *
-        std::max(nbatch_K2 + 4, nbatch_V2 + 4) * sizeof(half2);
+        std::max(stride_k, stride_v) * sizeof(half2);
     const size_t shared_kv_2 = static_cast<size_t>(nbatch_fa) *
-        (nbatch_K2 + 4 + nbatch_V2 + 4) * sizeof(half2);
+        (stride_k + stride_v) * sizeof(half2);
     const size_t shared_q = static_cast<size_t>(ncols) * (DKQ / 2 + 4) * sizeof(half2);
     const size_t shared_mask = static_cast<size_t>(ncols1) * (nbatch_fa / 2 + 4) * sizeof(half2);
     const size_t shared_combine = static_cast<size_t>(nwarps) * cols_per_warp *
@@ -756,8 +766,14 @@ static mfq_tensor_backend::Tensor mfq_attention_mma_decode_impl(
     const int nstages = ggml_cuda_fattn_mma_get_nstages(DKQ_EXPECTED, DV_EXPECTED, ncols1, ncols2, cc);
     const bool q_in_reg = ggml_cuda_fattn_mma_get_Q_in_reg(DKQ_EXPECTED, DV_EXPECTED, ncols, cc);
     const int cols_per_warp = std::min(ncols, get_cols_per_warp(cc));
-    const size_t shared_kv_1 = nbatch_fa * std::max(nbatch_K2 + 4, nbatch_V2 + 4) * sizeof(half2);
-    const size_t shared_kv_2 = nbatch_fa * (nbatch_K2 + 4 + nbatch_V2 + 4) * sizeof(half2);
+    const int stride_k =
+        ggml_cuda_fattn_smem_swizzle::tile_stride(nbatch_K2, cc);
+    const int stride_v =
+        ggml_cuda_fattn_smem_swizzle::tile_stride(nbatch_V2, cc);
+    const size_t shared_kv_1 =
+        nbatch_fa * std::max(stride_k, stride_v) * sizeof(half2);
+    const size_t shared_kv_2 =
+        nbatch_fa * (stride_k + stride_v) * sizeof(half2);
     const size_t shared_q = ncols * (DKQ_EXPECTED / 2 + 4) * sizeof(half2);
     const size_t shared_mask = ncols1 * (nbatch_fa / 2 + 4) * sizeof(half2);
     const size_t shared_combine = nwarps * cols_per_warp *

@@ -5900,17 +5900,18 @@ __device__ __forceinline__ void nvq_moe_grouped_f16_task(
         static_assert(kTileK % kActivationVectorWidth == 0);
         constexpr int kActivationVectorsPerRow =
             kTileK / kActivationVectorWidth;
-        constexpr int kActivationVectors =
-            BM * kActivationVectorsPerRow;
-        for (int index = tid;
-             index < kActivationVectors;
-             index += kThreads) {
-            const int m_local = index / kActivationVectorsPerRow;
-            const int vector_local =
-                index - m_local * kActivationVectorsPerRow;
+        static_assert(kThreads % BM == 0);
+        constexpr int kActivationLanesPerRow = kThreads / BM;
+        const int m_local = tid / kActivationLanesPerRow;
+        const int vector_lane =
+            tid - m_local * kActivationLanesPerRow;
+        const int source_row = source_rows[m_local];
+#pragma unroll
+        for (int vector_local = vector_lane;
+             vector_local < kActivationVectorsPerRow;
+             vector_local += kActivationLanesPerRow) {
             const int k_local = vector_local * kActivationVectorWidth;
             const int k = k_base + k_local;
-            const int source_row = source_rows[m_local];
             __half * destination =
                 activation_tile + m_local * kStrideK + k_local;
             if (source_row < 0 || k >= K) {

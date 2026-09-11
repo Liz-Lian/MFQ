@@ -1208,6 +1208,9 @@ __device__ __forceinline__ PackedMoeEight unpack_eight_moe_mma(
             *reinterpret_cast<const uint16_t *>(values + byte + 4);
         first_word = words01;
         second_word = (words01 >> 24) | (word2 << 8);
+    } else if constexpr (BITS == 8) {
+        first_word = *reinterpret_cast<const uint32_t *>(values + index);
+        second_word = *reinterpret_cast<const uint32_t *>(values + index + 4);
     } else {
         return {
             unpack_four_moe_mma<BITS, GS>(values, index),
@@ -3228,7 +3231,8 @@ __device__ __forceinline__ void nint_moe_mma_profile(
                 store_moe_dequant_four(&W_s[nn][gl * GS + 24],
                                        packed3, d, m);
             } else if constexpr (
-                (BITS <= 4 || (BITS == 6 && BM >= 32)) && GS % 8 == 0) {
+                (BITS <= 4 || (BITS == 6 && BM >= 32) || BITS == 8) &&
+                GS % 8 == 0) {
                 PackedMoeEight packed = valid
                     ? unpack_eight_moe_mma<BITS, GS>(qg, 0)
                     : PackedMoeEight{0, 0};

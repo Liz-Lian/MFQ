@@ -295,6 +295,15 @@ mfq_tensor_backend::Tensor nint_moe_grouped_matmul_hetero_f16_cuda(
     bool routed_input, mfq_tensor_backend::Tensor out,
     mfq_tensor_backend::Tensor ids_dst, mfq_tensor_backend::Tensor expert_bounds, mfq_tensor_backend::Tensor tile_bounds,
     mfq_tensor_backend::Tensor tile_experts, int64_t route_tile_m);
+mfq_tensor_backend::Tensor nint_moe_grouped_matmul_hetero_masked_f16_cuda(
+    mfq_tensor_backend::Tensor weight_ptrs, mfq_tensor_backend::Tensor pool_params,
+    mfq_tensor_backend::Tensor expert_pool, mfq_tensor_backend::Tensor expert_local,
+    mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor ids,
+    int64_t n_experts, int64_t out_per_expert, int64_t input_width,
+    bool routed_input, mfq_tensor_backend::Tensor out,
+    mfq_tensor_backend::Tensor ids_dst, mfq_tensor_backend::Tensor expert_bounds,
+    mfq_tensor_backend::Tensor tile_bounds,
+    mfq_tensor_backend::Tensor tile_experts, int64_t route_tile_m);
 mfq_tensor_backend::Tensor nint_moe_grouped_matmul_hetero_f16_slice_cuda(
     mfq_tensor_backend::Tensor weight_ptrs, mfq_tensor_backend::Tensor pool_params,
     mfq_tensor_backend::Tensor expert_pool, mfq_tensor_backend::Tensor expert_local,
@@ -7137,7 +7146,7 @@ struct MixedMoeRuntime {
         }
 
         if (use_nint_prefill) {
-            nint_moe_grouped_matmul_hetero_f16_cuda(
+            nint_moe_grouped_matmul_hetero_masked_f16_cuda(
                 nint_dispatch->weight_ptrs,
                 nint_dispatch->pool_params,
                 nint_dispatch->expert_pool,

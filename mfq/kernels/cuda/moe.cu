@@ -5135,7 +5135,8 @@ static mfq_tensor_backend::Tensor nint_moe_grouped_matmul_hetero_f16_impl(
         mfq_tensor_backend::Tensor tile_experts,
         int64_t route_tile_m,
         int64_t weight_out_stride,
-        int64_t weight_row_offset) {
+        int64_t weight_row_offset,
+        bool masked_experts) {
     MFQ_RUNTIME_CHECK(n_experts > 0 && n_experts <= 4096, "n_experts must be in [1,4096]");
     MFQ_RUNTIME_CHECK(out_per_expert > 0 && out_per_expert <= INT_MAX,
         "out_per_expert must be positive");
@@ -5228,10 +5229,21 @@ static mfq_tensor_backend::Tensor nint_moe_grouped_matmul_hetero_f16_impl(
     const bool coarse_tiles = tile_m == bm;
     MFQ_RUNTIME_CHECK(tile_m == kRouteTile || coarse_tiles,
         "coarse route tile size must match the MMA row tile");
-    const int block_cap = forced_block_cap != 0 ? forced_block_cap :
-        (pairs >= 32768 ? 8192 : 4096);
     const int64_t max_tiles = (pairs + tile_m - 1) / tile_m + experts;
     const int64_t max_tasks = max_tiles * ntiles_n;
+    int block_cap = forced_block_cap != 0 ? forced_block_cap :
+        (pairs >= 32768 ? 8192 : 4096);
+    if (forced_block_cap == 0 && masked_experts && max_tasks > block_cap) {
+        const int average_route_tiles =
+            (rows_per_expert + tile_m - 1) / tile_m;
+        const int task_period = average_route_tiles * ntiles_n;
+        // A grid stride spanning an integer number of experts can leave the
+        // same CTAs on masked experts every iteration. Advance by one expert
+        // period so useful work rotates across the resident CTAs.
+        if (task_period > 0 && block_cap % task_period == 0) {
+            block_cap += task_period;
+        }
+    }
     const int blocks = static_cast<int>(
         std::max<int64_t>(1, std::min<int64_t>(block_cap, max_tasks)));
 
@@ -5292,7 +5304,31 @@ mfq_tensor_backend::Tensor nint_moe_grouped_matmul_hetero_f16_cuda(
         weight_ptrs, pool_params, expert_pool, expert_local, x, ids,
         n_experts, out_per_expert, input_width, routed_input, out,
         ids_dst, expert_bounds, tile_bounds, tile_experts, route_tile_m,
-        out_per_expert, 0);
+        out_per_expert, 0, false);
+}
+
+mfq_tensor_backend::Tensor nint_moe_grouped_matmul_hetero_masked_f16_cuda(
+        mfq_tensor_backend::Tensor weight_ptrs,
+        mfq_tensor_backend::Tensor pool_params,
+        mfq_tensor_backend::Tensor expert_pool,
+        mfq_tensor_backend::Tensor expert_local,
+        mfq_tensor_backend::Tensor x,
+        mfq_tensor_backend::Tensor ids,
+        int64_t n_experts,
+        int64_t out_per_expert,
+        int64_t input_width,
+        bool routed_input,
+        mfq_tensor_backend::Tensor out,
+        mfq_tensor_backend::Tensor ids_dst,
+        mfq_tensor_backend::Tensor expert_bounds,
+        mfq_tensor_backend::Tensor tile_bounds,
+        mfq_tensor_backend::Tensor tile_experts,
+        int64_t route_tile_m) {
+    return nint_moe_grouped_matmul_hetero_f16_impl(
+        weight_ptrs, pool_params, expert_pool, expert_local, x, ids,
+        n_experts, out_per_expert, input_width, routed_input, out,
+        ids_dst, expert_bounds, tile_bounds, tile_experts, route_tile_m,
+        out_per_expert, 0, true);
 }
 
 mfq_tensor_backend::Tensor nint_moe_grouped_matmul_hetero_f16_slice_cuda(
@@ -5318,7 +5354,7 @@ mfq_tensor_backend::Tensor nint_moe_grouped_matmul_hetero_f16_slice_cuda(
         weight_ptrs, pool_params, expert_pool, expert_local, x, ids,
         n_experts, out_per_expert, input_width, routed_input, out,
         ids_dst, expert_bounds, tile_bounds, tile_experts, route_tile_m,
-        weight_out_stride, weight_row_offset);
+        weight_out_stride, weight_row_offset, false);
 }
 
 mfq_tensor_backend::Tensor nint_moe_grouped_matmul_pool_ws_cuda(

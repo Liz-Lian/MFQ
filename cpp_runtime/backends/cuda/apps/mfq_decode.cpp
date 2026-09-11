@@ -27294,10 +27294,16 @@ static int run_nintm_tensor_check(
         int routes,
         int reps,
         int split_width,
-        bool routed_input) {
-    if (tokens < 1 || tokens > 4096 || routes < 1 || reps < 1 ||
+        bool routed_input,
+        bool benchmark_only) {
+    const int max_tokens = benchmark_only ? 131072 : 4096;
+    if (tokens < 1 || tokens > max_tokens || routes < 1 || reps < 1 ||
             split_width < 0) {
         throw std::runtime_error("NINTM tensor check dimensions are invalid");
+    }
+    if (benchmark_only && split_width != 0) {
+        throw std::runtime_error(
+            "NINTM benchmark-only mode does not support split checks");
     }
     MfqFile mfq(mfq_path);
     auto weight = load_nint_moe_gpu(
@@ -27318,18 +27324,27 @@ static int run_nintm_tensor_check(
     }
     const int64_t count =
         (int64_t)tokens * (routed_input ? routes : 1) * weight.neuron_len;
-    auto sequence = mfq_tensor_backend::arange(
-        count,
-        mfq_tensor_backend::TensorOptions().device(mfq_tensor_backend::kCUDA).dtype(mfq_tensor_backend::kFloat32));
-    auto x = (
-        (sequence.remainder(257) - 128.0) / 127.0 +
-        0.03125 * mfq_tensor_backend::sin(sequence * 0.015625))
-        .to(mfq_tensor_backend::kFloat16)
-        .reshape(
-            routed_input
-                ? std::vector<int64_t>{tokens, routes, weight.neuron_len}
-                : std::vector<int64_t>{tokens, weight.neuron_len})
-        .contiguous();
+    const auto input_shape = routed_input
+        ? std::vector<int64_t>{tokens, routes, weight.neuron_len}
+        : std::vector<int64_t>{tokens, weight.neuron_len};
+    mfq_tensor_backend::Tensor x;
+    if (benchmark_only) {
+        x = mfq_tensor_backend::zeros(
+            input_shape,
+            mfq_tensor_backend::TensorOptions()
+                .device(mfq_tensor_backend::kCUDA)
+                .dtype(mfq_tensor_backend::kFloat16));
+    } else {
+        auto sequence = mfq_tensor_backend::arange(
+            count,
+            mfq_tensor_backend::TensorOptions().device(mfq_tensor_backend::kCUDA).dtype(mfq_tensor_backend::kFloat32));
+        x = (
+            (sequence.remainder(257) - 128.0) / 127.0 +
+            0.03125 * mfq_tensor_backend::sin(sequence * 0.015625))
+            .to(mfq_tensor_backend::kFloat16)
+            .reshape(input_shape)
+            .contiguous();
+    }
     std::vector<int32_t> host_ids((size_t)tokens * routes);
     for (int token = 0; token < tokens; ++token) {
         for (int route = 0; route < routes; ++route) {
@@ -27360,6 +27375,23 @@ static int run_nintm_tensor_check(
     MFQ_CUDA_CHECK(cudaEventElapsedTime(&elapsed, start, stop));
     MFQ_CUDA_CHECK(cudaEventDestroy(start));
     MFQ_CUDA_CHECK(cudaEventDestroy(stop));
+    if (benchmark_only) {
+        std::cout << std::fixed << std::setprecision(9)
+                  << "nintm_tensor_benchmark"
+                  << " tensor=" << tensor_name
+                  << " tokens=" << tokens
+                  << " routes=" << routes
+                  << " experts=" << weight.n_experts
+                  << " out=" << weight.out_per_expert
+                  << " k=" << weight.neuron_len
+                  << " routed_input=" << (routed_input ? 1 : 0)
+                  << " mixed=" << (weight.mixed_forward ? 1 : 0)
+                  << " hetero=" << (weight.hetero_supported ? 1 : 0)
+                  << " weight_bytes=" << nint_moe_weight_bytes(weight)
+                  << " cuda_ms=" << elapsed / reps
+                  << '\n';
+        return 0;
+    }
     double dense_reference_rel = -1.0;
     double dense_reference_mean_abs = -1.0;
     double dense_reference_max_abs = -1.0;
@@ -29888,6 +29920,7 @@ int main(int argc, char ** argv) {
         bool compare_dsv4_hc_model = false;
         bool check_attention_swa_decode = false;
         bool check_nintm_routed_input = false;
+        bool check_nintm_benchmark_only = false;
         bool parallel_test_duplicates = false;
         bool server_mode = false;
         bool check_runtime_assets = false;
@@ -30000,6 +30033,7 @@ int main(int argc, char ** argv) {
             else if (a == "--check-nintm-reps" && i + 1 < argc) check_nintm_reps = std::stoi(argv[++i]);
             else if (a == "--check-nintm-split-width" && i + 1 < argc) check_nintm_split_width = std::stoi(argv[++i]);
             else if (a == "--check-nintm-routed-input") check_nintm_routed_input = true;
+            else if (a == "--check-nintm-benchmark-only") check_nintm_benchmark_only = true;
             else if (a == "--check-dsv4-output-a" && i + 1 < argc) check_dsv4_output_a = argv[++i];
             else if (a == "--check-dsv4-output-a-batch" && i + 1 < argc) check_dsv4_output_a_batch = std::stoi(argv[++i]);
             else if (a == "--check-dsv4-output-a-reps" && i + 1 < argc) check_dsv4_output_a_reps = std::stoi(argv[++i]);
@@ -30434,7 +30468,8 @@ int main(int argc, char ** argv) {
                 const int result = run_nintm_tensor_check(
                     mfq_path, tensor_name, check_nintm_tokens,
                     check_nintm_routes, check_nintm_reps,
-                    check_nintm_split_width, check_nintm_routed_input);
+                    check_nintm_split_width, check_nintm_routed_input,
+                    check_nintm_benchmark_only);
                 if (result != 0) return result;
             }
             return 0;

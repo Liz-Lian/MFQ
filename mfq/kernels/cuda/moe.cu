@@ -1181,6 +1181,22 @@ __device__ __forceinline__ PackedMoeEight unpack_eight_moe_mma(
     } else if constexpr (BITS == 4 && GS == 24) {
         first_word = *reinterpret_cast<const uint32_t *>(values + (index >> 1));
         second_word = first_word >> 16;
+    } else if constexpr (BITS == 5 && GS == 28) {
+        const int byte = (index * 5) >> 3;
+        if ((byte & 1) == 0) {
+            first_word = static_cast<uint32_t>(
+                             *reinterpret_cast<const uint16_t *>(values + byte)) |
+                (static_cast<uint32_t>(
+                     *reinterpret_cast<const uint16_t *>(values + byte + 2)) << 16);
+        } else {
+            first_word = static_cast<uint32_t>(values[byte]) |
+                (static_cast<uint32_t>(
+                     *reinterpret_cast<const uint16_t *>(values + byte + 1)) << 8) |
+                (static_cast<uint32_t>(values[byte + 3]) << 24);
+        }
+        second_word =
+            (first_word >> 20) |
+            (static_cast<uint32_t>(values[byte + 4]) << 12);
     } else if constexpr (BITS == 6 && GS == 24) {
         const int byte = (index >> 2) * 3;
         const uint32_t words01 =
@@ -3185,7 +3201,34 @@ __device__ __forceinline__ void nint_moe_mma_profile(
                 m = neuron_min[weight_row] * static_cast<float>(sub_min[meta]);
                 qg = q_packed + meta * QBYTES;
             }
-            if constexpr ((BITS <= 4 || (BITS == 6 && BM == 32)) && GS % 8 == 0) {
+            if constexpr (BITS == 5 && GS == 28 && BM == 64) {
+                const PackedMoeEight packed0 = valid
+                    ? unpack_eight_moe_mma<5, 28>(qg, 0)
+                    : PackedMoeEight{0, 0};
+                const PackedMoeEight packed1 = valid
+                    ? unpack_eight_moe_mma<5, 28>(qg, 8)
+                    : PackedMoeEight{0, 0};
+                const PackedMoeEight packed2 = valid
+                    ? unpack_eight_moe_mma<5, 28>(qg, 16)
+                    : PackedMoeEight{0, 0};
+                const int packed3 = valid
+                    ? unpack_four_moe_mma<5, 28>(qg, 24) : 0;
+                store_moe_dequant_four(&W_s[nn][gl * GS],
+                                       packed0.first, d, m);
+                store_moe_dequant_four(&W_s[nn][gl * GS + 4],
+                                       packed0.second, d, m);
+                store_moe_dequant_four(&W_s[nn][gl * GS + 8],
+                                       packed1.first, d, m);
+                store_moe_dequant_four(&W_s[nn][gl * GS + 12],
+                                       packed1.second, d, m);
+                store_moe_dequant_four(&W_s[nn][gl * GS + 16],
+                                       packed2.first, d, m);
+                store_moe_dequant_four(&W_s[nn][gl * GS + 20],
+                                       packed2.second, d, m);
+                store_moe_dequant_four(&W_s[nn][gl * GS + 24],
+                                       packed3, d, m);
+            } else if constexpr (
+                (BITS <= 4 || (BITS == 6 && BM == 32)) && GS % 8 == 0) {
                 PackedMoeEight packed = valid
                     ? unpack_eight_moe_mma<BITS, GS>(qg, 0)
                     : PackedMoeEight{0, 0};

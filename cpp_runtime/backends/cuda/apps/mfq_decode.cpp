@@ -366,7 +366,7 @@ mfq_tensor_backend::Tensor nvq_moe_grouped_matmul_hetero_f16_cuda(
     int64_t route_tile_m, mfq_tensor_backend::Tensor out,
     mfq_tensor_backend::Tensor ids_dst,
     mfq_tensor_backend::Tensor expert_bounds, mfq_tensor_backend::Tensor tile_bounds,
-    mfq_tensor_backend::Tensor tile_experts);
+    mfq_tensor_backend::Tensor tile_experts, bool masked_experts);
 mfq_tensor_backend::Tensor nvq_moe_grouped_matmul_hetero_ws_cuda(
     mfq_tensor_backend::Tensor weight_ptrs, mfq_tensor_backend::Tensor weight_sizes,
     mfq_tensor_backend::Tensor pool_params, mfq_tensor_backend::Tensor expert_pool,
@@ -6996,6 +6996,7 @@ struct MixedNvqDispatch {
     mfq_tensor_backend::Tensor expert_pool;
     mfq_tensor_backend::Tensor expert_local;
     int pool_count = 0;
+    bool masked_experts = false;
 };
 
 struct MixedMoeRuntime {
@@ -7181,7 +7182,8 @@ struct MixedMoeRuntime {
                 x, n_experts, out_per_expert, neuron_len,
                 nvq_tile_m, output,
                 route.ids_dst, route.expert_bounds,
-                nvq_tile_bounds, nvq_tile_experts);
+                nvq_tile_bounds, nvq_tile_experts,
+                nvq_dispatch->masked_experts);
         }
 
         mfq_tensor_backend::Tensor shared_nint_qx;
@@ -7613,6 +7615,7 @@ static void initialize_mixed_nvq_dispatch(
     mfq_tensor_backend::Device target = mfq_tensor_backend::Device(
         mfq_tensor_backend::kCUDA, mfq_current_cuda_device());
     int dispatch_pool = 0;
+    int owned_experts = 0;
     for (const auto & pool : runtime.pools) {
         if (pool.family != MixedMoeFamily::Nvq) continue;
         const auto & weight = pool.nvq;
@@ -7677,12 +7680,14 @@ static void initialize_mixed_nvq_dispatch(
             }
             expert_pool[static_cast<size_t>(expert)] = dispatch_pool;
             expert_local[static_cast<size_t>(expert)] = local[expert];
+            ++owned_experts;
         }
         ++dispatch_pool;
     }
 
     auto dispatch = std::make_shared<MixedNvqDispatch>();
     dispatch->pool_count = dispatch_pool;
+    dispatch->masked_experts = owned_experts < runtime.n_experts;
     dispatch->weight_ptrs = mfq_tensor_backend::from_blob(
         weight_ptrs.data(), {dispatch_pool, 5},
         mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt64))

@@ -6467,7 +6467,8 @@ mfq_tensor_backend::Tensor nvq_moe_grouped_matmul_hetero_f16_cuda(
     mfq_tensor_backend::Tensor ids_dst,
     mfq_tensor_backend::Tensor expert_bounds,
     mfq_tensor_backend::Tensor tile_bounds,
-    mfq_tensor_backend::Tensor tile_experts) {
+    mfq_tensor_backend::Tensor tile_experts,
+    bool masked_experts) {
     MFQ_RUNTIME_CHECK(
         n_experts > 0 && n_experts <= 4096,
         "NVQ heterogeneous expert count must be in [1,4096]");
@@ -6570,22 +6571,25 @@ mfq_tensor_backend::Tensor nvq_moe_grouped_matmul_hetero_f16_cuda(
         kNvqMoeF16HeteroTileN;
     const int base_block_cap = pairs >= 32768 ? 8192 : 4096;
     int block_cap = base_block_cap;
-    if (tile_m == 8 && base_block_cap == 4096 && rows_per_expert > 16) {
+    const int64_t max_tasks =
+        static_cast<int64_t>(max_tiles) * ntiles_n;
+    if (max_tasks > base_block_cap) {
         const int average_route_tiles =
             (rows_per_expert + tile_m - 1) / tile_m;
         const int task_period = average_route_tiles * ntiles_n;
-        const int64_t max_tasks =
-            static_cast<int64_t>(max_tiles) * ntiles_n;
         // Rotate CTAs between expert phases when the grid stride would
         // otherwise repeat the same valid/empty task pattern.
-        if (max_tasks > base_block_cap && task_period > 1 &&
-            base_block_cap % task_period == 0) {
-            block_cap += std::min(16, std::max(1, task_period / 4));
+        if (task_period > 1 && base_block_cap % task_period == 0) {
+            if (masked_experts && tile_m != 8 && task_period >= 64) {
+                block_cap += task_period;
+            } else if (tile_m == 8 && base_block_cap == 4096 &&
+                       rows_per_expert > 16) {
+                block_cap += std::min(16, std::max(1, task_period / 4));
+            }
         }
     }
     const int blocks = static_cast<int>(std::max<int64_t>(
-        1, std::min<int64_t>(
-               static_cast<int64_t>(max_tiles) * ntiles_n, block_cap)));
+        1, std::min<int64_t>(max_tasks, block_cap)));
 #define NVQ_MOE_HETERO_F16_LAUNCH(BM_VALUE, ROUTE_VALUE, GROUP_VALUE)           \
     do {                                                                         \
         constexpr int kSharedBytes = sizeof(NvqMoeF16SharedStorage<             \

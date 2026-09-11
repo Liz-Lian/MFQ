@@ -5172,9 +5172,12 @@ static mfq_tensor_backend::Tensor nint_moe_grouped_matmul_hetero_f16_impl(
     const dim3 threads(32, 8);
     const cudaStream_t stream = mfq_current_cuda_stream();
     const int tile_m = static_cast<int>(route_tile_m);
+    const int rows_per_expert = std::max(
+        1, (pairs + experts - 1) / experts);
     const int bm = tile_m != kRouteTile ? tile_m :
         (forced_bm != 0 ? forced_bm :
-            (tokens <= 128 ? 64 : (tokens <= 512 ? 32 : 64)));
+            (rows_per_expert <= 16 ? 16 :
+             rows_per_expert <= 32 ? 32 : 64));
     const bool coarse_tiles = tile_m == bm;
     MFQ_RUNTIME_CHECK(tile_m == kRouteTile || coarse_tiles,
         "coarse route tile size must match the MMA row tile");

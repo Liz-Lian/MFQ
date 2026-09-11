@@ -28226,6 +28226,100 @@ static int run_moe_check(
     return 0;
 }
 
+static int run_attention_prefill_check(
+    int tokens, int reps, int D, bool sliding, int window)
+{
+    if (tokens < 1 || tokens > 262144) {
+        throw std::runtime_error(
+            "--check-attention-prefill must be in [1, 262144]");
+    }
+    if (reps < 1) {
+        throw std::runtime_error("--check-attention-reps must be positive");
+    }
+    if (D != 128 && D != 256 && D != 512) {
+        throw std::runtime_error(
+            "--check-attention-head-dim must be 128, 256, or 512");
+    }
+    if (sliding && D != 256) {
+        throw std::runtime_error(
+            "SWA prefill check currently requires head_dim 256");
+    }
+    if (sliding && window < 1) {
+        throw std::runtime_error(
+            "--check-attention-window must be positive");
+    }
+    if (D == 512 && tokens % 64 != 0) {
+        throw std::runtime_error(
+            "head_dim 512 prefill requires a token count aligned to 64");
+    }
+
+    constexpr int B = 1;
+    constexpr int Hq = 16;
+    const int Hk = sliding ? 8 : 2;
+    auto cuda = mfq_tensor_backend::TensorOptions().device(
+        mfq_tensor_backend::kCUDA);
+    mfq_tensor_backend::manual_seed(20260912);
+    auto q = mfq_tensor_backend::randn(
+        {B, Hq, tokens, D}, cuda.dtype(mfq_tensor_backend::kFloat32));
+    auto k = mfq_tensor_backend::randn(
+        {B, Hk, tokens, D}, cuda.dtype(mfq_tensor_backend::kFloat16));
+    auto v = mfq_tensor_backend::randn(
+        {B, Hk, tokens, D}, cuda.dtype(mfq_tensor_backend::kFloat16));
+    const double scale = 1.0 / std::sqrt((double)D);
+    auto run_test = [&]() {
+        if (sliding) {
+            return mfq_attention_mma256_swa_cuda(
+                q, k, v, scale, window);
+        }
+        if (D == 128) {
+            return mfq_attention_mma128_cuda(q, k, v, scale);
+        }
+        if (D == 512) {
+            return mfq_attention_mma512_cuda(q, k, v, scale);
+        }
+        return mfq_attention_mma256_cuda(q, k, v, scale);
+    };
+
+    mfq_tensor_backend::Tensor output;
+    for (int i = 0; i < 5; ++i) output = run_test();
+    mfq_cuda_synchronize();
+    cudaEvent_t start, stop;
+    MFQ_CUDA_CHECK(cudaEventCreate(&start));
+    MFQ_CUDA_CHECK(cudaEventCreate(&stop));
+    auto stream = mfq_get_current_cuda_stream().stream();
+    MFQ_CUDA_CHECK(cudaEventRecord(start, stream));
+    for (int i = 0; i < reps; ++i) output = run_test();
+    MFQ_CUDA_CHECK(cudaEventRecord(stop, stream));
+    MFQ_CUDA_CHECK(cudaEventSynchronize(stop));
+    float elapsed = 0.0f;
+    MFQ_CUDA_CHECK(cudaEventElapsedTime(&elapsed, start, stop));
+    MFQ_CUDA_CHECK(cudaEventDestroy(start));
+    MFQ_CUDA_CHECK(cudaEventDestroy(stop));
+    const bool finite = mfq_tensor_backend::isfinite(output).all().item<bool>();
+    const int query_tile = tokens % 64 == 0
+        ? (sliding ? 32 : (Hq / Hk == 8 ? 8 : 16))
+        : (tokens <= 8 ? 8 : tokens <= 16 ? 16 : tokens <= 32 ? 32 : 64);
+    const uint64_t range_bytes =
+        (uint64_t)B * ((tokens + query_tile - 1) / query_tile) *
+        2 * sizeof(int32_t);
+    const uint64_t legacy_mask_bytes_min = sliding
+        ? (uint64_t)tokens * tokens * sizeof(uint16_t)
+        : 0;
+    std::cout << "attention_prefill_check mode="
+              << (sliding ? "swa" : "full")
+              << " head_dim=" << D
+              << " tokens=" << tokens
+              << " window=" << (sliding ? window : 0)
+              << " test_ms=" << elapsed / reps
+              << " tokens_per_second="
+              << (1000.0 * tokens * reps / elapsed)
+              << " range_bytes=" << range_bytes
+              << " removed_dense_mask_bytes_at_least="
+              << legacy_mask_bytes_min
+              << " finite=" << (finite ? 1 : 0) << "\n";
+    return finite ? 0 : 1;
+}
+
 static int run_attention_decode_check(int length, int reps, int D, bool sliding, int window) {
     if (length < 1 || length > 262144) {
         throw std::runtime_error("--check-attention-decode must be in [1, 262144]");
@@ -29914,6 +30008,7 @@ int main(int argc, char ** argv) {
         int check_dsv4_output_a_batch = 1;
         int check_dsv4_output_a_reps = 200;
         int check_attention_decode = 0;
+        int check_attention_prefill = 0;
         int check_attention_reps = 200;
         int check_attention_head_dim = 256;
         int check_attention_window = 4096;
@@ -29927,6 +30022,7 @@ int main(int argc, char ** argv) {
         bool compare_mma_decode = false;
         bool compare_nvq_vec4 = false;
         bool check_gemma4_swa = false;
+        bool check_attention_swa_prefill = false;
         bool check_glm_dsa = false;
         bool check_dsv4_attention = false;
         bool check_dsv4_hc = false;
@@ -30058,10 +30154,12 @@ int main(int argc, char ** argv) {
             else if (a == "--check-dsv4-output-a-batch" && i + 1 < argc) check_dsv4_output_a_batch = std::stoi(argv[++i]);
             else if (a == "--check-dsv4-output-a-reps" && i + 1 < argc) check_dsv4_output_a_reps = std::stoi(argv[++i]);
             else if (a == "--check-attention-decode" && i + 1 < argc) check_attention_decode = std::stoi(argv[++i]);
+            else if (a == "--check-attention-prefill" && i + 1 < argc) check_attention_prefill = std::stoi(argv[++i]);
             else if (a == "--check-attention-reps" && i + 1 < argc) check_attention_reps = std::stoi(argv[++i]);
             else if (a == "--check-attention-head-dim" && i + 1 < argc) check_attention_head_dim = std::stoi(argv[++i]);
             else if (a == "--check-attention-window" && i + 1 < argc) check_attention_window = std::stoi(argv[++i]);
             else if (a == "--check-attention-swa-decode") check_attention_swa_decode = true;
+            else if (a == "--check-attention-swa-prefill") check_attention_swa_prefill = true;
             else if (a == "--check-gemma4-swa") check_gemma4_swa = true;
             else if (a == "--check-glm-dsa") check_glm_dsa = true;
             else if (a == "--check-dsv4-attention") check_dsv4_attention = true;
@@ -30501,6 +30599,12 @@ int main(int argc, char ** argv) {
             return run_dsv4_output_a_check(
                 mfq_path, check_dsv4_output_a,
                 check_dsv4_output_a_batch, check_dsv4_output_a_reps);
+        }
+        if (check_attention_prefill > 0) {
+            return run_attention_prefill_check(
+                check_attention_prefill, check_attention_reps,
+                check_attention_head_dim, check_attention_swa_prefill,
+                check_attention_window);
         }
         if (check_attention_decode > 0) {
             return run_attention_decode_check(

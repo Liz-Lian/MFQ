@@ -138,34 +138,23 @@ mfq_tensor_backend::Tensor minicpm_flash128_output_cast_cuda(
     return output;
 }
 
-__global__ void mfq_causal_kv_max_kernel(
-    int* kv_max, int B, int T, int tiles, int query_tile, int kv_tile)
+__global__ void mfq_causal_kv_range_kernel(
+    int* kv_range, int B, int T, int tiles, int query_tile, int kv_tile,
+    int window)
 {
     for (int i = blockIdx.x * blockDim.x + threadIdx.x;
          i < B * tiles; i += gridDim.x * blockDim.x) {
         int tile = i % tiles;
+        int query_start = tile * query_tile;
         int visible = min(T, (tile + 1) * query_tile);
-        kv_max[i] = ((visible + kv_tile - 1) / kv_tile) * kv_tile;
-    }
-}
-
-__global__ void mfq_swa_causal_mask_kernel(
-    half* mask, int* kv_max, int B, int T, int mask_stride, int tiles,
-    int window, int query_tile, int kv_tile)
-{
-    const size_t total = (size_t)T * mask_stride;
-    for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-         i < total; i += (size_t)gridDim.x * blockDim.x) {
-        const int query = (int)(i / mask_stride);
-        const int key = (int)(i - (size_t)query * mask_stride);
-        const bool visible = key < T && key <= query && query - key < window;
-        mask[i] = visible ? __float2half(0.0f) : __float2half(-INFINITY);
-    }
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x;
-         i < B * tiles; i += gridDim.x * blockDim.x) {
-        const int tile = i % tiles;
-        const int visible = min(T, (tile + 1) * query_tile);
-        kv_max[i] = ((visible + kv_tile - 1) / kv_tile) * kv_tile;
+        // Store the exact lower bound for the first query in this tile. The
+        // MMA kernel advances it once per query row, avoiding a materialized
+        // T x T mask while retaining exact causal/window semantics.
+        kv_range[2 * i + 0] = window > 0
+            ? query_start - window + 1
+            : -T;
+        kv_range[2 * i + 1] =
+            ((visible + kv_tile - 1) / kv_tile) * kv_tile;
     }
 }
 
@@ -214,11 +203,9 @@ __global__ void mfq_glm_mla_mask_kernel(
 struct MfqAttentionMmaCache {
     int B = 0;
     int T = 0;
-    int mask_stride = 0;
     int query_tile = 0;
     int kv_tile = 0;
-    mfq_tensor_backend::Tensor mask;
-    mfq_tensor_backend::Tensor kv_max;
+    mfq_tensor_backend::Tensor kv_range;
 };
 
 static MfqAttentionMmaCache & mfq_attention_mma_cache(
@@ -228,12 +215,12 @@ static MfqAttentionMmaCache & mfq_attention_mma_cache(
     if (cache.B != B || cache.T != T || cache.query_tile != query_tile ||
         cache.kv_tile != kv_tile) {
         auto cuda = mfq_tensor_backend::TensorOptions().device(mfq_tensor_backend::kCUDA);
-        cache.mask_stride = 0;
         const int tiles = (T + query_tile - 1) / query_tile;
-        cache.kv_max = mfq_tensor_backend::empty({B, tiles}, cuda.dtype(mfq_tensor_backend::kInt32));
+        cache.kv_range = mfq_tensor_backend::empty(
+            {B, tiles, 2}, cuda.dtype(mfq_tensor_backend::kInt32));
         const int blocks = std::min(65535, std::max(1, (B * tiles + 255) / 256));
-        mfq_causal_kv_max_kernel<<<blocks, 256, 0, mfq_current_cuda_stream()>>>(
-            cache.kv_max.data_ptr<int>(), B, T, tiles, query_tile, kv_tile);
+        mfq_causal_kv_range_kernel<<<blocks, 256, 0, mfq_current_cuda_stream()>>>(
+            cache.kv_range.data_ptr<int>(), B, T, tiles, query_tile, kv_tile, 0);
         cache.B = B;
         cache.T = T;
         cache.query_tile = query_tile;
@@ -250,15 +237,14 @@ static MfqAttentionMmaCache & mfq_attention_mma_swa_cache(
     if (cache.B != B || cache.T != T || cache_window != window ||
         cache.query_tile != query_tile || cache.kv_tile != kv_tile) {
         auto cuda = mfq_tensor_backend::TensorOptions().device(mfq_tensor_backend::kCUDA);
-        cache.mask_stride = ((T + kv_tile - 1) / kv_tile) * kv_tile;
-        cache.mask = mfq_tensor_backend::empty({T, cache.mask_stride}, cuda.dtype(mfq_tensor_backend::kFloat16));
         const int tiles = (T + query_tile - 1) / query_tile;
-        cache.kv_max = mfq_tensor_backend::empty({B, tiles}, cuda.dtype(mfq_tensor_backend::kInt32));
-        const int blocks = std::min(65535, (T * cache.mask_stride + 255) / 256);
-        mfq_swa_causal_mask_kernel<<<blocks, 256, 0, mfq_current_cuda_stream()>>>(
-            reinterpret_cast<half*>(cache.mask.data_ptr<mfq_half>()),
-            cache.kv_max.data_ptr<int>(), B, T, cache.mask_stride, tiles,
-            window, query_tile, kv_tile);
+        cache.kv_range = mfq_tensor_backend::empty(
+            {B, tiles, 2}, cuda.dtype(mfq_tensor_backend::kInt32));
+        const int blocks = std::min(
+            65535, std::max(1, (B * tiles + 255) / 256));
+        mfq_causal_kv_range_kernel<<<blocks, 256, 0, mfq_current_cuda_stream()>>>(
+            cache.kv_range.data_ptr<int>(), B, T, tiles, query_tile, kv_tile,
+            window);
         cache.B = B;
         cache.T = T;
         cache.query_tile = query_tile;
@@ -311,8 +297,10 @@ static mfq_tensor_backend::Tensor mfq_attention_mma_launch(
         ? mfq_attention_mma_swa_cache(B, T, window, ncols1, nbatch_fa)
         : mfq_attention_mma_cache(B, T, ncols1, nbatch_fa);
     auto out = mfq_tensor_backend::empty({B, T, Hq, DV}, q.options());
-    using Kernel = decltype(&flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, false, false>);
-    Kernel kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, false, false>;
+    using Kernel = decltype(&flash_attn_ext_f16<
+        DKQ, DV, ncols1, ncols2, false, false, true>);
+    Kernel kernel = flash_attn_ext_f16<
+        DKQ, DV, ncols1, ncols2, false, false, true>;
     static bool shared_limit_set[32] = {};
     MFQ_RUNTIME_CHECK(device >= 0 && device < 32, "mfq_attention_mma256: unsupported CUDA device index");
     if (!shared_limit_set[device]) {
@@ -329,14 +317,13 @@ static mfq_tensor_backend::Tensor mfq_attention_mma_launch(
     const uint3 ne01 = init_fastdiv_values(T);
     const uint32_t n_head_log2 = 1u << (uint32_t)floorf(log2f((float)Hq));
     const dim3 block(32, nwarps, 1);
-    const char * mask_pointer = sliding
-        ? reinterpret_cast<const char*>(cache.mask.data_ptr()) : nullptr;
+    const char * mask_pointer = nullptr;
     kernel<<<ntiles_dst, block, shared_total, mfq_current_cuda_stream()>>>(
         reinterpret_cast<const char*>(q.data_ptr<float>()),
         reinterpret_cast<const char*>(k.data_ptr<mfq_half>()),
         reinterpret_cast<const char*>(v.data_ptr<mfq_half>()),
         mask_pointer,
-        nullptr, static_cast<int*>(cache.kv_max.data_ptr()),
+        nullptr, static_cast<int*>(cache.kv_range.data_ptr()),
         static_cast<float*>(out.data_ptr()), nullptr,
         (float)scale, 0.0f, 1.0f, 1.0f, n_head_log2, 0.0f,
         D, ne01, Hq, B,
@@ -345,9 +332,7 @@ static mfq_tensor_backend::Tensor mfq_attention_mma_launch(
         D * (int)sizeof(half), T * D * (int)sizeof(half), (int64_t)Hk * T * D * (int)sizeof(half),
         D * (int)sizeof(half), T * D * (int)sizeof(half), (int64_t)Hk * T * D * (int)sizeof(half),
         T, 1, 1,
-        cache.mask_stride * (int)sizeof(half),
-        T * cache.mask_stride * (int)sizeof(half),
-        (int64_t)T * cache.mask_stride * (int)sizeof(half));
+        0, 0, 0);
     const auto status = cudaGetLastError();
     MFQ_RUNTIME_CHECK(status == cudaSuccess,
                 "mfq_attention_mma256 launch failed: ", cudaGetErrorString(status));

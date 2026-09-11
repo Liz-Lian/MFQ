@@ -3221,22 +3221,38 @@ __device__ __forceinline__ void nint_moe_mma_profile(
             }
         }
 
-        constexpr int XPAIRS = BM * (BK / 2);
-        for (int index = tid; index < XPAIRS; index += 256) {
-            const int mm = index / (BK / 2);
-            const int pair_k = index - mm * (BK / 2);
-            const int k = kb + pair_k * 2;
-            __half2 value = __float2half2_rn(0.0f);
+        constexpr int kActivationVectorWidth = 8;
+        static_assert(BK % kActivationVectorWidth == 0);
+        constexpr int kActivationVectorsPerRow =
+            BK / kActivationVectorWidth;
+        constexpr int kActivationVectors =
+            BM * kActivationVectorsPerRow;
+        for (int index = tid; index < kActivationVectors; index += 256) {
+            const int mm = index / kActivationVectorsPerRow;
+            const int vector_local =
+                index - mm * kActivationVectorsPerRow;
+            const int k_local = vector_local * kActivationVectorWidth;
+            const int k = kb + k_local;
             const int source_row = source_rows_s[mm];
-            if (source_row >= 0) {
-                const __half * row = x + static_cast<size_t>(source_row) * k_real;
-                if (k + 1 < k_real) {
-                    value = *reinterpret_cast<const __half2 *>(row + k);
-                } else if (k < k_real) {
-                    value = __halves2half2(row[k], __float2half_rn(0.0f));
+            __half * destination = &X_s[mm][k_local];
+            if (source_row < 0 || k >= k_real) {
+                *reinterpret_cast<int4 *>(destination) =
+                    make_int4(0, 0, 0, 0);
+            } else if ((k_real & 7) == 0 && k + 7 < k_real) {
+                *reinterpret_cast<int4 *>(destination) =
+                    *reinterpret_cast<const int4 *>(
+                        x + static_cast<size_t>(source_row) * k_real + k);
+            } else {
+#pragma unroll
+                for (int element = 0;
+                     element < kActivationVectorWidth;
+                     ++element) {
+                    destination[element] = k + element < k_real
+                        ? x[static_cast<size_t>(source_row) * k_real +
+                            k + element]
+                        : __float2half_rn(0.0f);
                 }
             }
-            *reinterpret_cast<__half2 *>(&X_s[mm][pair_k * 2]) = value;
         }
         __syncthreads();
 
@@ -3379,24 +3395,43 @@ __device__ __forceinline__ void nint8_zero_moe_mma_profile(
             }
         }
 
-        constexpr int XPAIRS = BM * (BK / 2);
-        for (int index = tid; index < XPAIRS; index += 256) {
-            const int mm = index / (BK / 2);
-            const int pair_k = index - mm * (BK / 2);
+        constexpr int kActivationVectorWidth = 8;
+        static_assert(BK % kActivationVectorWidth == 0);
+        constexpr int kActivationVectorsPerRow =
+            BK / kActivationVectorWidth;
+        constexpr int kActivationVectors =
+            BM * kActivationVectorsPerRow;
+        for (int index = tid; index < kActivationVectors; index += 256) {
+            const int mm = index / kActivationVectorsPerRow;
+            const int vector_local =
+                index - mm * kActivationVectorsPerRow;
+            const int k_local = vector_local * kActivationVectorWidth;
             const int compact = first + mm;
-            const int k = kb + pair_k * 2;
-            __half2 value = __float2half2_rn(0.0f);
+            const int k = kb + k_local;
+            __half * destination = &X_s[mm][k_local];
+            int source_row = -1;
             if (compact < last) {
                 const int pair = ids_dst[compact];
-                const int source_row = routed_input ? pair : pair / routes;
-                const __half * row = x + static_cast<size_t>(source_row) * k_real;
-                if (k + 1 < k_real) {
-                    value = *reinterpret_cast<const __half2 *>(row + k);
-                } else if (k < k_real) {
-                    value = __halves2half2(row[k], __float2half_rn(0.0f));
+                source_row = routed_input ? pair : pair / routes;
+            }
+            if (source_row < 0 || k >= k_real) {
+                *reinterpret_cast<int4 *>(destination) =
+                    make_int4(0, 0, 0, 0);
+            } else if ((k_real & 7) == 0 && k + 7 < k_real) {
+                *reinterpret_cast<int4 *>(destination) =
+                    *reinterpret_cast<const int4 *>(
+                        x + static_cast<size_t>(source_row) * k_real + k);
+            } else {
+#pragma unroll
+                for (int element = 0;
+                     element < kActivationVectorWidth;
+                     ++element) {
+                    destination[element] = k + element < k_real
+                        ? x[static_cast<size_t>(source_row) * k_real +
+                            k + element]
+                        : __float2half_rn(0.0f);
                 }
             }
-            *reinterpret_cast<__half2 *>(&X_s[mm][pair_k * 2]) = value;
         }
         __syncthreads();
 

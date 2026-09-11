@@ -6124,8 +6124,9 @@ nvq_moe_grouped_hetero_f16_kernel(
     static_assert(BM % ROUTE_TILE_M == 0);
     constexpr int kStrideK =
         NvqMoeF16KLayout<GROUPS_PER_CHUNK>::kStrideK;
-    __shared__ NvqMoeF16SharedStorage<
-        BM, BN, GROUPS_PER_CHUNK> shared;
+    extern __shared__ __align__(16) uint8_t shared_bytes[];
+    auto & shared = *reinterpret_cast<NvqMoeF16SharedStorage<
+        BM, BN, GROUPS_PER_CHUNK> *>(shared_bytes);
     auto * weight_tile = reinterpret_cast<__half *>(shared.bytes);
     auto * activation_tile = weight_tile + BN * kStrideK;
     auto * output_tile = reinterpret_cast<float *>(shared.bytes);
@@ -6571,10 +6572,22 @@ mfq_tensor_backend::Tensor nvq_moe_grouped_matmul_hetero_f16_cuda(
         1, std::min<int64_t>(
                static_cast<int64_t>(max_tiles) * ntiles_n, block_cap)));
 #define NVQ_MOE_HETERO_F16_LAUNCH(BM_VALUE, ROUTE_VALUE, GROUP_VALUE)           \
-    nvq_moe_grouped_hetero_f16_kernel<                                          \
-        BM_VALUE, ROUTE_VALUE, GROUP_VALUE><<<                                  \
-        blocks, dim3(32, BM_VALUE == 128 ? 16 : 8), 0,                         \
-        mfq_current_cuda_stream()>>>(                                           \
+    do {                                                                         \
+        constexpr int kSharedBytes = sizeof(NvqMoeF16SharedStorage<             \
+            BM_VALUE, kNvqMoeF16HeteroTileN, GROUP_VALUE>);                     \
+        if constexpr (kSharedBytes > 48 * 1024) {                               \
+            static const cudaError_t attribute_status = cudaFuncSetAttribute(   \
+                nvq_moe_grouped_hetero_f16_kernel<                              \
+                    BM_VALUE, ROUTE_VALUE, GROUP_VALUE>,                        \
+                cudaFuncAttributeMaxDynamicSharedMemorySize, kSharedBytes);     \
+            MFQ_RUNTIME_CHECK(                                                   \
+                attribute_status == cudaSuccess,                                \
+                "failed to opt in to the NVQ MoE shared-memory size");          \
+        }                                                                        \
+        nvq_moe_grouped_hetero_f16_kernel<                                      \
+            BM_VALUE, ROUTE_VALUE, GROUP_VALUE><<<                              \
+            blocks, dim3(32, BM_VALUE == 128 ? 16 : 8), kSharedBytes,           \
+            mfq_current_cuda_stream()>>>(                                       \
         weight_ptrs.data_ptr<int64_t>(), weight_sizes.data_ptr<int64_t>(),      \
         pool_params.data_ptr<int32_t>(), expert_pool.data_ptr<int32_t>(),       \
         expert_local.data_ptr<int32_t>(),                                      \
@@ -6584,11 +6597,12 @@ mfq_tensor_backend::Tensor nvq_moe_grouped_matmul_hetero_f16_cuda(
         reinterpret_cast<__half *>(out.data_ptr<mfq_half>()), routes,          \
         static_cast<int>(n_experts), pools,                                    \
         static_cast<int>(out_per_expert), static_cast<int>(neuron_len),        \
-        max_tiles, routed_input)
+        max_tiles, routed_input);                                                \
+    } while (false)
     if (tile_m == 128) {
-        NVQ_MOE_HETERO_F16_LAUNCH(128, 128, 2);
+        NVQ_MOE_HETERO_F16_LAUNCH(128, 128, 4);
     } else if (tile_m == 64) {
-        NVQ_MOE_HETERO_F16_LAUNCH(128, 64, 2);
+        NVQ_MOE_HETERO_F16_LAUNCH(128, 64, 4);
     } else if (fine_bm == 16) {
         NVQ_MOE_HETERO_F16_LAUNCH(16, 8, 4);
     } else if (fine_bm == 32) {

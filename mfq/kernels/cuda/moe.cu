@@ -3228,7 +3228,7 @@ __device__ __forceinline__ void nint_moe_mma_profile(
                 store_moe_dequant_four(&W_s[nn][gl * GS + 24],
                                        packed3, d, m);
             } else if constexpr (
-                (BITS <= 4 || (BITS == 6 && BM == 32)) && GS % 8 == 0) {
+                (BITS <= 4 || (BITS == 6 && BM >= 32)) && GS % 8 == 0) {
                 PackedMoeEight packed = valid
                     ? unpack_eight_moe_mma<BITS, GS>(qg, 0)
                     : PackedMoeEight{0, 0};

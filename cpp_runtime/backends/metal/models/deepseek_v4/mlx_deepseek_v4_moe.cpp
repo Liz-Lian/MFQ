@@ -132,9 +132,9 @@ MlxRoutedLinear load_routed(
     const MfqContainer& model,
     const std::string& name) {
     const auto& record = model.record(name);
-    if (record.dtype != "NINTM") {
+    if (record.dtype != "MFE") {
         throw std::runtime_error(
-            "DeepSeek-V4 routed expert tensor must use NINTM: "
+            "DeepSeek-V4 routed expert tensor must use MFE: "
             + name);
     }
     const auto mapped = model.map_record(name);
@@ -218,7 +218,7 @@ int count_available(const array& value) {
 
 array streamed_availability(
     const std::optional<array>& requested,
-    MlxNintMoeOffloadCache& offload,
+    MlxMfeOffloadCache& offload,
     const std::vector<std::string>& projection_names,
     int experts) {
     auto result = bool_vector(requested, experts);
@@ -263,7 +263,7 @@ MlxDeepseekV4Moe MlxDeepseekV4Moe::load(
     const DeepseekV4Config& config,
     std::size_t layer,
     const std::optional<array>& available,
-    std::shared_ptr<MlxNintMoeOffloadCache>
+    std::shared_ptr<MlxMfeOffloadCache>
         offload) {
     config.validate();
     if (layer >=
@@ -526,7 +526,7 @@ MlxDeepseekV4Moe MlxDeepseekV4Moe::load_named(
     const DeepseekV4Config& config,
     const std::string& prefix,
     const std::optional<array>& available,
-    std::shared_ptr<MlxNintMoeOffloadCache> offload,
+    std::shared_ptr<MlxMfeOffloadCache> offload,
     std::size_t expert_cache_layer) {
     config.validate();
     if (prefix.empty()) {
@@ -808,7 +808,7 @@ MlxDeepseekV4Moe::MlxDeepseekV4Moe(
         routed_up,
     std::optional<MlxRoutedLinear>
         routed_down,
-    std::shared_ptr<MlxNintMoeOffloadCache>
+    std::shared_ptr<MlxMfeOffloadCache>
         expert_offload,
     std::shared_ptr<MlxDeepseekV4SsdExpertCache>
         ssd_expert_cache,

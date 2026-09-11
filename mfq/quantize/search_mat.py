@@ -1,14 +1,14 @@
-"""Per-tensor NintSpec search based on profiles.
+"""Per-tensor NINT search over uniform template seeds.
 
-Given weights and a target bpw, search a free ``k in [2,8]`` for every profile in the **fixed profile catalog**
-(the ``(bits, gs)`` pairs in :data:`mfq.formats.nint.PROFILE_CATALOG`) and select the
+Given weights and a target bpw, search a free ``k in [2,8]`` for every entry in the uniform template catalog
+(the ``(bits, gs)`` pairs in :data:`mfq.formats.nint.UNIFORM_TEMPLATE_CATALOG`) and select the
 :class:`~mfq.formats.nint.NintSpec` with the highest SNR. This is the core of MFQ per-tensor mixed precision
 (development documentation v2 sections 1.7 and 2.2).
 
-Why ``gs`` is fixed while ``k`` is free:
-- ``gs`` determines kernel tiling, and every distinct ``gs`` needs a dedicated kernel; limiting ``gs`` values controls kernel count.
-- ``k`` is baked into ``neuron_scale = f16(neu_s/(2^k-1))`` and does not appear in dequantization arithmetic, so **the kernel
-  cannot see ``k`` and it may vary freely**. Thus ``k`` provides fine-grained bpw without adding kernels.
+The catalog bounds the search space; it does not enumerate runtime formats.
+Per-neuron q/k choices are encoded as row metadata and consumed by one kernel.
+``gs`` remains a tensor-level choice because heterogeneous group boundaries
+cannot be made row-transparent in the same packed stream.
 
 The search quantizes and dequantizes the entire matrix to evaluate SNR without subset sampling, ensuring rigorous reproducibility.
 """
@@ -19,7 +19,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from mfq.formats.nint import PROFILE_CATALOG, NintSpec
+from mfq.formats.nint import UNIFORM_TEMPLATE_CATALOG, NintSpec
 from mfq.quantize import nint_quant
 from mfq.utils.tensor import snr
 
@@ -48,7 +48,7 @@ def search(
     weight: np.ndarray,
     target_bpw: float,
     axis: int = 0,
-    profiles: tuple[tuple[int, int], ...] = PROFILE_CATALOG,
+    profiles: tuple[tuple[int, int], ...] = UNIFORM_TEMPLATE_CATALOG,
 ) -> SearchResult:
     """Search a free k for every profile and return the complete :class:`SearchResult` with the best SNR under budget.
 
@@ -84,7 +84,7 @@ def best_spec(
     weight: np.ndarray,
     target_bpw: float,
     axis: int = 0,
-    profiles: tuple[tuple[int, int], ...] = PROFILE_CATALOG,
+    profiles: tuple[tuple[int, int], ...] = UNIFORM_TEMPLATE_CATALOG,
 ) -> NintSpec:
     """Return the NintSpec with the highest SNR among candidates at or below ``target_bpw``."""
 

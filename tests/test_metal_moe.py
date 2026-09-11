@@ -1,4 +1,4 @@
-"""Apple-silicon routed NINTM and NEPQ tests."""
+"""Apple-silicon routed MFE and NEPQ tests."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ except RuntimeError:
     pytest.skip("Metal device unavailable", allow_module_level=True)
 
 from mfq.formats import io  # noqa: E402
-from mfq.formats.moe import NintMoePool, NintMoeTensor  # noqa: E402
+from mfq.formats.mfe import MfePool, MfeTensor  # noqa: E402
 from mfq.formats.mx import MxTensor  # noqa: E402
 from mfq.formats.nepq import (  # noqa: E402
     NEPQ0_A,
@@ -62,7 +62,7 @@ def _nint_moe(
     cohorts: tuple[tuple[int, ...], ...],
     *,
     bits: tuple[int, ...] | None = None,
-) -> NintMoeTensor:
+) -> MfeTensor:
     experts, out, width = dense.shape
     if bits is None:
         bits = (4,) * len(cohorts)
@@ -78,15 +78,15 @@ def _nint_moe(
     for ids, profile in zip(cohorts, bits, strict=True):
         rows = dense[np.asarray(ids)].reshape(len(ids) * out, width)
         pools.append(
-            NintMoePool(
+            MfePool(
                 np.asarray(ids, dtype=np.int32),
                 quantize(rows, profiles[profile]),
             )
         )
-    return NintMoeTensor((experts, out, width), tuple(pools))
+    return MfeTensor((experts, out, width), tuple(pools))
 
 
-def _decode_nint_moe(tensor: NintMoeTensor) -> np.ndarray:
+def _decode_nint_moe(tensor: MfeTensor) -> np.ndarray:
     result = np.empty(tensor.shape, dtype=np.float32)
     for pool in tensor.pools:
         decoded = dequantize(pool.tensor).reshape(
@@ -179,10 +179,10 @@ def _mxfp4_rows(rows: int, width: int, seed: int) -> tuple[MxTensor, np.ndarray]
 @pytest.mark.parametrize("spec", [NEPQ0_A, NEPQ1_A])
 def test_routed_nepq_a_sparse_residual_uses_grouped_dispatch(spec):
     tensor, _ = _nepq_a_tensor(spec)
-    moe = NintMoeTensor(
+    moe = MfeTensor(
         tensor.shape,
         (
-            NintMoePool(
+            MfePool(
                 np.arange(tensor.n_experts, dtype=np.int32),
                 tensor,
             ),
@@ -220,7 +220,7 @@ def test_routed_nepq_a_sparse_residual_uses_grouped_dispatch(spec):
 
 
 @pytest.mark.parametrize("path", ["direct", "compact", "route_mma", "expert_mma"])
-def test_routed_nintm_mxfp4_cohort_all_grouped_paths(path: str):
+def test_routed_mfe_mxfp4_cohort_all_grouped_paths(path: str):
     rng = np.random.default_rng(948)
     experts, out, width = 4, 9, 96
     mx_ids = np.asarray([0, 2], dtype=np.int32)
@@ -230,11 +230,11 @@ def test_routed_nintm_mxfp4_cohort_all_grouped_paths(path: str):
         np.float32
     )
     nint_tensor = quantize(nint_source, NintSpec(4, 24, 6))
-    tensor = NintMoeTensor(
+    tensor = MfeTensor(
         (experts, out, width),
         (
-            NintMoePool(mx_ids, mx_tensor),
-            NintMoePool(nint_ids, nint_tensor),
+            MfePool(mx_ids, mx_tensor),
+            MfePool(nint_ids, nint_tensor),
         ),
     )
     dense = np.empty((experts, out, width), dtype=np.float32)
@@ -243,7 +243,7 @@ def test_routed_nintm_mxfp4_cohort_all_grouped_paths(path: str):
     source = rng.normal(0.0, 0.04, size=(9, width)).astype(np.float16)
     ids = np.tile(np.asarray([[0, 1]], dtype=np.int32), (9, 1))
     ids[1::2] = np.asarray([2, 3], dtype=np.int32)
-    layer = MlxRoutedLinear.from_blob(io.pack_nint_moe(tensor))
+    layer = MlxRoutedLinear.from_blob(io.pack_mfe(tensor))
     assert layer.uses_grouped_kernel
     options = {
         "direct": dict(compact_threshold=None),
@@ -270,7 +270,7 @@ def test_routed_nintm_mxfp4_cohort_all_grouped_paths(path: str):
     np.testing.assert_allclose(actual, expected, rtol=tolerance, atol=tolerance)
 
 
-def test_routed_nintm_mixed_precision_cohorts():
+def test_routed_mfe_mixed_precision_cohorts():
     rng = np.random.default_rng(10)
     dense = rng.normal(0, 0.1, size=(4, 7, 40)).astype(np.float32)
     tensor = _nint_moe(dense, ((0, 2), (1, 3)), bits=(4, 5))
@@ -316,16 +316,21 @@ def test_routed_grouped_nint_bit_widths(bits: int, width: int):
     ("cohorts", "bits"),
     [(((0, 1, 2, 3),), (4,)), (((0, 2), (1, 3)), (4, 6))],
 )
-def test_routed_nintm_blob_keeps_nint_cohorts_packed(cohorts, bits):
+def test_routed_mfe_blob_keeps_nint_cohorts_packed(cohorts, bits):
     rng = np.random.default_rng(20260905)
     dense = rng.normal(0, 0.1, size=(4, 7, 48)).astype(np.float32)
     tensor = _nint_moe(dense, cohorts, bits=bits)
     source = rng.normal(0, 0.1, size=(3, 48)).astype(np.float32)
     ids = np.asarray([[0, 3], [2, 1], [3, 0]], dtype=np.int32)
 
-    layer = MlxRoutedLinear.from_blob(io.pack_nint_moe(tensor))
+    layer = MlxRoutedLinear.from_blob(io.pack_mfe(tensor))
     assert layer.uses_grouped_kernel
     assert layer.grouped_weight.nint_q.dtype == mx.uint8
+    assert len(layer.grouped_weight.nint_cohorts) == len(cohorts)
+    assert all(
+        int(cohort.weight.q_packed.size) > 1
+        for cohort in layer.grouped_weight.nint_cohorts
+    )
     actual = _array(layer(source, ids))
 
     decoded = _decode_nint_moe(tensor)
@@ -380,10 +385,10 @@ def test_nint_octet_loader_handles_group_boundaries(groupsize: int):
         dense.reshape((-1, width)),
         NintSpec(4, groupsize, 6),
     )
-    tensor = NintMoeTensor(
+    tensor = MfeTensor(
         dense.shape,
         (
-            NintMoePool(
+            MfePool(
                 np.asarray([0, 1], dtype=np.int32),
                 quantized,
             ),
@@ -416,9 +421,9 @@ def test_routed_nepq_selects_global_expert():
     tensor = _nepq_tensor(NEPQ0_S)
     tensor.rotation_block = 0
     tensor.rotation_seed = 0
-    container = NintMoeTensor(
+    container = MfeTensor(
         tensor.shape,
-        (NintMoePool(np.asarray([0, 1], dtype=np.int32), tensor),),
+        (MfePool(np.asarray([0, 1], dtype=np.int32), tensor),),
     )
     source = (
         np.random.default_rng(20).normal(0, 0.1, size=(3, tensor.neuron_len)).astype(np.float32)
@@ -437,26 +442,26 @@ def test_routed_nepq_selects_global_expert():
     np.testing.assert_allclose(actual, expected, rtol=4e-5, atol=4e-5)
 
 
-def test_routed_mixed_nint_and_npq_single_dispatch():
+def test_routed_mixed_nint_and_npq_composed_dispatch():
     rng = np.random.default_rng(25)
     out, width = 13, 80
     dense = rng.normal(0, 0.1, size=(out, width)).astype(np.float32)
     nint = quantize(dense, NintSpec(4, 24, 6))
     npq, npq_decoded = _npq(True, 26)
-    tensor = NintMoeTensor(
+    tensor = MfeTensor(
         (2, out, width),
         (
-            NintMoePool(np.asarray([0], dtype=np.int32), nint),
-            NintMoePool(np.asarray([1], dtype=np.int32), npq),
+            MfePool(np.asarray([0], dtype=np.int32), nint),
+            MfePool(np.asarray([1], dtype=np.int32), npq),
         ),
     )
     source = rng.normal(0, 0.1, size=(3, width)).astype(np.float32)
     ids = np.asarray([[0, 1], [1, 0], [1, 1]], dtype=np.int32)
-    blob = io.pack_nint_moe(tensor)
+    blob = io.pack_mfe(tensor)
     layer = MlxRoutedLinear.from_blob(blob)
     assert layer.uses_grouped_kernel
     actual = _array(layer(source, ids))
-    fallback = _array(MlxRoutedLinear(io.unpack_nint_moe(blob))(source, ids))
+    fallback = _array(MlxRoutedLinear(io.unpack_mfe(blob))(source, ids))
     np.testing.assert_array_equal(actual, fallback)
     decoded = (dequantize(nint), npq_decoded)
     expected = np.stack(
@@ -469,23 +474,23 @@ def test_routed_mixed_nint_and_npq_single_dispatch():
 
 
 @pytest.mark.parametrize("compact", [False, True])
-def test_routed_mixed_nint_and_nint8_zero_single_dispatch(compact: bool):
+def test_routed_mixed_nint_and_nint8_zero_composed_dispatch(compact: bool):
     rng = np.random.default_rng(251)
     out, width = 13, 64
     nint_dense = rng.normal(0, 0.1, size=(out, width)).astype(np.float32)
     q8_dense = rng.normal(0, 0.1, size=(out, width)).astype(np.float32)
     nint = quantize(nint_dense, NintSpec(4, 24, 6))
     q8 = quantize_nint8_zero(q8_dense)
-    tensor = NintMoeTensor(
+    tensor = MfeTensor(
         (2, out, width),
         (
-            NintMoePool(np.asarray([0], dtype=np.int32), nint),
-            NintMoePool(np.asarray([1], dtype=np.int32), q8),
+            MfePool(np.asarray([0], dtype=np.int32), nint),
+            MfePool(np.asarray([1], dtype=np.int32), q8),
         ),
     )
     source = rng.normal(0, 0.1, size=(8, width)).astype(np.float16 if compact else np.float32)
     ids = np.tile(np.asarray([[0, 1]], dtype=np.int32), (8, 1))
-    layer = MlxRoutedLinear.from_blob(io.pack_nint_moe(tensor))
+    layer = MlxRoutedLinear.from_blob(io.pack_mfe(tensor))
     assert layer.uses_grouped_kernel
     actual = _array(
         grouped_moe_matmul(
@@ -522,11 +527,11 @@ def test_route_compacted_matrix_handles_expert_boundary_tile(
     second_dense = rng.normal(0, 0.1, size=(out, width)).astype(np.float32)
     first = quantize(first_dense, NintSpec(4, 24, 6))
     second = quantize_nint8_zero(second_dense)
-    tensor = NintMoeTensor(
+    tensor = MfeTensor(
         (2, out, width),
         (
-            NintMoePool(np.asarray([0], dtype=np.int32), first),
-            NintMoePool(np.asarray([1], dtype=np.int32), second),
+            MfePool(np.asarray([0], dtype=np.int32), first),
+            MfePool(np.asarray([1], dtype=np.int32), second),
         ),
     )
     source = rng.normal(0, 0.1, size=(9, width)).astype(np.float16)
@@ -555,21 +560,21 @@ def test_route_compacted_matrix_handles_expert_boundary_tile(
 def test_routed_multiple_vq_pool_offsets():
     first, first_decoded = _nvq(NVQ2_E8, 27)
     second, second_decoded = _nvq(NVQ3_D4, 28)
-    tensor = NintMoeTensor(
+    tensor = MfeTensor(
         (2, first.shape[0], first.neuron_len),
         (
-            NintMoePool(np.asarray([0], dtype=np.int32), first),
-            NintMoePool(np.asarray([1], dtype=np.int32), second),
+            MfePool(np.asarray([0], dtype=np.int32), first),
+            MfePool(np.asarray([1], dtype=np.int32), second),
         ),
     )
     rng = np.random.default_rng(29)
     source = rng.normal(0, 0.1, size=(2, first.neuron_len)).astype(np.float32)
     ids = np.asarray([[1, 0], [0, 1]], dtype=np.int32)
-    blob = io.pack_nint_moe(tensor)
+    blob = io.pack_mfe(tensor)
     layer = MlxRoutedLinear.from_blob(blob)
     assert layer.uses_grouped_kernel
     actual = _array(layer(source, ids))
-    fallback = _array(MlxRoutedLinear(io.unpack_nint_moe(blob))(source, ids))
+    fallback = _array(MlxRoutedLinear(io.unpack_mfe(blob))(source, ids))
     np.testing.assert_array_equal(actual, fallback)
     decoded = (first_decoded, second_decoded)
     expected = np.stack(
@@ -584,11 +589,11 @@ def test_routed_multiple_vq_pool_offsets():
 def test_routed_extended_jsc_index_widths():
     first, first_decoded = _jsc(NVQ2_E8_4096, 20260834)
     second, second_decoded = _jsc(NVQ3_D4_1024, 20260835)
-    tensor = NintMoeTensor(
+    tensor = MfeTensor(
         (2, first.shape[0], first.neuron_len),
         (
-            NintMoePool(np.asarray([0], dtype=np.int32), first),
-            NintMoePool(np.asarray([1], dtype=np.int32), second),
+            MfePool(np.asarray([0], dtype=np.int32), first),
+            MfePool(np.asarray([1], dtype=np.int32), second),
         ),
     )
     source = (
@@ -623,11 +628,11 @@ def test_route_compacted_mixed_nint_npq_prefill():
     dense = rng.normal(0, 0.1, size=(out, width)).astype(np.float32)
     nint = quantize(dense, NintSpec(4, 24, 6))
     npq, npq_decoded = _npq(True, 31)
-    tensor = NintMoeTensor(
+    tensor = MfeTensor(
         (2, out, width),
         (
-            NintMoePool(np.asarray([0], dtype=np.int32), nint),
-            NintMoePool(np.asarray([1], dtype=np.int32), npq),
+            MfePool(np.asarray([0], dtype=np.int32), nint),
+            MfePool(np.asarray([1], dtype=np.int32), npq),
         ),
     )
     source = rng.normal(0, 0.1, size=(8, width)).astype(np.float32)
@@ -657,11 +662,11 @@ def test_route_compacted_matrix_mixed_nint_npq_prefill():
     dense = rng.normal(0, 0.1, size=(out, width)).astype(np.float32)
     nint = quantize(dense, NintSpec(4, 24, 6))
     npq, npq_decoded = _npq(True, 302)
-    tensor = NintMoeTensor(
+    tensor = MfeTensor(
         (2, out, width),
         (
-            NintMoePool(np.asarray([0], dtype=np.int32), nint),
-            NintMoePool(np.asarray([1], dtype=np.int32), npq),
+            MfePool(np.asarray([0], dtype=np.int32), nint),
+            MfePool(np.asarray([1], dtype=np.int32), npq),
         ),
     )
     source = rng.normal(0, 0.1, size=(8, width)).astype(np.float16)
@@ -688,18 +693,18 @@ def test_route_compacted_matrix_mixed_nint_npq_prefill():
 
 def test_rotated_nepq_uses_grouped_dispatch():
     tensor = _nepq_tensor(NEPQ0_S)
-    container = NintMoeTensor(
+    container = MfeTensor(
         tensor.shape,
-        (NintMoePool(np.asarray([0, 1], dtype=np.int32), tensor),),
+        (MfePool(np.asarray([0, 1], dtype=np.int32), tensor),),
     )
     rng = np.random.default_rng(31)
     source = rng.normal(0, 0.1, size=(3, tensor.neuron_len)).astype(np.float32)
     ids = np.asarray([[0, 1], [1, 0], [1, 1]], dtype=np.int32)
-    blob = io.pack_nint_moe(container)
+    blob = io.pack_mfe(container)
     layer = MlxRoutedLinear.from_blob(blob)
     assert layer.uses_grouped_kernel
     actual = _array(layer(source, ids))
-    fallback = _array(MlxRoutedLinear(io.unpack_nint_moe(blob))(source, ids))
+    fallback = _array(MlxRoutedLinear(io.unpack_mfe(blob))(source, ids))
     np.testing.assert_array_equal(actual, fallback)
     signs = rotation_signs(
         tensor.neuron_len,
@@ -717,7 +722,7 @@ def test_rotated_nepq_uses_grouped_dispatch():
     np.testing.assert_allclose(actual, expected, rtol=5e-4, atol=5e-4)
 
 
-def test_routed_nintm_swiglu_and_route_reduction():
+def test_routed_mfe_swiglu_and_route_reduction():
     rng = np.random.default_rng(30)
     experts, hidden, intermediate = 3, 24, 32
     gate_dense = rng.normal(0, 0.1, size=(experts, intermediate, hidden)).astype(np.float32)
@@ -751,7 +756,7 @@ def test_routed_nintm_swiglu_and_route_reduction():
     np.testing.assert_allclose(actual, expected, rtol=6e-5, atol=6e-5)
 
 
-def test_routed_nintm_independent_random_gate_up_down_precisions():
+def test_routed_mfe_independent_random_gate_up_down_precisions():
     """Keep precision allocation independent across all three MoE projections."""
 
     rng = np.random.default_rng(20260908)
@@ -764,7 +769,7 @@ def test_routed_nintm_independent_random_gate_up_down_precisions():
         rng.shuffle(assignment)
         return assignment
 
-    def quantized_projection(dense: np.ndarray, assignment: np.ndarray) -> NintMoeTensor:
+    def quantized_projection(dense: np.ndarray, assignment: np.ndarray) -> MfeTensor:
         cohorts = tuple(
             tuple(int(value) for value in np.flatnonzero(assignment == bits))
             for bits in precision_choices
@@ -805,18 +810,18 @@ def test_routed_nintm_independent_random_gate_up_down_precisions():
         down_assignment,
     )
 
-    # Keep three independent blobs while Gate/Up share one grouped dispatch.
-    gate_blob = io.pack_nint_moe(gate)
-    up_blob = io.pack_nint_moe(up)
-    down_blob = io.pack_nint_moe(down)
+    # Keep three independent blobs while Gate/Up share one routed call.
+    gate_blob = io.pack_mfe(gate)
+    up_blob = io.pack_mfe(up)
+    down_blob = io.pack_mfe(down)
     gate_layer = MlxRoutedLinear.from_blob(gate_blob)
     up_layer = MlxRoutedLinear.from_blob(up_blob)
     down_layer = MlxRoutedLinear.from_blob(down_blob)
     gate_up_layer = MlxRoutedLinearGroup((gate_layer, up_layer))
     assert gate_up_layer.uses_grouped_kernel
-    assert io.pack_nint_moe(io.unpack_nint_moe(gate_blob)) == gate_blob
-    assert io.pack_nint_moe(io.unpack_nint_moe(up_blob)) == up_blob
-    assert io.pack_nint_moe(io.unpack_nint_moe(down_blob)) == down_blob
+    assert io.pack_mfe(io.unpack_mfe(gate_blob)) == gate_blob
+    assert io.pack_mfe(io.unpack_mfe(up_blob)) == up_blob
+    assert io.pack_mfe(io.unpack_mfe(down_blob)) == down_blob
 
     gate_dense = _decode_nint_moe(gate)
     up_dense = _decode_nint_moe(up)

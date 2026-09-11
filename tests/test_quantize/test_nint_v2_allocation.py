@@ -2,14 +2,56 @@ from __future__ import annotations
 
 import numpy as np
 
+from mfq.calibration.allocator import GroupCandidate, allocate_lp_rounded
 from mfq.formats.nint import NintSpec
-from mfq.quantize.nint_v2 import (
+from mfq.quantize.nint_quant import dequantize, quantize
+from mfq.quantize.nint import (
+    _allocate_separable_lp_rounded,
     allocate_row_profiles,
     candidate_profiles,
     measure_row_profile_losses,
     profile_variable_bits,
 )
-from mfq.quantize.nint_quant import dequantize, quantize
+
+
+def test_separable_allocator_matches_expanded_lp_reference() -> None:
+    rng = np.random.default_rng(20260911)
+    for _ in range(32):
+        rows = int(rng.integers(2, 9))
+        profile_count = int(rng.integers(3, 9))
+        costs = np.sort(
+            rng.choice(np.arange(10, 101), size=profile_count, replace=False)
+        ).astype(np.int64)
+        losses = rng.lognormal(0.0, 1.0, size=(rows, profile_count))
+        target = int(rng.integers(rows * costs[0], rows * costs[-1] + 1))
+
+        selected, actual, selected_loss = _allocate_separable_lp_rounded(
+            losses,
+            costs,
+            target,
+        )
+        reference = allocate_lp_rounded(
+            (
+                GroupCandidate(
+                    group=f"row:{row}",
+                    profile=f"profile:{profile}",
+                    specs={"index": profile},
+                    storage_bits=int(costs[profile]),
+                    train_loss=float(losses[row, profile]),
+                    validation_loss=float(losses[row, profile]),
+                )
+                for row in range(rows)
+                for profile in range(profile_count)
+            ),
+            target,
+        )
+        reference_selected = np.asarray(
+            [reference.selected[f"row:{row}"].specs["index"] for row in range(rows)]
+        )
+
+        np.testing.assert_array_equal(selected, reference_selected)
+        assert actual == reference.actual_storage_bits
+        np.testing.assert_allclose(selected_loss, reference.train_loss, rtol=1e-12)
 
 
 def test_joint_qk_allocation_moves_budget_to_important_neurons() -> None:
@@ -69,6 +111,34 @@ def test_joint_qk_allocation_keeps_uniform_profile_without_signal() -> None:
     np.testing.assert_array_equal(result.row_q_bits, np.full(7, 4))
     np.testing.assert_array_equal(result.row_sub_bits, np.full(7, 6))
     assert result.actual_variable_bits == result.target_variable_bits
+
+
+def test_joint_qk_allocation_respects_an_explicit_tight_payload_budget() -> None:
+    spec = NintSpec(4, 24, 6)
+    profiles = candidate_profiles(spec)
+    rows = 7
+    values_per_row = 72
+    groups_per_row = 3
+    losses = np.zeros((rows, len(profiles)), dtype=np.float64)
+    uniform_bits = rows * profile_variable_bits(
+        spec.bits,
+        spec.sub_bits,
+        values_per_row=values_per_row,
+        groups_per_row=groups_per_row,
+    )
+    tight_budget = uniform_bits - rows * 5
+
+    result = allocate_row_profiles(
+        losses,
+        profiles,
+        spec,
+        values_per_row=values_per_row,
+        groups_per_row=groups_per_row,
+        target_variable_bits=tight_budget,
+    )
+
+    assert result.actual_variable_bits <= tight_budget
+    assert "uniform-fallback" not in result.solver
 
 
 def test_candidate_profiles_follow_the_header_k_window() -> None:

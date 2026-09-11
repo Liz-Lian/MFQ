@@ -19,57 +19,21 @@ def embedding(weight: torch.Tensor, token_ids: torch.Tensor) -> torch.Tensor:
 def nint_embedding(g: dict, token_ids: torch.Tensor) -> torch.Tensor:
     """Gather and dequantize selected NINT embedding rows."""
 
-    if g.get("q") is not None and g.get("d_eff") is not None and g.get("m_eff") is not None:
-        return ext().nint_embedding_lookup_cuda(
-            g["q"],
-            g["d_eff"].contiguous(),
-            g["m_eff"].contiguous(),
-            token_ids.contiguous().to(device=g["q"].device, dtype=torch.int64),
-            int(g["neuron_len"]),
-            int(g["gs"]),
+    if g.get("row_q_bits") is None or g.get("row_q_bit_offsets") is None:
+        raise ValueError(
+            "NINT embedding requires canonical per-neuron row metadata"
         )
-    if g.get("sub_scale") is not None:
-        if g.get("mixed_q", False):
-            return ext().nint_embedding_lookup_packed_mixed_q_cuda(
-                g["q_packed"],
-                g["row_q_bits"],
-                g["row_q_bit_offsets"],
-                g["sub_scale"],
-                g["sub_min"],
-                g["neuron_scale"],
-                g["neuron_min"],
-                token_ids.contiguous().to(
-                    device=g["q_packed"].device, dtype=torch.int64
-                ),
-                int(g["neuron_len"]),
-                int(g["gs"]),
-            )
-        if int(g.get("bits", 4)) != 4:
-            return ext().nint_embedding_lookup_packed_compact_bits_cuda(
-                g["q_packed"],
-                g["sub_scale"],
-                g["sub_min"],
-                g["neuron_scale"],
-                g["neuron_min"],
-                token_ids.contiguous().to(device=g["q_packed"].device, dtype=torch.int64),
-                int(g["neuron_len"]),
-                int(g["gs"]),
-                int(g["bits"]),
-            )
-        return ext().nint_embedding_lookup_packed_compact_cuda(
-            g["q_packed"],
-            g["sub_scale"],
-            g["sub_min"],
-            g["neuron_scale"],
-            g["neuron_min"],
-            token_ids.contiguous().to(device=g["q_packed"].device, dtype=torch.int64),
-            int(g["neuron_len"]),
-            int(g["gs"]),
-        )
-    return ext().nint_embedding_lookup_packed_eff_cuda(
+    return ext().nint_embedding_cuda(
         g["q_packed"],
-        g["eff_pair_h"].contiguous(),
-        token_ids.contiguous().to(device=g["q_packed"].device, dtype=torch.int64),
+        g["row_q_bits"],
+        g["row_q_bit_offsets"],
+        g["sub_scale"],
+        g["sub_min"],
+        g["neuron_scale"],
+        g["neuron_min"],
+        token_ids.contiguous().to(
+            device=g["q_packed"].device, dtype=torch.int64
+        ),
         int(g["neuron_len"]),
         int(g["gs"]),
     )

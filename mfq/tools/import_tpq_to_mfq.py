@@ -32,9 +32,9 @@ from mfq.formats.runtime_profile import (
     architecture_profile,
 )
 from mfq.formats.io import (
-    _NINT_MOE_HDR,
-    _NINT_MOE_MAGIC_V2,
-    _NINT_MOE_POOL_V2_HDR,
+    _MFE_HDR,
+    _MFE_MAGIC,
+    _MFE_POOL_HDR,
     _u32,
 )
 from mfq.formats.mx import MXFP8_DTYPE, mx_header_bytes
@@ -625,7 +625,7 @@ def _expert_record_nbytes(
     columns: int,
     specs: dict[str, TpqPqSpec],
 ) -> int:
-    total = _NINT_MOE_HDR.size
+    total = _MFE_HDR.size
     for tier in _POOL_ORDER:
         expert_ids = layout.get(tier)
         if not expert_ids:
@@ -645,7 +645,7 @@ def _expert_record_nbytes(
             spec,
         )
         total += (
-            _NINT_MOE_POOL_V2_HDR.size
+            _MFE_POOL_HDR.size
             + len(expert_ids) * 4
             + len(dtype)
             + payload
@@ -673,8 +673,8 @@ def _write_expert_projection(
             dropped_experts=dropped_experts,
         )
         output.write(
-            _NINT_MOE_HDR.pack(
-                _NINT_MOE_MAGIC_V2,
+            _MFE_HDR.pack(
+                _MFE_MAGIC,
                 n_experts,
                 rows_per_expert,
                 columns,
@@ -700,7 +700,7 @@ def _write_expert_projection(
                 spec,
             )
             output.write(
-                _NINT_MOE_POOL_V2_HDR.pack(
+                _MFE_POOL_HDR.pack(
                     len(expert_ids),
                     len(dtype),
                     payload_nbytes,
@@ -873,14 +873,14 @@ def _projection_record_nbytes(
     rows_per_expert: int,
     columns: int,
 ) -> int:
-    total = _NINT_MOE_HDR.size
+    total = _MFE_HDR.size
     for spec, _codebook_key, experts in pools:
         dtype = spec.label.encode("ascii")
         payload = tpq_pq_payload_nbytes(
             (len(experts) * rows_per_expert, columns), spec
         )
         total += (
-            _NINT_MOE_POOL_V2_HDR.size
+            _MFE_POOL_HDR.size
             + len(experts) * 4
             + len(dtype)
             + payload
@@ -900,8 +900,8 @@ def _write_projection_vq_record(
     pools: tuple[tuple[TpqPqSpec, str, tuple[int, ...]], ...],
 ) -> None:
     output.write(
-        _NINT_MOE_HDR.pack(
-            _NINT_MOE_MAGIC_V2,
+        _MFE_HDR.pack(
+            _MFE_MAGIC,
             n_experts,
             rows_per_expert,
             columns,
@@ -916,7 +916,7 @@ def _write_projection_vq_record(
                 (len(expert_ids) * rows_per_expert, columns), spec
             )
             output.write(
-                _NINT_MOE_POOL_V2_HDR.pack(
+                _MFE_POOL_HDR.pack(
                     len(expert_ids), len(dtype), payload_nbytes, 0
                 )
             )
@@ -1028,7 +1028,7 @@ def _projection_expert_records(
                     pools=_pools,
                 )
 
-            records.append(_StreamRecord(name, "NINTM", nbytes, write_projection))
+            records.append(_StreamRecord(name, "MFE", nbytes, write_projection))
     return records
 
 
@@ -1118,7 +1118,7 @@ def _expert_records(
                     dropped_experts=_dropped_experts,
                 )
 
-            records.append(_StreamRecord(name, "NINTM", nbytes, write_projection))
+            records.append(_StreamRecord(name, "MFE", nbytes, write_projection))
     return records
 
 

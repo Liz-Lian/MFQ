@@ -59,7 +59,7 @@ public:
             rope_base,
         std::pair<mlx::core::array, mlx::core::array>
             rope_compressed,
-        std::shared_ptr<MlxNintMoeOffloadCache> offload =
+        std::shared_ptr<MlxMfeOffloadCache> offload =
             nullptr);
 
     static MlxDeepseekV4Layer load(
@@ -191,7 +191,7 @@ struct MlxDeepseekV4TextSessionState {
 // and never invokes Python or a subprocess.
 class MlxDeepseekV4CausalLm {
 public:
-    // NINTM is fully resident by default, matching the CUDA runtime.  Passing
+    // MFE is fully resident by default, matching the CUDA runtime.  Passing
     // a cache budget explicitly opts into the bounded expert-residency mode.
     static MlxDeepseekV4CausalLm load(
         const MfqContainer& model,
@@ -230,7 +230,7 @@ public:
         int max_context,
         mlx::core::Dtype activation_dtype =
             mlx::core::float16,
-        std::shared_ptr<MlxNintMoeOffloadCache>
+        std::shared_ptr<MlxMfeOffloadCache>
             expert_offload = nullptr,
         std::shared_ptr<MlxDeepseekV4SsdExpertCache>
             ssd_expert_cache = nullptr,
@@ -400,7 +400,7 @@ private:
     std::optional<MlxLinear> hc_head_fn_;
     std::optional<mlx::core::array> hc_head_base_;
     std::optional<mlx::core::array> hc_head_scale_;
-    std::shared_ptr<MlxNintMoeOffloadCache>
+    std::shared_ptr<MlxMfeOffloadCache>
         expert_offload_;
     std::shared_ptr<MlxDeepseekV4SsdExpertCache>
         ssd_expert_cache_;

@@ -310,7 +310,7 @@ void print_help() {
         << " -ub, --ubatch-size N     physical token batch (default n_batch)\n"
         << "      --kl-score-count N  score only the first N stored rows/chunk\n"
         << "      --tokenizer-gguf P  external tokenizer GGUF; embedded is default\n"
-        << "      --moe-gpu-cache-gb N bounded disk-backed NINTM expert cache\n"
+        << "      --moe-gpu-cache-gb N bounded disk-backed MFE expert cache\n"
         << "                           default: full unified-memory residency\n\n"
         << "The evaluator follows llama.cpp's non-strided WikiText-2 protocol: "
            "each window is independent and only its second half is scored.\n";
@@ -1211,11 +1211,11 @@ std::string inferred_precision(
     bool quantized = false;
     for (const auto& [dtype, count] : dtypes) {
         (void)count;
-        if (dtype.rfind("NINT", 0) == 0 ||
-            dtype.rfind("NVQ", 0) == 0 ||
-            dtype.rfind("NPQ", 0) == 0 ||
-            dtype.rfind("NEPQ", 0) == 0 ||
-            dtype.rfind("TPQ", 0) == 0 ||
+        if (dtype == "NINT" ||
+            dtype == "NINT8-0" ||
+            dtype == "NVQ" ||
+            dtype == "NPQ" ||
+            dtype == "NEPQ" ||
             dtype.rfind("TPQ", 0) == 0) {
             quantized = true;
         }

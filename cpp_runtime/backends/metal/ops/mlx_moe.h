@@ -16,7 +16,7 @@ namespace mfq::metal {
 
 class MfqContainer;
 
-struct MlxNintMoeProjectionInfo {
+struct MlxMfeProjectionInfo {
     int experts = 0;
     int out_per_expert = 0;
     int neuron_len = 0;
@@ -47,39 +47,39 @@ private:
 
     std::shared_ptr<const Impl> impl_;
 
-    friend class MlxNintMoeOffloadCache;
+    friend class MlxMfeOffloadCache;
 };
 
-// Optional bounded per-expert residency for NINTM records.
+// Optional bounded per-expert residency for MFE records.
 //
-// This is an offload policy, not the NINTM container itself. Full-resident
-// MlxNintMoeWeight is the default model path. The cache is constructed only
+// This is an offload policy, not the MFE container itself. Full-resident
+// MlxMfeWeight is the default model path. The cache is constructed only
 // after an explicit disk-offload request. Apple Silicon has unified memory,
 // so there is no separate CUDA-style CPU-RAM versus device-RAM mode. Disk
 // backing uses read_range(); the LRU limit accounts for packed expert bytes
 // staged in unified memory for active dispatches.
-class MlxNintMoeOffloadCache {
+class MlxMfeOffloadCache {
 public:
-    MlxNintMoeOffloadCache(
+    MlxMfeOffloadCache(
         const MfqContainer& model,
         std::size_t cache_limit_bytes,
         int experts);
-    ~MlxNintMoeOffloadCache();
+    ~MlxMfeOffloadCache();
 
-    MlxNintMoeOffloadCache(
-        const MlxNintMoeOffloadCache&) = delete;
-    MlxNintMoeOffloadCache& operator=(
-        const MlxNintMoeOffloadCache&) = delete;
+    MlxMfeOffloadCache(
+        const MlxMfeOffloadCache&) = delete;
+    MlxMfeOffloadCache& operator=(
+        const MlxMfeOffloadCache&) = delete;
 
     // Returns false only for a valid non-streamable representation (for
-    // example NIM1 or a mixed non-TPQ NIM2 record).  Malformed TPQ records
+    // example legacy NIM1 or a mixed non-TPQ MFE record). Malformed TPQ records
     // still raise.
     bool can_offload(const std::string& name);
     bool can_stream(const std::string& name) {
         return can_offload(name);
     }
 
-    MlxNintMoeProjectionInfo projection_info(
+    MlxMfeProjectionInfo projection_info(
         const std::string& name);
     std::vector<std::uint8_t> availability(
         const std::string& name);
@@ -105,9 +105,9 @@ private:
 };
 
 // Compatibility names for callers that used the original TPQ-specific API.
-// New model/runtime code must use the generic NINTM names above.
-using MlxTpqProjectionInfo = MlxNintMoeProjectionInfo;
-using MlxTpqExpertResidency = MlxNintMoeOffloadCache;
+// New model/runtime code must use the generic MFE names above.
+using MlxTpqProjectionInfo = MlxMfeProjectionInfo;
+using MlxTpqExpertResidency = MlxMfeOffloadCache;
 
 // A sorted routed-MoE row block list.  The plan is built once on the GPU and
 // shared by gate/up and down projections so every populated row block can be
@@ -125,27 +125,30 @@ struct MlxGroupedMmqPlan {
 // name because the same plan serves NINT, VQ, MX, and dense expert cohorts.
 using MlxGroupedVqMmqPlan = MlxGroupedMmqPlan;
 
-// Native packed NINTM routed-expert weight.
+// Native packed MFE routed-expert weight.
 //
-// NINT1-NINT8, NINT8-0, VQ-family, MXFP4/MXFP8, and BF16/F16 cohorts are
-// decoded directly by one heterogeneous Metal dispatch. Expert IDs retain
-// the global ordering from the NINTM container while each descriptor points
-// at its cohort-local rows.
-class MlxNintMoeWeight {
+// VQ-family, MXFP4/MXFP8, and BF16/F16 cohorts use the common heterogeneous
+// Metal dispatch. NINT and MXFP4-SQ are composed at the routing layer and each
+// reuse their one standalone Linear matmul kernel; neither adds an MFE-specific
+// decoder. Expert IDs retain the global ordering from the MFE container while
+// each descriptor or standalone cohort map points at its local rows.
+class MlxMfeWeight {
 public:
-    static MlxNintMoeWeight from_blob(
+    static MlxMfeWeight from_blob(
         std::span<const std::uint8_t> blob);
 
-    // Gate/up and other shape-compatible projections can share one dispatch.
-    // The returned last dimension is
+    // Gate/up and other shape-compatible projections can share one routed
+    // call. Formats with projection fusion use one dispatch; standalone NINT
+    // projections reuse the same NINT kernel in separate dispatches. The
+    // returned last dimension is
     // projections() * out_per_expert(), in projection-major order.
-    static MlxNintMoeWeight concatenate_projections(
-        const std::vector<MlxNintMoeWeight>& weights);
+    static MlxMfeWeight concatenate_projections(
+        const std::vector<MlxMfeWeight>& weights);
 
     // Build a native MXFP4 routed view over a shared slot arena without
     // copying packed values or scales. slot_for_expert maps each global
     // expert ID to one arena row.
-    static MlxNintMoeWeight from_mxfp4_slots(
+    static MlxMfeWeight from_mxfp4_slots(
         int experts,
         int out_per_expert,
         int neuron_len,
@@ -227,7 +230,7 @@ public:
 private:
     struct Impl;
 
-    explicit MlxNintMoeWeight(std::shared_ptr<const Impl> impl);
+    explicit MlxMfeWeight(std::shared_ptr<const Impl> impl);
 
     mlx::core::array routed_matmul_impl(
         const mlx::core::array& input,
@@ -245,7 +248,7 @@ private:
     std::shared_ptr<const Impl> impl_;
 };
 
-using MlxMoeWeight = MlxNintMoeWeight;
+using MlxMoeWeight = MlxMfeWeight;
 
 // Resolve canonical split Gate/Up projections into one packed dispatch.
 // Legacy fused ``gate_up.weight`` remains a read-only compatibility input.

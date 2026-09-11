@@ -1,5 +1,5 @@
 #include "mfq_container.h"
-#include "nintm_expert_store.h"
+#include "mfe_expert_store.h"
 #include "mlx_ssd_expert_cache.h"
 
 #include "nlohmann/json.hpp"
@@ -561,7 +561,7 @@ void test_hf_virtual_mxfp8_geometries(
     }
 }
 
-void test_hf_virtual_nintm_experts(
+void test_hf_virtual_mfe_experts(
     const std::filesystem::path& root) {
     const auto hf = root / "hf-native-experts";
     std::filesystem::create_directories(hf);
@@ -628,28 +628,28 @@ void test_hf_virtual_nintm_experts(
     for (const auto name : {gate, up, down}) {
         require(model.contains(std::string(name)),
                 "HF native expert projection was not virtualized");
-        require(model.record(std::string(name)).dtype == "NINTM",
-                "HF native expert projection did not become NINTM");
+        require(model.record(std::string(name)).dtype == "MFE",
+                "HF native expert projection did not become MFE");
         const auto blob = model.read(std::string(name));
         require(blob.size() == 1286,
-                "HF virtual NINTM byte count mismatch");
-        require(std::string(blob.begin(), blob.begin() + 4) == "NIM2" &&
+                "HF virtual MFE byte count mismatch");
+        require(std::string(blob.begin(), blob.begin() + 4) == "MFE1" &&
                     blob[4] == 2 && blob[8] == 32 && blob[12] == 32 &&
                     blob[16] == 2,
-                "HF virtual NINTM header mismatch");
+                "HF virtual MFE header mismatch");
         require(std::string(blob.begin() + 48, blob.begin() + 53) == "MXFP4" &&
                     std::string(blob.begin() + 681, blob.begin() + 686) == "MXFP4",
-                "HF virtual NINTM pool dtype mismatch");
+                "HF virtual MFE pool dtype mismatch");
         require(std::string(blob.begin() + 53, blob.begin() + 57) == "MXT1" &&
                     std::string(blob.begin() + 686, blob.begin() + 690) == "MXT1",
-                "HF virtual NINTM nested payload mismatch");
+                "HF virtual MFE nested payload mismatch");
     }
     const auto gate_tail = model.read_range(std::string(gate), 620, 666);
     require(gate_tail.size() == 666 && gate_tail[1] == 0x71 &&
                 gate_tail[2] == 0x71 && gate_tail.back() == 0x72,
-            "HF virtual NINTM segmented range mismatch");
+            "HF virtual MFE segmented range mismatch");
 
-    const mfq::metal::MlxNintMxfp4ExpertStore store(
+    const mfq::metal::MlxMfeMxfp4ExpertStore store(
         model,
         {"model.block.0", "predictor.stage.0"},
         {2, 1},
@@ -658,11 +658,11 @@ void test_hf_virtual_nintm_experts(
     require(store.num_layers() == 2 && store.num_experts(0) == 2 &&
                 store.num_experts(1) == 1 &&
                 store.max_num_experts() == 2,
-            "canonical NINTM expert inventory mismatch");
+            "canonical MFE expert inventory mismatch");
     std::vector<std::byte> slot(store.slot_bytes());
     const auto stats = store.load(0, 1, slot);
     require(stats.bytes == slot.size() && stats.read_calls == 6,
-            "canonical NINTM exact expert read mismatch");
+            "canonical MFE exact expert read mismatch");
     const auto view = store.view(slot);
     require(std::to_integer<std::uint8_t>(view.w1_weight.front()) == 0x14 &&
                 std::to_integer<std::uint8_t>(view.w2_weight.front()) == 0x15 &&
@@ -670,7 +670,7 @@ void test_hf_virtual_nintm_experts(
                 std::to_integer<std::uint8_t>(view.w1_scale.front()) == 0x72 &&
                 std::to_integer<std::uint8_t>(view.w2_scale.front()) == 0x73 &&
                 std::to_integer<std::uint8_t>(view.w3_scale.front()) == 0x74,
-            "canonical NINTM expert payload mismatch");
+            "canonical MFE expert payload mismatch");
 
     mfq::metal::MlxMoeSsdExpertCache cache(
         model,
@@ -713,7 +713,7 @@ int main() {
         test_hf_virtual_full_precision_container(
             root.path());
         test_hf_virtual_mxfp8_geometries(root.path());
-        test_hf_virtual_nintm_experts(root.path());
+        test_hf_virtual_mfe_experts(root.path());
         std::cout << "MFQ Metal container test passed\n";
         return 0;
     } catch (const std::exception& error) {

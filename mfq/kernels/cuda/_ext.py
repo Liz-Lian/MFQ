@@ -40,7 +40,6 @@ _SOURCES = [
     os.path.join(_DIR, "mx_matmul.cu"),
     os.path.join(_DIR, "mxfp4_sq.cu"),
     os.path.join(_DIR, "nint_matmul.cu"),
-    os.path.join(_DIR, "nint_small_m.cu"),
     os.path.join(_DIR, "nvq_matmul.cu"),
     os.path.join(_DIR, "nepq.cu"),
     os.path.join(_DIR, "nepq_residual.cu"),

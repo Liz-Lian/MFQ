@@ -26,7 +26,7 @@ Test each artifact on its target backend before deployment.
 
 ## Shared conversion, storage, and serving
 
-- NINTM v2 mixed-family HF/GGUF streaming conversion.
+- Canonical MFE mixed-family HF/GGUF streaming conversion.
 - Self-contained MFQ files with embedded runtime configuration, tokenizer,
   chat template, special-token metadata, and optional sampling profiles.
 - Numbered MFQ shards with direct quantizer output and Python/C++ loading.
@@ -46,7 +46,9 @@ optional migration A/B runtime.
 
 ### Packed compute
 
-- Packed NINT/NVQ/NPQ/NEPQ group-vectorized GEMV.
+- One metadata-driven packed NINT kernel for dense, routed, and small-M
+  execution across all per-neuron q/k assignments.
+- Packed NVQ/NPQ/NEPQ group-vectorized GEMV.
 - `qmv_wide` small-M MMQ and online-decode `simdgroup_matrix` GEMM.
 - Temporary dequantization plus MLX GEMM beyond the measured large-M
   crossover.
@@ -55,10 +57,12 @@ optional migration A/B runtime.
 
 ### Fused and heterogeneous execution
 
-- Fused SwiGLU for compatible NINT/VQ-family gate/up projections.
-- Single-dispatch heterogeneous NINTM/NEPQ routing.
-- Mixed-format QKV and FFN projection groups in one heterogeneous Metal
-  dispatch.
+- SwiGLU graph composition for NINT and fused execution for compatible
+  VQ-family gate/up projections.
+- MFE routing composes NINT through the ordinary NINT kernel with grouped
+  execution for the remaining formats.
+- Mixed-format QKV and FFN projection groups use grouped execution when their
+  formats support it; groups containing NINT reuse the ordinary NINT kernel.
 - GPU-resident greedy, softmax, top-k/top-p, and sampling-penalty kernels.
 
 ### Attention and state

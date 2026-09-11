@@ -1,631 +1,329 @@
-// Embedding lookup helpers.
-// Raw path: weight [vocab, D], token_ids arbitrary shape -> out token_ids.shape + [D].
-// NINT path: selected-row dequant from compressed token embedding rows.
+// Dense and canonical packed embedding lookup helpers.
+
+#include <algorithm>
+#include <cstdint>
 
 #include <cuda_fp16.h>
-#include "mfq_tensor_backend.h"
 #include <cuda_runtime.h>
 
-template <int BITS>
-__device__ __forceinline__ uint8_t nint_unpack_qbits_one(const uint8_t* p, int lane)
-{
-    if constexpr (BITS == 8) {
-        return p[lane];
-    } else {
-        constexpr uint32_t MASK = (1u << BITS) - 1u;
-        int bit = lane * BITS;
-        int byte = bit >> 3;
-        int shift = bit & 7;
-        uint32_t word = (uint32_t)p[byte];
-        if (shift + BITS > 8) {
-            word |= ((uint32_t)p[byte + 1] << 8);
-        }
-        return (uint8_t)((word >> shift) & MASK);
-    }
-}
+#include "mfq_tensor_backend.h"
 
-__device__ __forceinline__ uint8_t nint_unpack_mixed_qbits_one(
-    const uint8_t* stream,
-    uint64_t row_bit_offset,
-    int element,
-    int bits)
-{
-    const uint64_t bit = row_bit_offset + (uint64_t)element * (uint64_t)bits;
+
+namespace {
+
+
+__device__ __forceinline__ uint8_t unpack_nint_code(
+        const uint8_t * stream,
+        uint64_t row_bit_offset,
+        int element,
+        int bits) {
+    const uint64_t bit = row_bit_offset +
+        static_cast<uint64_t>(element) * static_cast<uint64_t>(bits);
     const uint64_t byte = bit >> 3;
-    const int shift = (int)(bit & 7u);
-    uint32_t word = (uint32_t)stream[byte];
+    const int shift = static_cast<int>(bit & 7u);
+    uint32_t word = static_cast<uint32_t>(stream[byte]);
     if (shift + bits > 8) {
-        word |= (uint32_t)stream[byte + 1] << 8;
+        word |= static_cast<uint32_t>(stream[byte + 1]) << 8;
     }
-    return (uint8_t)((word >> shift) & ((1u << bits) - 1u));
+    return static_cast<uint8_t>(
+        (word >> shift) & ((1u << bits) - 1u));
 }
 
-template <typename scalar_t>
-__global__ void embedding_lookup_kernel(
-    const scalar_t* __restrict__ weight,
-    const int64_t* __restrict__ ids,
-    scalar_t* __restrict__ out,
-    int N,
-    int D,
-    int vocab)
-{
-    size_t total = (size_t)N * D;
-    for (size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-         idx < total;
-         idx += (size_t)gridDim.x * blockDim.x) {
-        int d = (int)(idx % D);
-        int n = (int)(idx / D);
-        int64_t tok = ids[n];
-        if (tok < 0 || tok >= vocab) {
-            out[idx] = scalar_t(0);
-        } else {
-            out[idx] = weight[(size_t)tok * D + d];
-        }
-    }
-}
 
-__global__ void nint_embedding_lookup_kernel(
-    const uint8_t* __restrict__ q,
-    const float* __restrict__ d_eff,
-    const float* __restrict__ m_eff,
-    const int64_t* __restrict__ ids,
-    half* __restrict__ out,
-    int N,
-    int vocab,
-    int ng,
-    int gs,
-    int D)
-{
-    size_t total = (size_t)N * D;
-    for (size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-         idx < total;
-         idx += (size_t)gridDim.x * blockDim.x) {
-        int d = (int)(idx % D);
-        int n = (int)(idx / D);
-        int64_t tok = ids[n];
-        float val = 0.0f;
-        if (tok >= 0 && tok < vocab) {
-            int g = d / gs;
-            int lane = d - g * gs;
-            size_t q_idx = (((size_t)tok * ng + g) * gs + lane);
-            size_t m_idx = (size_t)tok * ng + g;
-            val = d_eff[m_idx] * (float)q[q_idx] - m_eff[m_idx];
-        }
-        out[idx] = __float2half(val);
-    }
-}
-
-__global__ void nint_embedding_lookup_packed_eff_kernel(
-    const uint8_t* __restrict__ q_packed,
-    const half2* __restrict__ eff_pair,
-    const int64_t* __restrict__ ids,
-    half* __restrict__ out,
-    int N,
-    int vocab,
-    int ng,
-    int gs,
-    int qbytes,
-    int D)
-{
-    size_t total = (size_t)N * D;
-    for (size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-         idx < total;
-         idx += (size_t)gridDim.x * blockDim.x) {
-        int d = (int)(idx % D);
-        int n = (int)(idx / D);
-        int64_t tok = ids[n];
-        float val = 0.0f;
-        if (tok >= 0 && tok < vocab) {
-            int g = d / gs;
-            int lane = d - g * gs;
-            uint8_t qb = q_packed[((size_t)tok * ng + g) * qbytes + lane / 2];
-            uint8_t qv = (lane & 1) ? (qb >> 4) : (qb & 0x0F);
-            half2 dm = eff_pair[(size_t)tok * ng + g];
-            float d_eff = __half2float(__low2half(dm));
-            float m_eff = __half2float(__high2half(dm));
-            val = d_eff * (float)qv - m_eff;
-        }
-        out[idx] = __float2half(val);
-    }
-}
-
-__global__ void nint_embedding_lookup_packed_compact_kernel(
-    const uint8_t* __restrict__ q_packed,
-    const uint8_t* __restrict__ sub_scale,
-    const uint8_t* __restrict__ sub_min,
-    const float* __restrict__ neuron_scale,
-    const float* __restrict__ neuron_min,
-    const int64_t* __restrict__ ids,
-    half* __restrict__ out,
-    int N,
-    int vocab,
-    int ng,
-    int gs,
-    int qbytes,
-    int D)
-{
-    size_t total = (size_t)N * D;
-    for (size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-         idx < total;
-         idx += (size_t)gridDim.x * blockDim.x) {
-        int d = (int)(idx % D);
-        int n = (int)(idx / D);
-        int64_t tok = ids[n];
-        float val = 0.0f;
-        if (tok >= 0 && tok < vocab) {
-            int g = d / gs;
-            int lane = d - g * gs;
-            size_t meta_idx = (size_t)tok * ng + g;
-            uint8_t qb = q_packed[meta_idx * qbytes + lane / 2];
-            uint8_t qv = (lane & 1) ? (qb >> 4) : (qb & 0x0F);
-            float d_eff = neuron_scale[tok] * (float)sub_scale[meta_idx];
-            float m_eff = neuron_min[tok] * (float)sub_min[meta_idx];
-            val = d_eff * (float)qv - m_eff;
-        }
-        out[idx] = __float2half(val);
-    }
-}
-
-template <int BITS, int GS>
-__global__ void nint_embedding_lookup_packed_compact_bits_kernel(
-    const uint8_t* __restrict__ q_packed,
-    const uint8_t* __restrict__ sub_scale,
-    const uint8_t* __restrict__ sub_min,
-    const float* __restrict__ neuron_scale,
-    const float* __restrict__ neuron_min,
-    const int64_t* __restrict__ ids,
-    half* __restrict__ out,
-    int N,
-    int vocab,
-    int ng,
-    int D)
-{
-    constexpr int QBYTES = (GS * BITS + 7) / 8;
-    size_t total = (size_t)N * D;
-    for (size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-         idx < total;
-         idx += (size_t)gridDim.x * blockDim.x) {
-        int d = (int)(idx % D);
-        int n = (int)(idx / D);
-        int64_t tok = ids[n];
-        float val = 0.0f;
-        if (tok >= 0 && tok < vocab) {
-            int g = d / GS;
-            int lane = d - g * GS;
-            size_t meta_idx = (size_t)tok * ng + g;
-            uint8_t qv = nint_unpack_qbits_one<BITS>(q_packed + meta_idx * QBYTES, lane);
-            float d_eff = neuron_scale[tok] * (float)sub_scale[meta_idx];
-            float m_eff = neuron_min[tok] * (float)sub_min[meta_idx];
-            val = d_eff * (float)qv - m_eff;
-        }
-        out[idx] = __float2half(val);
-    }
-}
-
-__global__ void nint_embedding_lookup_packed_mixed_q_kernel(
-    const uint8_t* __restrict__ q_packed,
-    const uint8_t* __restrict__ row_q_bits,
-    const int64_t* __restrict__ row_q_bit_offsets,
-    const uint8_t* __restrict__ sub_scale,
-    const uint8_t* __restrict__ sub_min,
-    const float* __restrict__ neuron_scale,
-    const float* __restrict__ neuron_min,
-    const int64_t* __restrict__ ids,
-    half* __restrict__ out,
-    int N,
-    int vocab,
-    int ng,
-    int gs,
-    int D)
-{
-    const size_t total = (size_t)N * (size_t)D;
-    for (size_t index = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-         index < total;
-         index += (size_t)gridDim.x * blockDim.x) {
-        const int column = (int)(index % (size_t)D);
-        const int token_index = (int)(index / (size_t)D);
-        const int64_t token = ids[token_index];
-        float value = 0.0f;
-        if (token >= 0 && token < vocab) {
-            const int group = column / gs;
-            const size_t metadata = (size_t)token * (size_t)ng + (size_t)group;
-            const int bits = (int)row_q_bits[token];
-            const uint8_t quantized = nint_unpack_mixed_qbits_one(
-                q_packed,
-                (uint64_t)row_q_bit_offsets[token],
-                column,
-                bits);
-            const float scale = neuron_scale[token] * (float)sub_scale[metadata];
-            const float minimum = neuron_min[token] * (float)sub_min[metadata];
-            value = scale * (float)quantized - minimum;
-        }
-        out[index] = __float2half(value);
-    }
-}
-
-__global__ void nint8_zero_embedding_lookup_kernel(
-    const int8_t* __restrict__ q,
-    const half* __restrict__ scale,
-    const int64_t* __restrict__ ids,
-    half* __restrict__ out,
-    int N,
-    int vocab,
-    int ng,
-    int D)
-{
-    const size_t total = static_cast<size_t>(N) * D;
-    for (size_t index =
-             static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+template <typename Scalar>
+__global__ void dense_embedding_kernel(
+        const Scalar * __restrict__ weight,
+        const int64_t * __restrict__ token_ids,
+        Scalar * __restrict__ output,
+        int token_count,
+        int width,
+        int vocabulary) {
+    const size_t total = static_cast<size_t>(token_count) * width;
+    for (size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x +
+             threadIdx.x;
          index < total;
          index += static_cast<size_t>(gridDim.x) * blockDim.x) {
-        const int d = static_cast<int>(index % D);
-        const int n = static_cast<int>(index / D);
-        const int64_t token = ids[n];
+        const int column = static_cast<int>(index % width);
+        const int token_index = static_cast<int>(index / width);
+        const int64_t token = token_ids[token_index];
+        output[index] = token >= 0 && token < vocabulary
+            ? weight[static_cast<size_t>(token) * width + column]
+            : Scalar(0);
+    }
+}
+
+
+__global__ void nint_embedding_kernel(
+        const uint8_t * __restrict__ bitstream,
+        const uint8_t * __restrict__ row_q_bits,
+        const int64_t * __restrict__ row_q_bit_offsets,
+        const uint8_t * __restrict__ subgroup_scale,
+        const uint8_t * __restrict__ subgroup_minimum,
+        const float * __restrict__ neuron_scale,
+        const float * __restrict__ neuron_minimum,
+        const int64_t * __restrict__ token_ids,
+        __half * __restrict__ output,
+        int token_count,
+        int vocabulary,
+        int groups,
+        int group_size,
+        int width) {
+    const size_t total = static_cast<size_t>(token_count) * width;
+    for (size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x +
+             threadIdx.x;
+         index < total;
+         index += static_cast<size_t>(gridDim.x) * blockDim.x) {
+        const int column = static_cast<int>(index % width);
+        const int token_index = static_cast<int>(index / width);
+        const int64_t token = token_ids[token_index];
         float value = 0.0f;
-        if (token >= 0 && token < vocab) {
-            const int group = d / 32;
-            const int lane = d % 32;
-            const size_t block =
-                static_cast<size_t>(token) * ng + group;
-            value = __half2float(scale[block]) *
-                static_cast<float>(q[block * 32 + lane]);
+        if (token >= 0 && token < vocabulary) {
+            const int group = column / group_size;
+            const size_t metadata = static_cast<size_t>(token) * groups + group;
+            const int bits = static_cast<int>(row_q_bits[token]);
+            const uint8_t code = unpack_nint_code(
+                bitstream,
+                static_cast<uint64_t>(row_q_bit_offsets[token]),
+                column,
+                bits);
+            const float scale = neuron_scale[token] *
+                static_cast<float>(subgroup_scale[metadata]);
+            const float minimum = neuron_minimum[token] *
+                static_cast<float>(subgroup_minimum[metadata]);
+            value = scale * static_cast<float>(code) - minimum;
         }
-        out[index] = __float2half(value);
+        output[index] = __float2half_rn(value);
     }
 }
 
-mfq_tensor_backend::Tensor embedding_lookup_cuda(mfq_tensor_backend::Tensor weight, mfq_tensor_backend::Tensor token_ids)
-{
-    MFQ_RUNTIME_CHECK(weight.is_cuda() && weight.is_contiguous(), "embedding_lookup: weight must be cuda contiguous");
-    MFQ_RUNTIME_CHECK(token_ids.is_cuda() && token_ids.is_contiguous() && token_ids.scalar_type() == mfq_tensor_backend::kInt64,
-                "embedding_lookup: token_ids must be cuda contiguous int64");
-    MFQ_RUNTIME_CHECK(weight.dim() == 2, "embedding_lookup: weight must be [vocab,D]");
-    MFQ_RUNTIME_CHECK(weight.scalar_type() == mfq_tensor_backend::kFloat32 || weight.scalar_type() == mfq_tensor_backend::kFloat16,
-                "embedding_lookup: weight dtype must be f32 or f16");
-    int vocab = (int)weight.size(0);
-    int D = (int)weight.size(1);
-    int N = (int)token_ids.numel();
-    auto out_shape = token_ids.sizes().vec();
-    out_shape.push_back(D);
-    auto out = mfq_tensor_backend::empty(out_shape, weight.options());
-    constexpr int BD = 256;
-    size_t total = (size_t)N * D;
-    int grid = (int)((total + BD - 1) / BD);
-    grid = grid > 4096 ? 4096 : grid;
-    MFQ_DISPATCH_FLOATING_TYPES_AND_HALF(weight.scalar_type(), "embedding_lookup_cuda", [&] {
-        embedding_lookup_kernel<scalar_t><<<grid, BD, 0, mfq_current_cuda_stream()>>>(
-            weight.data_ptr<scalar_t>(), token_ids.data_ptr<int64_t>(), out.data_ptr<scalar_t>(), N, D, vocab);
-    });
-    return out;
-}
 
-mfq_tensor_backend::Tensor nint_embedding_lookup_cuda(
-    mfq_tensor_backend::Tensor q,
-    mfq_tensor_backend::Tensor d_eff,
-    mfq_tensor_backend::Tensor m_eff,
-    mfq_tensor_backend::Tensor token_ids,
-    int64_t neuron_len,
-    int64_t gs)
-{
-    MFQ_RUNTIME_CHECK(q.is_cuda() && q.is_contiguous() && q.scalar_type() == mfq_tensor_backend::kUInt8,
-                "nint_embedding_lookup: q must be cuda contiguous uint8");
-    MFQ_RUNTIME_CHECK(d_eff.is_cuda() && d_eff.is_contiguous() && d_eff.scalar_type() == mfq_tensor_backend::kFloat32,
-                "nint_embedding_lookup: d_eff must be cuda contiguous f32");
-    MFQ_RUNTIME_CHECK(m_eff.is_cuda() && m_eff.is_contiguous() && m_eff.scalar_type() == mfq_tensor_backend::kFloat32,
-                "nint_embedding_lookup: m_eff must be cuda contiguous f32");
-    MFQ_RUNTIME_CHECK(token_ids.is_cuda() && token_ids.is_contiguous() && token_ids.scalar_type() == mfq_tensor_backend::kInt64,
-                "nint_embedding_lookup: token_ids must be cuda contiguous int64");
-    MFQ_RUNTIME_CHECK(q.dim() == 3, "nint_embedding_lookup: q must be [vocab,ng,gs]");
-    int vocab = (int)q.size(0);
-    int ng = (int)q.size(1);
-    MFQ_RUNTIME_CHECK(q.size(2) == gs, "nint_embedding_lookup: q gs mismatch");
-    MFQ_RUNTIME_CHECK(d_eff.size(0) == vocab && d_eff.size(1) == ng && m_eff.sizes() == d_eff.sizes(),
-                "nint_embedding_lookup: metadata shape mismatch");
-    int D = (int)neuron_len;
-    int N = (int)token_ids.numel();
-    auto out_shape = token_ids.sizes().vec();
-    out_shape.push_back(D);
-    auto out = mfq_tensor_backend::empty(out_shape, q.options().dtype(mfq_tensor_backend::kFloat16));
-    constexpr int BD = 256;
-    size_t total = (size_t)N * D;
-    int grid = (int)((total + BD - 1) / BD);
-    grid = grid > 4096 ? 4096 : grid;
-    nint_embedding_lookup_kernel<<<grid, BD, 0, mfq_current_cuda_stream()>>>(
-        q.data_ptr<uint8_t>(), d_eff.data_ptr<float>(), m_eff.data_ptr<float>(),
-        token_ids.data_ptr<int64_t>(), reinterpret_cast<half*>(out.data_ptr<mfq_half>()),
-        N, vocab, ng, (int)gs, D);
-    return out;
-}
-
-mfq_tensor_backend::Tensor nint_embedding_lookup_packed_eff_cuda(
-    mfq_tensor_backend::Tensor q_packed,
-    mfq_tensor_backend::Tensor eff_pair,
-    mfq_tensor_backend::Tensor token_ids,
-    int64_t neuron_len,
-    int64_t gs)
-{
-    MFQ_RUNTIME_CHECK(q_packed.is_cuda() && q_packed.is_contiguous() && q_packed.scalar_type() == mfq_tensor_backend::kUInt8,
-                "nint_embedding_lookup_packed_eff: q_packed must be cuda contiguous uint8");
-    MFQ_RUNTIME_CHECK(eff_pair.is_cuda() && eff_pair.is_contiguous() && eff_pair.scalar_type() == mfq_tensor_backend::kFloat16,
-                "nint_embedding_lookup_packed_eff: eff_pair must be cuda contiguous f16");
-    MFQ_RUNTIME_CHECK(token_ids.is_cuda() && token_ids.is_contiguous() && token_ids.scalar_type() == mfq_tensor_backend::kInt64,
-                "nint_embedding_lookup_packed_eff: token_ids must be cuda contiguous int64");
-    MFQ_RUNTIME_CHECK(q_packed.dim() == 3, "nint_embedding_lookup_packed_eff: q_packed must be [vocab,ng,gs/2]");
-    MFQ_RUNTIME_CHECK(eff_pair.dim() == 3 && eff_pair.size(2) == 2,
-                "nint_embedding_lookup_packed_eff: eff_pair must be [vocab,ng,2]");
-    int vocab = (int)q_packed.size(0);
-    int ng = (int)q_packed.size(1);
-    int qbytes = (int)q_packed.size(2);
-    MFQ_RUNTIME_CHECK(qbytes * 2 == gs, "nint_embedding_lookup_packed_eff: q_packed gs mismatch");
-    MFQ_RUNTIME_CHECK(eff_pair.size(0) == vocab && eff_pair.size(1) == ng,
-                "nint_embedding_lookup_packed_eff: metadata shape mismatch");
-    int D = (int)neuron_len;
-    int N = (int)token_ids.numel();
-    auto out_shape = token_ids.sizes().vec();
-    out_shape.push_back(D);
-    auto out = mfq_tensor_backend::empty(out_shape, q_packed.options().dtype(mfq_tensor_backend::kFloat16));
-    constexpr int BD = 256;
-    size_t total = (size_t)N * D;
-    int grid = (int)((total + BD - 1) / BD);
-    grid = grid > 4096 ? 4096 : grid;
-    nint_embedding_lookup_packed_eff_kernel<<<grid, BD, 0, mfq_current_cuda_stream()>>>(
-        q_packed.data_ptr<uint8_t>(), reinterpret_cast<const half2*>(eff_pair.data_ptr<mfq_half>()),
-        token_ids.data_ptr<int64_t>(), reinterpret_cast<half*>(out.data_ptr<mfq_half>()),
-        N, vocab, ng, (int)gs, qbytes, D);
-    return out;
-}
-
-mfq_tensor_backend::Tensor nint_embedding_lookup_packed_compact_cuda(
-    mfq_tensor_backend::Tensor q_packed,
-    mfq_tensor_backend::Tensor sub_scale,
-    mfq_tensor_backend::Tensor sub_min,
-    mfq_tensor_backend::Tensor neuron_scale,
-    mfq_tensor_backend::Tensor neuron_min,
-    mfq_tensor_backend::Tensor token_ids,
-    int64_t neuron_len,
-    int64_t gs)
-{
-    MFQ_RUNTIME_CHECK(q_packed.is_cuda() && q_packed.is_contiguous() && q_packed.scalar_type() == mfq_tensor_backend::kUInt8,
-                "nint_embedding_lookup_packed_compact: q_packed must be cuda contiguous uint8");
-    MFQ_RUNTIME_CHECK(sub_scale.is_cuda() && sub_scale.is_contiguous() && sub_scale.scalar_type() == mfq_tensor_backend::kUInt8,
-                "nint_embedding_lookup_packed_compact: sub_scale must be cuda contiguous uint8");
-    MFQ_RUNTIME_CHECK(sub_min.is_cuda() && sub_min.is_contiguous() && sub_min.scalar_type() == mfq_tensor_backend::kUInt8,
-                "nint_embedding_lookup_packed_compact: sub_min must be cuda contiguous uint8");
-    MFQ_RUNTIME_CHECK(neuron_scale.is_cuda() && neuron_scale.is_contiguous() && neuron_scale.scalar_type() == mfq_tensor_backend::kFloat32,
-                "nint_embedding_lookup_packed_compact: neuron_scale must be cuda contiguous f32");
-    MFQ_RUNTIME_CHECK(neuron_min.is_cuda() && neuron_min.is_contiguous() && neuron_min.scalar_type() == mfq_tensor_backend::kFloat32,
-                "nint_embedding_lookup_packed_compact: neuron_min must be cuda contiguous f32");
-    MFQ_RUNTIME_CHECK(token_ids.is_cuda() && token_ids.is_contiguous() && token_ids.scalar_type() == mfq_tensor_backend::kInt64,
-                "nint_embedding_lookup_packed_compact: token_ids must be cuda contiguous int64");
-    MFQ_RUNTIME_CHECK(q_packed.dim() == 3, "nint_embedding_lookup_packed_compact: q_packed must be [vocab,ng,gs/2]");
-    int vocab = (int)q_packed.size(0);
-    int ng = (int)q_packed.size(1);
-    int qbytes = (int)q_packed.size(2);
-    MFQ_RUNTIME_CHECK(qbytes * 2 == gs, "nint_embedding_lookup_packed_compact: q_packed gs mismatch");
-    MFQ_RUNTIME_CHECK(sub_scale.size(0) == vocab && sub_scale.size(1) == ng,
-                "nint_embedding_lookup_packed_compact: sub_scale shape mismatch");
-    MFQ_RUNTIME_CHECK(sub_min.sizes() == sub_scale.sizes(), "nint_embedding_lookup_packed_compact: sub_min shape mismatch");
-    MFQ_RUNTIME_CHECK(neuron_scale.size(0) == vocab && neuron_min.size(0) == vocab,
-                "nint_embedding_lookup_packed_compact: neuron metadata shape mismatch");
-    int D = (int)neuron_len;
-    int N = (int)token_ids.numel();
-    auto out_shape = token_ids.sizes().vec();
-    out_shape.push_back(D);
-    auto out = mfq_tensor_backend::empty(out_shape, q_packed.options().dtype(mfq_tensor_backend::kFloat16));
-    constexpr int BD = 256;
-    size_t total = (size_t)N * D;
-    int grid = (int)((total + BD - 1) / BD);
-    grid = grid > 4096 ? 4096 : grid;
-    nint_embedding_lookup_packed_compact_kernel<<<grid, BD, 0, mfq_current_cuda_stream()>>>(
-        q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(), sub_min.data_ptr<uint8_t>(),
-        neuron_scale.data_ptr<float>(), neuron_min.data_ptr<float>(),
-        token_ids.data_ptr<int64_t>(), reinterpret_cast<half*>(out.data_ptr<mfq_half>()),
-        N, vocab, ng, (int)gs, qbytes, D);
-    return out;
-}
-
-mfq_tensor_backend::Tensor nint_embedding_lookup_packed_compact_bits_cuda(
-    mfq_tensor_backend::Tensor q_packed,
-    mfq_tensor_backend::Tensor sub_scale,
-    mfq_tensor_backend::Tensor sub_min,
-    mfq_tensor_backend::Tensor neuron_scale,
-    mfq_tensor_backend::Tensor neuron_min,
-    mfq_tensor_backend::Tensor token_ids,
-    int64_t neuron_len,
-    int64_t gs,
-    int64_t bits)
-{
-    MFQ_RUNTIME_CHECK(bits == 2 || bits == 3 || bits == 5 || bits == 6 || bits == 8,
-                "packed-bits embedding supports bits in {2,3,5,6,8}, got ", bits);
-    MFQ_RUNTIME_CHECK(q_packed.is_cuda() && q_packed.is_contiguous() && q_packed.scalar_type() == mfq_tensor_backend::kUInt8,
-                "nint_embedding_lookup_packed_compact_bits: q_packed must be cuda contiguous uint8");
-    MFQ_RUNTIME_CHECK(sub_scale.is_cuda() && sub_scale.is_contiguous() && sub_scale.scalar_type() == mfq_tensor_backend::kUInt8,
-                "nint_embedding_lookup_packed_compact_bits: sub_scale must be cuda contiguous uint8");
-    MFQ_RUNTIME_CHECK(sub_min.is_cuda() && sub_min.is_contiguous() && sub_min.scalar_type() == mfq_tensor_backend::kUInt8,
-                "nint_embedding_lookup_packed_compact_bits: sub_min must be cuda contiguous uint8");
-    MFQ_RUNTIME_CHECK(neuron_scale.is_cuda() && neuron_scale.is_contiguous() && neuron_scale.scalar_type() == mfq_tensor_backend::kFloat32,
-                "nint_embedding_lookup_packed_compact_bits: neuron_scale must be cuda contiguous f32");
-    MFQ_RUNTIME_CHECK(neuron_min.is_cuda() && neuron_min.is_contiguous() && neuron_min.scalar_type() == mfq_tensor_backend::kFloat32,
-                "nint_embedding_lookup_packed_compact_bits: neuron_min must be cuda contiguous f32");
-    MFQ_RUNTIME_CHECK(token_ids.is_cuda() && token_ids.is_contiguous() && token_ids.scalar_type() == mfq_tensor_backend::kInt64,
-                "nint_embedding_lookup_packed_compact_bits: token_ids must be cuda contiguous int64");
-    MFQ_RUNTIME_CHECK(q_packed.dim() == 3, "nint_embedding_lookup_packed_compact_bits: q_packed must be [vocab,ng,qbytes]");
-    int vocab = (int)q_packed.size(0);
-    int ng = (int)q_packed.size(1);
-    MFQ_RUNTIME_CHECK((int)q_packed.size(2) == (((int)gs * (int)bits + 7) / 8),
-                "nint_embedding_lookup_packed_compact_bits: q_packed gs/bits mismatch");
-    MFQ_RUNTIME_CHECK(sub_scale.size(0) == vocab && sub_scale.size(1) == ng,
-                "nint_embedding_lookup_packed_compact_bits: sub_scale shape mismatch");
-    MFQ_RUNTIME_CHECK(sub_min.sizes() == sub_scale.sizes(), "nint_embedding_lookup_packed_compact_bits: sub_min shape mismatch");
-    MFQ_RUNTIME_CHECK(neuron_scale.size(0) == vocab && neuron_min.size(0) == vocab,
-                "nint_embedding_lookup_packed_compact_bits: neuron metadata shape mismatch");
-    int D = (int)neuron_len;
-    int N = (int)token_ids.numel();
-    auto out_shape = token_ids.sizes().vec();
-    out_shape.push_back(D);
-    auto out = mfq_tensor_backend::empty(out_shape, q_packed.options().dtype(mfq_tensor_backend::kFloat16));
-    constexpr int BD = 256;
-    size_t total = (size_t)N * D;
-    int grid = (int)((total + BD - 1) / BD);
-    grid = grid > 4096 ? 4096 : grid;
-
-#define NINT_EMB_BITS_LAUNCH(BITSVAL, GSVAL)                                           \
-    nint_embedding_lookup_packed_compact_bits_kernel<BITSVAL, GSVAL><<<grid, BD, 0, mfq_current_cuda_stream()>>>( \
-        q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(), sub_min.data_ptr<uint8_t>(), \
-        neuron_scale.data_ptr<float>(), neuron_min.data_ptr<float>(), token_ids.data_ptr<int64_t>(), \
-        reinterpret_cast<half*>(out.data_ptr<mfq_half>()), N, vocab, ng, D)
-
-#define NINT_EMB_BITS_GS_SWITCH(BITSVAL)                                                \
-    switch ((int)gs) {                                                                  \
-        case 16: NINT_EMB_BITS_LAUNCH(BITSVAL, 16); break;                              \
-        case 20: NINT_EMB_BITS_LAUNCH(BITSVAL, 20); break;                              \
-        case 22: NINT_EMB_BITS_LAUNCH(BITSVAL, 22); break;                              \
-        case 24: NINT_EMB_BITS_LAUNCH(BITSVAL, 24); break;                              \
-        case 26: NINT_EMB_BITS_LAUNCH(BITSVAL, 26); break;                              \
-        case 28: NINT_EMB_BITS_LAUNCH(BITSVAL, 28); break;                              \
-        case 30: NINT_EMB_BITS_LAUNCH(BITSVAL, 30); break;                              \
-        case 32: NINT_EMB_BITS_LAUNCH(BITSVAL, 32); break;                              \
-        case 34: NINT_EMB_BITS_LAUNCH(BITSVAL, 34); break;                              \
-        case 36: NINT_EMB_BITS_LAUNCH(BITSVAL, 36); break;                              \
-        case 40: NINT_EMB_BITS_LAUNCH(BITSVAL, 40); break;                              \
-        case 48: NINT_EMB_BITS_LAUNCH(BITSVAL, 48); break;                              \
-        case 64: NINT_EMB_BITS_LAUNCH(BITSVAL, 64); break;                              \
-        default: MFQ_RUNTIME_CHECK(false, "packed-bits embedding unsupported gs ", gs);        \
+__global__ void nint8_zero_embedding_kernel(
+        const int8_t * __restrict__ quantized,
+        const __half * __restrict__ scale,
+        const int64_t * __restrict__ token_ids,
+        __half * __restrict__ output,
+        int token_count,
+        int vocabulary,
+        int groups,
+        int width) {
+    const size_t total = static_cast<size_t>(token_count) * width;
+    for (size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x +
+             threadIdx.x;
+         index < total;
+         index += static_cast<size_t>(gridDim.x) * blockDim.x) {
+        const int column = static_cast<int>(index % width);
+        const int token_index = static_cast<int>(index / width);
+        const int64_t token = token_ids[token_index];
+        float value = 0.0f;
+        if (token >= 0 && token < vocabulary) {
+            const int group = column / 32;
+            const int lane = column & 31;
+            const size_t block = static_cast<size_t>(token) * groups + group;
+            value = __half2float(scale[block]) * static_cast<float>(
+                quantized[block * 32 + lane]);
+        }
+        output[index] = __float2half_rn(value);
     }
-
-    if (bits == 2) {
-        NINT_EMB_BITS_GS_SWITCH(2);
-    } else if (bits == 3) {
-        NINT_EMB_BITS_GS_SWITCH(3);
-    } else if (bits == 5) {
-        NINT_EMB_BITS_GS_SWITCH(5);
-    } else if (bits == 6) {
-        NINT_EMB_BITS_GS_SWITCH(6);
-    } else {
-        NINT_EMB_BITS_GS_SWITCH(8);
-    }
-#undef NINT_EMB_BITS_GS_SWITCH
-#undef NINT_EMB_BITS_LAUNCH
-    return out;
 }
 
-mfq_tensor_backend::Tensor nint_embedding_lookup_packed_mixed_q_cuda(
-    mfq_tensor_backend::Tensor q_packed,
-    mfq_tensor_backend::Tensor row_q_bits,
-    mfq_tensor_backend::Tensor row_q_bit_offsets,
-    mfq_tensor_backend::Tensor sub_scale,
-    mfq_tensor_backend::Tensor sub_min,
-    mfq_tensor_backend::Tensor neuron_scale,
-    mfq_tensor_backend::Tensor neuron_min,
-    mfq_tensor_backend::Tensor token_ids,
-    int64_t neuron_len,
-    int64_t gs)
-{
+
+int launch_blocks(size_t elements) {
+    constexpr int threads = 256;
+    return static_cast<int>(std::min<size_t>(
+        (elements + threads - 1) / threads, 4096));
+}
+
+
+}  // namespace
+
+
+mfq_tensor_backend::Tensor embedding_lookup_cuda(
+        mfq_tensor_backend::Tensor weight,
+        mfq_tensor_backend::Tensor token_ids) {
     MFQ_RUNTIME_CHECK(
-        q_packed.is_cuda() && q_packed.is_contiguous() &&
-        q_packed.scalar_type() == mfq_tensor_backend::kUInt8 && q_packed.dim() == 1,
-        "mixed-q embedding values must be CUDA contiguous uint8 rank-1");
+        weight.is_cuda() && weight.is_contiguous() && weight.dim() == 2,
+        "embedding weight must be contiguous CUDA rank-2");
+    MFQ_RUNTIME_CHECK(
+        weight.scalar_type() == mfq_tensor_backend::kFloat32 ||
+        weight.scalar_type() == mfq_tensor_backend::kFloat16,
+        "embedding weight must be fp16 or fp32");
+    MFQ_RUNTIME_CHECK(
+        token_ids.is_cuda() && token_ids.is_contiguous() &&
+        token_ids.scalar_type() == mfq_tensor_backend::kInt64 &&
+        token_ids.device() == weight.device(),
+        "embedding token IDs must be contiguous CUDA int64 on the weight device");
+    const int vocabulary = static_cast<int>(weight.size(0));
+    const int width = static_cast<int>(weight.size(1));
+    const int token_count = static_cast<int>(token_ids.numel());
+    auto shape = token_ids.sizes().vec();
+    shape.push_back(width);
+    auto output = mfq_tensor_backend::empty(shape, weight.options());
+    if (token_count == 0) {
+        return output;
+    }
+    constexpr int threads = 256;
+    const int blocks = launch_blocks(
+        static_cast<size_t>(token_count) * width);
+    MFQ_DISPATCH_FLOATING_TYPES_AND_HALF(
+        weight.scalar_type(), "embedding_lookup_cuda", [&] {
+            dense_embedding_kernel<scalar_t><<<
+                blocks, threads, 0, mfq_current_cuda_stream()>>>(
+                    weight.data_ptr<scalar_t>(),
+                    token_ids.data_ptr<int64_t>(),
+                    output.data_ptr<scalar_t>(),
+                    token_count,
+                    width,
+                    vocabulary);
+        });
+    MFQ_CUDA_KERNEL_LAUNCH_CHECK();
+    return output;
+}
+
+
+mfq_tensor_backend::Tensor nint_embedding_cuda(
+        mfq_tensor_backend::Tensor bitstream,
+        mfq_tensor_backend::Tensor row_q_bits,
+        mfq_tensor_backend::Tensor row_q_bit_offsets,
+        mfq_tensor_backend::Tensor subgroup_scale,
+        mfq_tensor_backend::Tensor subgroup_minimum,
+        mfq_tensor_backend::Tensor neuron_scale,
+        mfq_tensor_backend::Tensor neuron_minimum,
+        mfq_tensor_backend::Tensor token_ids,
+        int64_t width,
+        int64_t group_size) {
+    MFQ_RUNTIME_CHECK(
+        bitstream.is_cuda() && bitstream.is_contiguous() &&
+        bitstream.scalar_type() == mfq_tensor_backend::kUInt8 &&
+        bitstream.dim() == 1,
+        "NINT embedding bitstream must be contiguous CUDA uint8 rank-1");
     MFQ_RUNTIME_CHECK(
         row_q_bits.is_cuda() && row_q_bits.is_contiguous() &&
-        row_q_bits.scalar_type() == mfq_tensor_backend::kUInt8 && row_q_bits.dim() == 1,
-        "mixed-q embedding row widths must be CUDA contiguous uint8 rank-1");
-    MFQ_RUNTIME_CHECK(
-        row_q_bit_offsets.is_cuda() && row_q_bit_offsets.is_contiguous() &&
+        row_q_bits.scalar_type() == mfq_tensor_backend::kUInt8 &&
+        row_q_bits.dim() == 1 && row_q_bit_offsets.is_cuda() &&
+        row_q_bit_offsets.is_contiguous() &&
         row_q_bit_offsets.scalar_type() == mfq_tensor_backend::kInt64 &&
         row_q_bit_offsets.dim() == 1,
-        "mixed-q embedding row offsets must be CUDA contiguous int64 rank-1");
+        "NINT embedding q metadata is invalid");
     MFQ_RUNTIME_CHECK(
-        sub_scale.is_cuda() && sub_scale.is_contiguous() &&
-        sub_scale.scalar_type() == mfq_tensor_backend::kUInt8 && sub_scale.dim() == 2 &&
-        sub_min.is_cuda() && sub_min.is_contiguous() &&
-        sub_min.scalar_type() == mfq_tensor_backend::kUInt8 &&
-        sub_min.sizes() == sub_scale.sizes(),
-        "mixed-q embedding subgroup metadata is invalid");
+        subgroup_scale.is_cuda() && subgroup_scale.is_contiguous() &&
+        subgroup_scale.scalar_type() == mfq_tensor_backend::kUInt8 &&
+        subgroup_scale.dim() == 2 && subgroup_minimum.is_cuda() &&
+        subgroup_minimum.is_contiguous() &&
+        subgroup_minimum.scalar_type() == mfq_tensor_backend::kUInt8 &&
+        subgroup_minimum.sizes() == subgroup_scale.sizes(),
+        "NINT embedding subgroup metadata is invalid");
     MFQ_RUNTIME_CHECK(
         neuron_scale.is_cuda() && neuron_scale.is_contiguous() &&
         neuron_scale.scalar_type() == mfq_tensor_backend::kFloat32 &&
-        neuron_min.is_cuda() && neuron_min.is_contiguous() &&
-        neuron_min.scalar_type() == mfq_tensor_backend::kFloat32,
-        "mixed-q embedding neuron metadata is invalid");
+        neuron_minimum.is_cuda() && neuron_minimum.is_contiguous() &&
+        neuron_minimum.scalar_type() == mfq_tensor_backend::kFloat32,
+        "NINT embedding neuron metadata is invalid");
     MFQ_RUNTIME_CHECK(
         token_ids.is_cuda() && token_ids.is_contiguous() &&
         token_ids.scalar_type() == mfq_tensor_backend::kInt64,
-        "mixed-q embedding token IDs must be CUDA contiguous int64");
-    const int vocab = (int)sub_scale.size(0);
-    const int ng = (int)sub_scale.size(1);
+        "NINT embedding token IDs must be contiguous CUDA int64");
+    const int vocabulary = static_cast<int>(subgroup_scale.size(0));
+    const int groups = static_cast<int>(subgroup_scale.size(1));
     MFQ_RUNTIME_CHECK(
-        row_q_bits.numel() == vocab && row_q_bit_offsets.numel() == vocab &&
-        neuron_scale.numel() == vocab && neuron_min.numel() == vocab,
-        "mixed-q embedding row metadata shape mismatch");
+        vocabulary > 0 && groups > 0 && group_size >= 4 && group_size <= 64 &&
+        width > 0 && width <= static_cast<int64_t>(groups) * group_size,
+        "NINT embedding dimensions are invalid");
     MFQ_RUNTIME_CHECK(
-        gs > 0 && neuron_len > 0 && neuron_len <= (int64_t)ng * gs,
-        "mixed-q embedding dimensions are invalid");
-    const int D = (int)neuron_len;
-    const int N = (int)token_ids.numel();
+        row_q_bits.numel() == vocabulary &&
+        row_q_bit_offsets.numel() == vocabulary &&
+        neuron_scale.numel() == vocabulary &&
+        neuron_minimum.numel() == vocabulary,
+        "NINT embedding row metadata shape mismatch");
+    MFQ_RUNTIME_CHECK(
+        bitstream.device() == row_q_bits.device() &&
+        bitstream.device() == row_q_bit_offsets.device() &&
+        bitstream.device() == subgroup_scale.device() &&
+        bitstream.device() == subgroup_minimum.device() &&
+        bitstream.device() == neuron_scale.device() &&
+        bitstream.device() == neuron_minimum.device() &&
+        bitstream.device() == token_ids.device(),
+        "NINT embedding tensors must share one CUDA device");
+    const int token_count = static_cast<int>(token_ids.numel());
     auto shape = token_ids.sizes().vec();
-    shape.push_back(D);
-    auto out = mfq_tensor_backend::empty(
-        shape, q_packed.options().dtype(mfq_tensor_backend::kFloat16));
+    shape.push_back(width);
+    auto output = mfq_tensor_backend::empty(
+        shape, bitstream.options().dtype(mfq_tensor_backend::kFloat16));
+    if (token_count == 0) {
+        return output;
+    }
     constexpr int threads = 256;
-    const size_t total = (size_t)N * (size_t)D;
-    int blocks = (int)((total + threads - 1) / threads);
-    blocks = std::min(blocks, 4096);
-    nint_embedding_lookup_packed_mixed_q_kernel<<<
+    const int blocks = launch_blocks(
+        static_cast<size_t>(token_count) * width);
+    nint_embedding_kernel<<<
         blocks, threads, 0, mfq_current_cuda_stream()>>>(
-            q_packed.data_ptr<uint8_t>(),
+            bitstream.data_ptr<uint8_t>(),
             row_q_bits.data_ptr<uint8_t>(),
             row_q_bit_offsets.data_ptr<int64_t>(),
-            sub_scale.data_ptr<uint8_t>(),
-            sub_min.data_ptr<uint8_t>(),
+            subgroup_scale.data_ptr<uint8_t>(),
+            subgroup_minimum.data_ptr<uint8_t>(),
             neuron_scale.data_ptr<float>(),
-            neuron_min.data_ptr<float>(),
+            neuron_minimum.data_ptr<float>(),
             token_ids.data_ptr<int64_t>(),
-            reinterpret_cast<half*>(out.data_ptr<mfq_half>()),
-            N, vocab, ng, (int)gs, D);
+            reinterpret_cast<__half *>(output.data_ptr<mfq_half>()),
+            token_count,
+            vocabulary,
+            groups,
+            static_cast<int>(group_size),
+            static_cast<int>(width));
     MFQ_CUDA_KERNEL_LAUNCH_CHECK();
-    return out;
+    return output;
 }
 
+
 mfq_tensor_backend::Tensor nint8_zero_embedding_lookup_cuda(
-    mfq_tensor_backend::Tensor q,
-    mfq_tensor_backend::Tensor scale,
-    mfq_tensor_backend::Tensor token_ids,
-    int64_t neuron_len)
-{
+        mfq_tensor_backend::Tensor quantized,
+        mfq_tensor_backend::Tensor scale,
+        mfq_tensor_backend::Tensor token_ids,
+        int64_t width) {
     MFQ_RUNTIME_CHECK(
-        q.is_cuda() && q.is_contiguous() &&
-            q.scalar_type() == mfq_tensor_backend::kUInt8 && q.dim() == 3 &&
-            q.size(2) == 32,
-        "NINT8-0 embedding q must be contiguous CUDA uint8 [vocab,ng,32]");
+        quantized.is_cuda() && quantized.is_contiguous() &&
+        quantized.scalar_type() == mfq_tensor_backend::kUInt8 &&
+        quantized.dim() == 3 && quantized.size(2) == 32,
+        "NINT8-0 embedding q must be contiguous CUDA uint8 [V,G,32]");
     MFQ_RUNTIME_CHECK(
         scale.is_cuda() && scale.is_contiguous() &&
-            scale.scalar_type() == mfq_tensor_backend::kFloat16 && scale.dim() == 2 &&
-            scale.size(0) == q.size(0) && scale.size(1) == q.size(1),
-        "NINT8-0 embedding scale must be contiguous CUDA f16 [vocab,ng]");
+        scale.scalar_type() == mfq_tensor_backend::kFloat16 &&
+        scale.dim() == 2 && scale.size(0) == quantized.size(0) &&
+        scale.size(1) == quantized.size(1),
+        "NINT8-0 embedding scale must be contiguous CUDA fp16 [V,G]");
     MFQ_RUNTIME_CHECK(
         token_ids.is_cuda() && token_ids.is_contiguous() &&
-            token_ids.scalar_type() == mfq_tensor_backend::kInt64,
-        "NINT8-0 embedding token_ids must be contiguous CUDA int64");
+        token_ids.scalar_type() == mfq_tensor_backend::kInt64 &&
+        token_ids.device() == quantized.device() &&
+        scale.device() == quantized.device(),
+        "NINT8-0 embedding tensors must share one CUDA device");
     MFQ_RUNTIME_CHECK(
-        neuron_len > 0 && neuron_len <= q.size(1) * 32,
-        "NINT8-0 embedding neuron_len is invalid");
-    const int vocab = static_cast<int>(q.size(0));
-    const int ng = static_cast<int>(q.size(1));
-    const int count = static_cast<int>(token_ids.numel());
+        width > 0 && width <= quantized.size(1) * 32,
+        "NINT8-0 embedding width is invalid");
+    const int vocabulary = static_cast<int>(quantized.size(0));
+    const int groups = static_cast<int>(quantized.size(1));
+    const int token_count = static_cast<int>(token_ids.numel());
     auto shape = token_ids.sizes().vec();
-    shape.push_back(neuron_len);
-    auto out = mfq_tensor_backend::empty(shape, q.options().dtype(mfq_tensor_backend::kFloat16));
+    shape.push_back(width);
+    auto output = mfq_tensor_backend::empty(
+        shape, quantized.options().dtype(mfq_tensor_backend::kFloat16));
+    if (token_count == 0) {
+        return output;
+    }
     constexpr int threads = 256;
-    const size_t total = static_cast<size_t>(count) * neuron_len;
-    int blocks = static_cast<int>((total + threads - 1) / threads);
-    blocks = std::min(blocks, 4096);
-    nint8_zero_embedding_lookup_kernel<<<
+    const int blocks = launch_blocks(
+        static_cast<size_t>(token_count) * width);
+    nint8_zero_embedding_kernel<<<
         blocks, threads, 0, mfq_current_cuda_stream()>>>(
-        reinterpret_cast<const int8_t *>(q.data_ptr<uint8_t>()),
-        reinterpret_cast<const half *>(scale.data_ptr<mfq_half>()),
-        token_ids.data_ptr<int64_t>(),
-        reinterpret_cast<half *>(out.data_ptr<mfq_half>()),
-        count, vocab, ng, static_cast<int>(neuron_len));
+            reinterpret_cast<const int8_t *>(
+                quantized.data_ptr<uint8_t>()),
+            reinterpret_cast<const __half *>(scale.data_ptr<mfq_half>()),
+            token_ids.data_ptr<int64_t>(),
+            reinterpret_cast<__half *>(output.data_ptr<mfq_half>()),
+            token_count,
+            vocabulary,
+            groups,
+            static_cast<int>(width));
     MFQ_CUDA_KERNEL_LAUNCH_CHECK();
-    return out;
+    return output;
 }

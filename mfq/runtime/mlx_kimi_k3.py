@@ -18,7 +18,7 @@ except ModuleNotFoundError as exc:  # pragma: no cover - optional dependency
 
 from mfq.formats import io
 from mfq.formats.io import MfqTensor
-from mfq.formats.moe import NintMoeTensor
+from mfq.formats.mfe import MfeTensor
 from mfq.kernels.metal.kimi_k3 import (
     kimi_attention_residual,
     kimi_gated_rmsnorm,
@@ -478,8 +478,8 @@ class MlxKimiMoE:
         )
         gate_up = model.tensors[names.layer(names.expert_gate_up, layer)]
         down = model.tensors[names.layer(names.expert_down, layer)]
-        if not isinstance(gate_up, NintMoeTensor) or not isinstance(down, NintMoeTensor):
-            raise TypeError("Kimi TPQ2 expert records must use NINTM")
+        if not isinstance(gate_up, MfeTensor) or not isinstance(down, MfeTensor):
+            raise TypeError("Kimi TPQ2 expert records must use MFE")
         self.experts = MlxRoutedSiTUFFN(
             gate_up,
             down,

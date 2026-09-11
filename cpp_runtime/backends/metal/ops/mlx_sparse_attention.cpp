@@ -1,6 +1,6 @@
 #include "mlx_sparse_attention.h"
 
-#include "mfq_nintm_prefill_embedded.h"
+#include "mfq_mfe_prefill_embedded.h"
 
 #include <mlx/backend/metal/device.h>
 #include <mlx/primitives.h>

@@ -43,7 +43,7 @@ void install_legacy_tensor_compatibility(MfqContainer& model) {
         model.header().architecture,
         legacy_model_config(model),
         stored_tensor_names(model));
-    model.install_hf_nintm_views(
+    model.install_hf_mfe_views(
         compatibility.canonical_to_stored);
     model.install_legacy_aliases(
         std::move(compatibility.canonical_to_stored),

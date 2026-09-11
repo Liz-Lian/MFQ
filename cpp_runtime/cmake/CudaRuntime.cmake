@@ -18,7 +18,7 @@ find_package(CUDAToolkit REQUIRED)
 find_package(Threads REQUIRED)
 
 add_library(mfq-cuda-storage STATIC
-    ${MFQ_CUDA_ROOT}/storage/nintm_expert_store.cpp
+    ${MFQ_CUDA_ROOT}/storage/mfe_expert_store.cpp
 )
 add_library(mfq::cuda-storage ALIAS mfq-cuda-storage)
 target_include_directories(mfq-cuda-storage PUBLIC
@@ -77,7 +77,6 @@ set(MFQ_CUDA_KERNEL_SOURCES
     ${MFQ_CUDA_KERNEL_ROOT}/nepq.cu
     ${MFQ_CUDA_KERNEL_ROOT}/nepq_residual.cu
     ${MFQ_CUDA_KERNEL_ROOT}/nint_matmul.cu
-    ${MFQ_CUDA_KERNEL_ROOT}/nint_small_m.cu
     ${MFQ_CUDA_KERNEL_ROOT}/norm.cu
     ${MFQ_CUDA_KERNEL_ROOT}/nvq_matmul.cu
     ${MFQ_CUDA_KERNEL_ROOT}/rope.cu
@@ -136,26 +135,19 @@ if(BUILD_TESTING)
         set_tests_properties(${target} PROPERTIES SKIP_RETURN_CODE 77)
     endfunction()
 
-    add_executable(mfq-cuda-nintm-expert-store-test
-        ${MFQ_CUDA_ROOT}/tests/mfq_nintm_expert_store_test.cpp)
-    target_link_libraries(mfq-cuda-nintm-expert-store-test PRIVATE
+    add_executable(mfq-cuda-mfe-expert-store-test
+        ${MFQ_CUDA_ROOT}/tests/mfq_mfe_expert_store_test.cpp)
+    target_link_libraries(mfq-cuda-mfe-expert-store-test PRIVATE
         mfq-cuda-storage)
-    target_compile_features(mfq-cuda-nintm-expert-store-test PRIVATE cxx_std_20)
-    add_test(NAME mfq-cuda-nintm-expert-store-test
-        COMMAND mfq-cuda-nintm-expert-store-test)
+    target_compile_features(mfq-cuda-mfe-expert-store-test PRIVATE cxx_std_20)
+    add_test(NAME mfq-cuda-mfe-expert-store-test
+        COMMAND mfq-cuda-mfe-expert-store-test)
 
     add_executable(mfq-mxfp4-sq-test ${MFQ_CUDA_ROOT}/tests/mfq_mxfp4_sq_test.cu)
     target_compile_definitions(mfq-mxfp4-sq-test PRIVATE MFQ_NATIVE_CUDA_RUNTIME=1)
     target_include_directories(mfq-mxfp4-sq-test PRIVATE ${MFQ_REPOSITORY_ROOT})
     target_link_libraries(mfq-mxfp4-sq-test PRIVATE mfq-cuda-core mfq-cuda-native-kernels)
     set_target_properties(mfq-mxfp4-sq-test PROPERTIES
-        CUDA_ARCHITECTURES "${MFQ_CUDA_ARCHITECTURES}"
-        CUDA_RUNTIME_LIBRARY Shared CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED ON)
-
-    add_executable(mfq-nint-small-m-bench ${MFQ_REPOSITORY_ROOT}/bench/cuda_nint_small_m_bench.cu)
-    target_compile_definitions(mfq-nint-small-m-bench PRIVATE MFQ_NATIVE_CUDA_RUNTIME=1)
-    target_link_libraries(mfq-nint-small-m-bench PRIVATE mfq-cuda-core mfq-cuda-native-kernels)
-    set_target_properties(mfq-nint-small-m-bench PROPERTIES
         CUDA_ARCHITECTURES "${MFQ_CUDA_ARCHITECTURES}"
         CUDA_RUNTIME_LIBRARY Shared CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED ON)
 
@@ -174,10 +166,6 @@ if(BUILD_TESTING)
     mfq_add_cuda_test(mfq-cuda-activation-test
         ${MFQ_CUDA_ROOT}/tests/mfq_cuda_activation_test.cu
         mfq-cuda-native-kernels)
-    mfq_add_cuda_test(mfq-nint-small-m-test
-        ${MFQ_CUDA_ROOT}/tests/mfq_nint_small_m_test.cu
-        mfq-cuda-native-kernels)
-    target_compile_definitions(mfq-nint-small-m-test PRIVATE MFQ_NATIVE_CUDA_RUNTIME=1)
     mfq_add_cuda_test(mfq-paged-kv-test
         ${MFQ_CUDA_ROOT}/tests/mfq_paged_kv_test.cu
         mfq-cuda-native-kernels)

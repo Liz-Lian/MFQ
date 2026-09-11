@@ -1,9 +1,9 @@
-"""Single-dispatch heterogeneous routed matmul for Apple silicon.
+"""Mixed-format routed matmul for Apple silicon.
 
 Each global expert owns one fixed-width descriptor.  The descriptor points
-into concatenated packed NINT, VQ-family, or MXFP4 streams, so one Metal
-dispatch can execute routes spanning different precision cohorts without
-first evaluating every expert in every cohort.
+into concatenated VQ-family, NINT8-0, or MXFP4 streams. NINT cohorts retain
+their canonical packed weights and reuse the ordinary NINT matmul kernel;
+their results are composed with the remaining format-level dispatch.
 """
 
 from __future__ import annotations
@@ -19,8 +19,9 @@ except ModuleNotFoundError as exc:  # pragma: no cover - optional dependency
         "MFQ's Metal backend requires MLX; install with `pip install -e '.[metal]'`"
     ) from exc
 
-from mfq.formats.io import view_nint_moe_blob
-from mfq.formats.moe import NintMoeTensor
+from mfq.formats.io import view_mfe_blob
+from mfq.formats.compat import NINT_DTYPE
+from mfq.formats.mfe import MfeTensor
 from mfq.formats.mx import MXFP4_DTYPE, MxTensor
 from mfq.formats.nepq import NepqTensor
 from mfq.formats.nint import NintTensor
@@ -31,7 +32,7 @@ from mfq.formats.nvq import NvqJscTensor, NvqTensor
 from mfq.formats.nvq1_l import Nvq1LTensor
 from mfq.formats.nvq1_s import Nvq1STensor
 from mfq.kernels.metal.mx import MetalMxWeight
-from mfq.kernels.metal.nint import MetalNintWeight
+from mfq.kernels.metal.nint import MetalNintWeight, nint_routed_matmul
 from mfq.kernels.metal.nint8_zero import MetalNint8ZeroWeight
 from mfq.kernels.metal.vq import _BITSTREAM_HEADER, MetalVqWeight, signed_hadamard
 
@@ -913,118 +914,6 @@ _GROUPED_SOURCE = r"""
                     (token * uint(ROUTES) + route) * uint(PROJECTIONS)
                     + projection
                 ) * uint(OUT) + output
-            ] = T(total);
-        }
-    }
-"""
-
-
-_GROUPED_NINT4_QMV_SOURCE = r"""
-    constexpr uint SIMD_GROUPS = 2u;
-    constexpr uint ROWS_PER_SIMD = 4u;
-    constexpr uint ROWS_PER_TG = SIMD_GROUPS * ROWS_PER_SIMD;
-    constexpr uint OUTPUT_TILES = (uint(OUT) + ROWS_PER_TG - 1u) / ROWS_PER_TG;
-    constexpr uint VALUES_PER_LANE = 16u;
-    constexpr uint BLOCK_K = 32u * VALUES_PER_LANE;
-
-    uint lane = thread_index_in_simdgroup;
-    uint simd_group = simdgroup_index_in_threadgroup;
-    uint workgroup = threadgroup_position_in_grid.x;
-    uint output_tile = workgroup % OUTPUT_TILES;
-    uint projection_index = workgroup / OUTPUT_TILES;
-    uint projection = projection_index % uint(PROJECTIONS);
-    uint route_index = projection_index / uint(PROJECTIONS);
-    if (route_index >= uint(ROUTE_COUNT)) {
-        return;
-    }
-    uint output_base =
-        output_tile * ROWS_PER_TG + simd_group * ROWS_PER_SIMD;
-
-    int expert = int(expert_ids[route_index]);
-    if (expert < 0 || expert >= int(EXPERTS)) {
-        for (uint row = 0u; row < ROWS_PER_SIMD; ++row) {
-            uint output = output_base + row;
-            if (lane == 0u && output < uint(OUT)) {
-                y[
-                    (route_index * uint(PROJECTIONS) + projection)
-                    * uint(OUT) + output
-                ] = T(0.0f);
-            }
-        }
-        return;
-    }
-
-    uint descriptor_base = (
-        uint(expert) * uint(PROJECTIONS) + projection
-    ) * uint(DESCRIPTOR_SIZE);
-    uint local_expert = uint(descriptors[descriptor_base + 1u]);
-    uint groupsize = uint(descriptors[descriptor_base + 5u]);
-    uint groups = uint(descriptors[descriptor_base + 6u]);
-    uint q_offset = uint(descriptors[descriptor_base + 7u]);
-    uint sub_offset = uint(descriptors[descriptor_base + 8u]);
-    uint anchor_offset = uint(descriptors[descriptor_base + 9u]);
-    uint x_offset = route_index * uint(K);
-    uint padded_columns = groups * groupsize;
-    uint packed_row_bytes = padded_columns >> 1u;
-    float accumulators[ROWS_PER_SIMD] = {0.0f};
-
-    for (uint block = 0u; block < uint(K); block += BLOCK_K) {
-        uint column_base = block + lane * VALUES_PER_LANE;
-        if (column_base >= uint(K)) {
-            continue;
-        }
-        float activations[VALUES_PER_LANE];
-        for (uint component = 0u; component < VALUES_PER_LANE; ++component) {
-            activations[component] = float(x[x_offset + column_base + component]);
-        }
-        uint first_group = column_base / groupsize;
-        uint next_group_column = (first_group + 1u) * groupsize;
-
-        for (uint row = 0u; row < ROWS_PER_SIMD; ++row) {
-            uint output = min(output_base + row, uint(OUT) - 1u);
-            uint pool_output = local_expert * uint(OUT) + output;
-            uint metadata_base = sub_offset + pool_output * groups;
-            float anchor_scale = nint_anchor_scale[anchor_offset + pool_output];
-            float anchor_minimum = nint_anchor_min[anchor_offset + pool_output];
-            float scale0 = anchor_scale * float(nint_sub_scale[
-                metadata_base + first_group
-            ]);
-            float minimum0 = anchor_minimum * float(nint_sub_min[
-                metadata_base + first_group
-            ]);
-            uint second_group = min(first_group + 1u, groups - 1u);
-            float scale1 = anchor_scale * float(nint_sub_scale[
-                metadata_base + second_group
-            ]);
-            float minimum1 = anchor_minimum * float(nint_sub_min[
-                metadata_base + second_group
-            ]);
-
-            uint packed_offset = q_offset + pool_output * packed_row_bytes
-                + (column_base >> 1u);
-            const device uint* packed_words =
-                reinterpret_cast<const device uint*>(nint_q + packed_offset);
-            ulong packed = ulong(packed_words[0])
-                | (ulong(packed_words[1]) << 32u);
-            for (uint component = 0u; component < VALUES_PER_LANE; ++component) {
-                uint column = column_base + component;
-                bool upper = column >= next_group_column;
-                float scale = upper ? scale1 : scale0;
-                float minimum = upper ? minimum1 : minimum0;
-                uint quantized = uint((packed >> (component * 4u)) & 15ul);
-                accumulators[row] += activations[component]
-                    * (scale * float(quantized) - minimum);
-            }
-        }
-    }
-
-    for (uint row = 0u; row < ROWS_PER_SIMD; ++row) {
-        float total = simd_sum(accumulators[row]);
-        uint output = output_base + row;
-        if (lane == 0u && output < uint(OUT)) {
-            y[
-                (route_index * uint(PROJECTIONS) + projection)
-                * uint(OUT) + output
             ] = T(total);
         }
     }
@@ -2135,23 +2024,6 @@ _GROUPED_KERNEL = mx.fast.metal_kernel(
     compile_options={"math_mode": "fast"},
 )
 
-_GROUPED_NINT4_QMV_KERNEL = mx.fast.metal_kernel(
-    name="mfq_nint4_grouped_qmv",
-    input_names=[
-        "descriptors",
-        "nint_q",
-        "nint_sub_scale",
-        "nint_sub_min",
-        "nint_anchor_scale",
-        "nint_anchor_min",
-        "x",
-        "expert_ids",
-    ],
-    output_names=["y"],
-    source=_GROUPED_NINT4_QMV_SOURCE,
-    compile_options={"math_mode": "fast"},
-)
-
 _GROUPED_COMPACT_KERNEL = mx.fast.metal_kernel(
     name="mfq_heterogeneous_grouped_compact_mmq",
     input_names=[
@@ -2270,8 +2142,14 @@ def _join(
 
 
 @dataclass(frozen=True)
+class _NintCohort:
+    weight: MetalNintWeight
+    expert_map: mx.array
+
+
+@dataclass(frozen=True)
 class MetalMoeWeight:
-    """Concatenated packed buffers and per-expert heterogeneous descriptors."""
+    """Packed format cohorts and per-expert MFE descriptors."""
 
     descriptors: mx.array
     nint_q: mx.array
@@ -2301,20 +2179,18 @@ class MetalMoeWeight:
     out_per_expert: int
     neuron_len: int
     projections: int
+    nint_cohorts: tuple[_NintCohort, ...]
+    projection_views: tuple[MetalMoeWeight, ...]
 
     @classmethod
     def from_blob(cls, blob: bytes | memoryview) -> MetalMoeWeight:
-        """Upload a heterogeneous NIM2 tensor without expanding NINT q streams."""
+        """Upload an MFE tensor without expanding NINT q streams."""
 
-        shape, pools = view_nint_moe_blob(blob)
+        shape, pools = view_mfe_blob(blob)
         experts, out_per_expert, neuron_len = shape
         descriptors = np.zeros((experts, _DESCRIPTOR_SIZE), dtype=np.int32)
 
-        nint_q: list[mx.array] = []
-        nint_sub_scale: list[mx.array] = []
-        nint_sub_min: list[mx.array] = []
-        nint_anchor_scale: list[mx.array] = []
-        nint_anchor_min: list[mx.array] = []
+        nint_cohorts: list[_NintCohort] = []
         q8_q: list[mx.array] = []
         q8_scales: list[mx.array] = []
         vq_indices: list[mx.array] = []
@@ -2359,13 +2235,15 @@ class MetalMoeWeight:
             expected_rows = int(expert_ids.size) * out_per_expert
             runtime_nbytes = len(pool.runtime_payload)
 
-            if pool.dtype.startswith("NINT") and pool.dtype[4:].isdigit():
+            if pool.dtype == NINT_DTYPE:
                 if runtime_nbytes:
-                    raise ValueError("NINT cohorts cannot carry NINTM runtime metadata")
+                    raise ValueError("NINT cohorts cannot carry MFE runtime metadata")
                 weight = MetalNintWeight.from_blob(pool.tensor_payload)
                 if weight.out != expected_rows or weight.neuron_len != neuron_len:
-                    raise ValueError("NINTM NINT cohort dimensions are inconsistent")
+                    raise ValueError("MFE NINT cohort dimensions are inconsistent")
+                expert_map = np.full(experts, -1, dtype=np.int32)
                 for local_expert, expert in enumerate(expert_ids):
+                    expert_map[int(expert)] = local_expert
                     descriptor = descriptors[int(expert)]
                     descriptor[_FAMILY] = _FAMILY_NINT
                     descriptor[_LOCAL_EXPERT] = local_expert
@@ -2377,12 +2255,10 @@ class MetalMoeWeight:
                     descriptor[_NINT_Q_OFFSET] = offsets["nint_q"]
                     descriptor[_NINT_SUB_OFFSET] = offsets["nint_sub"]
                     descriptor[_NINT_ANCHOR_OFFSET] = offsets["nint_anchor"]
-                    descriptor[_NINT_Q5_EXEC] = int(weight.q5_exec)
-                nint_q.append(weight.q_packed)
-                nint_sub_scale.append(weight.sub_scale)
-                nint_sub_min.append(weight.sub_min)
-                nint_anchor_scale.append(weight.neuron_scale)
-                nint_anchor_min.append(weight.neuron_min)
+                    descriptor[_NINT_Q5_EXEC] = 0
+                nint_cohorts.append(
+                    _NintCohort(weight, mx.array(expert_map))
+                )
                 offsets["nint_q"] += _size(weight.q_packed) + 2
                 offsets["nint_sub"] += _size(weight.sub_scale)
                 offsets["nint_anchor"] += _size(weight.neuron_scale)
@@ -2390,10 +2266,10 @@ class MetalMoeWeight:
 
             if pool.dtype == "NINT8-0":
                 if runtime_nbytes:
-                    raise ValueError("NINT8-0 cohorts cannot carry NINTM runtime metadata")
+                    raise ValueError("NINT8-0 cohorts cannot carry MFE runtime metadata")
                 weight = MetalNint8ZeroWeight.from_blob(pool.tensor_payload)
                 if weight.out != expected_rows or weight.neuron_len != neuron_len:
-                    raise ValueError("NINTM NINT8-0 cohort dimensions are inconsistent")
+                    raise ValueError("MFE NINT8-0 cohort dimensions are inconsistent")
                 for local_expert, expert in enumerate(expert_ids):
                     descriptor = descriptors[int(expert)]
                     descriptor[_FAMILY] = _FAMILY_NINT8_ZERO
@@ -2411,10 +2287,10 @@ class MetalMoeWeight:
 
             if pool.dtype == MXFP4_DTYPE:
                 if runtime_nbytes:
-                    raise ValueError("MXFP4 cohorts cannot carry NINTM runtime metadata")
+                    raise ValueError("MXFP4 cohorts cannot carry MFE runtime metadata")
                 weight = MetalMxWeight.from_blob(pool.dtype, pool.tensor_payload)
                 if weight.out != expected_rows or weight.in_features != neuron_len:
-                    raise ValueError("NINTM MXFP4 cohort dimensions are inconsistent")
+                    raise ValueError("MFE MXFP4 cohort dimensions are inconsistent")
                 groups = neuron_len // 32
                 for local_expert, expert in enumerate(expert_ids):
                     descriptor = descriptors[int(expert)]
@@ -2435,12 +2311,12 @@ class MetalMoeWeight:
                 weight = MetalVqWeight.from_blob(pool.dtype, pool.tensor_payload)
             except (TypeError, ValueError) as exc:
                 raise UnsupportedGroupedMoeError(
-                    f"unsupported zero-expand NINTM cohort {pool.dtype!r}"
+                    f"unsupported zero-expand MFE cohort {pool.dtype!r}"
                 ) from exc
             if weight.out != expected_rows or weight.neuron_len != neuron_len:
-                raise ValueError("NINTM VQ cohort dimensions are inconsistent")
+                raise ValueError("MFE VQ cohort dimensions are inconsistent")
             if bool(runtime_nbytes) != bool(weight.rotation_block):
-                raise ValueError("NINTM VQ rotation metadata presence is inconsistent")
+                raise ValueError("MFE VQ rotation metadata presence is inconsistent")
             rotation_variant = 0
             if weight.rotation_block:
                 key = (weight.rotation_block, weight.rotation_seed)
@@ -2520,25 +2396,16 @@ class MetalMoeWeight:
 
         if offsets["nint_q"] > (1 << 31) - 1:
             raise UnsupportedGroupedMoeError(
-                "multi-cohort NINTM packed buffers above INT32_MAX require sharding"
+                "multi-cohort MFE packed buffers above INT32_MAX require sharding"
             )
-
-        # Keep the common single-cohort stream in its native shape.  Besides
-        # avoiding an unnecessary copy, this preserves the large-buffer path
-        # used by homogeneous NINTM tensors; offsets are zero in this case.
-        joined_nint_q = (
-            mx.contiguous(nint_q[0])
-            if len(nint_q) == 1
-            else _join(nint_q, dtype=mx.uint8, padding=2)
-        )
 
         return cls(
             descriptors=mx.array(descriptors),
-            nint_q=joined_nint_q,
-            nint_sub_scale=_join(nint_sub_scale, dtype=mx.uint8),
-            nint_sub_min=_join(nint_sub_min, dtype=mx.uint8),
-            nint_anchor_scale=_join(nint_anchor_scale, dtype=mx.float32),
-            nint_anchor_min=_join(nint_anchor_min, dtype=mx.float32),
+            nint_q=mx.zeros((1,), dtype=mx.uint8),
+            nint_sub_scale=mx.zeros((1,), dtype=mx.uint8),
+            nint_sub_min=mx.zeros((1,), dtype=mx.uint8),
+            nint_anchor_scale=mx.zeros((1,), dtype=mx.float32),
+            nint_anchor_min=mx.zeros((1,), dtype=mx.float32),
             q8_q=_join(q8_q, dtype=mx.int8),
             q8_scales=_join(q8_scales, dtype=mx.float16),
             vq_indices=_join(vq_indices, dtype=mx.uint8, padding=2),
@@ -2561,20 +2428,18 @@ class MetalMoeWeight:
             out_per_expert=out_per_expert,
             neuron_len=neuron_len,
             projections=1,
+            nint_cohorts=tuple(nint_cohorts),
+            projection_views=(),
         )
 
     @classmethod
-    def from_tensor(cls, tensor: NintMoeTensor) -> MetalMoeWeight:
+    def from_tensor(cls, tensor: MfeTensor) -> MetalMoeWeight:
         descriptors = np.zeros(
             (tensor.n_experts, _DESCRIPTOR_SIZE),
             dtype=np.int32,
         )
 
-        nint_q: list[mx.array] = []
-        nint_sub_scale: list[mx.array] = []
-        nint_sub_min: list[mx.array] = []
-        nint_anchor_scale: list[mx.array] = []
-        nint_anchor_min: list[mx.array] = []
+        nint_cohorts: list[_NintCohort] = []
         q8_q: list[mx.array] = []
         q8_scales: list[mx.array] = []
         vq_indices: list[mx.array] = []
@@ -2619,9 +2484,10 @@ class MetalMoeWeight:
             source = pool.tensor
             expert_ids = np.asarray(pool.expert_ids, dtype=np.int32).reshape(-1)
             if isinstance(source, NintTensor):
-                weight: MetalNintWeight | MetalVqWeight = MetalNintWeight.from_tensor(source)
+                weight = MetalNintWeight.from_tensor(source)
                 if weight.out != expert_ids.size * tensor.out_per_expert:
-                    raise ValueError("NINTM NINT cohort row count is inconsistent")
+                    raise ValueError("MFE NINT cohort row count is inconsistent")
+                expert_map = np.full(tensor.n_experts, -1, dtype=np.int32)
                 common = (
                     _FAMILY_NINT,
                     weight.bits,
@@ -2630,9 +2496,10 @@ class MetalMoeWeight:
                     offsets["nint_q"],
                     offsets["nint_sub"],
                     offsets["nint_anchor"],
-                    int(weight.q5_exec),
+                    0,
                 )
                 for local_expert, expert in enumerate(expert_ids):
+                    expert_map[int(expert)] = local_expert
                     descriptor = descriptors[int(expert)]
                     descriptor[_FAMILY] = common[0]
                     descriptor[_LOCAL_EXPERT] = local_expert
@@ -2646,11 +2513,10 @@ class MetalMoeWeight:
                     descriptor[_NINT_ANCHOR_OFFSET] = common[6]
                     descriptor[_NINT_Q5_EXEC] = common[7]
 
-                nint_q.append(weight.q_packed)
-                nint_sub_scale.append(weight.sub_scale)
-                nint_sub_min.append(weight.sub_min)
-                nint_anchor_scale.append(weight.neuron_scale)
-                nint_anchor_min.append(weight.neuron_min)
+                nint_cohorts.append(
+                    _NintCohort(weight, mx.array(expert_map))
+                )
+
                 offsets["nint_q"] += _size(weight.q_packed) + 2
                 offsets["nint_sub"] += _size(weight.sub_scale)
                 offsets["nint_anchor"] += _size(weight.neuron_scale)
@@ -2659,7 +2525,7 @@ class MetalMoeWeight:
             if isinstance(source, Nint8ZeroTensor):
                 q8_weight = MetalNint8ZeroWeight.from_tensor(source)
                 if q8_weight.out != expert_ids.size * tensor.out_per_expert:
-                    raise ValueError("NINTM NINT8-0 cohort row count is inconsistent")
+                    raise ValueError("MFE NINT8-0 cohort row count is inconsistent")
                 for local_expert, expert in enumerate(expert_ids):
                     descriptor = descriptors[int(expert)]
                     descriptor[_FAMILY] = _FAMILY_NINT8_ZERO
@@ -2678,12 +2544,12 @@ class MetalMoeWeight:
             if isinstance(source, MxTensor):
                 if source.dtype != MXFP4_DTYPE:
                     raise TypeError(
-                        "grouped Metal NINTM supports native MXFP4 cohorts, "
+                        "grouped Metal MFE supports native MXFP4 cohorts, "
                         f"received {source.dtype}"
                     )
                 mx_weight = MetalMxWeight.from_tensor(source)
                 if mx_weight.out != expert_ids.size * tensor.out_per_expert:
-                    raise ValueError("NINTM MXFP4 cohort row count is inconsistent")
+                    raise ValueError("MFE MXFP4 cohort row count is inconsistent")
                 groups = tensor.neuron_len // 32
                 for local_expert, expert in enumerate(expert_ids):
                     descriptor = descriptors[int(expert)]
@@ -2702,12 +2568,12 @@ class MetalMoeWeight:
 
             if not isinstance(source, _VQ_TYPES):
                 raise TypeError(
-                    "grouped Metal NINTM supports NINT/NVQ/NPQ/NEPQ/MXFP4 cohorts; "
+                    "grouped Metal MFE supports NINT/NVQ/NPQ/NEPQ/MXFP4 cohorts; "
                     f"received {type(source).__name__}"
                 )
             weight = MetalVqWeight.from_tensor(source)
             if weight.out != expert_ids.size * tensor.out_per_expert:
-                raise ValueError("NINTM VQ cohort row count is inconsistent")
+                raise ValueError("MFE VQ cohort row count is inconsistent")
             rotation_variant = 0
             if weight.rotation_block:
                 key = (weight.rotation_block, weight.rotation_seed)
@@ -2792,11 +2658,11 @@ class MetalMoeWeight:
 
         return cls(
             descriptors=mx.array(descriptors),
-            nint_q=_join(nint_q, dtype=mx.uint8, padding=2),
-            nint_sub_scale=_join(nint_sub_scale, dtype=mx.uint8),
-            nint_sub_min=_join(nint_sub_min, dtype=mx.uint8),
-            nint_anchor_scale=_join(nint_anchor_scale, dtype=mx.float32),
-            nint_anchor_min=_join(nint_anchor_min, dtype=mx.float32),
+            nint_q=mx.zeros((1,), dtype=mx.uint8),
+            nint_sub_scale=mx.zeros((1,), dtype=mx.uint8),
+            nint_sub_min=mx.zeros((1,), dtype=mx.uint8),
+            nint_anchor_scale=mx.zeros((1,), dtype=mx.float32),
+            nint_anchor_min=mx.zeros((1,), dtype=mx.float32),
             q8_q=_join(q8_q, dtype=mx.int8),
             q8_scales=_join(q8_scales, dtype=mx.float16),
             vq_indices=_join(vq_indices, dtype=mx.uint8, padding=2),
@@ -2819,6 +2685,8 @@ class MetalMoeWeight:
             out_per_expert=tensor.out_per_expert,
             neuron_len=tensor.neuron_len,
             projections=1,
+            nint_cohorts=tuple(nint_cohorts),
+            projection_views=(),
         )
 
     @classmethod
@@ -2826,7 +2694,7 @@ class MetalMoeWeight:
         cls,
         weights: tuple[MetalMoeWeight, ...],
     ) -> MetalMoeWeight:
-        """Combine compatible routed projections into one packed dispatch."""
+        """Combine compatible projections behind one routed call."""
 
         if not weights:
             raise ValueError("at least one grouped projection is required")
@@ -2954,17 +2822,20 @@ class MetalMoeWeight:
             out_per_expert=first.out_per_expert,
             neuron_len=first.neuron_len,
             projections=len(weights),
+            nint_cohorts=(),
+            projection_views=(
+                tuple(weights)
+                if any(weight.nint_cohorts for weight in weights)
+                else ()
+            ),
         )
 
     @property
     def packed_nbytes(self) -> int:
+        if self.projection_views:
+            return sum(weight.packed_nbytes for weight in self.projection_views)
         arrays = (
             self.descriptors,
-            self.nint_q,
-            self.nint_sub_scale,
-            self.nint_sub_min,
-            self.nint_anchor_scale,
-            self.nint_anchor_min,
             self.q8_q,
             self.q8_scales,
             self.vq_indices,
@@ -2983,7 +2854,11 @@ class MetalMoeWeight:
             self.residual_second,
             *(signs for signs, _, _ in self.rotation_specs),
         )
-        return sum(int(array.nbytes) for array in arrays)
+        cohort_bytes = sum(
+            cohort.weight.packed_nbytes + int(cohort.expert_map.nbytes)
+            for cohort in self.nint_cohorts
+        )
+        return cohort_bytes + sum(int(array.nbytes) for array in arrays)
 
 
 def grouped_moe_matmul(
@@ -2994,17 +2869,13 @@ def grouped_moe_matmul(
     compact_threshold: int | None = 0,
     matrix_threshold: int | None = 0,
     expert_matrix_threshold: int | None = 1,
-    nint4_qmv: bool = True,
 ) -> mx.array:
-    """Execute routed experts with direct decode or route-compacted MMQ/MMA.
+    """Execute routed experts with standalone NINT and grouped peers.
 
     The zero-valued auto thresholds select route compaction near four routes per
-    expert and MMA near sixteen.  Pure NINT2/3 weights skip the intermediate
-    compact-MMQ range because their direct packed kernel remains faster up to
-    the MMA crossover.  The matrix path normally uses the expert-owned kernel,
-    which decodes each weight tile once and reuses it across assigned routes.
-    Setting ``expert_matrix_threshold=None`` exposes the route-owned MMA variant
-    for tuning and regression tests.
+    expert and MMA near sixteen for VQ, MXFP4, and NINT8-0. Every NINT profile
+    reuses the ordinary metadata-driven NINT matmul kernel instead of entering
+    one of those heterogeneous kernels.
     """
 
     source = x if isinstance(x, mx.array) else mx.array(x)
@@ -3014,16 +2885,13 @@ def grouped_moe_matmul(
     if ids.ndim != 2:
         raise ValueError("routed expert IDs must have [tokens,routes] shape")
     tokens, routes = (int(value) for value in ids.shape)
-    if source.ndim == 2:
+    shared_input = source.ndim == 2
+    if shared_input:
         if tuple(int(value) for value in source.shape) != (
             tokens,
             weight.neuron_len,
         ):
             raise ValueError("shared routed input must have [tokens,neuron_len] shape")
-        source = mx.broadcast_to(
-            source[:, None, :],
-            (tokens, routes, weight.neuron_len),
-        )
     elif source.ndim != 3 or tuple(int(value) for value in source.shape) != (
         tokens,
         routes,
@@ -3032,6 +2900,14 @@ def grouped_moe_matmul(
         raise ValueError("routed input must have [tokens,K] or [tokens,routes,K] shape")
     if source.dtype not in (mx.float16, mx.float32):
         source = source.astype(mx.float16)
+    routed_source = mx.contiguous(source)
+    if shared_input:
+        source = mx.broadcast_to(
+            routed_source[:, None, :],
+            (tokens, routes, weight.neuron_len),
+        )
+    else:
+        source = routed_source
     source = mx.contiguous(source)
     ids = mx.contiguous(ids)
     if tokens == 0 or routes == 0:
@@ -3042,6 +2918,22 @@ def grouped_moe_matmul(
                 weight.projections * weight.out_per_expert,
             ),
             dtype=source.dtype,
+        )
+
+    if weight.projection_views:
+        return mx.concatenate(
+            [
+                grouped_moe_matmul(
+                    projection,
+                    routed_source,
+                    ids,
+                    compact_threshold=compact_threshold,
+                    matrix_threshold=matrix_threshold,
+                    expert_matrix_threshold=expert_matrix_threshold,
+                )
+                for projection in weight.projection_views
+            ],
+            axis=-1,
         )
 
     route_count = tokens * routes
@@ -3070,16 +2962,49 @@ def grouped_moe_matmul(
         chunks = [
             grouped_moe_matmul(
                 weight,
-                source[start : min(start + chunk_tokens, tokens)],
+                routed_source[start : min(start + chunk_tokens, tokens)],
                 ids[start : min(start + chunk_tokens, tokens)],
                 compact_threshold=compact_threshold,
                 matrix_threshold=matrix_threshold,
                 expert_matrix_threshold=expert_matrix_threshold,
-                nint4_qmv=nint4_qmv,
             )
             for start in range(0, tokens, chunk_tokens)
         ]
         return mx.concatenate(chunks, axis=0)
+
+    descriptor_values = weight.descriptor_values
+    standalone_output: mx.array | None = None
+    if weight.nint_cohorts:
+        for cohort in weight.nint_cohorts:
+            projected = nint_routed_matmul(
+                cohort.weight,
+                routed_source,
+                ids,
+                cohort.expert_map,
+                weight.out_per_expert,
+            )
+            standalone_output = (
+                projected
+                if standalone_output is None
+                else standalone_output + projected
+            )
+        descriptor_families = descriptor_values[:, _FAMILY]
+        if bool(np.all(descriptor_families == _FAMILY_NINT)):
+            return standalone_output
+
+        nint_experts = mx.array(
+            np.ascontiguousarray(
+                descriptor_families == _FAMILY_NINT,
+                dtype=np.bool_,
+            )
+        )
+        valid = (ids >= 0) & (ids < weight.experts)
+        safe = mx.minimum(mx.maximum(ids, 0), weight.experts - 1)
+        routed_to_nint = valid & mx.take(nint_experts, safe, axis=0)
+        ids = mx.contiguous(mx.where(routed_to_nint, -1, ids).astype(mx.int32))
+
+    def merge_standalone(output: mx.array) -> mx.array:
+        return output if standalone_output is None else output + standalone_output
 
     if weight.rotation_specs:
         flattened = source.reshape((tokens * routes, weight.neuron_len))
@@ -3089,65 +3014,6 @@ def grouped_moe_matmul(
             for signs, block, _ in weight.rotation_specs
         )
         source = mx.contiguous(mx.concatenate(variants, axis=0))
-
-    descriptor_values = weight.descriptor_values
-    uniform_nint4 = bool(
-        nint4_qmv
-        and compact_threshold == 0
-        and matrix_threshold == 0
-        and route_count <= 64
-        and weight.neuron_len % 16 == 0
-        and np.all(descriptor_values[:, _FAMILY] == _FAMILY_NINT)
-        and np.all(descriptor_values[:, _NINT_BITS] == 4)
-        and np.all(descriptor_values[:, _NINT_GS] % 2 == 0)
-        and np.all(
-            (
-                descriptor_values[:, _NINT_NG]
-                * descriptor_values[:, _NINT_GS]
-                // 2
-            )
-            % 4
-            == 0
-        )
-        and np.all(descriptor_values[:, _NINT_Q_OFFSET] % 4 == 0)
-    )
-    if uniform_nint4:
-        return _GROUPED_NINT4_QMV_KERNEL(
-            inputs=[
-                weight.descriptors,
-                weight.nint_q,
-                weight.nint_sub_scale,
-                weight.nint_sub_min,
-                weight.nint_anchor_scale,
-                weight.nint_anchor_min,
-                source,
-                ids.reshape((route_count,)),
-            ],
-            template=[
-                ("T", source.dtype),
-                ("ROUTE_COUNT", route_count),
-                ("EXPERTS", weight.experts),
-                ("OUT", weight.out_per_expert),
-                ("PROJECTIONS", weight.projections),
-                ("K", weight.neuron_len),
-                ("DESCRIPTOR_SIZE", _DESCRIPTOR_SIZE),
-            ],
-            grid=(
-                route_count
-                * weight.projections
-                * ((weight.out_per_expert + 7) // 8)
-                * 64,
-                1,
-                1,
-            ),
-            threadgroup=(64, 1, 1),
-            output_shapes=[(
-                tokens,
-                routes,
-                weight.projections * weight.out_per_expert,
-            )],
-            output_dtypes=[source.dtype],
-        )[0]
 
     def add_sparse_residual(base: mx.array) -> mx.array:
         profiles = weight.descriptor_values[:, _VQ_PROFILE]
@@ -3210,15 +3076,9 @@ def grouped_moe_matmul(
         weight.mx_scales,
     ]
     descriptor_families = descriptor_values[:, _FAMILY]
-    only_low_bit_nint = bool(
-        np.all(descriptor_families == _FAMILY_NINT)
-        and np.all(weight.descriptor_values[:, _NINT_BITS] <= 3)
-    )
+    generic_experts = int(np.count_nonzero(descriptor_families != _FAMILY_NINT))
     effective_compact_threshold = (
-        max(
-            128,
-            weight.experts * (16 if only_low_bit_nint else 4),
-        )
+        max(128, generic_experts * 4)
         if compact_threshold == 0
         else compact_threshold
     )
@@ -3236,7 +3096,7 @@ def grouped_moe_matmul(
         )
         matrix_group_sizes = np.where(
             descriptor_families == _FAMILY_NINT,
-            weight.descriptor_values[:, _NINT_GS],
+            32,
             np.where(
                 descriptor_families == _FAMILY_NINT8_ZERO,
                 32,
@@ -3250,7 +3110,10 @@ def grouped_moe_matmul(
         route_matrix_safe = bool(np.all(matrix_group_sizes <= 48))
         use_expert_matrix = use_matrix and (
             not route_matrix_safe
-            or (expert_matrix_threshold is not None and route_count >= int(expert_matrix_threshold))
+            or (
+                expert_matrix_threshold is not None
+                and route_count >= int(expert_matrix_threshold)
+            )
         )
         kernel = (
             _GROUPED_EXPERT_MMA_KERNEL
@@ -3309,7 +3172,7 @@ def grouped_moe_matmul(
                 weight.projections * weight.out_per_expert,
             )
         )
-        return add_sparse_residual(result)
+        return merge_standalone(add_sparse_residual(result))
 
     result = _GROUPED_KERNEL(
         inputs=[*inputs, source, ids],
@@ -3338,7 +3201,7 @@ def grouped_moe_matmul(
         ],
         output_dtypes=[source.dtype],
     )[0]
-    return add_sparse_residual(result)
+    return merge_standalone(add_sparse_residual(result))
 
 
 __all__ = [

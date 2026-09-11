@@ -1,7 +1,8 @@
-"""Apple-silicon packed NINT Metal kernel tests."""
+"""Apple-silicon tests for the unified metadata-driven NINT path."""
 
 from __future__ import annotations
 
+import struct
 from pathlib import Path
 
 import numpy as np
@@ -15,15 +16,10 @@ except RuntimeError:
 
 from mfq.formats import io  # noqa: E402
 from mfq.formats.header import FileHeader  # noqa: E402
-from mfq.formats.nint import NINT2_SPEC, NintSpec  # noqa: E402
+from mfq.formats.nint import NINT2_SPEC, NintSpec, NintTensor  # noqa: E402
 from mfq.kernels.metal import nint as metal_nint  # noqa: E402
 from mfq.kernels.metal.nint import (  # noqa: E402
     MetalNintWeight,
-    _can_use_nint4_gs24_decode,
-    _can_use_nint4_gs24_m2_decode,
-    _can_use_nint5_gs28_decode,
-    _can_use_nint6_gs24_decode,
-    _maximum_scalar_gemm_rows,
     nint_backward_input,
     nint_dequantize,
     nint_dequantize_matmul,
@@ -32,10 +28,11 @@ from mfq.kernels.metal.nint import (  # noqa: E402
     nint_gemv,
     nint_matmul,
     nint_mmq,
+    nint_routed_matmul,
     nint_swiglu,
 )
 from mfq.quantize import nint_quant  # noqa: E402
-from mfq.runtime.mlx_linear import MlxNintLinear, MlxNintModel, MlxSwiGLUFFN  # noqa: E402
+from mfq.runtime.mlx_linear import MlxNintLinear, MlxNintModel  # noqa: E402
 
 
 def _array(value: mx.array) -> np.ndarray:
@@ -43,96 +40,62 @@ def _array(value: mx.array) -> np.ndarray:
     return np.asarray(value)
 
 
-def test_large_packed_buffer_uses_multiple_mlx_dimensions(monkeypatch):
-    monkeypatch.setattr(metal_nint, "_MLX_MAX_DIMENSION", 31)
-    source = np.arange(96, dtype=np.uint8)
-    shaped = metal_nint._mlx_safe_buffer_shape(source, preferred_rows=6)
-    assert shaped.shape == (6, 16)
-    assert np.shares_memory(shaped, source)
-
-
-def test_scalar_gemm_chunk_limit_keeps_long_multimodal_prefill_grid_in_range():
-    assert _maximum_scalar_gemm_rows(16_384, 8) == 32_760
-    maximum_rows = _maximum_scalar_gemm_rows(6_144, 8)
-    assert ((maximum_rows + 7) // 8) * 6_144 * 32 <= (1 << 31) - 1
-    assert ((maximum_rows + 15) // 8) * 6_144 * 32 > (1 << 31) - 1
-
-
 def _random(seed: int, shape: tuple[int, ...], scale: float = 0.1) -> np.ndarray:
-    return np.random.default_rng(seed).normal(0.0, scale, size=shape).astype(np.float32)
-
-
-def _nint_gs24_fixture(
-    *,
-    bits: int,
-    out: int,
-    width: int,
-    seed: int,
-) -> nint_quant.NintTensor:
-    groups = (width + 23) // 24
-    rng = np.random.default_rng(seed)
-    return nint_quant.NintTensor(
-        spec=NintSpec(bits, 24, 7),
-        shape=(out, width),
-        axis=0,
-        q=rng.integers(
-            0,
-            1 << bits,
-            size=(out, groups, 24),
-            dtype=np.uint8,
-        ),
-        neuron_scale=rng.uniform(
-            0.0004,
-            0.0012,
-            size=out,
-        ).astype(np.float32),
-        neuron_min=rng.uniform(
-            0.0002,
-            0.0007,
-            size=out,
-        ).astype(np.float32),
-        sub_scale=rng.integers(
-            1,
-            9,
-            size=(out, groups),
-            dtype=np.uint8,
-        ),
-        sub_min=rng.integers(
-            1,
-            7,
-            size=(out, groups),
-            dtype=np.uint8,
-        ),
-        neuron_len=width,
+    return np.random.default_rng(seed).normal(0.0, scale, size=shape).astype(
+        np.float32
     )
 
 
-def _nint4_gs24_fixture(
-    *,
-    out: int,
-    width: int,
-    seed: int,
-) -> nint_quant.NintTensor:
-    return _nint_gs24_fixture(
-        bits=4,
-        out=out,
-        width=width,
-        seed=seed,
+def _mixed_tensor(seed: int = 1) -> NintTensor:
+    tensor = nint_quant.quantize(
+        _random(seed, (12, 77)),
+        NintSpec(4, 24, 6),
     )
+    tensor.row_q_bits = np.asarray(
+        [1, 2, 3, 4, 5, 6, 7, 8, 2, 4, 6, 8], dtype=np.uint8
+    )
+    for row, bits in enumerate(tensor.row_q_bits):
+        tensor.q[row] &= (1 << int(bits)) - 1
+    tensor.row_sub_bits = np.asarray(
+        [5, 6, 7, 8, 5, 6, 7, 8, 5, 6, 7, 8], dtype=np.uint8
+    )
+    for row, bits in enumerate(tensor.row_sub_bits):
+        tensor.sub_scale[row] &= (1 << int(bits)) - 1
+        tensor.sub_min[row] &= (1 << int(bits)) - 1
+    return tensor
 
 
-def _nint6_gs24_fixture(
-    *,
-    out: int,
-    width: int,
-    seed: int,
-) -> nint_quant.NintTensor:
-    return _nint_gs24_fixture(
-        bits=6,
-        out=out,
-        width=width,
-        seed=seed,
-    )
+def _legacy_blob(tensor: NintTensor) -> bytes:
+    spec = tensor.spec
+    out, groups, _ = tensor.q.shape
+    parts = [
+        struct.pack(
+            "<BBiii",
+            spec.bits,
+            spec.sub_bits,
+            spec.groupsize,
+            tensor.axis,
+            tensor.neuron_len,
+        ),
+        struct.pack("<I", len(tensor.shape)),
+        struct.pack(f"<{len(tensor.shape)}q", *tensor.shape),
+        struct.pack("<II", out, groups),
+        np.asarray(tensor.neuron_scale, dtype="<f2").tobytes(),
+        np.asarray(tensor.neuron_min, dtype="<f2").tobytes(),
+        io.pack_bits(tensor.sub_scale, spec.sub_bits),
+        io.pack_bits(tensor.sub_min, spec.sub_bits),
+        io.pack_bits(tensor.q, spec.bits),
+    ]
+    return b"".join(parts)
+
+
+def test_python_metal_has_one_nint_matmul_kernel():
+    kernels = {
+        name
+        for name in vars(metal_nint)
+        if name.startswith("_NINT_") and name.endswith("_KERNEL")
+    }
+    assert kernels == {"_NINT_MATMUL_KERNEL", "_NINT_ROW_DECODE_KERNEL"}
 
 
 @pytest.mark.parametrize(
@@ -147,548 +110,187 @@ def _nint6_gs24_fixture(
     ],
 )
 @pytest.mark.parametrize("rows", [1, 3, 9])
-def test_packed_nint_matmul_matches_numpy(spec: NintSpec, width: int, rows: int):
-    weight = _random(1000 + spec.bits * 10 + rows, (23, width))
-    source = _random(2000 + spec.bits * 10 + rows, (rows, width))
-    tensor = nint_quant.quantize(weight, spec)
-    packed = MetalNintWeight.from_tensor(tensor)
-
-    actual = _array(nint_matmul(packed, mx.array(source)))
+def test_uniform_presets_share_one_matmul(
+    spec: NintSpec,
+    width: int,
+    rows: int,
+):
+    tensor = nint_quant.quantize(_random(100 + spec.bits, (23, width)), spec)
+    source = _random(200 + rows, (rows, width))
+    actual = _array(
+        nint_matmul(
+            MetalNintWeight.from_tensor(tensor),
+            source,
+            dequantize_threshold=None,
+        )
+    )
     expected = source @ nint_quant.dequantize(tensor).T
-
-    assert actual.shape == expected.shape
     np.testing.assert_allclose(actual, expected, rtol=2e-5, atol=2e-5)
 
 
-@pytest.mark.parametrize(
-    "spec",
-    [
-        NINT2_SPEC,
-        NintSpec(3, 24, 5),
-        NintSpec(4, 24, 6),
-        NintSpec(5, 28, 7),
-        NintSpec(6, 26, 7),
-        NintSpec(8, 48, 7),
-    ],
-)
-@pytest.mark.parametrize(
-    "rows,operation",
-    [
-        (1, nint_gemv),
-        (4, nint_mmq),
-        (17, nint_gemm),
-    ],
-)
-def test_explicit_nint_gemv_mmq_gemm_paths(spec: NintSpec, rows: int, operation):
-    tensor = nint_quant.quantize(_random(300 + spec.bits, (19, 89)), spec)
-    source = _random(400 + spec.bits + rows, (rows, 89))
-    actual = _array(operation(MetalNintWeight.from_tensor(tensor), source))
+@pytest.mark.parametrize("from_blob", [False, True])
+def test_mixed_qk_uses_same_matmul(from_blob: bool):
+    tensor = _mixed_tensor(3)
+    weight = (
+        MetalNintWeight.from_blob(io.pack_nint(tensor))
+        if from_blob
+        else MetalNintWeight.from_tensor(tensor)
+    )
+    source = _random(4, (6, tensor.neuron_len))
+    actual = _array(nint_matmul(weight, source, dequantize_threshold=None))
     expected = source @ nint_quant.dequantize(tensor).T
-    assert actual.dtype == np.float32
     np.testing.assert_allclose(actual, expected, rtol=2e-5, atol=2e-5)
+    np.testing.assert_array_equal(_array(weight.row_q_bits), tensor.row_q_bits)
 
 
-def test_packed_nint_matmul_preserves_prefix_shape():
-    tensor = nint_quant.quantize(_random(11, (13, 65)), NintSpec(4, 24, 6))
-    source = _random(12, (2, 3, 65))
-    actual = _array(nint_matmul(MetalNintWeight.from_tensor(tensor), source))
-    expected = source @ nint_quant.dequantize(tensor).T
-    assert actual.shape == (2, 3, 13)
-    np.testing.assert_allclose(actual, expected, rtol=2e-5, atol=2e-5)
-
-
-def test_packed_nint_matmul_supports_fp16_input():
-    tensor = nint_quant.quantize(_random(15, (29, 91)), NintSpec(4, 24, 6))
-    source = _random(16, (5, 91)).astype(np.float16)
-    actual = _array(nint_matmul(MetalNintWeight.from_tensor(tensor), mx.array(source)))
-    expected = source.astype(np.float32) @ nint_quant.dequantize(tensor).T
-    assert actual.dtype == np.float16
-    np.testing.assert_allclose(actual, expected, rtol=2e-3, atol=2e-3)
-
-
-@pytest.mark.parametrize("bits", range(1, 9))
-def test_packed_nint_backward_and_custom_vjp(bits: int):
-    spec = NintSpec(bits, 24, 7)
-    tensor = nint_quant.quantize(_random(7100 + bits, (11, 77)), spec)
-    packed = MetalNintWeight.from_tensor(tensor)
-    dense = nint_quant.dequantize(tensor)
-    gradient = _random(7200 + bits, (3, 11))
-    expected = gradient @ dense
-
-    actual = _array(nint_backward_input(packed, gradient))
-    np.testing.assert_allclose(actual, expected, rtol=3e-5, atol=3e-5)
-
-    source = mx.array(_random(7300 + bits, (3, 77)))
-    cotangent = mx.array(gradient)
-    differentiated = mx.grad(
-        lambda value: mx.sum(nint_matmul(packed, value) * cotangent)
-    )(source)
-    np.testing.assert_allclose(
-        _array(differentiated), expected, rtol=3e-5, atol=3e-5
-    )
-
-
-@pytest.mark.parametrize(
-    "spec",
-    [
-        NINT2_SPEC,
-        NintSpec(3, 24, 5),
-        NintSpec(4, 24, 6),
-        NintSpec(5, 28, 7),
-        NintSpec(6, 26, 7),
-        NintSpec(8, 48, 7),
-    ],
-)
-@pytest.mark.parametrize("rows", [1, 2, 4, 6, 16])
-def test_fp16_packed_nint_backward_paths(spec: NintSpec, rows: int):
-    tensor = nint_quant.quantize(_random(7400 + spec.bits, (67, 144)), spec)
-    packed = MetalNintWeight.from_tensor(tensor)
-    gradient = _random(7500 + spec.bits + rows, (rows, 67)).astype(np.float16)
-    actual = _array(nint_backward_input(packed, gradient))
-    expected = gradient.astype(np.float32) @ nint_quant.dequantize(tensor)
-    np.testing.assert_allclose(actual, expected, rtol=3e-3, atol=3e-3)
-
-
-def test_nint5_gs28_decode_subsimd_matches_two_level_dequant():
-    spec = NintSpec(5, 28, 7)
-    tensor = nint_quant.quantize(_random(151, (37, 111)), spec)
-    packed = MetalNintWeight.from_blob(io.pack_nint(tensor))
-    source = _random(152, (1, 111)).astype(np.float16)
-    source_mx = mx.array(source)
-
-    assert _can_use_nint5_gs28_decode(packed, source_mx, 1)
-    actual = _array(nint_gemv(packed, source_mx))
-    expected = source.astype(np.float32) @ nint_quant.dequantize(tensor).T
-
-    assert actual.dtype == np.float16
-    assert actual.shape == (1, 37)
-    np.testing.assert_allclose(actual, expected, rtol=2e-3, atol=2e-3)
-
-
-def test_nint5_gs28_decode_compatibility_keeps_fallbacks():
-    gs28_tensor = nint_quant.quantize(
-        _random(153, (19, 83)),
-        NintSpec(5, 28, 7),
-    )
-    gs28 = MetalNintWeight.from_tensor(gs28_tensor)
-    fp16 = mx.array(_random(154, (1, 83)).astype(np.float16))
-    fp32_host = _random(155, (1, 83))
-    fp32 = mx.array(fp32_host)
-    assert _can_use_nint5_gs28_decode(gs28, fp16, 1)
-    assert not _can_use_nint5_gs28_decode(gs28, fp32, 1)
-    assert not _can_use_nint5_gs28_decode(gs28, fp16, 2)
-
-    gs24_tensor = nint_quant.quantize(
-        _random(156, (19, 83)),
-        NintSpec(5, 24, 7),
-    )
-    other_group_size = MetalNintWeight.from_tensor(gs24_tensor)
-    assert other_group_size.q5_exec
-    assert not _can_use_nint5_gs28_decode(
-        other_group_size,
-        mx.array(_random(157, (1, 83)).astype(np.float16)),
-        1,
-    )
-
-    # Exercise both compatibility fallbacks rather than only the predicate.
-    fp32_actual = _array(nint_gemv(gs28, fp32))
-    fp32_expected = fp32_host @ nint_quant.dequantize(gs28_tensor).T
-    np.testing.assert_allclose(
-        fp32_actual,
-        fp32_expected,
-        rtol=2e-5,
-        atol=2e-5,
-    )
-
-    gs24_source = _random(158, (1, 83)).astype(np.float16)
-    gs24_actual = _array(nint_gemv(other_group_size, gs24_source))
-    gs24_expected = (
-        gs24_source.astype(np.float32)
-        @ nint_quant.dequantize(gs24_tensor).T
-    )
-    np.testing.assert_allclose(
-        gs24_actual,
-        gs24_expected,
-        rtol=2e-3,
-        atol=2e-3,
-    )
-
-
-def test_nint4_gs24_decode_tail_and_nonzero_metadata():
-    tensor = _nint4_gs24_fixture(out=37, width=111, seed=169)
-    packed = MetalNintWeight.from_tensor(tensor)
-    source = _random(170, (1, 111)).astype(np.float16)
-    source_mx = mx.array(source)
-
-    assert 111 % 24 != 0
-    assert 37 % 16 != 0
-    assert np.all(tensor.sub_scale != 0)
-    assert np.all(tensor.sub_min != 0)
-    assert _can_use_nint4_gs24_decode(packed, source_mx, 1)
-
-    actual = _array(nint_gemv(packed, source_mx))
-    expected = (
-        source.astype(np.float32)
-        @ nint_quant.dequantize(tensor).T
-    )
-    assert actual.dtype == np.float16
-    assert actual.shape == (1, 37)
-    np.testing.assert_allclose(actual, expected, rtol=2e-3, atol=2e-3)
-
-
-def test_nint4_gs24_decode_compatibility_keeps_fallbacks():
-    tensor = _nint4_gs24_fixture(out=19, width=83, seed=171)
-    packed = MetalNintWeight.from_tensor(tensor)
-    fp16 = mx.array(_random(172, (1, 83)).astype(np.float16))
-    fp32_host = _random(173, (1, 83))
-    fp32 = mx.array(fp32_host)
-
-    assert _can_use_nint4_gs24_decode(packed, fp16, 1)
-    assert not _can_use_nint4_gs24_decode(packed, fp32, 1)
-    assert not _can_use_nint4_gs24_decode(packed, fp16, 2)
-
-    other_group_tensor = nint_quant.quantize(
-        _random(174, (19, 83)),
-        NintSpec(4, 26, 7),
-    )
-    other_group = MetalNintWeight.from_tensor(other_group_tensor)
-    assert not _can_use_nint4_gs24_decode(
-        other_group,
-        mx.array(_random(175, (1, 83)).astype(np.float16)),
-        1,
-    )
-
-    # Exercise both dtype and row-count fallbacks.
-    fp32_actual = _array(nint_gemv(packed, fp32))
-    fp32_expected = fp32_host @ nint_quant.dequantize(tensor).T
-    np.testing.assert_allclose(
-        fp32_actual,
-        fp32_expected,
-        rtol=2e-5,
-        atol=2e-5,
-    )
-
-    multirow = _random(176, (2, 83)).astype(np.float16)
-    multirow_actual = _array(nint_mmq(packed, multirow))
-    multirow_expected = (
-        multirow.astype(np.float32)
-        @ nint_quant.dequantize(tensor).T
-    )
-    np.testing.assert_allclose(
-        multirow_actual,
-        multirow_expected,
-        rtol=2e-3,
-        atol=2e-3,
-    )
-
-
-def test_nint4_gs24_m2_decode_reuses_weights_across_both_rows():
-    tensor = _nint4_gs24_fixture(out=37, width=96, seed=179)
-    packed = MetalNintWeight.from_tensor(tensor)
-    source = _random(180, (2, 96)).astype(np.float16)
-    source_mx = mx.array(source)
-
-    assert tensor.shape[0] % 16 != 0
-    assert _can_use_nint4_gs24_m2_decode(packed, source_mx, 2)
-    assert not _can_use_nint4_gs24_m2_decode(packed, source_mx, 1)
-    assert not _can_use_nint4_gs24_m2_decode(
-        packed,
-        mx.array(source.astype(np.float32)),
-        2,
-    )
-
-    actual = _array(nint_mmq(packed, source_mx))
-    expected = source.astype(np.float32) @ nint_quant.dequantize(tensor).T
-    assert actual.dtype == np.float16
-    assert actual.shape == (2, 37)
-    np.testing.assert_allclose(actual, expected, rtol=2e-3, atol=2e-3)
-
-
-def test_nint4_gs24_decode_large_output_tail():
-    tensor = _nint4_gs24_fixture(
-        out=65_539,
-        width=25,
-        seed=177,
-    )
-    packed = MetalNintWeight.from_tensor(tensor)
-    source = _random(178, (1, 25)).astype(np.float16)
-
-    assert tensor.shape[0] % 16 != 0
-    actual = _array(nint_gemv(packed, source))
-    expected = (
-        source.astype(np.float32)
-        @ nint_quant.dequantize(tensor).T
-    )
-    assert actual.shape == (1, 65_539)
-    np.testing.assert_allclose(actual, expected, rtol=2e-3, atol=2e-3)
-
-
-def test_nint6_gs24_decode_tail_and_nonzero_metadata():
-    tensor = _nint6_gs24_fixture(out=37, width=111, seed=159)
-    packed = MetalNintWeight.from_tensor(tensor)
-    source = _random(160, (1, 111)).astype(np.float16)
-    source_mx = mx.array(source)
-
-    assert 111 % 24 != 0
-    assert 37 % 16 != 0
-    assert np.all(tensor.sub_scale != 0)
-    assert np.all(tensor.sub_min != 0)
-    assert _can_use_nint6_gs24_decode(packed, source_mx, 1)
-
-    actual = _array(nint_gemv(packed, source_mx))
-    expected = (
-        source.astype(np.float32)
-        @ nint_quant.dequantize(tensor).T
-    )
-    assert actual.dtype == np.float16
-    assert actual.shape == (1, 37)
-    np.testing.assert_allclose(actual, expected, rtol=2e-3, atol=2e-3)
-
-
-def test_nint6_gs24_decode_compatibility_keeps_fallbacks():
-    tensor = _nint6_gs24_fixture(out=19, width=83, seed=161)
-    packed = MetalNintWeight.from_tensor(tensor)
-    fp16 = mx.array(_random(162, (1, 83)).astype(np.float16))
-    fp32_host = _random(163, (1, 83))
-    fp32 = mx.array(fp32_host)
-
-    assert _can_use_nint6_gs24_decode(packed, fp16, 1)
-    assert not _can_use_nint6_gs24_decode(packed, fp32, 1)
-    assert not _can_use_nint6_gs24_decode(packed, fp16, 2)
-
-    other_group_tensor = nint_quant.quantize(
-        _random(164, (19, 83)),
-        NintSpec(6, 26, 7),
-    )
-    other_group = MetalNintWeight.from_tensor(other_group_tensor)
-    assert not _can_use_nint6_gs24_decode(
-        other_group,
-        mx.array(_random(165, (1, 83)).astype(np.float16)),
-        1,
-    )
-
-    # Exercise both dtype and row-count fallbacks.
-    fp32_actual = _array(nint_gemv(packed, fp32))
-    fp32_expected = fp32_host @ nint_quant.dequantize(tensor).T
-    np.testing.assert_allclose(
-        fp32_actual,
-        fp32_expected,
-        rtol=2e-5,
-        atol=2e-5,
-    )
-
-    multirow = _random(166, (2, 83)).astype(np.float16)
-    multirow_actual = _array(nint_mmq(packed, multirow))
-    multirow_expected = (
-        multirow.astype(np.float32)
-        @ nint_quant.dequantize(tensor).T
-    )
-    np.testing.assert_allclose(
-        multirow_actual,
-        multirow_expected,
-        rtol=2e-3,
-        atol=2e-3,
-    )
-
-
-def test_nint6_gs24_decode_large_output_tail():
-    tensor = _nint6_gs24_fixture(
-        out=65_539,
-        width=25,
-        seed=167,
-    )
-    packed = MetalNintWeight.from_tensor(tensor)
-    source = _random(168, (1, 25)).astype(np.float16)
-
-    assert tensor.shape[0] % 16 != 0
-    actual = _array(nint_gemv(packed, source))
-    expected = (
-        source.astype(np.float32)
-        @ nint_quant.dequantize(tensor).T
-    )
-    assert actual.shape == (1, 65_539)
-    np.testing.assert_allclose(actual, expected, rtol=2e-3, atol=2e-3)
-
-
-@pytest.mark.parametrize(
-    "spec",
-    [
-        NINT2_SPEC,
-        NintSpec(3, 24, 5),
-        NintSpec(4, 24, 6),
-        NintSpec(5, 28, 7),
-        NintSpec(6, 26, 7),
-        NintSpec(8, 48, 7),
-    ],
-)
-def test_nint_fp16_simdgroup_matrix_gemm(spec: NintSpec):
-    tensor = nint_quant.quantize(_random(160 + spec.bits, (35, 93)), spec)
-    source = _random(170 + spec.bits, (33, 93)).astype(np.float16)
-    actual = _array(nint_gemm(MetalNintWeight.from_tensor(tensor), source))
-    expected = source.astype(np.float32) @ nint_quant.dequantize(tensor).T
-    assert actual.dtype == np.float16
-    np.testing.assert_allclose(actual, expected, rtol=3e-3, atol=3e-3)
-
-
-def test_nint_fp16_m64_tile_row_mapping():
-    spec = NintSpec(4, 24, 6)
-    tensor = nint_quant.quantize(_random(181, (67, 101)), spec)
-    source = _random(182, (65, 101)).astype(np.float16)
-    actual = _array(nint_gemm(MetalNintWeight.from_tensor(tensor), source))
-    expected = source.astype(np.float32) @ nint_quant.dequantize(tensor).T
-    np.testing.assert_allclose(actual, expected, rtol=3e-3, atol=3e-3)
-
-
-@pytest.mark.parametrize(
-    "spec",
-    [
-        NINT2_SPEC,
-        NintSpec(3, 24, 5),
-        NintSpec(4, 24, 6),
-        NintSpec(5, 28, 7),
-        NintSpec(6, 26, 7),
-        NintSpec(8, 48, 7),
-    ],
-)
-def test_nint_temporary_dequant_dense_gemm(spec: NintSpec):
-    tensor = nint_quant.quantize(_random(190 + spec.bits, (35, 93)), spec)
-    weight = MetalNintWeight.from_tensor(tensor)
-    source = _random(200 + spec.bits, (67, 93)).astype(np.float16)
-    decoded = nint_quant.dequantize(tensor)
-    actual_weight = _array(nint_dequantize(weight))
-    actual = _array(nint_dequantize_matmul(weight, source))
-    selected = _array(nint_matmul(weight, source))
-    np.testing.assert_allclose(actual_weight, decoded, rtol=2e-3, atol=2e-3)
-    np.testing.assert_allclose(
-        actual,
-        source.astype(np.float32) @ decoded.T,
-        rtol=4e-3,
-        atol=4e-3,
-    )
-    np.testing.assert_array_equal(selected, actual)
-
-
-@pytest.mark.parametrize(
-    "spec",
-    [
-        NINT2_SPEC,
-        NintSpec(3, 24, 5),
-        NintSpec(4, 24, 6),
-        NintSpec(5, 28, 7),
-        NintSpec(6, 26, 7),
-        NintSpec(8, 48, 7),
-    ],
-)
-def test_packed_nint_blob_upload_matches_tensor_upload(spec: NintSpec):
-    tensor = nint_quant.quantize(_random(17 + spec.bits, (21, 89)), spec)
-    from_tensor = MetalNintWeight.from_tensor(tensor)
-    from_blob = MetalNintWeight.from_blob(io.pack_nint(tensor))
-    source = _random(18 + spec.bits, (3, 89))
-    actual = _array(nint_matmul(from_blob, source))
-    expected = _array(nint_matmul(from_tensor, source))
-    np.testing.assert_allclose(actual, expected, rtol=0, atol=0)
-
-
-def test_mixed_sub_bits_blob_expands_metadata_into_the_existing_metal_kernel():
-    row_sub_bits = np.resize(
-        np.asarray([5, 6, 7, 8], dtype=np.uint8), 21
-    )
+def test_tiny_float32_input_uses_same_address_space_agnostic_matmul():
     tensor = nint_quant.quantize(
-        _random(60911, (21, 89)),
-        NintSpec(4, 24, 6),
-        row_sub_bits=row_sub_bits,
+        _random(12, (8, 8)),
+        NintSpec(4, 8, 4),
     )
-    from_tensor = MetalNintWeight.from_tensor(tensor)
-    from_blob = MetalNintWeight.from_blob(io.pack_nint(tensor))
-    source = _random(60912, (5, 89))
-
-    np.testing.assert_allclose(
-        _array(nint_matmul(from_blob, source)),
-        _array(nint_matmul(from_tensor, source)),
-        rtol=0,
-        atol=0,
+    source = _random(13, (1, 8))
+    actual = _array(
+        nint_matmul(
+            MetalNintWeight.from_tensor(tensor),
+            source,
+            dequantize_threshold=None,
+        )
     )
-
-
-def test_packed_nint_embedding_decodes_selected_rows():
-    tensor = nint_quant.quantize(_random(21, (31, 73)), NintSpec(5, 28, 7))
-    ids = np.asarray([[0, 7, 30], [3, 9, 4]], dtype=np.int32)
-    actual = _array(nint_embedding(MetalNintWeight.from_tensor(tensor), ids, dtype=mx.float32))
-    expected = nint_quant.dequantize(tensor)[ids]
-    np.testing.assert_allclose(actual, expected, rtol=1e-6, atol=1e-6)
-
-
-def test_mlx_linear_keeps_weight_packed():
-    tensor = nint_quant.quantize(_random(31, (19, 96)), NintSpec(4, 24, 6))
-    layer = MlxNintLinear(tensor)
-    unpacked_nbytes = int(np.prod(tensor.shape)) * np.dtype(np.float16).itemsize
-    assert layer.packed_nbytes < unpacked_nbytes
-
-    source = _random(32, (4, 96))
-    actual = _array(layer(source))
     expected = source @ nint_quant.dequantize(tensor).T
     np.testing.assert_allclose(actual, expected, rtol=2e-5, atol=2e-5)
 
 
-def test_mlx_swiglu_ffn_matches_numpy():
-    hidden, intermediate = 48, 64
-    gate = nint_quant.quantize(_random(41, (intermediate, hidden)), NintSpec(4, 24, 6))
-    up = nint_quant.quantize(_random(42, (intermediate, hidden)), NintSpec(4, 24, 6))
-    down = nint_quant.quantize(_random(43, (hidden, intermediate)), NintSpec(4, 24, 6))
-    source = _random(44, (2, hidden))
-
-    actual = _array(MlxSwiGLUFFN(gate, up, down)(source))
-    gate_value = source @ nint_quant.dequantize(gate).T
-    up_value = source @ nint_quant.dequantize(up).T
-    hidden_value = gate_value / (1.0 + np.exp(-gate_value)) * up_value
-    expected = hidden_value @ nint_quant.dequantize(down).T
-    np.testing.assert_allclose(actual, expected, rtol=3e-5, atol=4e-5)
-
-
-def test_mlx_important_neuron_ffn_sums_independent_branches():
-    hidden = 8
-    low_width = 6
-    high_width = 2
-    source = _random(45, (3, hidden))
-    tensors = {
-        "gate": _random(46, (low_width, hidden)),
-        "up": _random(47, (low_width, hidden)),
-        "down": _random(48, (hidden, low_width)),
-        "gate.in_high": _random(49, (high_width, hidden)),
-        "up.in_high": _random(50, (high_width, hidden)),
-        "down.in_high": _random(51, (hidden, high_width)),
-    }
-
-    actual = _array(MlxNintModel(tensors).ffn("gate", "up", "down")(source))
-
-    def branch(suffix: str) -> np.ndarray:
-        gate = source @ tensors["gate" + suffix].T
-        up = source @ tensors["up" + suffix].T
-        return (
-            gate / (1.0 + np.exp(-gate))
-            * up
-        ) @ tensors["down" + suffix].T
-
-    expected = branch("") + branch(".in_high")
-    np.testing.assert_allclose(actual, expected, rtol=3e-5, atol=4e-5)
+@pytest.mark.parametrize("routed_input", [False, True])
+def test_mixed_qk_routed_reuses_same_matmul(routed_input: bool):
+    tensor = _mixed_tensor(13)
+    weight = MetalNintWeight.from_tensor(tensor)
+    out_per_expert = 6
+    expert_map = np.asarray([-1, 0, -1, -1, 1, 9], dtype=np.int32)
+    ids = np.asarray([[1, 4, 5], [4, 1, -1]], dtype=np.int32)
+    shared = _random(14, (2, tensor.neuron_len))
+    source = (
+        np.stack((shared, shared * 0.5, shared * -0.25), axis=1)
+        if routed_input
+        else shared
+    )
+    actual = _array(
+        nint_routed_matmul(
+            weight,
+            source,
+            ids,
+            expert_map,
+            out_per_expert,
+        )
+    )
+    dense = nint_quant.dequantize(tensor).reshape(
+        2,
+        out_per_expert,
+        tensor.neuron_len,
+    )
+    expected = np.zeros_like(actual)
+    for token in range(ids.shape[0]):
+        for route in range(ids.shape[1]):
+            expert = int(ids[token, route])
+            local = int(expert_map[expert]) if 0 <= expert < expert_map.size else -1
+            if 0 <= local < dense.shape[0]:
+                row = source[token, route] if routed_input else source[token]
+                expected[token, route] = row @ dense[local].T
+    np.testing.assert_allclose(actual, expected, rtol=2e-5, atol=2e-5)
 
 
-def test_mlx_important_neuron_ffn_rejects_partial_branch():
-    tensors = {
-        "gate": _random(52, (4, 8)),
-        "up": _random(53, (4, 8)),
-        "down": _random(54, (8, 4)),
-        "gate.in_high": _random(55, (2, 8)),
-    }
-    with pytest.raises(ValueError, match="matching gate/up/down"):
-        MlxNintModel(tensors).ffn("gate", "up", "down")
+@pytest.mark.parametrize("from_blob", [False, True])
+def test_mixed_q_runtime_rows_are_byte_aligned_and_contiguous(from_blob: bool):
+    tensor = _mixed_tensor(4)
+    weight = (
+        MetalNintWeight.from_blob(io.pack_nint(tensor))
+        if from_blob
+        else MetalNintWeight.from_tensor(tensor)
+    )
+    row_bytes = (
+        tensor.q.shape[1]
+        * tensor.q.shape[2]
+        * tensor.row_q_bits.astype(np.uint64)
+        + 7
+    ) // 8
+    expected_offsets = np.zeros(tensor.q.shape[0], dtype=np.uint64)
+    np.cumsum(row_bytes[:-1], out=expected_offsets[1:])
+    np.testing.assert_array_equal(
+        _array(weight.row_q_byte_offsets),
+        expected_offsets.astype(np.uint32),
+    )
+    np.testing.assert_array_equal(
+        _array(weight.row_q_layout) >> 4,
+        np.zeros(tensor.q.shape[0], dtype=np.uint8),
+    )
 
 
-def test_nint5_fused_swiglu_matches_separate_projections():
-    spec = NintSpec(5, 28, 7)
-    gate = nint_quant.quantize(_random(45, (37, 85)), spec)
-    up = nint_quant.quantize(_random(46, (37, 85)), spec)
-    source = _random(47, (4, 85))
+def test_legacy_uniform_blob_is_normalized_to_row_metadata():
+    tensor = nint_quant.quantize(_random(5, (17, 73)), NintSpec(4, 24, 6))
+    weight = MetalNintWeight.from_blob(_legacy_blob(tensor))
+    source = _random(6, (4, 73))
+    actual = _array(nint_matmul(weight, source, dequantize_threshold=None))
+    expected = source @ nint_quant.dequantize(tensor).T
+    np.testing.assert_allclose(actual, expected, rtol=2e-5, atol=2e-5)
+    np.testing.assert_array_equal(
+        _array(weight.row_q_bits), np.full(17, 4, dtype=np.uint8)
+    )
+
+
+def test_explicit_entry_points_reuse_common_matmul():
+    tensor = nint_quant.quantize(_random(7, (19, 75)), NintSpec(5, 24, 6))
+    weight = MetalNintWeight.from_tensor(tensor)
+    for rows, operation in ((1, nint_gemv), (4, nint_mmq), (17, nint_gemm)):
+        source = _random(10 + rows, (rows, 75))
+        actual = _array(operation(weight, source))
+        expected = source @ nint_quant.dequantize(tensor).T
+        np.testing.assert_allclose(actual, expected, rtol=2e-5, atol=2e-5)
+
+
+def test_matmul_preserves_prefix_shape_and_fp16():
+    tensor = nint_quant.quantize(_random(30, (13, 41)), NintSpec(6, 24, 7))
+    source = _random(31, (2, 3, 41)).astype(np.float16)
+    actual = _array(nint_matmul(MetalNintWeight.from_tensor(tensor), source))
+    expected = source.astype(np.float32) @ nint_quant.dequantize(tensor).T
+    assert actual.shape == (2, 3, 13)
+    assert actual.dtype == np.float16
+    np.testing.assert_allclose(actual, expected, rtol=3e-3, atol=3e-3)
+
+
+@pytest.mark.parametrize("bits", [2, 4, 5, 8])
+def test_backward_and_custom_vjp(bits: int):
+    tensor = nint_quant.quantize(
+        _random(40 + bits, (17, 48)), NintSpec(bits, 24, 6)
+    )
+    weight = MetalNintWeight.from_tensor(tensor)
+    source = mx.array(_random(50 + bits, (4, 48)))
+    cotangent = mx.array(_random(60 + bits, (4, 17)))
+    direct = nint_backward_input(weight, cotangent)
+    _, vjp = mx.vjp(lambda value: nint_matmul(weight, value), [source], [cotangent])
+    mx.eval(direct, vjp[0])
+    np.testing.assert_allclose(_array(vjp[0]), _array(direct), rtol=0, atol=0)
+
+
+def test_dequantize_embedding_and_dense_gemm():
+    tensor = _mixed_tensor(70)
+    weight = MetalNintWeight.from_tensor(tensor)
+    dense = _array(nint_dequantize(weight, dtype=mx.float32))
+    expected_dense = nint_quant.dequantize(tensor)
+    np.testing.assert_allclose(dense, expected_dense, rtol=0, atol=1e-6)
+
+    ids = np.asarray([0, 5, 11], dtype=np.int32)
+    selected = _array(nint_embedding(weight, ids, dtype=mx.float32))
+    np.testing.assert_allclose(selected, expected_dense[ids], rtol=0, atol=1e-6)
+
+    source = _random(71, (65, tensor.neuron_len)).astype(np.float16)
+    actual = _array(nint_dequantize_matmul(weight, source))
+    reference = source.astype(np.float32) @ expected_dense.T
+    np.testing.assert_allclose(actual, reference, rtol=3e-3, atol=3e-3)
+
+
+def test_swiglu_reuses_two_common_projections():
+    gate = _mixed_tensor(80)
+    up = _mixed_tensor(81)
+    source = _random(82, (4, gate.neuron_len))
     actual = _array(
         nint_swiglu(
             MetalNintWeight.from_tensor(gate),
@@ -702,24 +304,33 @@ def test_nint5_fused_swiglu_matches_separate_projections():
     np.testing.assert_allclose(actual, expected, rtol=3e-5, atol=4e-5)
 
 
+def test_mlx_linear_keeps_weight_packed():
+    tensor = _mixed_tensor(90)
+    linear = MlxNintLinear(tensor)
+    assert isinstance(linear.packed_weight, MetalNintWeight)
+    assert linear.packed_nbytes < tensor.q.size * np.dtype(np.float32).itemsize
+    source = _random(91, (3, tensor.neuron_len))
+    expected = source @ nint_quant.dequantize(tensor).T
+    np.testing.assert_allclose(_array(linear(source)), expected, rtol=2e-5, atol=2e-5)
+
+
 def test_mlx_model_roundtrip(tmp_path: Path):
-    tensor = nint_quant.quantize(_random(51, (17, 72)), NintSpec(4, 24, 6))
-    path = tmp_path / "metal-test.mfq"
+    tensor = _mixed_tensor(100)
+    path = tmp_path / "metal-unified-nint.mfq"
     io.save(
         path,
         FileHeader(model_arch="metal-test", num_tensors=1),
         {"model.embed_tokens.weight": tensor},
     )
-
     with MlxNintModel.from_mfq(path) as model:
-        source = _random(52, (3, 72))
-        actual_linear = _array(model.linear("model.embed_tokens.weight")(source))
-        expected_linear = source @ nint_quant.dequantize(tensor).T
-        np.testing.assert_allclose(actual_linear, expected_linear, rtol=2e-5, atol=2e-5)
-
-        ids = np.asarray([0, 5, 16], dtype=np.int32)
-        actual = _array(model.embedding("model.embed_tokens.weight")(ids))
-        expected = nint_quant.dequantize(tensor)[ids].astype(np.float16)
-        np.testing.assert_allclose(actual, expected, rtol=0, atol=1e-4)
-        assert isinstance(model.tensors, io.MMapTensorStore)
-        assert not model.tensors._cache
+        source = _random(101, (3, tensor.neuron_len))
+        actual = _array(model.linear("model.embed_tokens.weight")(source))
+        expected = source @ nint_quant.dequantize(tensor).T
+        np.testing.assert_allclose(actual, expected, rtol=2e-5, atol=2e-5)
+        ids = np.asarray([0, 5, 11], dtype=np.int32)
+        np.testing.assert_allclose(
+            _array(model.embedding("model.embed_tokens.weight")(ids)),
+            nint_quant.dequantize(tensor)[ids].astype(np.float16),
+            rtol=0,
+            atol=1e-4,
+        )

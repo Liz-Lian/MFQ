@@ -83,9 +83,13 @@ def test_minicpmo45_loader_requests_official_sdpa_attention():
 
 
 def test_minicpmo45_record_dtype_detection():
-    assert _record_is_quantized("NINT4")
-    assert _record_is_quantized("NVQ3J512")
-    assert _record_is_quantized("NPQ0-L")
+    assert _record_is_quantized("NINT")
+    assert not _record_is_quantized("NINT4")
+    assert _record_is_quantized("NVQ")
+    assert _record_is_quantized("NPQ")
+    assert _record_is_quantized("NEPQ")
+    assert not _record_is_quantized("NVQ3J512")
+    assert not _record_is_quantized("NPQ0-L")
     assert not _record_is_quantized("BF16")
 
 

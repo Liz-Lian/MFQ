@@ -110,9 +110,7 @@ def test_grouped_linear_mixes_nint_q8_and_vq_with_variable_outputs(rows: int):
     q8 = quantize_nint8_zero(rng.normal(0, 0.1, size=(11, width)).astype(np.float32))
     nvq, nvq_dense = _nvq(20260810 + rows, 13, width)
     group = MlxLinearGroup((nint, q8, nvq))
-    assert group.uses_grouped_kernel
-    assert group.grouped_weight is not None
-    assert group.grouped_weight.output_widths == (17, 11, 13)
+    assert not group.uses_grouped_kernel
 
     source = rng.normal(0, 0.1, size=(rows, width)).astype(np.float16)
     actual = tuple(_array(item) for item in group(source))
@@ -205,12 +203,44 @@ def test_grouped_linear_mixes_every_nint_width():
         for index, spec in enumerate(specs)
     )
     group = MlxLinearGroup(tensors)
-    assert group.uses_grouped_kernel
+    assert not group.uses_grouped_kernel
     source = rng.normal(0, 0.1, size=(2, width)).astype(np.float32)
     actual = tuple(_array(item) for item in group(source))
     for result, tensor in zip(actual, tensors, strict=True):
         expected = source @ dequantize(tensor).T
         np.testing.assert_allclose(result, expected, rtol=3e-5, atol=3e-5)
+
+
+def test_adaptive_nint_group_reuses_unified_nint_kernel():
+    rng = np.random.default_rng(20260826)
+    width = 96
+    tensors = (
+        quantize(
+            rng.normal(0, 0.1, size=(7, width)).astype(np.float32),
+            NintSpec(3, 24, 6),
+        ),
+        quantize(
+            rng.normal(0, 0.1, size=(9, width)).astype(np.float32),
+            NintSpec(4, 24, 6),
+        ),
+    )
+    tensors[0].row_q_bits = np.asarray([3, 5, 6, 8, 3, 5, 6], dtype=np.uint8)
+    tensors[1].row_q_bits = np.asarray(
+        [4, 5, 6, 8, 4, 5, 6, 8, 4], dtype=np.uint8
+    )
+    group = MlxLinearGroup(tensors)
+    assert not group.uses_grouped_kernel
+
+    source = rng.normal(0, 0.1, size=(3, width)).astype(np.float16)
+    actual = tuple(_array(item) for item in group(source))
+    for result, tensor in zip(actual, tensors, strict=True):
+        expected = source.astype(np.float32) @ dequantize(tensor).T
+        np.testing.assert_allclose(
+            result,
+            expected.astype(np.float16),
+            rtol=4e-3,
+            atol=4e-3,
+        )
 
 
 def test_grouped_linear_mixes_extended_jsc_index_widths():
@@ -254,12 +284,7 @@ def test_grouped_linear_preserves_rotated_nepq_output_shape():
         NintSpec(4, 24, 6),
     )
     group = MlxLinearGroup((nint, nepq))
-    assert group.uses_grouped_kernel
-    assert group.grouped_weight is not None
-    assert group.grouped_weight.output_shapes == (
-        (5,),
-        (nepq.n_experts, nepq.out_per_expert),
-    )
+    assert not group.uses_grouped_kernel
 
     source = rng.normal(
         0,

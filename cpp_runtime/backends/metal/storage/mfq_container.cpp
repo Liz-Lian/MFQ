@@ -516,7 +516,9 @@ MfqHeader MfqContainer::load_records(
     for (std::uint32_t index = 0; index < header.record_count; ++index) {
         MfqRecord value;
         value.name = input.string("record name");
-        value.dtype = input.string("record dtype");
+        value.stored_dtype = input.string("record dtype");
+        value.dtype = std::string(
+            mfq::canonical_format_dtype(value.stored_dtype));
         value.source_path = path;
         value.nbytes =
             input.scalar<std::uint64_t>("record length");
@@ -1227,7 +1229,7 @@ void MfqContainer::install_legacy_aliases(
     legacy_tensor_layout_ = layout;
 }
 
-void MfqContainer::install_hf_nintm_views(
+void MfqContainer::install_hf_mfe_views(
     const std::unordered_map<std::string, std::string>&
         canonical_to_stored) {
     if (!hf_store_) {
@@ -1307,7 +1309,7 @@ void MfqContainer::install_hf_nintm_views(
                 .nbytes = count,
             });
             logical_offset = checked_add(
-                logical_offset, count, "virtual NINTM metadata");
+                logical_offset, count, "virtual MFE metadata");
         };
         const auto append_tensor = [&](const std::string& tensor_name) {
             const auto& tensor = hf_store_->tensor(tensor_name);
@@ -1317,11 +1319,11 @@ void MfqContainer::install_hf_nintm_views(
                 .nbytes = tensor.nbytes,
             });
             logical_offset = checked_add(
-                logical_offset, tensor.nbytes, "virtual NINTM tensor");
+                logical_offset, tensor.nbytes, "virtual MFE tensor");
         };
 
         std::vector<std::uint8_t> header;
-        header.insert(header.end(), {'N', 'I', 'M', '2'});
+        header.insert(header.end(), {'M', 'F', 'E', '1'});
         append_little<std::uint32_t>(
             header, static_cast<std::uint32_t>(expert_count));
         // Output/input dimensions are filled after validating the first
@@ -1356,7 +1358,7 @@ void MfqContainer::install_hf_nintm_views(
                 source_output > std::numeric_limits<std::uint32_t>::max() ||
                 source_input > std::numeric_limits<std::uint32_t>::max()) {
                 throw std::runtime_error(
-                    "native HF expert geometry exceeds NINTM: " + stored);
+                    "native HF expert geometry exceeds MFE: " + stored);
             }
             if (dtype.empty()) {
                 dtype = record->second.dtype;
@@ -1392,18 +1394,19 @@ void MfqContainer::install_hf_nintm_views(
 
         MfqRecord record;
         record.name = name;
-        record.dtype = "NINTM";
+        record.dtype = "MFE";
+        record.stored_dtype = "MFE";
         record.source_path = hf_store_->root();
         record.nbytes = logical_offset;
         if (!records_.emplace(name, std::move(record)).second ||
             !hf_records_.emplace(name, std::move(aggregate)).second) {
             throw std::runtime_error(
-                "duplicate virtual native NINTM projection: " + name);
+                "duplicate virtual native MFE projection: " + name);
         }
     }
     if (records_.size() > kMaxRecordEntries) {
         throw std::runtime_error(
-            "HF virtual NINTM projections exceed the record limit");
+            "HF virtual MFE projections exceed the record limit");
     }
     header_.record_count = static_cast<std::uint32_t>(records_.size());
 }

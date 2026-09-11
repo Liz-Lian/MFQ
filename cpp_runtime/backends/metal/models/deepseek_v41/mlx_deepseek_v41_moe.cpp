@@ -25,9 +25,9 @@ int checked_int(std::int64_t value, const char* name) {
 MlxMoeWeight moe_weight(
     const MfqContainer& model,
     const std::string& name) {
-    if (model.record(name).dtype != "NINTM") {
+    if (model.record(name).dtype != "MFE") {
         throw std::runtime_error(
-            "DeepSeek-V4.1 routed expert tensor must use NINTM: " + name);
+            "DeepSeek-V4.1 routed expert tensor must use MFE: " + name);
     }
     const auto mapped = model.map_record(name);
     return MlxMoeWeight::from_blob(mapped.view());

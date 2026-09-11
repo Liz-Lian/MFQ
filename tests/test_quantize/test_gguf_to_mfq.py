@@ -220,7 +220,7 @@ def test_imatrix_binds_mixed_nint_experts(tmp_path):
     item = SimpleNamespace(
         name="blk.0.ffn_up_exps.weight",
         source_name="blk.0.ffn_up_exps.weight",
-        target_dtype="NINTM",
+        target_dtype="MFE",
         storage_shape=(6, 4),
         original_shape=(2, 3, 4),
         expert_precisions=(
@@ -695,7 +695,7 @@ def test_gguf_plan_accepts_expertwise_precision_scheme():
         target_dtype="NINT4",
     )
     applied = _apply_expert_scheme([base], scheme)[0]
-    assert applied.target_dtype == "NINTM"
+    assert applied.target_dtype == "MFE"
     assert applied.expert_specs == specs
     assert _estimate_blob_bytes(applied) == _nint_moe_blob_nbytes(shape, specs)
 

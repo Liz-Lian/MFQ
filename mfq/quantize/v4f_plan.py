@@ -13,9 +13,9 @@ import numpy as np
 
 from mfq.formats.io import (
     _NINT_HDR,
-    _NINT_MOE_HDR,
-    _NINT_MOE_POOL_V2_HDR,
-    _NINT_MOE_ROTATION_HDR,
+    _MFE_HDR,
+    _MFE_POOL_HDR,
+    _MFE_ROTATION_HDR,
 )
 from mfq.formats.nepq import (
     NEPQ0_S,
@@ -273,7 +273,7 @@ def routed_family_blob_bytes(
     projection: str,
     family_counts: dict[str, int],
 ) -> int:
-    """Return the exact NINTM blob bytes for one V4F routed projection."""
+    """Return the exact MFE blob bytes for one V4F routed projection."""
 
     if projection not in {"gate_up", "down"}:
         raise ValueError(f"unsupported V4F routed projection: {projection}")
@@ -290,7 +290,7 @@ def routed_family_blob_bytes(
     if sum(normalized.values()) != 256:
         raise ValueError("V4F routed family counts must sum to 256")
 
-    total = _NINT_MOE_HDR.size
+    total = _MFE_HDR.size
     total += sum(
         routed_family_pool_bytes(projection, family, count)
         for family, count in normalized.items()
@@ -303,7 +303,7 @@ def routed_family_pool_bytes(
     family: str,
     count: int,
 ) -> int:
-    """Return one non-empty NINTM cohort's exact serialized bytes."""
+    """Return one non-empty MFE cohort's exact serialized bytes."""
 
     if projection not in {"gate_up", "down"}:
         raise ValueError(f"unsupported V4F routed projection: {projection}")
@@ -320,7 +320,7 @@ def routed_family_pool_bytes(
     columns = 4096 if projection == "gate_up" else 2048
     runtime_nbytes = 0
     if family == "NEPQ0-S":
-        runtime_nbytes = _NINT_MOE_ROTATION_HDR.size + columns
+        runtime_nbytes = _MFE_ROTATION_HDR.size + columns
         payload = _NEPQ_HEADER.size + NEPQ0_S.payload_nbytes(
             count,
             rows_per_expert,
@@ -354,7 +354,7 @@ def routed_family_pool_bytes(
             _ROUTED_NINT[family],
         )
     return int(
-        _NINT_MOE_POOL_V2_HDR.size
+        _MFE_POOL_HDR.size
         + count * 4
         + len(family)
         + runtime_nbytes

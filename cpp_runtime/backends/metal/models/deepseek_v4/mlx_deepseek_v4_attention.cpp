@@ -1039,7 +1039,6 @@ public:
         if (grouped_.has_value() &&
             grouped_->supports(input) &&
             (rows > 1 ||
-             grouped_->has_single_row_nint_fast_path() ||
              grouped_->has_single_row_mxfp8_fast_path())) {
             return (*grouped_)(input);
         }

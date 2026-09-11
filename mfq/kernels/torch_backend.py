@@ -50,14 +50,15 @@ def _pack_qbits(q, bits: int, device: str | torch.device) -> torch.Tensor:
     return torch.as_tensor(packed, device=device)
 
 
-def _pack_mixed_row_qbits(
-    tensor: NintTensor,
+def _pack_row_qbits(
+    q_values: np.ndarray,
+    row_widths: np.ndarray,
     device: str | torch.device,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    q = np.ascontiguousarray(tensor.q, dtype=np.uint8)
-    row_q_bits = np.ascontiguousarray(tensor.row_q_bits, dtype=np.uint8).reshape(-1)
+    q = np.ascontiguousarray(q_values, dtype=np.uint8)
+    row_q_bits = np.ascontiguousarray(row_widths, dtype=np.uint8).reshape(-1)
     if row_q_bits.shape != (q.shape[0],) or np.any((row_q_bits < 1) | (row_q_bits > 8)):
-        raise ValueError("mixed-q NINT row widths must be an uint8 vector in [1,8]")
+        raise ValueError("NINT row widths must be a uint8 vector in [1,8]")
     values_per_row = int(np.prod(q.shape[1:], dtype=np.int64))
     row_offsets = np.empty(q.shape[0], dtype=np.int64)
     streams: list[np.ndarray] = []
@@ -68,7 +69,7 @@ def _pack_mixed_row_qbits(
             continue
         values = np.ascontiguousarray(q[rows].reshape(-1), dtype=np.uint8)
         if np.any(values >= (1 << bits)):
-            raise ValueError(f"mixed-q NINT values exceed their q{bits} row budget")
+            raise ValueError(f"NINT values exceed their q{bits} row budget")
         value_bits = np.unpackbits(
             values[:, None], axis=-1, bitorder="little"
         )[:, :bits]
@@ -167,18 +168,14 @@ def nint_deploy_arrays(tensor: NintTensor) -> dict[str, np.ndarray]:
         "neuron_scale": np.ascontiguousarray(tensor.neuron_scale, dtype=np.float32),
         "neuron_min": np.ascontiguousarray(tensor.neuron_min, dtype=np.float32),
     }
-    if tensor.has_mixed_q_bits:
-        q_packed, row_q_bits, row_q_bit_offsets = _pack_mixed_row_qbits(
-            tensor, "cpu"
-        )
-        result["q_packed"] = np.ascontiguousarray(q_packed.numpy(), dtype=np.uint8)
-        result["row_q_bits"] = np.ascontiguousarray(row_q_bits.numpy(), dtype=np.uint8)
-        result["row_q_bit_offsets"] = np.ascontiguousarray(
-            row_q_bit_offsets.numpy(), dtype=np.int64
-        )
-    else:
-        q_packed = _pack_qbits(tensor.q, tensor.spec.bits, "cpu")
-        result["q_packed"] = np.ascontiguousarray(q_packed.numpy(), dtype=np.uint8)
+    q_packed, row_q_bits, row_q_bit_offsets = _pack_row_qbits(
+        tensor.q, tensor.row_q_bits, "cpu"
+    )
+    result["q_packed"] = np.ascontiguousarray(q_packed.numpy(), dtype=np.uint8)
+    result["row_q_bits"] = np.ascontiguousarray(row_q_bits.numpy(), dtype=np.uint8)
+    result["row_q_bit_offsets"] = np.ascontiguousarray(
+        row_q_bit_offsets.numpy(), dtype=np.int64
+    )
     return result
 
 
@@ -192,36 +189,51 @@ def nint_deploy_to_gpu(
     axis: int,
     device: str | torch.device,
 ) -> dict:
-    """Upload execution-ready NINT arrays without CPU bit unpack/repack."""
+    """Upload the canonical row-metadata NINT layout.
+
+    Old deploy caches without row descriptors are normalized here.  Past this
+    compatibility boundary uniform and heterogeneous tensors are identical.
+    """
 
     required = {"q_packed", "sub_scale", "sub_min", "neuron_scale", "neuron_min"}
-    mixed_fields = {"row_q_bits", "row_q_bit_offsets"}
-    mixed_q = mixed_fields.issubset(arrays)
-    if set(arrays) != required | (mixed_fields if mixed_q else set()):
+    row_fields = {"row_q_bits", "row_q_bit_offsets"}
+    has_row_metadata = row_fields.issubset(arrays)
+    if set(arrays) != required | (row_fields if has_row_metadata else set()):
         raise ValueError("NINT deploy arrays do not contain the required fields")
     q_packed = np.asarray(arrays["q_packed"])
     sub_scale = np.asarray(arrays["sub_scale"])
     sub_min = np.asarray(arrays["sub_min"])
     neuron_scale = np.asarray(arrays["neuron_scale"])
     neuron_min = np.asarray(arrays["neuron_min"])
-    if mixed_q:
+    if has_row_metadata:
         if q_packed.ndim != 1:
-            raise ValueError("mixed-q packed NINT values must be rank-1")
+            raise ValueError("canonical packed NINT values must be rank-1")
         row_q_bits = np.asarray(arrays["row_q_bits"])
         row_q_bit_offsets = np.asarray(arrays["row_q_bit_offsets"])
         out = int(row_q_bits.size)
         if row_q_bits.shape != (out,) or row_q_bit_offsets.shape != (out,):
-            raise ValueError("mixed-q NINT row metadata shape mismatch")
+            raise ValueError("NINT row metadata shape mismatch")
         if np.any((row_q_bits < 1) | (row_q_bits > 8)):
-            raise ValueError("mixed-q NINT row widths must be in [1,8]")
+            raise ValueError("NINT row widths must be in [1,8]")
         ng = int(sub_scale.shape[1]) if sub_scale.ndim == 2 else 0
     else:
         if q_packed.ndim != 3:
-            raise ValueError("packed NINT values must have [out, groups, bytes] shape")
+            raise ValueError("legacy packed NINT values must have [out, groups, bytes] shape")
         out, ng, qbytes = (int(value) for value in q_packed.shape)
         expected_qbytes = (int(groupsize) * int(bits) + 7) // 8
         if qbytes != expected_qbytes:
             raise ValueError(f"packed NINT group has {qbytes} bytes; expected {expected_qbytes}")
+        unpacked = _unpack_qbits(
+            torch.as_tensor(q_packed), int(groupsize), int(bits)
+        ).numpy()
+        packed_tensor, widths_tensor, offsets_tensor = _pack_row_qbits(
+            unpacked,
+            np.full(out, int(bits), dtype=np.uint8),
+            "cpu",
+        )
+        q_packed = packed_tensor.numpy()
+        row_q_bits = widths_tensor.numpy()
+        row_q_bit_offsets = offsets_tensor.numpy()
     if sub_scale.shape != (out, ng) or sub_min.shape != (out, ng):
         raise ValueError("packed NINT sub-scale shape mismatch")
     if neuron_scale.shape != (out,) or neuron_min.shape != (out,):
@@ -240,13 +252,11 @@ def nint_deploy_to_gpu(
         "shape": tuple(int(value) for value in shape),
         "axis": int(axis),
         "device": device,
-    }
-    if mixed_q:
-        result["row_q_bits"] = torch.as_tensor(row_q_bits, device=device)
-        result["row_q_bit_offsets"] = torch.as_tensor(
+        "row_q_bits": torch.as_tensor(row_q_bits, device=device),
+        "row_q_bit_offsets": torch.as_tensor(
             row_q_bit_offsets, device=device
-        )
-        result["mixed_q"] = True
+        ),
+    }
     return result
 
 
@@ -274,22 +284,16 @@ def to_gpu(
 ) -> dict:
     """Move NINT execution metadata to GPU.
 
-    ``layout="deploy"`` is the default runtime path and keeps compact NINT
-    metadata resident. ``layout="experimental"`` builds the older extra
-    layouts for kernel experiments.
+    ``layout="deploy"`` is the only execution layout.  The optional argument
+    remains solely to reject callers that still request a retired layout.
     """
 
     if layout is None:
         layout = os.environ.get("MFQ_NINT_LAYOUT", "deploy")
-    q = torch.as_tensor(tensor.q, device=device)
     bits = int(tensor.spec.bits)
-    mixed_q = tensor.has_mixed_q_bits
-    if mixed_q:
-        q_packed, row_q_bits, row_q_bit_offsets = _pack_mixed_row_qbits(
-            tensor, device
-        )
-    else:
-        q_packed = _pack_qbits(tensor.q, bits, device)
+    q_packed, row_q_bits, row_q_bit_offsets = _pack_row_qbits(
+        tensor.q, tensor.row_q_bits, device
+    )
     sub_scale = torch.as_tensor(tensor.sub_scale, device=device)
     sub_min = torch.as_tensor(tensor.sub_min, device=device)
     neuron_scale = torch.as_tensor(tensor.neuron_scale, device=device)
@@ -309,133 +313,38 @@ def to_gpu(
         "shape": tensor.shape,
         "axis": tensor.axis,
         "device": device,
+        "row_q_bits": row_q_bits,
+        "row_q_bit_offsets": row_q_bit_offsets,
     }
-    if mixed_q:
-        g.update({
-            "row_q_bits": row_q_bits,
-            "row_q_bit_offsets": row_q_bit_offsets,
-            "mixed_q": True,
-        })
     if layout == "deploy":
-        del q
         return g
     if layout != "experimental":
         raise ValueError(f"unknown NINT GPU layout: {layout!r}")
-    if mixed_q:
-        raise ValueError("mixed-q NINT only supports the deploy execution layout")
-
-    eff_pair_h = _eff_pair_h(tensor, device)
-    d_eff = neuron_scale[:, None] * sub_scale.to(torch.float32)
-    m_eff = neuron_min[:, None] * sub_min.to(torch.float32)
-    if bits != 4:
-        g.update({
-            "q": q,
-            "eff_pair_h": eff_pair_h,
-            "d_eff": d_eff,
-            "m_eff": m_eff,
-            "d_eff_h": d_eff.to(torch.float16).contiguous(),
-            "m_eff_h": m_eff.to(torch.float16).contiguous(),
-        })
-        return g
-
-    q_mmq_packed = None
-    sub_scale_mmq = None
-    sub_min_mmq = None
-    d_eff_mmq = None
-    m_eff_mmq = None
-    gs = int(tensor.spec.groupsize)
-    if gs == 16:
-        gpk = 16
-    elif gs == 24:
-        gpk = 10
-    elif gs == 32:
-        gpk = 8
-    elif gs == 48:
-        gpk = 5
-    else:
-        raise ValueError(f"unsupported NINT groupsize {gs}")
-
-    out, ng, qbytes = q_packed.shape
-    mmq_y = 64
-    ntiles = (out + mmq_y - 1) // mmq_y
-    nchunks = (ng + gpk - 1) // gpk
-    out_pad = ntiles * mmq_y
-    ng_pad = nchunks * gpk
-
-    q_pad = torch.zeros((out_pad, ng_pad, qbytes), device=device, dtype=q_packed.dtype)
-    q_pad[:out, :ng, :] = q_packed
-    q_mmq_packed = (
-        q_pad.reshape(ntiles, mmq_y, nchunks, gpk, qbytes)
-        .permute(0, 2, 1, 3, 4)
-        .contiguous()
-        .reshape(ntiles, nchunks, mmq_y, gpk * qbytes)
-    )
-    ss_pad = torch.zeros((out_pad, ng_pad), device=device, dtype=sub_scale.dtype)
-    sm_pad = torch.zeros((out_pad, ng_pad), device=device, dtype=sub_min.dtype)
-    ss_pad[:out, :ng] = sub_scale
-    sm_pad[:out, :ng] = sub_min
-    sub_scale_mmq = ss_pad.reshape(ntiles, mmq_y, nchunks, gpk).permute(0, 2, 1, 3).contiguous()
-    sub_min_mmq = sm_pad.reshape(ntiles, mmq_y, nchunks, gpk).permute(0, 2, 1, 3).contiguous()
-    de_pad = torch.zeros((out_pad, ng_pad), device=device, dtype=torch.float32)
-    me_pad = torch.zeros((out_pad, ng_pad), device=device, dtype=torch.float32)
-    de_pad[:out, :ng] = d_eff
-    me_pad[:out, :ng] = m_eff
-    d_eff_mmq = de_pad.reshape(ntiles, mmq_y, nchunks, gpk).permute(0, 2, 1, 3).contiguous()
-    m_eff_mmq = me_pad.reshape(ntiles, mmq_y, nchunks, gpk).permute(0, 2, 1, 3).contiguous()
-
-    g.update({
-        "q": q,                                                              # [out,ng,gs] uint8
-        "eff_pair_h": eff_pair_h,                                             # [out,ng,2] f16, d/m packed
-        "q_mmq_packed": q_mmq_packed,                                        # [ntile,nchunk,64,gpk*gs/2] uint8
-        "d_eff": d_eff,                                                       # [out,ng] f32, execution metadata
-        "m_eff": m_eff,                                                       # [out,ng] f32, execution metadata
-        "d_eff_h": d_eff.to(torch.float16).contiguous(),                      # [out,ng] f16, compact execution metadata
-        "m_eff_h": m_eff.to(torch.float16).contiguous(),                      # [out,ng] f16, compact execution metadata
-        "sub_scale_mmq": sub_scale_mmq,                                      # [ntile,nchunk,64,gpk] uint8
-        "sub_min_mmq": sub_min_mmq,                                          # [ntile,nchunk,64,gpk] uint8
-        "d_eff_mmq": d_eff_mmq,                                              # [ntile,nchunk,64,gpk] f32
-        "m_eff_mmq": m_eff_mmq,                                              # [ntile,nchunk,64,gpk] f32
-    })
-    return g
+    raise ValueError("the legacy experimental NINT layout has been retired")
 
 
 def dequantize(g: dict, dtype: torch.dtype = torch.float16) -> torch.Tensor:
     """Fully dequantize to ``dtype`` (fp16 by default) and restore the original shape."""
 
-    if g.get("mixed_q", False):
-        if g["q_packed"].device.type == "cuda":
-            from mfq.kernels.cuda._ext import ext
+    if g.get("row_q_bits") is None or g.get("row_q_bit_offsets") is None:
+        raise ValueError(
+            "NINT runtime input lacks canonical per-neuron row metadata"
+        )
+    if g["q_packed"].device.type == "cuda":
+        from mfq.kernels.cuda._ext import ext
 
-            return ext().nint_dequant_full_packed_mixed_q_cuda(
-                g["q_packed"],
-                g["row_q_bits"],
-                g["row_q_bit_offsets"],
-                g["sub_scale"],
-                g["sub_min"],
-                g["neuron_scale"],
-                g["neuron_min"],
-                int(g["neuron_len"]),
-                int(g["gs"]),
-            ).to(dtype)
-        q = _unpack_mixed_row_qbits(g).to(torch.float32)
-    elif g.get("q") is not None:
-        q = g["q"].to(torch.float32)
-    else:
-        bits = int(g.get("bits", 4))
-        if bits != 4 and g["q_packed"].device.type == "cuda":
-            from mfq.kernels.cuda._ext import ext
-
-            return ext().nint_dequant_full_packed_compact_bits_cuda(
-                g["q_packed"],
-                g["sub_scale"],
-                g["sub_min"],
-                g["neuron_scale"],
-                g["neuron_min"],
-                int(g["neuron_len"]),
-                int(g["gs"]),
-                bits,
-            ).to(dtype)
-        q = _unpack_qbits(g["q_packed"], int(g["gs"]), bits).to(torch.float32)
+        return ext().nint_decode_cuda(
+            g["q_packed"],
+            g["row_q_bits"],
+            g["row_q_bit_offsets"],
+            g["sub_scale"],
+            g["sub_min"],
+            g["neuron_scale"],
+            g["neuron_min"],
+            int(g["neuron_len"]),
+            int(g["gs"]),
+        ).to(dtype)
+    q = _unpack_mixed_row_qbits(g).to(torch.float32)
     recon = (_d_eff(g)[:, :, None] * q - _m_eff(g)[:, :, None])   # [out,ng,gs]
     recon = recon.reshape(g["out"], -1)[:, : g["neuron_len"]]     # [out, neuron_len]
     S, a = g["shape"], g["axis"]
@@ -449,20 +358,4 @@ def matmul(g: dict, x: torch.Tensor) -> torch.Tensor:
     ``x``: ``[..., in]`` in fp16/f32 and already on the GPU. Returns ``[..., out]`` in fp16.
     """
 
-    out, ng, gs = g["out"], g["ng"], g["gs"]
-    if g.get("mixed_q", False):
-        return x.to(torch.float16) @ dequantize(g).T
-    if g.get("q") is None and int(g.get("bits", 4)) != 4:
-        return x.to(torch.float16) @ dequantize(g).T
-    q = g["q"].to(torch.float32) if g.get("q") is not None else _unpack_q4(g["q_packed"], gs).to(torch.float32)
-    Wq = (_d_eff(g)[:, :, None] * q).reshape(out, ng * gs)[:, : g["neuron_len"]]
-    Wq = Wq.to(torch.float16)
-
-    xb = x.to(torch.float16)
-    xin = xb.shape[-1]
-    if xin != ng * gs:
-        xb = torch.nn.functional.pad(xb, (0, ng * gs - xin))   # Zero-pad the trailing group
-    xs = xb.reshape(*xb.shape[:-1], ng, gs).sum(-1).to(torch.float16)   # [..., ng]
-    y = xb[..., :xin].to(torch.float16) @ Wq.T                          # [..., out]
-    y = y - xs @ _m_eff(g).to(torch.float16).T                          # Zero-point correction
-    return y
+    return x.to(torch.float16) @ dequantize(g).T

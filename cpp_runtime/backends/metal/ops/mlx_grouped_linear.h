@@ -31,14 +31,13 @@ public:
     using std::runtime_error::runtime_error;
 };
 
-// Single-dispatch heterogeneous packed linear projections.
+// Packed projection coordinator.
 //
-// All projections share an input width but may use different output widths
-// and packed NINT, NINT8-0, NVQ, NPQ, TPQ-I4G64, TPQ product-VQ, MXFP4,
-// or MXFP8 layouts. Expert-shaped/rotated NEPQ belongs to the MoE path and is
-// rejected here. The decode-oriented kernel intentionally accepts only one
-// through max_rows() flattened input rows. Callers should use their ordinary
-// per-weight or dense-GEMM path when supports() returns false.
+// All projections share an input width but may use different output widths.
+// NINT projections always reuse the single metadata-driven NINT v2 kernel;
+// q/k choices never create profile-specific or heterogeneous NINT kernels.
+// Other established formats may retain their format-level grouped paths.
+// Expert-shaped/rotated NEPQ belongs to the MoE path and is rejected here.
 class MlxGroupedLinear {
 public:
     static constexpr int max_rows() noexcept {
@@ -53,11 +52,8 @@ public:
     std::vector<mlx::core::array> matmul(
         const mlx::core::array& input) const;
 
-    // Decode-only two-projection fast path. Equally sized NINT projections
-    // share their activation loads. MXFP8 Gate/Up uses two independent
-    // 16-lane halves of each SIMD group so both projections remain parallel.
-    // Both paths round to the input dtype before applying limited SwiGLU in
-    // the same Metal dispatch.
+    // Decode-only MXFP8 two-projection fast path. NINT uses its common
+    // metadata-driven matmul plus the graph's elementwise SwiGLU.
     bool supports_single_row_swiglu(
         const mlx::core::array& input) const noexcept;
     mlx::core::array single_row_swiglu(
@@ -85,18 +81,16 @@ public:
     // that the grouped object owns another copy of those bytes.
     std::size_t packed_nbytes() const noexcept;
 
-    // Production projection groups bind each source array directly to one
-    // Metal dispatch. Larger NINT-only groups use the pooled compatibility
-    // kernel; groups which exceed the direct Metal buffer limit and contain
-    // VQ, TPQ, or MX layouts are unsupported.
+    // NINT projection groups remain graph-level compositions of the one
+    // standalone NINT matmul kernel. Other production groups may bind each
+    // source array directly to a format-level Metal dispatch; groups which
+    // exceed the direct buffer limit and contain VQ, TPQ, or MX are
+    // unsupported.
     bool uses_zero_copy_storage() const noexcept;
     std::size_t copied_packed_nbytes() const noexcept;
 
-    // True when a float16, single-row invocation can use a projection-fused
-    // decode kernel. The kernels assign the same output tile to every
-    // projection, so Q/K/V reuse each activation group in one dispatch.
-    // Other dtypes/row counts continue to use the ordinary grouped path.
-    bool has_single_row_nint_fast_path() const noexcept;
+    // True when a float16, single-row invocation can use the MXFP8
+    // projection-fused decode kernel.
     bool has_single_row_mxfp8_fast_path() const noexcept;
 
 private:

@@ -37,7 +37,7 @@ static Routed routed(const MfqFile& file, const std::string& name, int layer,
             return tb::matmul(selected,source.to(w.scalar_type()).unsqueeze(-1)).squeeze(-1);
         };
     }
-    auto w=std::make_shared<NintMoeWeight>(load_nint_moe_gpu(file,name,true,layer,"flash_next"));
+    auto w=std::make_shared<MfeWeight>(load_mfe_gpu(file,name,true,layer,"flash_next"));
     MFQ_RUNTIME_CHECK(w->n_experts==experts && w->out_per_expert==output && w->neuron_len==input,
         "Flash-Next routed tensor shape mismatch: ",name);
     return [w,experts](const Tensor& x,const Tensor& ids) {

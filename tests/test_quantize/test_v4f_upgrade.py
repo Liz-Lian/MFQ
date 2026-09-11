@@ -5,14 +5,14 @@ import json
 
 import numpy as np
 
-from mfq.formats.io import _pack_tensor, unpack_nint_moe
-from mfq.formats.moe import NintMoePool, NintMoeTensor
+from mfq.formats.io import _pack_tensor, unpack_mfe
+from mfq.formats.mfe import MfePool, MfeTensor
 from mfq.formats.nepq import NEPQ0_S
 from mfq.formats.nint import NintSpec
 from mfq.quantize.expert_sensitivity import load_expert_sensitivity_map
 from mfq.quantize.v4f_plan import routed_family_blob_bytes
 from mfq.quantize.v4f_upgrade import (
-    _nintm_profiles,
+    _mfe_profiles,
     _allocate_v4f_sensitivity_reallocation,
     allocate_v4f_marked_nint8_upgrade,
     allocate_v4f_nint4_upgrade,
@@ -23,7 +23,7 @@ from mfq.quantize.v4f_upgrade import (
 from mfq.quantize.nint_quant import quantize
 from mfq.tools.upgrade_v4f_mfq import (
     _allocation_family,
-    _nintm_allocation_profiles,
+    _mfe_allocation_profiles,
     _subset_pool_tensor,
     _write_upgraded_routed_blob,
 )
@@ -93,7 +93,7 @@ def _write_marks(path) -> None:
     path.write_text("\n".join(rows) + "\n},\n", encoding="utf-8")
 
 
-def test_nintm_profiles_preserves_duplicate_family_pools() -> None:
+def test_mfe_profiles_preserves_duplicate_family_pools() -> None:
     rng = np.random.default_rng(20260725)
     rows = 2
     width = 24
@@ -105,16 +105,16 @@ def test_nintm_profiles_preserves_duplicate_family_pools() -> None:
         rng.normal(size=(2 * rows, width)).astype(np.float32),
         NintSpec(4, 24, 6),
     )
-    tensor = NintMoeTensor(
+    tensor = MfeTensor(
         (4, rows, width),
         (
-            NintMoePool(np.array([0, 1], dtype=np.int32), first),
-            NintMoePool(np.array([2, 3], dtype=np.int32), second),
+            MfePool(np.array([0, 1], dtype=np.int32), first),
+            MfePool(np.array([2, 3], dtype=np.int32), second),
         ),
     )
     dtype, blob = _pack_tensor(tensor)
-    assert dtype == "NINTM"
-    shape, profiles, pools = _nintm_profiles(blob)
+    assert dtype == "MFE"
+    shape, profiles, pools = _mfe_profiles(blob)
     assert shape == (4, rows, width)
     assert profiles == ("NINT4",) * 4
     assert pools == (("NINT4", 2), ("NINT4", 2))
@@ -279,10 +279,10 @@ def test_write_upgraded_routed_blob_replaces_only_selected_experts(tmp_path) -> 
         rows=3 * rows,
         neuron_len=neuron_len,
     )
-    base = NintMoeTensor(
+    base = MfeTensor(
         (3, rows, neuron_len),
         (
-            NintMoePool(
+            MfePool(
                 np.asarray([0, 1, 2], dtype=np.int32),
                 base_tensor,
             ),
@@ -294,18 +294,18 @@ def test_write_upgraded_routed_blob_replaces_only_selected_experts(tmp_path) -> 
         axis=0,
     )
     dtype, selected_payload = _pack_tensor(selected_tensor, allow_moe=False)
-    assert dtype == "NINT4"
+    assert dtype == "NINT"
     selected_path = tmp_path / "selected.nint4"
     selected_path.write_bytes(selected_payload)
 
-    output = tmp_path / "upgraded.nintm"
+    output = tmp_path / "upgraded.mfe"
     _write_upgraded_routed_blob(base, (1,), selected_path, output)
-    restored = unpack_nint_moe(output.read_bytes())
+    restored = unpack_mfe(output.read_bytes())
 
-    assert restored.expert_profiles == ("NVQ2J", "NINT4-24", "NVQ2J")
-    shape, allocation_profiles = _nintm_allocation_profiles(output.read_bytes())
+    assert restored.expert_profiles == ("NVQ2J", "NINT", "NVQ2J")
+    shape, allocation_profiles = _mfe_allocation_profiles(output.read_bytes())
     assert shape == (3, rows, neuron_len)
-    assert allocation_profiles == ("NVQ2J", "NINT4", "NVQ2J")
+    assert allocation_profiles == ("NVQ", "NINT4", "NVQ")
     retained = restored.pools[0]
     assert retained.expert_ids.tolist() == [0, 2]
     original_rows = np.asarray(base_tensor.indices).reshape(3, rows, -1)
@@ -326,10 +326,10 @@ def test_write_upgraded_routed_blob_accepts_nint8(tmp_path) -> None:
         rows=2 * rows,
         neuron_len=neuron_len,
     )
-    base = NintMoeTensor(
+    base = MfeTensor(
         (2, rows, neuron_len),
         (
-            NintMoePool(
+            MfePool(
                 np.asarray([0, 1], dtype=np.int32),
                 base_tensor,
             ),
@@ -341,11 +341,11 @@ def test_write_upgraded_routed_blob_accepts_nint8(tmp_path) -> None:
         axis=0,
     )
     dtype, selected_payload = _pack_tensor(selected_tensor, allow_moe=False)
-    assert dtype == "NINT8"
+    assert dtype == "NINT"
     selected_path = tmp_path / "selected.nint8"
     selected_path.write_bytes(selected_payload)
 
-    output = tmp_path / "upgraded.nintm"
+    output = tmp_path / "upgraded.mfe"
     _write_upgraded_routed_blob(
         base,
         (1,),
@@ -353,8 +353,8 @@ def test_write_upgraded_routed_blob_accepts_nint8(tmp_path) -> None:
         output,
         "NINT8",
     )
-    restored = unpack_nint_moe(output.read_bytes())
-    assert restored.expert_profiles == ("NVQ2J", "NINT8-48")
+    restored = unpack_mfe(output.read_bytes())
+    assert restored.expert_profiles == ("NVQ2J", "NINT")
 
 
 def test_subset_nepq_pool_keeps_exact_selected_expert_payload() -> None:

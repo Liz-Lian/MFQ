@@ -1,4 +1,4 @@
-"""Expert-wise mixed-family quantization for the NINTM container."""
+"""Expert-wise mixed-family quantization for the MFE container."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ import numpy as np
 import torch
 
 from mfq.calibration.artifact import ExpertPrecision, nint_expert_precision
-from mfq.formats.moe import NintMoePool, NintMoeTensor
+from mfq.formats.mfe import MfePool, MfeTensor
 from mfq.formats.nepq import NepqTensor
 from mfq.formats.nint import NintSpec
 from mfq.formats.nint8_zero import (
@@ -645,7 +645,7 @@ def quantize_expertwise(
     artifact_root: str | Path | None = None,
     importance: np.ndarray | torch.Tensor | None = None,
     device: str | torch.device = "cuda",
-) -> NintMoeTensor:
+) -> MfeTensor:
     """Quantize ``[experts,out,K]`` into native family cohorts."""
 
     values = (
@@ -663,7 +663,7 @@ def quantize_expertwise(
     for expert, precision in enumerate(expert_profiles):
         cohorts.setdefault(precision, []).append(expert)
 
-    pools: list[NintMoePool] = []
+    pools: list[MfePool] = []
     for precision, expert_ids_list in cohorts.items():
         expert_ids = np.asarray(expert_ids_list, dtype=np.int32)
         artifact = _artifact_value(precision, artifacts, artifact_root)
@@ -741,8 +741,8 @@ def quantize_expertwise(
                 flat_importance,
                 device,
             )
-        pools.append(NintMoePool(expert_ids=expert_ids, tensor=tensor))
-    return NintMoeTensor(shape=shape, pools=tuple(pools))
+        pools.append(MfePool(expert_ids=expert_ids, tensor=tensor))
+    return MfeTensor(shape=shape, pools=tuple(pools))
 
 
 def _dequantize_pool(tensor: object) -> np.ndarray:
@@ -768,7 +768,7 @@ def _dequantize_pool(tensor: object) -> np.ndarray:
         return dequantize_npq0_l(tensor)
     if isinstance(tensor, Npq0STensor):
         return dequantize_npq0_s(tensor)
-    raise TypeError(f"unsupported NINTM cohort tensor: {type(tensor)!r}")
+    raise TypeError(f"unsupported MFE cohort tensor: {type(tensor)!r}")
 
 
 def dequantize_flat_precision(tensor: object) -> np.ndarray:
@@ -777,8 +777,8 @@ def dequantize_flat_precision(tensor: object) -> np.ndarray:
     return np.ascontiguousarray(_dequantize_pool(tensor), dtype=np.float32)
 
 
-def dequantize_expertwise(tensor: NintMoeTensor) -> np.ndarray:
-    """Restore any NINTM family combination to ``float32 [experts,out,K]``."""
+def dequantize_expertwise(tensor: MfeTensor) -> np.ndarray:
+    """Restore any MFE family combination to ``float32 [experts,out,K]``."""
 
     result = np.empty(tensor.shape, dtype=np.float32)
     for pool in tensor.pools:

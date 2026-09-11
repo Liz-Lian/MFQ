@@ -59,7 +59,7 @@ from mfq.calibration.statistics import (
 from mfq.formats.nint import NintSpec
 from mfq.quantize.nint_quant import quantize as quantize_nint_cpu
 from mfq.runtime.torch_linear import TorchNintLinear
-from mfq.formats.io import unpack_nint_moe
+from mfq.formats.io import unpack_mfe
 from mfq.quantize.expert_nint import dequantize_expertwise
 from mfq.tools.quantize_hf_to_mfq import (
     _nint_moe_blob_nbytes,
@@ -441,7 +441,14 @@ def test_execution_packed_candidates_reuse_exact_quantized_values(tmp_path: Path
         encoded = quantize_nint_cpu(weight, spec, axis=0)
         arrays = TorchNintLinear.deploy_arrays(encoded)
         np.testing.assert_array_equal(
-            _unpack_packed_q(arrays["q_packed"], bits, spec.groupsize),
+            _unpack_packed_q(
+                arrays["q_packed"],
+                bits,
+                spec.groupsize,
+                row_q_bits=arrays["row_q_bits"],
+                row_q_bit_offsets=arrays["row_q_bit_offsets"],
+                groups=encoded.q.shape[1],
+            ),
             encoded.q,
         )
 
@@ -801,7 +808,7 @@ def test_expertwise_scheme_roundtrip_plan_and_stream_writer(tmp_path: Path) -> N
 
     plan = _plan(root, True, None, "F16", scheme)
     assert len(plan) == 1
-    assert plan[0].target_dtype == "NINTM"
+    assert plan[0].target_dtype == "MFE"
     assert plan[0].expert_shape == shape
     assert plan[0].expert_specs == specs
 
@@ -816,9 +823,10 @@ def test_expertwise_scheme_roundtrip_plan_and_stream_writer(tmp_path: Path) -> N
         quant_backend="cpu",
         device="cpu",
     )
-    tensor = unpack_nint_moe(blob_path.read_bytes())
+    tensor = unpack_mfe(blob_path.read_bytes())
     assert nbytes == _nint_moe_blob_nbytes(shape, specs)
-    assert tensor.expert_profiles == tuple(profile.profile_label for profile in specs)
+    assert tensor.expert_profiles == ("NINT",) * len(specs)
+    assert tuple(pool.tensor.spec for pool in tensor.pools) == tuple(dict.fromkeys(specs))
     assert dequantize_expertwise(tensor).shape == shape
 
 

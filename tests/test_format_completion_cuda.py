@@ -7,7 +7,7 @@ torch = pytest.importorskip("torch")
 if not torch.cuda.is_available():
     pytest.skip("CUDA unavailable", allow_module_level=True)
 
-from mfq.formats.moe import NintMoePool, NintMoeTensor  # noqa: E402
+from mfq.formats.mfe import MfePool, MfeTensor  # noqa: E402
 from mfq.formats.mx import MxTensor  # noqa: E402
 from mfq.formats.nint8_zero import Nint8ZeroTensor  # noqa: E402
 from mfq.formats.tpq import (  # noqa: E402
@@ -449,12 +449,12 @@ def test_mixed_moe_routes_nint8_mxfp4_and_tpq(tokens: int):
             (TPQ_X.codebook_entries, TPQ_X.vector_size),
         ).astype(np.float32),
     )
-    tensor = NintMoeTensor(
+    tensor = MfeTensor(
         (experts, out, width),
         (
-            NintMoePool(np.array([0], dtype=np.int32), q8),
-            NintMoePool(np.array([1], dtype=np.int32), mx),
-            NintMoePool(np.array([2], dtype=np.int32), tpq),
+            MfePool(np.array([0], dtype=np.int32), q8),
+            MfePool(np.array([1], dtype=np.int32), mx),
+            MfePool(np.array([2], dtype=np.int32), tpq),
         ),
     )
     weight = to_gpu(tensor)

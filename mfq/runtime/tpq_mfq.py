@@ -19,7 +19,7 @@ import torch
 from mfq.formats.tpq import TpqInt4Tensor, TpqPqSpec, TpqPqTensor
 from mfq.formats.tpq import normalize_tpq_dtype, unpack_tpq_indices
 from mfq.formats.io import MMapTensorStore, is_bfloat16_array, load_mmap
-from mfq.formats.moe import NintMoePool, NintMoeTensor
+from mfq.formats.mfe import MfePool, MfeTensor
 from mfq.formats.mx import MXFP8_DTYPE, MxTensor
 
 _CHAR_TO_TIER = {
@@ -30,8 +30,8 @@ _CHAR_TO_TIER = {
     "d": "drop",
 }
 
-_NINT_MOE_HEADER = struct.Struct("<4sIIII")
-_NINT_MOE_POOL_V2_HEADER = struct.Struct("<IIQQ")
+_MFE_HEADER = struct.Struct("<4sIIII")
+_MFE_POOL_HEADER = struct.Struct("<IIQQ")
 _TPQ_PQ_HEADER = struct.Struct("<4sBBBBiiII")
 
 
@@ -214,7 +214,7 @@ class NativeTPQArtifact:
             expert_bytes = sum(
                 record.nbytes
                 for name, record in store.records.items()
-                if record.dtype == "NINTM"
+                if record.dtype == "MFE"
                 or ".ffn.experts." in name
             )
             index_storage = {
@@ -489,7 +489,7 @@ class MfqTpqStore:
         self._dense_names = tuple(
             name
             for name, record in self._store.records.items()
-            if record.dtype != "NINTM"
+            if record.dtype != "MFE"
             and not (
                 name.endswith(".scale")
                 and (
@@ -500,13 +500,13 @@ class MfqTpqStore:
             )
         )
         self._layer_cache: dict[
-            int, tuple[NintMoeTensor, NintMoeTensor]
+            int, tuple[MfeTensor, MfeTensor]
         ] = {}
         self._layer_maps: dict[
             int,
             tuple[
-                dict[int, tuple[NintMoePool, int]],
-                dict[int, tuple[NintMoePool, int]],
+                dict[int, tuple[MfePool, int]],
+                dict[int, tuple[MfePool, int]],
             ],
         ] = {}
         self._layer_lock = threading.RLock()
@@ -763,27 +763,29 @@ class MfqTpqStore:
         name: str,
     ) -> dict[int, tuple[_DirectTpqPool, int]]:
         record = self._store.records[name]
-        if record.dtype != "NINTM":
-            raise TypeError(f"native TPQ expert record is not NINTM: {name}")
+        if record.dtype != "MFE":
+            raise TypeError(f"native TPQ expert record is not MFE: {name}")
         mm = self._store.mmap_for(record)
         start = int(record.offset)
         end = start + int(record.nbytes)
-        if start + _NINT_MOE_HEADER.size > end:
+        if start + _MFE_HEADER.size > end:
             raise ValueError(f"truncated native TPQ expert header: {name}")
         magic, n_experts, rows_per_expert, columns, pool_count = (
-            _NINT_MOE_HEADER.unpack_from(mm, start)
+            _MFE_HEADER.unpack_from(mm, start)
         )
-        if magic != b"NIM2" or int(n_experts) != int(self.cfg["n_experts"]):
+        if magic not in (b"MFE1", b"NIM2") or int(n_experts) != int(
+            self.cfg["n_experts"]
+        ):
             raise ValueError(f"unsupported native TPQ expert container: {name}")
-        offset = start + _NINT_MOE_HEADER.size
+        offset = start + _MFE_HEADER.size
         result: dict[int, tuple[_DirectTpqPool, int]] = {}
         for _ in range(int(pool_count)):
-            if offset + _NINT_MOE_POOL_V2_HEADER.size > end:
+            if offset + _MFE_POOL_HEADER.size > end:
                 raise ValueError(f"truncated native TPQ pool header: {name}")
             expert_count, dtype_nbytes, payload_nbytes, runtime_nbytes = (
-                _NINT_MOE_POOL_V2_HEADER.unpack_from(mm, offset)
+                _MFE_POOL_HEADER.unpack_from(mm, offset)
             )
-            offset += _NINT_MOE_POOL_V2_HEADER.size
+            offset += _MFE_POOL_HEADER.size
             ids_nbytes = int(expert_count) * np.dtype("<i4").itemsize
             ids_end = offset + ids_nbytes
             dtype_end = ids_end + int(dtype_nbytes)
@@ -955,9 +957,9 @@ class MfqTpqStore:
 
     @staticmethod
     def _expert_map(
-        tensor: NintMoeTensor,
-    ) -> dict[int, tuple[NintMoePool, int]]:
-        result: dict[int, tuple[NintMoePool, int]] = {}
+        tensor: MfeTensor,
+    ) -> dict[int, tuple[MfePool, int]]:
+        result: dict[int, tuple[MfePool, int]] = {}
         for pool in tensor.pools:
             for local, expert in enumerate(
                 np.asarray(pool.expert_ids, dtype=np.int32)
@@ -969,10 +971,10 @@ class MfqTpqStore:
         self,
         layer: int,
     ) -> tuple[
-        tuple[NintMoeTensor, NintMoeTensor],
+        tuple[MfeTensor, MfeTensor],
         tuple[
-            dict[int, tuple[NintMoePool, int]],
-            dict[int, tuple[NintMoePool, int]],
+            dict[int, tuple[MfePool, int]],
+            dict[int, tuple[MfePool, int]],
         ],
     ]:
         layer = int(layer)
@@ -982,10 +984,10 @@ class MfqTpqStore:
             if tensors is None:
                 gate = self._store[self._gate_name(layer)]
                 down = self._store[self._down_name(layer)]
-                if not isinstance(gate, NintMoeTensor) or not isinstance(
-                    down, NintMoeTensor
+                if not isinstance(gate, MfeTensor) or not isinstance(
+                    down, MfeTensor
                 ):
-                    raise TypeError(f"native TPQ layer {layer} is not NINTM")
+                    raise TypeError(f"native TPQ layer {layer} is not MFE")
                 tensors = (gate, down)
                 maps = (
                     self._expert_map(gate),
@@ -1036,7 +1038,7 @@ class MfqTpqStore:
 
     @staticmethod
     def _pool_tensor(
-        pair: tuple[NintMoePool, int],
+        pair: tuple[MfePool, int],
     ) -> tuple[TpqPqTensor, int]:
         pool, local = pair
         if not isinstance(pool.tensor, TpqPqTensor):

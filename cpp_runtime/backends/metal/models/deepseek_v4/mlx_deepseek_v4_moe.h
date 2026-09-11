@@ -33,7 +33,7 @@ struct MlxDeepseekV4MoeBranches {
 
 // Complete DeepSeek-V4 shared plus routed expert subgraph. Ordinary router,
 // shared gate and shared up projections use one grouped packed dispatch when
-// their formats support it. Routed gate/up and down remain NINTM-native.
+// their formats support it. Routed gate/up and down remain MFE-native.
 class MlxDeepseekV4Moe {
 public:
     static MlxDeepseekV4Moe load(
@@ -42,7 +42,7 @@ public:
         std::size_t layer,
         const std::optional<mlx::core::array>& available =
             std::nullopt,
-        std::shared_ptr<MlxNintMoeOffloadCache> offload =
+        std::shared_ptr<MlxMfeOffloadCache> offload =
             nullptr);
 
     static MlxDeepseekV4Moe load(
@@ -63,7 +63,7 @@ public:
         const std::string& prefix,
         const std::optional<mlx::core::array>& available =
             std::nullopt,
-        std::shared_ptr<MlxNintMoeOffloadCache> offload =
+        std::shared_ptr<MlxMfeOffloadCache> offload =
             nullptr,
         std::size_t expert_cache_layer = 0);
 
@@ -143,7 +143,7 @@ private:
         std::optional<MlxRoutedLinear> routed_gate,
         std::optional<MlxRoutedLinear> routed_up,
         std::optional<MlxRoutedLinear> routed_down,
-        std::shared_ptr<MlxNintMoeOffloadCache>
+        std::shared_ptr<MlxMfeOffloadCache>
             expert_offload,
         std::shared_ptr<MlxDeepseekV4SsdExpertCache>
             ssd_expert_cache,
@@ -171,7 +171,7 @@ private:
     std::optional<MlxRoutedLinear> routed_gate_;
     std::optional<MlxRoutedLinear> routed_up_;
     std::optional<MlxRoutedLinear> routed_down_;
-    std::shared_ptr<MlxNintMoeOffloadCache>
+    std::shared_ptr<MlxMfeOffloadCache>
         expert_offload_;
     std::shared_ptr<MlxDeepseekV4SsdExpertCache>
         ssd_expert_cache_;

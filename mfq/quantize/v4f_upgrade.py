@@ -13,12 +13,18 @@ from pathlib import Path
 
 from mfq.formats.io import (
     _NINT_HDR,
-    _NINT_MOE_HDR,
-    _NINT_MOE_MAGIC_V2,
-    _NINT_MOE_POOL_V2_HDR,
+    _MFE_HDR,
+    _MFE_MAGIC,
+    _MFE_POOL_HDR,
     open_mmap,
 )
-from mfq.formats.nint import NintSpec
+from mfq.formats.compat import NINT_DTYPE, canonical_dtype
+from mfq.formats.nint import (
+    NINT_ADAPTIVE_FLAG,
+    NINT_K_SELECTOR_BITS,
+    NINT_Q_SELECTOR_BITS,
+    NintSpec,
+)
 from mfq.quantize.expert_sensitivity import (
     ExpertSensitivityMap,
     load_expert_sensitivity_map,
@@ -46,7 +52,9 @@ def _nint_blob_nbytes(rows: int, columns: int, spec: NintSpec) -> int:
     header = _NINT_HDR.size + 4 + 2 * 8 + 8
     sub = (rows * groups * spec.sub_bits + 7) // 8
     q = (rows * groups * spec.groupsize * spec.bits + 7) // 8
-    return int(header + rows * 4 + 2 * sub + q)
+    k_selectors = (rows * NINT_K_SELECTOR_BITS + 7) // 8
+    q_selectors = (rows * NINT_Q_SELECTOR_BITS + 7) // 8
+    return int(header + rows * 4 + k_selectors + 2 * sub + q_selectors + q)
 
 
 def sha256_file(path: str | Path) -> str:
@@ -319,7 +327,7 @@ def _allocation_family(profile: str) -> str:
     return match.group(1) if match else profile
 
 
-def _nintm_profiles(
+def _mfe_profiles(
     blob: bytes | memoryview,
 ) -> tuple[
     tuple[int, int, int],
@@ -327,50 +335,62 @@ def _nintm_profiles(
     tuple[tuple[str, int], ...],
 ]:
     view = memoryview(blob)
-    if len(view) < _NINT_MOE_HDR.size:
-        raise ValueError("truncated NINTM header")
+    if len(view) < _MFE_HDR.size:
+        raise ValueError("truncated MFE header")
     magic, n_experts, out_per_expert, neuron_len, pool_count = (
-        _NINT_MOE_HDR.unpack_from(view)
+        _MFE_HDR.unpack_from(view)
     )
-    if magic != _NINT_MOE_MAGIC_V2:
-        raise ValueError(f"unsupported NINTM magic: {magic!r}")
+    if magic != _MFE_MAGIC:
+        raise ValueError(f"unsupported MFE magic: {magic!r}")
     profiles = [""] * int(n_experts)
     pools: list[tuple[str, int]] = []
-    offset = _NINT_MOE_HDR.size
+    offset = _MFE_HDR.size
     for _ in range(int(pool_count)):
-        if offset + _NINT_MOE_POOL_V2_HDR.size > len(view):
-            raise ValueError("truncated NINTM pool header")
+        if offset + _MFE_POOL_HDR.size > len(view):
+            raise ValueError("truncated MFE pool header")
         expert_count, dtype_nbytes, payload_nbytes, runtime_nbytes = (
-            _NINT_MOE_POOL_V2_HDR.unpack_from(view, offset)
+            _MFE_POOL_HDR.unpack_from(view, offset)
         )
-        offset += _NINT_MOE_POOL_V2_HDR.size
+        offset += _MFE_POOL_HDR.size
         ids_nbytes = int(expert_count) * 4
         metadata_end = offset + ids_nbytes + int(dtype_nbytes)
         pool_end = metadata_end + int(runtime_nbytes) + int(payload_nbytes)
         if pool_end > len(view):
-            raise ValueError("truncated NINTM pool payload")
+            raise ValueError("truncated MFE pool payload")
         expert_ids = struct.unpack_from(
             f"<{int(expert_count)}i",
             view,
             offset,
         )
         offset += ids_nbytes
-        dtype = bytes(view[offset : offset + int(dtype_nbytes)]).decode("ascii")
-        family = _allocation_family(dtype)
+        stored_dtype = bytes(view[offset : offset + int(dtype_nbytes)]).decode("ascii")
+        dtype = canonical_dtype(stored_dtype)
+        if dtype == NINT_DTYPE:
+            payload_offset = metadata_end + int(runtime_nbytes)
+            if payload_offset + _NINT_HDR.size > pool_end:
+                raise ValueError("truncated MFE NINT payload header")
+            raw_bits, _sub_bits, groupsize, _axis, _width = _NINT_HDR.unpack_from(
+                view, payload_offset
+            )
+            bits = int(raw_bits & ~NINT_ADAPTIVE_FLAG)
+            profile = f"NINT{bits}-{int(groupsize)}"
+        else:
+            profile = dtype
+        family = _allocation_family(profile)
         pools.append((family, int(expert_count)))
         offset = pool_end
         for expert in expert_ids:
             if expert < 0 or expert >= n_experts:
-                raise ValueError(f"NINTM pool contains invalid expert {expert}")
+                raise ValueError(f"MFE pool contains invalid expert {expert}")
             if profiles[expert]:
                 raise ValueError(
-                    f"NINTM expert {expert} belongs to multiple pools"
+                    f"MFE expert {expert} belongs to multiple pools"
                 )
             profiles[expert] = family
     if offset != len(view):
-        raise ValueError("NINTM blob contains trailing bytes")
+        raise ValueError("MFE blob contains trailing bytes")
     if any(not family for family in profiles):
-        raise ValueError("NINTM pools do not cover every expert")
+        raise ValueError("MFE pools do not cover every expert")
     return (
         (int(n_experts), int(out_per_expert), int(neuron_len)),
         tuple(profiles),
@@ -394,13 +414,13 @@ def _read_v4f_mfq_profiles(
             match = _ROUTED_NAME.match(name)
             if match is None:
                 continue
-            if record.dtype != "NINTM":
-                raise TypeError(f"routed tensor is not NINTM: {name}")
+            if record.dtype != "MFE":
+                raise TypeError(f"routed tensor is not MFE: {name}")
             projection = match.group("projection")
             layer = int(match.group("layer"))
             blob = store.blob_view(record)
             try:
-                shape, families, pools = _nintm_profiles(blob)
+                shape, families, pools = _mfe_profiles(blob)
             finally:
                 blob.release()
             expected_shape = (
@@ -412,7 +432,7 @@ def _read_v4f_mfq_profiles(
                 raise ValueError(
                     f"unexpected routed shape for {name}: {shape}"
                 )
-            parsed_nbytes = _NINT_MOE_HDR.size + sum(
+            parsed_nbytes = _MFE_HDR.size + sum(
                 routed_family_pool_bytes(
                     projection,
                     family,

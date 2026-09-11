@@ -11,7 +11,7 @@
 
 namespace mfq::cuda {
 
-class NintMxfp4Unsupported : public std::runtime_error {
+class MfeMxfp4Unsupported : public std::runtime_error {
 public:
     using std::runtime_error::runtime_error;
 };
@@ -24,15 +24,15 @@ struct MfqRecordRange {
     std::uint64_t nbytes = 0;
 };
 
-struct NintMxfp4ExpertPart {
+struct MfeMxfp4ExpertPart {
     std::uint64_t offset = 0;
     std::uint64_t nbytes = 0;
 };
 
-// Exact-range view over one canonical NINTM routed projection. The store
+// Exact-range view over one canonical MFE routed projection. The store
 // retains only metadata; expert payloads remain in the MFQ container until a
 // cache miss asks for their MXFP4 values and scales.
-class NintMxfp4ExpertStore {
+class MfeMxfp4ExpertStore {
 public:
     enum Field : std::size_t {
         values = 0,
@@ -40,7 +40,7 @@ public:
         field_count = 2,
     };
 
-    explicit NintMxfp4ExpertStore(MfqRecordRange record);
+    explicit MfeMxfp4ExpertStore(MfqRecordRange record);
 
     int num_experts() const noexcept;
     int out_per_expert() const noexcept;
@@ -50,11 +50,11 @@ public:
     std::uint64_t payload_bytes() const noexcept;
     const MfqRecordRange& record() const noexcept;
 
-    const NintMxfp4ExpertPart& part(
+    const MfeMxfp4ExpertPart& part(
         int expert,
         std::size_t field) const;
     void read_part_into(
-        const NintMxfp4ExpertPart& part,
+        const MfeMxfp4ExpertPart& part,
         std::span<std::uint8_t> destination) const;
     std::vector<std::uint8_t> read_blob() const;
 
@@ -73,59 +73,59 @@ private:
     std::uint64_t values_bytes_per_expert_ = 0;
     std::uint64_t scales_bytes_per_expert_ = 0;
     std::uint64_t payload_bytes_ = 0;
-    std::vector<std::array<NintMxfp4ExpertPart, field_count>> experts_;
+    std::vector<std::array<MfeMxfp4ExpertPart, field_count>> experts_;
 };
 
-struct NintMxfp4ReadRequest {
-    const NintMxfp4ExpertStore* store = nullptr;
-    const NintMxfp4ExpertPart* part = nullptr;
+struct MfeMxfp4ReadRequest {
+    const MfeMxfp4ExpertStore* store = nullptr;
+    const MfeMxfp4ExpertPart* part = nullptr;
     std::span<std::uint8_t> destination;
 };
 
-struct NintMxfp4ReadBatchStats {
+struct MfeMxfp4ReadBatchStats {
     std::uint64_t bytes = 0;
     std::uint64_t calls = 0;
     std::uint64_t file_opens = 0;
     std::uint64_t wall_nanoseconds = 0;
 };
 
-struct NintMxfp4ReadState;
+struct MfeMxfp4ReadState;
 
-class NintMxfp4ReadTicket {
+class MfeMxfp4ReadTicket {
 public:
-    NintMxfp4ReadTicket() = default;
-    NintMxfp4ReadTicket(NintMxfp4ReadTicket&&) noexcept;
-    NintMxfp4ReadTicket& operator=(NintMxfp4ReadTicket&&) noexcept;
-    ~NintMxfp4ReadTicket();
+    MfeMxfp4ReadTicket() = default;
+    MfeMxfp4ReadTicket(MfeMxfp4ReadTicket&&) noexcept;
+    MfeMxfp4ReadTicket& operator=(MfeMxfp4ReadTicket&&) noexcept;
+    ~MfeMxfp4ReadTicket();
 
-    NintMxfp4ReadTicket(const NintMxfp4ReadTicket&) = delete;
-    NintMxfp4ReadTicket& operator=(const NintMxfp4ReadTicket&) = delete;
+    MfeMxfp4ReadTicket(const MfeMxfp4ReadTicket&) = delete;
+    MfeMxfp4ReadTicket& operator=(const MfeMxfp4ReadTicket&) = delete;
 
     bool valid() const noexcept;
-    NintMxfp4ReadBatchStats wait();
+    MfeMxfp4ReadBatchStats wait();
 
 private:
-    explicit NintMxfp4ReadTicket(
-        std::shared_ptr<NintMxfp4ReadState> state);
+    explicit MfeMxfp4ReadTicket(
+        std::shared_ptr<MfeMxfp4ReadState> state);
 
-    std::shared_ptr<NintMxfp4ReadState> state_;
+    std::shared_ptr<MfeMxfp4ReadState> state_;
 
-    friend class NintMxfp4ReadPool;
+    friend class MfeMxfp4ReadPool;
 };
 
-class NintMxfp4ReadPool {
+class MfeMxfp4ReadPool {
 public:
-    explicit NintMxfp4ReadPool(std::size_t workers);
-    ~NintMxfp4ReadPool();
+    explicit MfeMxfp4ReadPool(std::size_t workers);
+    ~MfeMxfp4ReadPool();
 
-    NintMxfp4ReadPool(const NintMxfp4ReadPool&) = delete;
-    NintMxfp4ReadPool& operator=(const NintMxfp4ReadPool&) = delete;
+    MfeMxfp4ReadPool(const MfeMxfp4ReadPool&) = delete;
+    MfeMxfp4ReadPool& operator=(const MfeMxfp4ReadPool&) = delete;
 
     std::size_t workers() const noexcept;
-    NintMxfp4ReadTicket submit(
-        std::span<const NintMxfp4ReadRequest> requests);
-    NintMxfp4ReadBatchStats read(
-        std::span<const NintMxfp4ReadRequest> requests);
+    MfeMxfp4ReadTicket submit(
+        std::span<const MfeMxfp4ReadRequest> requests);
+    MfeMxfp4ReadBatchStats read(
+        std::span<const MfeMxfp4ReadRequest> requests);
 
 private:
     struct Impl;

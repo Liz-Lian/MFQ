@@ -2257,11 +2257,7 @@ public:
     }
 
     bool supports_fused_greedy() const noexcept {
-        if (config_.tie_embeddings || !output_) return false;
-        const auto* weight = output_->nint_weight_ref();
-        return weight != nullptr && weight->bits() == 6 &&
-            weight->group_size() == 24 &&
-            !weight->q5_execution_layout();
+        return false;
     }
 
     array forward_greedy(const array& ids, bool use_cache = true) {

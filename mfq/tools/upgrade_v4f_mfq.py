@@ -19,15 +19,15 @@ import numpy as np
 
 from mfq.formats.header import FileHeader, MFQ_MAGIC
 from mfq.formats.io import (
-    _NINT_MOE_HDR,
-    _NINT_MOE_MAGIC_V2,
-    _NINT_MOE_POOL_V2_HDR,
-    _pack_nint_moe_runtime,
+    _MFE_HDR,
+    _MFE_MAGIC,
+    _MFE_POOL_HDR,
+    _pack_mfe_runtime,
     _pack_tensor,
     _u32,
     open_mmap,
 )
-from mfq.formats.moe import NintMoePool, NintMoeTensor, expert_tensor_family
+from mfq.formats.mfe import MfePool, MfeTensor, expert_tensor_family
 from mfq.formats.nepq import NepqTensor
 from mfq.formats.nvq import NvqJscTensor, NvqTensor
 from mfq.quantize.nint_quant import NintTensor
@@ -70,31 +70,31 @@ def _allocation_family(profile: str) -> str:
     return match.group(1) if match else profile
 
 
-def _nintm_allocation_profiles(
+def _mfe_allocation_profiles(
     blob: bytes | memoryview,
 ) -> tuple[tuple[int, int, int], tuple[str, ...]]:
     view = memoryview(blob)
-    if len(view) < _NINT_MOE_HDR.size:
-        raise ValueError("truncated NINTM header")
+    if len(view) < _MFE_HDR.size:
+        raise ValueError("truncated MFE header")
     magic, n_experts, out_per_expert, neuron_len, pool_count = (
-        _NINT_MOE_HDR.unpack_from(view)
+        _MFE_HDR.unpack_from(view)
     )
-    if magic != _NINT_MOE_MAGIC_V2:
-        raise ValueError(f"unsupported NINTM magic: {magic!r}")
+    if magic != _MFE_MAGIC:
+        raise ValueError(f"unsupported MFE magic: {magic!r}")
     profiles = [""] * n_experts
-    offset = _NINT_MOE_HDR.size
+    offset = _MFE_HDR.size
     for _ in range(pool_count):
-        if offset + _NINT_MOE_POOL_V2_HDR.size > len(view):
-            raise ValueError("truncated NINTM pool header")
+        if offset + _MFE_POOL_HDR.size > len(view):
+            raise ValueError("truncated MFE pool header")
         expert_count, dtype_nbytes, payload_nbytes, runtime_nbytes = (
-            _NINT_MOE_POOL_V2_HDR.unpack_from(view, offset)
+            _MFE_POOL_HDR.unpack_from(view, offset)
         )
-        offset += _NINT_MOE_POOL_V2_HDR.size
+        offset += _MFE_POOL_HDR.size
         ids_nbytes = expert_count * np.dtype(np.int32).itemsize
         metadata_end = offset + ids_nbytes + dtype_nbytes
         pool_end = metadata_end + runtime_nbytes + payload_nbytes
         if pool_end > len(view):
-            raise ValueError("truncated NINTM pool payload")
+            raise ValueError("truncated MFE pool payload")
         expert_ids = tuple(
             int(value)
             for value in np.frombuffer(
@@ -110,15 +110,15 @@ def _nintm_allocation_profiles(
         family = _allocation_family(dtype)
         for expert in expert_ids:
             if expert < 0 or expert >= n_experts:
-                raise ValueError(f"NINTM pool contains invalid expert {expert}")
+                raise ValueError(f"MFE pool contains invalid expert {expert}")
             if profiles[expert]:
-                raise ValueError(f"NINTM expert {expert} belongs to multiple pools")
+                raise ValueError(f"MFE expert {expert} belongs to multiple pools")
             profiles[expert] = family
     if offset != len(view):
-        raise ValueError("NINTM blob contains trailing bytes")
+        raise ValueError("MFE blob contains trailing bytes")
     missing = [index for index, family in enumerate(profiles) if not family]
     if missing:
-        raise ValueError(f"NINTM pools omit experts {missing[:16]}")
+        raise ValueError(f"MFE pools omit experts {missing[:16]}")
     return (
         (int(n_experts), int(out_per_expert), int(neuron_len)),
         tuple(profiles),
@@ -508,7 +508,7 @@ def _subset_pool_tensor(
 
 
 def _write_upgraded_routed_stream(
-    base: NintMoeTensor,
+    base: MfeTensor,
     selected_ids: tuple[int, ...],
     selected_path: Path,
     handle,
@@ -548,8 +548,8 @@ def _write_upgraded_routed_stream(
         )
 
     handle.write(
-        _NINT_MOE_HDR.pack(
-            _NINT_MOE_MAGIC_V2,
+        _MFE_HDR.pack(
+            _MFE_MAGIC,
             base.n_experts,
             base.out_per_expert,
             base.neuron_len,
@@ -558,10 +558,10 @@ def _write_upgraded_routed_stream(
     )
     for expert_ids, tensor in pools:
         dtype, payload = _pack_tensor(tensor, allow_moe=False)
-        runtime = _pack_nint_moe_runtime(tensor)
+        runtime = _pack_mfe_runtime(tensor)
         dtype_bytes = dtype.encode("ascii")
         handle.write(
-            _NINT_MOE_POOL_V2_HDR.pack(
+            _MFE_POOL_HDR.pack(
                 len(expert_ids),
                 len(dtype_bytes),
                 len(payload),
@@ -575,7 +575,7 @@ def _write_upgraded_routed_stream(
         del payload, tensor
     dtype_bytes = selected_family.encode("ascii")
     handle.write(
-        _NINT_MOE_POOL_V2_HDR.pack(
+        _MFE_POOL_HDR.pack(
             len(selected_ids),
             len(dtype_bytes),
             selected_path.stat().st_size,
@@ -590,7 +590,7 @@ def _write_upgraded_routed_stream(
 
 
 def _write_upgraded_routed_blob(
-    base: NintMoeTensor,
+    base: MfeTensor,
     selected_ids: tuple[int, ...],
     selected_path: Path,
     output: Path,
@@ -784,8 +784,8 @@ def command_patch(args) -> None:
                         projection,
                     ) = replacements[name]
                     base_tensor = store[name]
-                    if not isinstance(base_tensor, NintMoeTensor):
-                        raise TypeError(f"base routed tensor is not NINTM: {name}")
+                    if not isinstance(base_tensor, MfeTensor):
+                        raise TypeError(f"base routed tensor is not MFE: {name}")
                     if hasattr(plan, "base_families"):
                         expected_base = plan.base_families(
                             projection, layer
@@ -887,11 +887,11 @@ def command_verify(args) -> None:
             layer = int(match.group("layer"))
             projection = match.group("projection")
             record = store.records[name]
-            if record.dtype != "NINTM":
-                raise TypeError(f"routed tensor is not NINTM: {name}")
+            if record.dtype != "MFE":
+                raise TypeError(f"routed tensor is not MFE: {name}")
             blob = store.blob_view(record)
             try:
-                shape, actual = _nintm_allocation_profiles(blob)
+                shape, actual = _mfe_allocation_profiles(blob)
             finally:
                 blob.release()
             expected_shape = (

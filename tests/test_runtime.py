@@ -97,7 +97,7 @@ def test_model_mmap_roundtrip_and_linear(tmp_path: Path):
     model.tensors.close()
 
 
-def test_profile_dispatch_uses_registered_backend():
+def test_common_nint_dispatch_uses_registered_backend():
     rng = np.random.default_rng(4)
     W = rng.normal(0, 0.05, size=(8, 96)).astype(np.float32)
     t = _qt(W, NintSpec(4, 24, 6))
@@ -108,7 +108,7 @@ def test_profile_dispatch_uses_registered_backend():
         return np.ones_like(nint_quant.dequantize(tensor))  # Sentinel: all ones
 
     try:
-        register_backend("NINT4-24", fake_kernel)
+        register_backend(fake_kernel)
         out = dequantize(t)
         assert calls["n"] == 1
         assert (out == 1.0).all()
@@ -119,6 +119,6 @@ def test_profile_dispatch_uses_registered_backend():
     assert not (out2 == 1.0).all()
 
 
-def test_profile_label():
-    assert NintSpec(4, 24, 6).profile_label == "NINT4-24"
-    assert NintSpec(4, 32, 8).profile_label == "NINT4-32"
+def test_uniform_template_label():
+    assert NintSpec(4, 24, 6).uniform_template_label == "NINT4-24"
+    assert NintSpec(4, 32, 8).uniform_template_label == "NINT4-32"

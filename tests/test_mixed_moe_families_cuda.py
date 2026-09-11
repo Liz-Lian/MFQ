@@ -16,7 +16,7 @@ if shutil.which("cl") is None and shutil.which("cl.exe") is None:
 
 from mfq.formats import io  # noqa: E402
 from mfq.formats.header import FileHeader  # noqa: E402
-from mfq.formats.moe import NintMoePool, NintMoeTensor  # noqa: E402
+from mfq.formats.mfe import MfePool, MfeTensor  # noqa: E402
 from mfq.formats.nepq import (  # noqa: E402
     NEPQ0_L,
     NEPQ0_S,
@@ -65,11 +65,11 @@ def _selected_reference(
 
 @pytest.mark.parametrize("family", FLAT_FAMILIES)
 @pytest.mark.parametrize("tokens", (1, 4, 13))
-def test_nintm_grouped_kernel_supports_flat_family(family: str, tokens: int):
+def test_mfe_grouped_kernel_supports_flat_family(family: str, tokens: int):
     tensor = make_flat_family(family)
-    container = NintMoeTensor(
+    container = MfeTensor(
         (2, 3, 96),
-        (NintMoePool(np.arange(2, dtype=np.int32), tensor),),
+        (MfePool(np.arange(2, dtype=np.int32), tensor),),
     )
     weight = to_gpu(container)
     family_index = FLAT_FAMILIES.index(family)
@@ -93,11 +93,11 @@ def test_nintm_grouped_kernel_supports_flat_family(family: str, tokens: int):
 
 @pytest.mark.parametrize("spec", (NEPQ0_S, NEPQ0_L, NEPQ1_S, NEPQ1_L))
 @pytest.mark.parametrize("tokens", (1, 4, 13))
-def test_nintm_grouped_kernel_supports_nepq_family(spec, tokens: int):
+def test_mfe_grouped_kernel_supports_nepq_family(spec, tokens: int):
     tensor = make_nepq(spec)
-    container = NintMoeTensor(
+    container = MfeTensor(
         tensor.shape,
-        (NintMoePool(np.arange(2, dtype=np.int32), tensor),),
+        (MfePool(np.arange(2, dtype=np.int32), tensor),),
     )
     weight = to_gpu(container)
     packed = weight.pools[0].weight
@@ -120,7 +120,7 @@ def test_nintm_grouped_kernel_supports_nepq_family(spec, tokens: int):
     assert relative < 0.02, (spec.label, tokens, relative)
 
 
-def _all_family_container() -> NintMoeTensor:
+def _all_family_container() -> MfeTensor:
     rows = 3
     neuron_len = 104
     pools = []
@@ -138,12 +138,12 @@ def _all_family_container() -> NintMoeTensor:
             axis=0,
         )
         pools.append(
-            NintMoePool(np.asarray([next_expert], dtype=np.int32), tensor)
+            MfePool(np.asarray([next_expert], dtype=np.int32), tensor)
         )
         next_expert += 1
     for family in FLAT_FAMILIES:
         pools.append(
-            NintMoePool(
+            MfePool(
                 np.asarray([next_expert], dtype=np.int32),
                 make_flat_family(family, rows=rows, neuron_len=neuron_len),
             )
@@ -152,20 +152,20 @@ def _all_family_container() -> NintMoeTensor:
     for spec in (NEPQ0_S, NEPQ0_L, NEPQ1_S, NEPQ1_L):
         tensor = make_nepq(spec)
         pools.append(
-            NintMoePool(
+            MfePool(
                 np.arange(next_expert, next_expert + tensor.n_experts, dtype=np.int32),
                 tensor,
             )
         )
         next_expert += tensor.n_experts
-    return NintMoeTensor(
+    return MfeTensor(
         (next_expert, rows, neuron_len),
         tuple(pools),
     )
 
 
 @pytest.mark.parametrize("tokens", (3, 13, 257, 1024))
-def test_cpp_runtime_matches_python_for_all_nintm_families(tmp_path, tokens: int):
+def test_cpp_runtime_matches_python_for_all_mfe_families(tmp_path, tokens: int):
     root = Path(__file__).resolve().parents[1]
     executable = next(
         (
@@ -186,7 +186,7 @@ def test_cpp_runtime_matches_python_for_all_nintm_families(tmp_path, tokens: int
     model_path = tmp_path / "all-families.mfq"
     io.save(
         model_path,
-        FileHeader(version=2, model_arch="nintm-test"),
+        FileHeader(version=2, model_arch="mfe-test"),
         {tensor_name: tensor},
     )
     _, stored_tensors = io.load(model_path)
@@ -229,13 +229,13 @@ def test_cpp_runtime_matches_python_for_all_nintm_families(tmp_path, tokens: int
         str(executable),
         "--mfq",
         str(model_path),
-        "--check-nintm-tensor",
+        "--check-mfe-tensor",
         tensor_name,
-        "--check-nintm-tokens",
+        "--check-mfe-tokens",
         str(tokens),
-        "--check-nintm-routes",
+        "--check-mfe-routes",
         str(routes),
-        "--check-nintm-reps",
+        "--check-mfe-reps",
         "2",
     ]
     completed = subprocess.run(
@@ -249,7 +249,7 @@ def test_cpp_runtime_matches_python_for_all_nintm_families(tmp_path, tokens: int
     line = next(
         value
         for value in completed.stdout.splitlines()
-        if value.startswith("nintm_tensor_check ")
+        if value.startswith("mfe_tensor_check ")
     )
     fields = dict(part.split("=", 1) for part in line.split()[1:])
     legacy_env = env.copy()
@@ -268,7 +268,7 @@ def test_cpp_runtime_matches_python_for_all_nintm_families(tmp_path, tokens: int
     legacy_line = next(
         value
         for value in legacy.stdout.splitlines()
-        if value.startswith("nintm_tensor_check ")
+        if value.startswith("mfe_tensor_check ")
     )
     legacy_fields = dict(
         part.split("=", 1) for part in legacy_line.split()[1:]

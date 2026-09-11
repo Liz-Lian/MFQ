@@ -101,7 +101,7 @@ MlxDeepseekV4SsdExpertArena::MlxDeepseekV4SsdExpertArena(
     slot_weights_ = std::make_unique<MlxDeepseekV4SsdExpertWeights>(
         MlxDeepseekV4SsdExpertWeights{
             .gate_up = MlxRoutedLinear(
-                MlxNintMoeWeight::from_mxfp4_slots(
+                MlxMfeWeight::from_mxfp4_slots(
                     experts,
                     checked_dimension(
                         2 * intermediate_size_, "gate/up size"),
@@ -110,7 +110,7 @@ MlxDeepseekV4SsdExpertArena::MlxDeepseekV4SsdExpertArena(
                     gate_up_weight_.array,
                     gate_up_scale_.array)),
             .down = MlxRoutedLinear(
-                MlxNintMoeWeight::from_mxfp4_slots(
+                MlxMfeWeight::from_mxfp4_slots(
                     experts,
                     checked_dimension(hidden_size_, "hidden size"),
                     checked_dimension(intermediate_size_, "intermediate size"),
@@ -228,7 +228,7 @@ MlxDeepseekV4SsdExpertArena::routed_weights(
     const int experts = checked_dimension(complete.size(), "expert count");
     return {
         .gate_up = MlxRoutedLinear(
-            MlxNintMoeWeight::from_mxfp4_slots(
+            MlxMfeWeight::from_mxfp4_slots(
                 experts,
                 checked_dimension(2 * intermediate_size_, "gate/up size"),
                 checked_dimension(hidden_size_, "hidden size"),
@@ -236,7 +236,7 @@ MlxDeepseekV4SsdExpertArena::routed_weights(
                 gate_up_weight_.array,
                 gate_up_scale_.array)),
         .down = MlxRoutedLinear(
-            MlxNintMoeWeight::from_mxfp4_slots(
+            MlxMfeWeight::from_mxfp4_slots(
                 experts,
                 checked_dimension(hidden_size_, "hidden size"),
                 checked_dimension(intermediate_size_, "intermediate size"),

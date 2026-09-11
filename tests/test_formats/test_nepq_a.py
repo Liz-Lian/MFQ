@@ -77,7 +77,7 @@ def test_nepq_a_file_dtype_roundtrip(spec, tmp_path):
     )
     _, store = io.load_mmap(path)
     try:
-        assert store.records["experts.weight"].dtype == spec.label
+        assert store.records["experts.weight"].dtype == "NEPQ"
         np.testing.assert_allclose(
             dequantize_nepq(store["experts.weight"]), expected, rtol=0, atol=0
         )

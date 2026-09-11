@@ -110,7 +110,7 @@ def test_mmap_mixed_q_and_sub_bits_embedding_reads_cohorts_in_place(
     )
 
     with io.open_mmap(path) as store:
-        assert store.records["embedding.weight"].dtype == "NINTv2"
+        assert store.records["embedding.weight"].dtype == "NINT"
         store.read_blob = lambda _name: (_ for _ in ()).throw(
             AssertionError("mixed-q row lookup copied the complete blob")
         )

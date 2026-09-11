@@ -1,6 +1,6 @@
 #include "mlx_ssd_expert_cache.h"
 
-#include "nintm_expert_store.h"
+#include "mfe_expert_store.h"
 
 #include <algorithm>
 #include <array>
@@ -758,7 +758,7 @@ struct MlxMoeSsdExpertCache::Impl {
         }
     }
 
-    MlxNintMxfp4ExpertStore store;
+    MlxMfeMxfp4ExpertStore store;
     const std::size_t slot_bytes;
     const std::size_t prefill_slots;
     const std::size_t total_slots;

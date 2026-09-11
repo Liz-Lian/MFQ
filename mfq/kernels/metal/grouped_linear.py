@@ -1,9 +1,8 @@
-"""Single-dispatch heterogeneous linear projections for Apple silicon.
+"""Single-dispatch non-NINT linear projections for Apple silicon.
 
-The decode path concatenates packed NINT, NINT8-0, VQ-family, and TPQ
-streams once. One fixed-width descriptor selects the decoder for each
-projection, allowing Q/K/V or gate/up matrices with different output widths
-and formats to share one Metal dispatch.
+The decode path concatenates packed NINT8-0, VQ-family, and TPQ streams once.
+NINT stays on its one metadata-driven matmul kernel and is composed at graph
+level instead of entering this heterogeneous kernel.
 """
 
 from __future__ import annotations
@@ -320,6 +319,10 @@ class MetalLinearGroupWeight:
     ) -> MetalLinearGroupWeight:
         if len(weights) < 2:
             raise ValueError("grouped linear requires at least two weights")
+        if any(isinstance(weight, MetalNintWeight) for weight in weights):
+            raise ValueError(
+                "NINT projections must reuse the unified NINT matmul kernel"
+            )
         neuron_len = int(weights[0].neuron_len)
         if neuron_len <= 0 or any(int(weight.neuron_len) != neuron_len for weight in weights):
             raise ValueError("grouped linear weights must share one input width")
@@ -371,6 +374,10 @@ class MetalLinearGroupWeight:
             )
 
             if isinstance(weight, MetalNintWeight):
+                if not weight.has_uniform_q_bits:
+                    raise ValueError(
+                        "adaptive NINT projections use the unified NINT kernel"
+                    )
                 descriptor[_FAMILY] = _FAMILY_NINT
                 descriptor[_NINT_BITS] = weight.bits
                 descriptor[_NINT_GS] = weight.groupsize
@@ -378,7 +385,7 @@ class MetalLinearGroupWeight:
                 descriptor[_NINT_Q_OFFSET] = offsets["nint_q"]
                 descriptor[_NINT_SUB_OFFSET] = offsets["nint_sub_scale"]
                 descriptor[_NINT_ANCHOR_OFFSET] = offsets["nint_anchor_scale"]
-                descriptor[_NINT_Q5_EXEC] = int(weight.q5_exec)
+                descriptor[_NINT_Q5_EXEC] = 0
                 streams["nint_q"].append(weight.q_packed)
                 streams["nint_sub_scale"].append(weight.sub_scale)
                 streams["nint_sub_min"].append(weight.sub_min)

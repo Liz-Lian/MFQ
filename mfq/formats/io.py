@@ -17,7 +17,7 @@ Binary layout
         num_tensors : uint32
     [TensorRecord] × num_tensors
         name        : len(uint32) + utf8
-        dtype       : len(uint32) + utf8   # "NINT4" / "NINT5" ...
+        dtype       : len(uint32) + utf8   # "NINT", "MFE", "BF16", ...
         blob_nbytes : uint64
     [blob 0][blob 1]...                     # Compact tensor data in record order
 
@@ -54,14 +54,29 @@ from typing import TypeAlias
 import numpy as np
 
 from mfq.formats.assets import ASSET_DTYPE
+from mfq.formats.compat import (
+    MFE_DTYPE,
+    MXFP4_SQ_DTYPE,
+    NEPQ_DTYPE,
+    NINT_DTYPE,
+    NPQ_DTYPE,
+    NVQ_DTYPE,
+    canonical_dtype,
+    is_nint_dtype,
+)
 from mfq.formats.header import MFQ_MAGIC, FileHeader
-from mfq.formats.moe import NintMoePool, NintMoeTensor
+from mfq.formats.mfe import MfePool, MfeTensor
 from mfq.formats.mx import MX_DTYPES, MxTensor, pack_mx, unpack_mx
+from mfq.formats.mxfp4_sq import (
+    Mxfp4SqTensor,
+    pack_mxfp4_sq,
+    unpack_mxfp4_sq,
+)
 from mfq.formats.nepq import NepqTensor, pack_nepq, rotation_signs, unpack_nepq
 from mfq.formats.nint import (
-    NINT_V2_FLAG,
-    NINT_V2_K_SELECTOR_BITS,
-    NINT_V2_Q_SELECTOR_BITS,
+    NINT_ADAPTIVE_FLAG,
+    NINT_K_SELECTOR_BITS,
+    NINT_Q_SELECTOR_BITS,
     NintSpec,
     NintTensor,
     _uint_dtype,
@@ -92,7 +107,7 @@ from mfq.formats.tpq import (
 MfqTensor: TypeAlias = (
     NintTensor
     | Nint8ZeroTensor
-    | NintMoeTensor
+    | MfeTensor
     | NvqTensor
     | NvqJscTensor
     | Npq0LTensor
@@ -103,6 +118,7 @@ MfqTensor: TypeAlias = (
     | TpqPqTensor
     | TpqInt4Tensor
     | MxTensor
+    | Mxfp4SqTensor
     | np.ndarray
     | bytes
 )
@@ -144,6 +160,7 @@ class MMapTensorRecord:
     offset: int
     nbytes: int
     source_index: int = 0
+    stored_dtype: str | None = None
 
 
 def _u32(x: int) -> bytes:
@@ -163,7 +180,7 @@ def _read_str(buf: bytes, off: int) -> tuple[str, int]:
 # ---------------------------------------------------------------------------
 # NINT codec packing / unpacking
 # ---------------------------------------------------------------------------
-_NINT_HDR = struct.Struct("<BBiii")   # bits|NINTv2 flag, sub_bits, groupsize, axis, neuron_len
+_NINT_HDR = struct.Struct("<BBiii")   # bits|adaptive flag, sub_bits, groupsize, axis, neuron_len
 
 
 def _mixed_nint_metadata_nbytes(
@@ -171,8 +188,8 @@ def _mixed_nint_metadata_nbytes(
     nominal_sub_bits: int,
     groups: int,
 ) -> int:
-    total = (int(selectors.size) * NINT_V2_K_SELECTOR_BITS + 7) // 8
-    for selector in range(1 << NINT_V2_K_SELECTOR_BITS):
+    total = (int(selectors.size) * NINT_K_SELECTOR_BITS + 7) // 8
+    for selector in range(1 << NINT_K_SELECTOR_BITS):
         rows = int(np.count_nonzero(selectors == selector))
         bits = nominal_sub_bits - 1 + selector
         if rows and not 1 <= bits <= 8:
@@ -192,8 +209,8 @@ def _pack_mixed_nint_metadata(
         row_sub_bits.astype(np.int16) - (nominal_sub_bits - 1),
         dtype=np.uint8,
     )
-    parts = [pack_bits(selectors, NINT_V2_K_SELECTOR_BITS)]
-    for selector in range(1 << NINT_V2_K_SELECTOR_BITS):
+    parts = [pack_bits(selectors, NINT_K_SELECTOR_BITS)]
+    for selector in range(1 << NINT_K_SELECTOR_BITS):
         rows = np.flatnonzero(selectors == selector)
         bits = nominal_sub_bits - 1 + selector
         if not rows.size:
@@ -221,14 +238,14 @@ def _unpack_mixed_nint_metadata(
         blob,
         off,
         out,
-        NINT_V2_K_SELECTOR_BITS,
+        NINT_K_SELECTOR_BITS,
     )
     row_sub_bits = selectors.astype(np.int16) + (nominal_sub_bits - 1)
     if np.any(row_sub_bits < 1) or np.any(row_sub_bits > 8):
         raise ValueError("invalid NINT v2 per-neuron subgroup width")
     sub_scale = np.empty((out, groups), dtype=np.uint8)
     sub_min = np.empty((out, groups), dtype=np.uint8)
-    for selector in range(1 << NINT_V2_K_SELECTOR_BITS):
+    for selector in range(1 << NINT_K_SELECTOR_BITS):
         rows = np.flatnonzero(selectors == selector)
         if not rows.size:
             continue
@@ -247,8 +264,8 @@ def _unpack_mixed_nint_metadata(
 
 
 def _mixed_nint_q_nbytes(selectors: np.ndarray, values_per_row: int) -> int:
-    total = (int(selectors.size) * NINT_V2_Q_SELECTOR_BITS + 7) // 8
-    for selector in range(1 << NINT_V2_Q_SELECTOR_BITS):
+    total = (int(selectors.size) * NINT_Q_SELECTOR_BITS + 7) // 8
+    for selector in range(1 << NINT_Q_SELECTOR_BITS):
         rows = int(np.count_nonzero(selectors == selector))
         bits = selector + 1
         total += (rows * values_per_row * bits + 7) // 8
@@ -257,8 +274,8 @@ def _mixed_nint_q_nbytes(selectors: np.ndarray, values_per_row: int) -> int:
 
 def _pack_mixed_nint_q(q: np.ndarray, row_q_bits: np.ndarray) -> bytes:
     selectors = np.ascontiguousarray(row_q_bits - 1, dtype=np.uint8)
-    parts = [pack_bits(selectors, NINT_V2_Q_SELECTOR_BITS)]
-    for selector in range(1 << NINT_V2_Q_SELECTOR_BITS):
+    parts = [pack_bits(selectors, NINT_Q_SELECTOR_BITS)]
+    for selector in range(1 << NINT_Q_SELECTOR_BITS):
         rows = np.flatnonzero(selectors == selector)
         if not rows.size:
             continue
@@ -283,12 +300,12 @@ def _unpack_mixed_nint_q(
         blob,
         off,
         out,
-        NINT_V2_Q_SELECTOR_BITS,
+        NINT_Q_SELECTOR_BITS,
     )
     row_q_bits = selectors.astype(np.uint8) + 1
     values_per_row = groups * groupsize
     q = np.empty((out, groups, groupsize), dtype=np.uint8)
-    for selector in range(1 << NINT_V2_Q_SELECTOR_BITS):
+    for selector in range(1 << NINT_Q_SELECTOR_BITS):
         rows = np.flatnonzero(selectors == selector)
         if not rows.size:
             continue
@@ -368,8 +385,7 @@ def pack_nint(tensor: NintTensor) -> bytes:
     out, ng, _gs = tensor.q.shape
     row_q_bits = normalize_row_q_bits(s, tensor.row_q_bits, out)
     row_sub_bits = normalize_row_sub_bits(s, tensor.row_sub_bits, out)
-    is_nint_v2 = tensor.is_nint_v2
-    header_bits = int(s.bits) | (NINT_V2_FLAG if is_nint_v2 else 0)
+    header_bits = int(s.bits) | NINT_ADAPTIVE_FLAG
     with np.errstate(over="ignore", invalid="ignore"):
         neuron_scale = np.ascontiguousarray(tensor.neuron_scale, dtype=np.float16)
         neuron_min = np.ascontiguousarray(tensor.neuron_min, dtype=np.float16)
@@ -381,29 +397,22 @@ def pack_nint(tensor: NintTensor) -> bytes:
     parts.append(struct.pack("<II", out, ng))
     parts.append(neuron_scale.tobytes())
     parts.append(neuron_min.tobytes())
-    if is_nint_v2:
-        parts.append(
-            _pack_mixed_nint_metadata(
-                np.asarray(tensor.sub_scale),
-                np.asarray(tensor.sub_min),
-                row_sub_bits,
-                int(s.sub_bits),
-            )
+    parts.append(
+        _pack_mixed_nint_metadata(
+            np.asarray(tensor.sub_scale),
+            np.asarray(tensor.sub_min),
+            row_sub_bits,
+            int(s.sub_bits),
         )
-    else:
-        parts.append(pack_bits(tensor.sub_scale, s.sub_bits))
-        parts.append(pack_bits(tensor.sub_min, s.sub_bits))
-    if is_nint_v2:
-        parts.append(_pack_mixed_nint_q(np.asarray(tensor.q), row_q_bits))
-    else:
-        parts.append(pack_bits(tensor.q, s.bits))
+    )
+    parts.append(_pack_mixed_nint_q(np.asarray(tensor.q), row_q_bits))
     return b"".join(parts)
 
 
 def unpack_nint(blob: bytes | memoryview) -> NintTensor:
     raw_bits, raw_sub_bits, groupsize, axis, neuron_len = _NINT_HDR.unpack_from(blob, 0)
-    is_nint_v2 = bool(raw_bits & NINT_V2_FLAG)
-    bits = int(raw_bits & ~NINT_V2_FLAG)
+    has_adaptive_storage = bool(raw_bits & NINT_ADAPTIVE_FLAG)
+    bits = int(raw_bits & ~NINT_ADAPTIVE_FLAG)
     sub_bits = int(raw_sub_bits)
     if not 1 <= int(bits) <= 8 or not 1 <= sub_bits <= 8:
         raise ValueError(
@@ -433,7 +442,7 @@ def unpack_nint(blob: bytes | memoryview) -> NintTensor:
     remaining = len(blob) - off
     row_sub_bits = None
     row_q_bits = None
-    if is_nint_v2:
+    if has_adaptive_storage:
         sub_scale, sub_min, row_sub_bits, off = _unpack_mixed_nint_metadata(
             blob,
             off,
@@ -476,27 +485,30 @@ def unpack_nint(blob: bytes | memoryview) -> NintTensor:
     )
 
 
-_NINT_MOE_MAGIC_V1 = b"NIM1"
-_NINT_MOE_MAGIC_V2 = b"NIM2"
-_NINT_MOE_HDR = struct.Struct("<4sIIII")
-_NINT_MOE_POOL_V1_HDR = struct.Struct("<IQ")
-_NINT_MOE_POOL_V2_HDR = struct.Struct("<IIQQ")
+_MFE_MAGIC = b"MFE1"
+_MFE_DELTA_MAGIC = b"MFD1"
+_LEGACY_MFE_MAGIC_V1 = b"NIM1"
+_LEGACY_MFE_MAGIC_V2 = b"NIM2"
+_LEGACY_MFE_DELTA_MAGIC = b"NID2"
+_MFE_HDR = struct.Struct("<4sIIII")
+_MFE_POOL_V1_HDR = struct.Struct("<IQ")
+_MFE_POOL_HDR = struct.Struct("<IIQQ")
 
 
 @dataclass(frozen=True)
-class NintMoePoolMetadata:
+class MfePoolMetadata:
     expert_ids: tuple[int, ...]
     dtype: str
     nint_spec: NintSpec | None
 
 
 @dataclass(frozen=True)
-class NintMoePoolBlob:
-    """Zero-copy view of one NIM2 cohort payload.
+class MfePoolBlob:
+    """Zero-copy view of one current-layout MFE cohort payload.
 
     The returned memoryviews borrow the lifetime of the input blob.  This is
     primarily used by deployment runtimes so multi-gigabyte expert tensors can
-    stay bit-packed instead of passing through :func:`unpack_nint_moe`.
+    stay bit-packed instead of passing through :func:`unpack_mfe`.
     """
 
     expert_ids: np.ndarray
@@ -505,40 +517,40 @@ class NintMoePoolBlob:
     tensor_payload: memoryview
 
 
-def view_nint_moe_blob(
+def view_mfe_blob(
     blob: bytes | memoryview,
-) -> tuple[tuple[int, int, int], tuple[NintMoePoolBlob, ...]]:
-    """Return validated zero-copy cohort views for a NIM2 container."""
+) -> tuple[tuple[int, int, int], tuple[MfePoolBlob, ...]]:
+    """Return validated zero-copy cohort views for an MFE container."""
 
     view = blob if isinstance(blob, memoryview) else memoryview(blob)
-    if len(view) < _NINT_MOE_HDR.size:
-        raise ValueError("truncated NINTM header")
+    if len(view) < _MFE_HDR.size:
+        raise ValueError("truncated MFE header")
     magic, n_experts, out_per_expert, neuron_len, pool_count = (
-        _NINT_MOE_HDR.unpack_from(view, 0)
+        _MFE_HDR.unpack_from(view, 0)
     )
-    if magic != _NINT_MOE_MAGIC_V2:
-        raise ValueError("NINTM blob views require the NIM2 format")
+    if magic not in {_MFE_MAGIC, _LEGACY_MFE_MAGIC_V2}:
+        raise ValueError("MFE blob views require MFE1 or legacy NIM2 storage")
     if pool_count == 0 or pool_count > n_experts:
-        raise ValueError("invalid NINTM pool count")
+        raise ValueError("invalid MFE pool count")
 
-    off = _NINT_MOE_HDR.size
+    off = _MFE_HDR.size
     owners = np.full(int(n_experts), -1, dtype=np.int32)
-    pools: list[NintMoePoolBlob] = []
+    pools: list[MfePoolBlob] = []
     for pool_index in range(int(pool_count)):
-        if off + _NINT_MOE_POOL_V2_HDR.size > len(view):
-            raise ValueError("truncated NINTM v2 pool header")
+        if off + _MFE_POOL_HDR.size > len(view):
+            raise ValueError("truncated MFE pool header")
         expert_count, dtype_nbytes, payload_nbytes, runtime_nbytes = (
-            _NINT_MOE_POOL_V2_HDR.unpack_from(view, off)
+            _MFE_POOL_HDR.unpack_from(view, off)
         )
-        off += _NINT_MOE_POOL_V2_HDR.size
+        off += _MFE_POOL_HDR.size
         if expert_count == 0 or dtype_nbytes == 0 or dtype_nbytes > 32:
-            raise ValueError("invalid NINTM v2 pool metadata")
+            raise ValueError("invalid MFE pool metadata")
         ids_nbytes = int(expert_count) * np.dtype(np.int32).itemsize
         dtype_end = off + ids_nbytes + int(dtype_nbytes)
         runtime_end = dtype_end + int(runtime_nbytes)
         payload_end = runtime_end + int(payload_nbytes)
         if payload_end > len(view):
-            raise ValueError("truncated NINTM v2 pool payload")
+            raise ValueError("truncated MFE pool payload")
         expert_ids = np.frombuffer(
             view,
             dtype=np.int32,
@@ -551,65 +563,65 @@ def view_nint_moe_blob(
             or np.unique(expert_ids).size != expert_ids.size
             or np.any(owners[expert_ids] >= 0)
         ):
-            raise ValueError("invalid or repeated NINTM expert id")
+            raise ValueError("invalid or repeated MFE expert id")
         owners[expert_ids] = pool_index
         off += ids_nbytes
         try:
             dtype = bytes(view[off:dtype_end]).decode("ascii")
         except UnicodeDecodeError as exc:
-            raise ValueError("NINTM cohort dtype must be ASCII") from exc
+            raise ValueError("MFE cohort dtype must be ASCII") from exc
         pools.append(
-            NintMoePoolBlob(
+            MfePoolBlob(
                 expert_ids=expert_ids,
-                dtype=dtype,
+                dtype=canonical_dtype(dtype),
                 runtime_payload=view[dtype_end:runtime_end],
                 tensor_payload=view[runtime_end:payload_end],
             )
         )
         off = payload_end
     if off != len(view):
-        raise ValueError(f"invalid NINTM tail: {len(view) - off} extra bytes")
+        raise ValueError(f"invalid MFE tail: {len(view) - off} extra bytes")
     missing = np.flatnonzero(owners < 0)
     if missing.size:
-        raise ValueError(f"NINTM pools do not cover experts {missing[:16].tolist()}")
+        raise ValueError(f"MFE pools do not cover experts {missing[:16].tolist()}")
     return (
         (int(n_experts), int(out_per_expert), int(neuron_len)),
         tuple(pools),
     )
 
 
-def inspect_nint_moe_header(
+def inspect_mfe_header(
     blob: bytes | memoryview,
-) -> tuple[tuple[int, int, int], tuple[NintMoePoolMetadata, ...]]:
-    """Read NINTM pool assignments without decoding packed tensor arrays."""
+) -> tuple[tuple[int, int, int], tuple[MfePoolMetadata, ...]]:
+    """Read MFE pool assignments without decoding packed tensor arrays."""
 
-    if len(blob) < _NINT_MOE_HDR.size:
-        raise ValueError("truncated NINTM header")
+    if len(blob) < _MFE_HDR.size:
+        raise ValueError("truncated MFE header")
     magic, n_experts, out_per_expert, neuron_len, pool_count = (
-        _NINT_MOE_HDR.unpack_from(blob, 0)
+        _MFE_HDR.unpack_from(blob, 0)
     )
-    if magic != _NINT_MOE_MAGIC_V2:
-        raise ValueError("NINTM metadata inspection requires the NIM2 format")
+    if magic not in {_MFE_MAGIC, _LEGACY_MFE_MAGIC_V2}:
+        raise ValueError("MFE metadata inspection requires MFE1 or legacy NIM2 storage")
     if pool_count == 0 or pool_count > n_experts:
-        raise ValueError("invalid NINTM pool count")
-    off = _NINT_MOE_HDR.size
+        raise ValueError("invalid MFE pool count")
+    off = _MFE_HDR.size
     pools = []
     owners = np.full(int(n_experts), -1, dtype=np.int32)
     for pool_index in range(pool_count):
-        if off + _NINT_MOE_POOL_V2_HDR.size > len(blob):
-            raise ValueError("truncated NINTM v2 pool header")
+        if off + _MFE_POOL_HDR.size > len(blob):
+            raise ValueError("truncated MFE pool header")
         expert_count, dtype_nbytes, payload_nbytes, runtime_nbytes = (
-            _NINT_MOE_POOL_V2_HDR.unpack_from(blob, off)
+            _MFE_POOL_HDR.unpack_from(blob, off)
         )
-        off += _NINT_MOE_POOL_V2_HDR.size
+        off += _MFE_POOL_HDR.size
         if expert_count == 0 or dtype_nbytes == 0 or dtype_nbytes > 32:
-            raise ValueError("invalid NINTM v2 pool metadata")
+            raise ValueError("invalid MFE pool metadata")
         ids_nbytes = int(expert_count) * np.dtype(np.int32).itemsize
         dtype_end = off + ids_nbytes + int(dtype_nbytes)
         payload_off = dtype_end + int(runtime_nbytes)
         payload_end = payload_off + int(payload_nbytes)
         if payload_end > len(blob):
-            raise ValueError("truncated NINTM v2 pool payload")
+            raise ValueError("truncated MFE pool payload")
         expert_id_array = np.frombuffer(
             blob, dtype=np.int32, count=int(expert_count), offset=off
         )
@@ -619,34 +631,34 @@ def inspect_nint_moe_header(
             or np.unique(expert_id_array).size != expert_id_array.size
             or np.any(owners[expert_id_array] >= 0)
         ):
-            raise ValueError("invalid or repeated NINTM expert id")
+            raise ValueError("invalid or repeated MFE expert id")
         owners[expert_id_array] = pool_index
         expert_ids = tuple(int(value) for value in expert_id_array)
         off += ids_nbytes
         try:
             dtype = bytes(blob[off:dtype_end]).decode("ascii")
         except UnicodeDecodeError as exc:
-            raise ValueError("NINTM cohort dtype must be ASCII") from exc
+            raise ValueError("MFE cohort dtype must be ASCII") from exc
+        stored_dtype = dtype
+        dtype = canonical_dtype(dtype)
         nint_spec = None
-        if dtype.startswith("NINT") and dtype != "NINT8-0":
+        if dtype == NINT_DTYPE:
             if payload_nbytes < _NINT_HDR.size:
-                raise ValueError("truncated NINTM NINT cohort header")
+                raise ValueError("truncated MFE NINT cohort header")
             raw_bits, raw_sub_bits, groupsize, _axis, _width = _NINT_HDR.unpack_from(
                 blob, payload_off
             )
-            is_nint_v2 = bool(raw_bits & NINT_V2_FLAG)
-            bits = int(raw_bits & ~NINT_V2_FLAG)
+            bits = int(raw_bits & ~NINT_ADAPTIVE_FLAG)
             sub_bits = int(raw_sub_bits)
             nint_spec = NintSpec(
                 bits=int(bits),
                 groupsize=int(groupsize),
                 sub_bits=sub_bits,
             )
-            expected_dtype = "NINTv2" if is_nint_v2 else f"NINT{nint_spec.bits}"
-            if dtype != expected_dtype:
-                raise ValueError("NINTM cohort dtype/spec mismatch")
+            if stored_dtype not in {NINT_DTYPE, "NINTv2", f"NINT{nint_spec.bits}"}:
+                raise ValueError("MFE cohort dtype/spec mismatch")
         pools.append(
-            NintMoePoolMetadata(
+            MfePoolMetadata(
                 expert_ids=expert_ids,
                 dtype=dtype,
                 nint_spec=nint_spec,
@@ -654,19 +666,19 @@ def inspect_nint_moe_header(
         )
         off = payload_end
     if off != len(blob):
-        raise ValueError(f"invalid NINTM tail: {len(blob) - off} extra bytes")
+        raise ValueError(f"invalid MFE tail: {len(blob) - off} extra bytes")
     missing = np.flatnonzero(owners < 0)
     if missing.size:
-        raise ValueError(f"NINTM pools do not cover experts {missing[:16].tolist()}")
+        raise ValueError(f"MFE pools do not cover experts {missing[:16].tolist()}")
     return (
         (int(n_experts), int(out_per_expert), int(neuron_len)),
         tuple(pools),
     )
-_NINT_MOE_ROTATION_HDR = struct.Struct("<4sIIQ")
-_NINT_MOE_ROTATION_MAGIC = b"HSG1"
+_MFE_ROTATION_HDR = struct.Struct("<4sIIQ")
+_MFE_ROTATION_MAGIC = b"HSG1"
 
 
-def _pack_nint_moe_runtime(tensor: MfqTensor) -> bytes:
+def _pack_mfe_runtime(tensor: MfqTensor) -> bytes:
     if not isinstance(tensor, NepqTensor) or not tensor.rotation_block:
         return b""
     signs = rotation_signs(
@@ -674,8 +686,8 @@ def _pack_nint_moe_runtime(tensor: MfqTensor) -> bytes:
     )
     return b"".join(
         [
-            _NINT_MOE_ROTATION_HDR.pack(
-                _NINT_MOE_ROTATION_MAGIC,
+            _MFE_ROTATION_HDR.pack(
+                _MFE_ROTATION_MAGIC,
                 int(tensor.neuron_len),
                 int(tensor.rotation_block),
                 int(tensor.rotation_seed),
@@ -685,38 +697,38 @@ def _pack_nint_moe_runtime(tensor: MfqTensor) -> bytes:
     )
 
 
-def _validate_nint_moe_runtime(tensor: MfqTensor, payload: bytes) -> None:
+def _validate_mfe_runtime(tensor: MfqTensor, payload: bytes) -> None:
     if not payload:
         if isinstance(tensor, NepqTensor) and tensor.rotation_block:
             raise ValueError("rotated NEPQ cohort lacks its runtime sign vector")
         return
     if not isinstance(tensor, NepqTensor) or not tensor.rotation_block:
-        raise ValueError("unexpected NINTM cohort runtime metadata")
-    if len(payload) < _NINT_MOE_ROTATION_HDR.size:
-        raise ValueError("truncated NINTM rotation metadata")
-    magic, width, block, seed = _NINT_MOE_ROTATION_HDR.unpack_from(payload)
-    expected_size = _NINT_MOE_ROTATION_HDR.size + int(width)
+        raise ValueError("unexpected MFE cohort runtime metadata")
+    if len(payload) < _MFE_ROTATION_HDR.size:
+        raise ValueError("truncated MFE rotation metadata")
+    magic, width, block, seed = _MFE_ROTATION_HDR.unpack_from(payload)
+    expected_size = _MFE_ROTATION_HDR.size + int(width)
     if (
-        magic != _NINT_MOE_ROTATION_MAGIC
+        magic != _MFE_ROTATION_MAGIC
         or width != tensor.neuron_len
         or block != tensor.rotation_block
         or seed != tensor.rotation_seed
         or len(payload) != expected_size
     ):
-        raise ValueError("NINTM rotation metadata does not match its NEPQ payload")
+        raise ValueError("MFE rotation metadata does not match its NEPQ payload")
     expected = rotation_signs(width, block, seed)
-    actual = np.frombuffer(payload, dtype=np.int8, offset=_NINT_MOE_ROTATION_HDR.size)
+    actual = np.frombuffer(payload, dtype=np.int8, offset=_MFE_ROTATION_HDR.size)
     if not np.array_equal(actual, expected):
-        raise ValueError("NINTM rotation sign vector is corrupt")
+        raise ValueError("MFE rotation sign vector is corrupt")
 
 
-def pack_nint_moe(tensor: NintMoeTensor) -> bytes:
+def pack_mfe(tensor: MfeTensor) -> bytes:
     """Pack heterogeneous expert cohorts without changing local row order."""
 
     n_experts, out_per_expert, neuron_len = tensor.shape
     parts = [
-        _NINT_MOE_HDR.pack(
-            _NINT_MOE_MAGIC_V2,
+        _MFE_HDR.pack(
+            _MFE_MAGIC,
             int(n_experts),
             int(out_per_expert),
             int(neuron_len),
@@ -726,12 +738,12 @@ def pack_nint_moe(tensor: NintMoeTensor) -> bytes:
     for pool in tensor.pools:
         expert_ids = np.ascontiguousarray(pool.expert_ids, dtype=np.int32).reshape(-1)
         dtype, payload = _pack_tensor(pool.tensor, allow_moe=False)
-        runtime_payload = _pack_nint_moe_runtime(pool.tensor)
+        runtime_payload = _pack_mfe_runtime(pool.tensor)
         dtype_bytes = dtype.encode("ascii")
         if not dtype_bytes or len(dtype_bytes) > 32:
-            raise ValueError(f"invalid NINTM cohort dtype: {dtype!r}")
+            raise ValueError(f"invalid MFE cohort dtype: {dtype!r}")
         parts.append(
-            _NINT_MOE_POOL_V2_HDR.pack(
+            _MFE_POOL_HDR.pack(
                 expert_ids.size,
                 len(dtype_bytes),
                 len(payload),
@@ -745,68 +757,68 @@ def pack_nint_moe(tensor: NintMoeTensor) -> bytes:
     return b"".join(parts)
 
 
-def _unpack_nint_moe_v1(
+def _unpack_mfe_v1(
     blob: bytes | memoryview,
     *,
     n_experts: int,
     out_per_expert: int,
     neuron_len: int,
     pool_count: int,
-) -> NintMoeTensor:
-    off = _NINT_MOE_HDR.size
-    pools: list[NintMoePool] = []
+) -> MfeTensor:
+    off = _MFE_HDR.size
+    pools: list[MfePool] = []
     for _ in range(pool_count):
-        if off + _NINT_MOE_POOL_V1_HDR.size > len(blob):
-            raise ValueError("truncated NINTM pool header")
-        expert_count, payload_nbytes = _NINT_MOE_POOL_V1_HDR.unpack_from(blob, off)
-        off += _NINT_MOE_POOL_V1_HDR.size
+        if off + _MFE_POOL_V1_HDR.size > len(blob):
+            raise ValueError("truncated legacy MFE pool header")
+        expert_count, payload_nbytes = _MFE_POOL_V1_HDR.unpack_from(blob, off)
+        off += _MFE_POOL_V1_HDR.size
         ids_nbytes = int(expert_count) * np.dtype(np.int32).itemsize
         payload_end = off + ids_nbytes + int(payload_nbytes)
         if expert_count == 0 or payload_end > len(blob):
-            raise ValueError("truncated NINTM pool payload")
+            raise ValueError("truncated legacy MFE pool payload")
         expert_ids = np.frombuffer(
             blob, dtype=np.int32, count=int(expert_count), offset=off
         ).copy()
         off += ids_nbytes
         tensor = unpack_nint(blob[off : off + int(payload_nbytes)])
         off += int(payload_nbytes)
-        pools.append(NintMoePool(expert_ids=expert_ids, tensor=tensor))
+        pools.append(MfePool(expert_ids=expert_ids, tensor=tensor))
     if off != len(blob):
-        raise ValueError(f"invalid NINTM tail: {len(blob) - off} extra bytes")
-    return NintMoeTensor(
+        raise ValueError(f"invalid legacy MFE tail: {len(blob) - off} extra bytes")
+    return MfeTensor(
         shape=(int(n_experts), int(out_per_expert), int(neuron_len)),
         pools=tuple(pools),
     )
 
 
-def _unpack_nint_moe_v2(
+def _unpack_mfe_v2(
     blob: bytes | memoryview,
     *,
     n_experts: int,
     out_per_expert: int,
     neuron_len: int,
     pool_count: int,
-) -> NintMoeTensor:
-    off = _NINT_MOE_HDR.size
-    pools: list[NintMoePool] = []
+) -> MfeTensor:
+    off = _MFE_HDR.size
+    pools: list[MfePool] = []
     for _ in range(pool_count):
-        if off + _NINT_MOE_POOL_V2_HDR.size > len(blob):
-            raise ValueError("truncated NINTM v2 pool header")
+        if off + _MFE_POOL_HDR.size > len(blob):
+            raise ValueError("truncated MFE pool header")
         (
             expert_count,
             dtype_nbytes,
             payload_nbytes,
             runtime_nbytes,
-        ) = _NINT_MOE_POOL_V2_HDR.unpack_from(blob, off)
-        off += _NINT_MOE_POOL_V2_HDR.size
+        ) = _MFE_POOL_HDR.unpack_from(blob, off)
+        off += _MFE_POOL_HDR.size
         if expert_count == 0 or dtype_nbytes == 0 or dtype_nbytes > 32:
-            raise ValueError("invalid NINTM v2 pool metadata")
+            raise ValueError("invalid MFE pool metadata")
         ids_nbytes = int(expert_count) * np.dtype(np.int32).itemsize
         dtype_end = off + ids_nbytes + int(dtype_nbytes)
         runtime_end = dtype_end + int(runtime_nbytes)
         payload_end = runtime_end + int(payload_nbytes)
         if payload_end > len(blob):
-            raise ValueError("truncated NINTM v2 pool payload")
+            raise ValueError("truncated MFE pool payload")
         expert_ids = np.frombuffer(
             blob, dtype=np.int32, count=int(expert_count), offset=off
         ).copy()
@@ -814,45 +826,45 @@ def _unpack_nint_moe_v2(
         try:
             dtype = bytes(blob[off : off + int(dtype_nbytes)]).decode("ascii")
         except UnicodeDecodeError as exc:
-            raise ValueError("NINTM cohort dtype must be ASCII") from exc
+            raise ValueError("MFE cohort dtype must be ASCII") from exc
         off += int(dtype_nbytes)
         runtime_payload = bytes(blob[off:runtime_end])
         off = runtime_end
         tensor = _unpack_tensor(dtype, blob[off:payload_end])
-        if isinstance(tensor, NintMoeTensor):
-            raise ValueError(f"unsupported nested NINTM cohort dtype: {dtype}")
-        _validate_nint_moe_runtime(tensor, runtime_payload)
+        if isinstance(tensor, MfeTensor):
+            raise ValueError(f"unsupported nested MFE cohort dtype: {dtype}")
+        _validate_mfe_runtime(tensor, runtime_payload)
         off = payload_end
-        pools.append(NintMoePool(expert_ids=expert_ids, tensor=tensor))
+        pools.append(MfePool(expert_ids=expert_ids, tensor=tensor))
     if off != len(blob):
-        raise ValueError(f"invalid NINTM tail: {len(blob) - off} extra bytes")
-    return NintMoeTensor(
+        raise ValueError(f"invalid MFE tail: {len(blob) - off} extra bytes")
+    return MfeTensor(
         shape=(int(n_experts), int(out_per_expert), int(neuron_len)),
         pools=tuple(pools),
     )
 
 
-def unpack_nint_moe(blob: bytes | memoryview) -> NintMoeTensor:
-    """Decode a versioned ``NINTM`` expert-wise precision container."""
+def unpack_mfe(blob: bytes | memoryview) -> MfeTensor:
+    """Decode the canonical MFE container and legacy NIM1/NIM2 payloads."""
 
-    if len(blob) < _NINT_MOE_HDR.size:
-        raise ValueError("truncated NINTM header")
-    magic, n_experts, out_per_expert, neuron_len, pool_count = _NINT_MOE_HDR.unpack_from(
+    if len(blob) < _MFE_HDR.size:
+        raise ValueError("truncated MFE header")
+    magic, n_experts, out_per_expert, neuron_len, pool_count = _MFE_HDR.unpack_from(
         blob, 0
     )
     if pool_count == 0 or pool_count > n_experts:
-        raise ValueError("invalid NINTM pool count")
+        raise ValueError("invalid MFE pool count")
     kwargs = {
         "n_experts": int(n_experts),
         "out_per_expert": int(out_per_expert),
         "neuron_len": int(neuron_len),
         "pool_count": int(pool_count),
     }
-    if magic == _NINT_MOE_MAGIC_V1:
-        return _unpack_nint_moe_v1(blob, **kwargs)
-    if magic == _NINT_MOE_MAGIC_V2:
-        return _unpack_nint_moe_v2(blob, **kwargs)
-    raise ValueError(f"invalid NINTM magic: {magic!r}")
+    if magic == _LEGACY_MFE_MAGIC_V1:
+        return _unpack_mfe_v1(blob, **kwargs)
+    if magic in {_MFE_MAGIC, _LEGACY_MFE_MAGIC_V2}:
+        return _unpack_mfe_v2(blob, **kwargs)
+    raise ValueError(f"invalid MFE magic: {magic!r}")
 
 
 _DENSE_DTYPES = {
@@ -913,14 +925,10 @@ def _unpack_tensor(dtype: str, blob: bytes | memoryview) -> MfqTensor:
         return bytes(blob)
     if dtype in MX_DTYPES:
         return unpack_mx(dtype, blob)
-    dtype = {
-        "NIQ2": "NVQ2",
-        "NIQ2J": "NVQ2J",
-        "NIQ3": "NVQ3",
-    }.get(dtype, dtype)
+    dtype = canonical_dtype(dtype)
     dtype = normalize_tpq_dtype(dtype)
-    if dtype == "NINTM":
-        return unpack_nint_moe(blob)
+    if dtype == MFE_DTYPE:
+        return unpack_mfe(blob)
     if dtype == "NINT8-0":
         return unpack_nint8_zero(blob)
     if dtype == "TPQ-I4G64":
@@ -937,72 +945,27 @@ def _unpack_tensor(dtype: str, blob: bytes | memoryview) -> MfqTensor:
                 f"MFQ dtype/blob mismatch: {dtype} contains {tensor.spec.label}"
             )
         return tensor
-    if dtype in {
-        "NEPQ0-S",
-        "NEPQ0-L",
-        "NEPQ1-S",
-        "NEPQ1-L",
-        "NEPQ0-A",
-        "NEPQ1-A",
-    }:
-        tensor = unpack_nepq(blob)
-        if tensor.spec.label != dtype:
-            raise ValueError(
-                f"MFQ dtype/blob mismatch: {dtype} contains {tensor.spec.label}"
-            )
-        return tensor
-    if dtype.startswith("NINT"):
+    if dtype == NEPQ_DTYPE:
+        return unpack_nepq(blob)
+    if dtype == MXFP4_SQ_DTYPE:
+        return unpack_mxfp4_sq(blob)
+    if dtype == NINT_DTYPE:
         return unpack_nint(blob)
-    if dtype == "NPQ0-L":
-        return unpack_npq0_l(blob)
-    if dtype == "NPQ0-S":
-        return unpack_npq0_s(blob)
-    if dtype == "NVQ1-L":
-        return unpack_nvq1_l(blob)
-    if dtype == "NVQ1-S":
-        return unpack_nvq1_s(blob)
-    if dtype in {
-        "NVQ2",
-        "NVQ2J",
-        "NVQ2J-L",
-        "NVQ2J-XL",
-        "NVQ3",
-        "NVQ3J",
-        "NVQ3J-512",
-        "NVQ3J-L",
-    }:
-        tensor = unpack_nvq(blob)
-        if dtype in {
-            "NVQ2J",
-            "NVQ2J-L",
-            "NVQ2J-XL",
-            "NVQ3J",
-            "NVQ3J-512",
-            "NVQ3J-L",
-        }:
-            if not isinstance(tensor, NvqJscTensor):
-                raise ValueError(f"MFQ dtype/blob mismatch: {dtype} lacks the JSC profile")
-            expected = {
-                "NVQ2J": "e8_256",
-                "NVQ2J-L": "e8_1024",
-                "NVQ2J-XL": "e8_4096",
-                "NVQ3J": "d4_256",
-                "NVQ3J-512": "d4_512",
-                "NVQ3J-L": "d4_1024",
-            }[dtype]
-            if tensor.spec.codebook != expected:
-                raise ValueError(
-                    f"MFQ dtype/blob mismatch: {dtype} contains {tensor.spec.codebook}"
-                )
-            return tensor
-        if isinstance(tensor, NvqJscTensor):
-            raise ValueError(f"MFQ dtype/blob mismatch: {dtype} contains NVQ-JSC")
-        expected = "e8_256" if dtype == "NVQ2" else "d4_256"
-        if tensor.spec.codebook != expected:
-            raise ValueError(
-                f"MFQ dtype/blob mismatch: {dtype} contains {tensor.spec.codebook}"
-            )
-        return tensor
+    magic = bytes(memoryview(blob)[:4])
+    if dtype == NPQ_DTYPE:
+        if magic == b"NPQL":
+            return unpack_npq0_l(blob)
+        if magic == b"NPQS":
+            return unpack_npq0_s(blob)
+        raise ValueError(f"invalid NPQ payload magic: {magic!r}")
+    if dtype == NVQ_DTYPE:
+        if magic == b"NQ1L":
+            return unpack_nvq1_l(blob)
+        if magic == b"NQ1S":
+            return unpack_nvq1_s(blob)
+        if magic in {b"NVQ1", b"NIQ1"}:
+            return unpack_nvq(blob)
+        raise ValueError(f"invalid NVQ payload magic: {magic!r}")
     return unpack_dense(dtype, blob)
 
 
@@ -1025,6 +988,8 @@ def _pack_tensor(tensor: MfqTensor, *, allow_moe: bool = True) -> tuple[str, byt
         return ASSET_DTYPE, tensor
     if isinstance(tensor, MxTensor):
         return tensor.dtype, pack_mx(tensor)
+    if isinstance(tensor, Mxfp4SqTensor):
+        return MXFP4_SQ_DTYPE, pack_mxfp4_sq(tensor)
     if isinstance(tensor, Nint8ZeroTensor):
         return "NINT8-0", pack_nint8_zero(tensor)
     if isinstance(tensor, TpqInt4Tensor):
@@ -1036,42 +1001,29 @@ def _pack_tensor(tensor: MfqTensor, *, allow_moe: bool = True) -> tuple[str, byt
     if isinstance(tensor, TpqPqTensor):
         return tensor.spec.label, pack_tpq_pq(tensor)
     if isinstance(tensor, NintTensor):
-        dtype = "NINTv2" if tensor.is_nint_v2 else f"NINT{tensor.spec.bits}"
-        return dtype, pack_nint(tensor)
-    if isinstance(tensor, NintMoeTensor):
+        return NINT_DTYPE, pack_nint(tensor)
+    if isinstance(tensor, MfeTensor):
         if not allow_moe:
-            raise TypeError("nested NINTM cohorts are not supported")
-        return "NINTM", pack_nint_moe(tensor)
+            raise TypeError("nested MFE cohorts are not supported")
+        return MFE_DTYPE, pack_mfe(tensor)
     if isinstance(tensor, NepqTensor):
-        return tensor.spec.label, pack_nepq(tensor)
+        return NEPQ_DTYPE, pack_nepq(tensor)
     if isinstance(tensor, Nvq1LTensor):
-        return "NVQ1-L", pack_nvq1_l(tensor)
+        return NVQ_DTYPE, pack_nvq1_l(tensor)
     if isinstance(tensor, Nvq1STensor):
-        return "NVQ1-S", pack_nvq1_s(tensor)
+        return NVQ_DTYPE, pack_nvq1_s(tensor)
     if isinstance(tensor, Npq0LTensor):
-        return "NPQ0-L", pack_npq0_l(tensor)
+        return NPQ_DTYPE, pack_npq0_l(tensor)
     if isinstance(tensor, Npq0STensor):
-        return "NPQ0-S", pack_npq0_s(tensor)
+        return NPQ_DTYPE, pack_npq0_s(tensor)
     if isinstance(tensor, NvqJscTensor):
-        dtype = {
-            "e8_256": "NVQ2J",
-            "e8_1024": "NVQ2J-L",
-            "e8_4096": "NVQ2J-XL",
-            "d4_256": "NVQ3J",
-            "d4_512": "NVQ3J-512",
-            "d4_1024": "NVQ3J-L",
-        }[tensor.spec.codebook]
-        return dtype, pack_nvq(tensor)
+        return NVQ_DTYPE, pack_nvq(tensor)
     if isinstance(tensor, NvqTensor):
-        dtype = {
-            "e8_256": "NVQ2",
-            "d4_256": "NVQ3",
-        }.get(tensor.spec.codebook)
-        if dtype is None:
+        if tensor.spec.codebook not in {"e8_256", "d4_256"}:
             raise ValueError(
                 f"{tensor.spec.codebook} requires an NvqJscTensor file profile"
             )
-        return dtype, pack_nvq(tensor)
+        return NVQ_DTYPE, pack_nvq(tensor)
     if isinstance(tensor, np.ndarray):
         return pack_dense(tensor)
     raise TypeError(f"unsupported tensor type: {type(tensor)!r}")
@@ -1272,6 +1224,7 @@ class MMapEmbeddingReader:
         record = records[name]
         self.name = name
         self.dtype = str(record.dtype)
+        self._stored_dtype = str(record.stored_dtype or record.dtype)
         self._mapping = mmap_for(record)
         self._blob_start = int(record.offset)
         self._blob_end = self._blob_start + int(record.nbytes)
@@ -1283,9 +1236,7 @@ class MMapEmbeddingReader:
 
         if self.dtype in self._DENSE_ROW_DTYPES:
             self._init_dense()
-        elif self.dtype in {"NINT", "NINTv2"} or (
-            self.dtype.startswith("NINT") and self.dtype[4:].isdigit()
-        ):
+        elif self.dtype == NINT_DTYPE:
             self._init_nint()
         else:
             raise TypeError(
@@ -1330,8 +1281,8 @@ class MMapEmbeddingReader:
         raw_bits, raw_sub_bits, groupsize, axis, neuron_len = _NINT_HDR.unpack_from(
             self._mapping, offset
         )
-        is_nint_v2 = bool(raw_bits & NINT_V2_FLAG)
-        bits = int(raw_bits & ~NINT_V2_FLAG)
+        has_adaptive_storage = bool(raw_bits & NINT_ADAPTIVE_FLAG)
+        bits = int(raw_bits & ~NINT_ADAPTIVE_FLAG)
         sub_bits = int(raw_sub_bits)
         offset += _NINT_HDR.size
         ndim = int(struct.unpack_from("<I", self._mapping, offset)[0])
@@ -1365,11 +1316,20 @@ class MMapEmbeddingReader:
                 f"mmap NINT embedding requires 1-8 bit fields, got "
                 f"bits={bits}, sub_bits={sub_bits}"
             )
-        expected_dtype = "NINTv2" if is_nint_v2 else f"NINT{int(bits)}"
-        if self.dtype != expected_dtype:
+        legacy_uniform_dtype = f"NINT{int(bits)}"
+        stored_dtype_matches = (
+            self._stored_dtype == NINT_DTYPE
+            or (self._stored_dtype == "NINTv2" and has_adaptive_storage)
+            or (
+                self._stored_dtype == legacy_uniform_dtype
+                and not has_adaptive_storage
+            )
+        )
+        if not stored_dtype_matches:
             raise ValueError(
                 f"MFQ dtype/blob mismatch for {self.name!r}: "
-                f"{self.dtype} contains {expected_dtype}"
+                f"stored dtype {self._stored_dtype!r} contains "
+                f"{'adaptive NINT' if has_adaptive_storage else legacy_uniform_dtype}"
             )
 
         anchors_nbytes = out * np.dtype("<f2").itemsize
@@ -1394,27 +1354,27 @@ class MMapEmbeddingReader:
             + q_count * old_q_dtype.itemsize
         )
         remaining = self._blob_end - offset
-        self._is_nint_v2 = is_nint_v2
-        self._row_sub_bits = None
+        self._adaptive_storage = has_adaptive_storage
+        self._row_sub_bits = np.full(out, sub_bits, dtype=np.uint8)
         self._row_cohort_rank = None
         self._mixed_metadata_streams: dict[int, tuple[int, int, int]] = {}
-        if is_nint_v2:
+        if has_adaptive_storage:
             selector_nbytes = (
-                out * NINT_V2_K_SELECTOR_BITS + 7
+                out * NINT_K_SELECTOR_BITS + 7
             ) // 8
-            self._require(offset, selector_nbytes, "NINTv2 k selectors")
+            self._require(offset, selector_nbytes, "NINT k selectors")
             selectors = self._packed_values(
                 offset,
                 selector_nbytes,
                 np.arange(out, dtype=np.int64),
-                NINT_V2_K_SELECTOR_BITS,
+                NINT_K_SELECTOR_BITS,
             )
             offset += selector_nbytes
             row_sub_bits = selectors.astype(np.int16) + (int(sub_bits) - 1)
             if np.any(row_sub_bits < 1) or np.any(row_sub_bits > 8):
-                raise ValueError(f"invalid NINTv2 k selectors for {self.name!r}")
+                raise ValueError(f"invalid NINT k selectors for {self.name!r}")
             row_rank = np.empty(out, dtype=np.int64)
-            for selector in range(1 << NINT_V2_K_SELECTOR_BITS):
+            for selector in range(1 << NINT_K_SELECTOR_BITS):
                 rows = np.flatnonzero(selectors == selector)
                 bits_for_rows = int(sub_bits) - 1 + selector
                 row_rank[rows] = np.arange(rows.size, dtype=np.int64)
@@ -1424,7 +1384,7 @@ class MMapEmbeddingReader:
                 self._require(
                     offset,
                     2 * stream_nbytes,
-                    f"NINTv2 {bits_for_rows}-bit metadata",
+                    f"NINT {bits_for_rows}-bit metadata",
                 )
                 self._mixed_metadata_streams[bits_for_rows] = (
                     offset,
@@ -1458,25 +1418,25 @@ class MMapEmbeddingReader:
                 f"remaining={remaining}, packed={packed_tail_nbytes}, old={old_tail_nbytes}"
             )
 
-        self._row_q_bits = None
+        self._row_q_bits = np.full(out, bits, dtype=np.uint8)
         self._row_q_cohort_rank = None
         self._mixed_q_streams: dict[int, tuple[int, int]] = {}
-        if is_nint_v2:
+        if has_adaptive_storage:
             selector_nbytes = (
-                out * NINT_V2_Q_SELECTOR_BITS + 7
+                out * NINT_Q_SELECTOR_BITS + 7
             ) // 8
-            self._require(offset, selector_nbytes, "NINTv2 q selectors")
+            self._require(offset, selector_nbytes, "NINT q selectors")
             selectors = self._packed_values(
                 offset,
                 selector_nbytes,
                 np.arange(out, dtype=np.int64),
-                NINT_V2_Q_SELECTOR_BITS,
+                NINT_Q_SELECTOR_BITS,
             )
             offset += selector_nbytes
             row_q_bits = selectors.astype(np.uint8) + 1
             row_rank = np.empty(out, dtype=np.int64)
             row_values = groups * int(groupsize)
-            for selector in range(1 << NINT_V2_Q_SELECTOR_BITS):
+            for selector in range(1 << NINT_Q_SELECTOR_BITS):
                 rows = np.flatnonzero(selectors == selector)
                 bits_for_rows = selector + 1
                 row_rank[rows] = np.arange(rows.size, dtype=np.int64)
@@ -1486,7 +1446,7 @@ class MMapEmbeddingReader:
                 self._require(
                     offset,
                     stream_nbytes,
-                    f"NINTv2 {bits_for_rows}-bit q values",
+                    f"NINT {bits_for_rows}-bit q values",
                 )
                 self._mixed_q_streams[bits_for_rows] = (
                     offset,
@@ -1494,7 +1454,7 @@ class MMapEmbeddingReader:
                 )
                 offset += stream_nbytes
             if offset != self._blob_end:
-                raise ValueError(f"invalid NINTv2 payload length for {self.name!r}")
+                raise ValueError(f"invalid NINT payload length for {self.name!r}")
             self._q_offset = -1
             self._q_stream_nbytes = 0
             self._row_q_bits = np.ascontiguousarray(row_q_bits, dtype=np.uint8)
@@ -1635,7 +1595,7 @@ class MMapEmbeddingReader:
             unique[:, None] * row_values
             + np.arange(row_values, dtype=np.int64)[None, :]
         )
-        if self._is_nint_v2:
+        if self._adaptive_storage:
             sub_scale = np.empty((count, self.groups), dtype=np.uint8)
             sub_min = np.empty((count, self.groups), dtype=np.uint8)
             selected_bits = self._row_sub_bits[unique]
@@ -1690,7 +1650,7 @@ class MMapEmbeddingReader:
                 self._old_sub_dtype,
                 metadata_indices,
             )
-        if self._is_nint_v2:
+        if self._adaptive_storage:
             q = np.empty((count, row_values), dtype=np.uint8)
             selected_bits = self._row_q_bits[unique]
             for bits_for_rows, (
@@ -1744,22 +1704,14 @@ class MMapEmbeddingReader:
             logical_bytes = int(unique.size) * self._dense_row_nbytes
         else:
             selected = self._read_nint(unique)
-            metadata_bits = (
-                int(unique.size) * self.sub_bits
-                if self._row_sub_bits is None
-                else int(self._row_sub_bits[unique].sum())
-            )
-            q_bits = (
-                int(unique.size) * self.bits
-                if self._row_q_bits is None
-                else int(self._row_q_bits[unique].sum())
-            )
+            metadata_bits = int(self._row_sub_bits[unique].sum())
+            q_bits = int(self._row_q_bits[unique].sum())
             logical_bits = (
                 32 * int(unique.size)
                 + self.groups * self.groupsize * q_bits
                 + 2 * self.groups * metadata_bits
-                + ((NINT_V2_K_SELECTOR_BITS + NINT_V2_Q_SELECTOR_BITS)
-                   * int(unique.size) if self._is_nint_v2 else 0)
+                + ((NINT_K_SELECTOR_BITS + NINT_Q_SELECTOR_BITS)
+                   * int(unique.size) if self._adaptive_storage else 0)
             )
             logical_bytes = (logical_bits + 7) // 8
         self.last_rows_read = int(unique.size)
@@ -1803,11 +1755,16 @@ def _open_single_mmap(
 
         records: dict[str, MMapTensorRecord] = {}
         blob_off = off
-        for name, dtype, blob_nbytes in raw_records:
+        for name, stored_dtype, blob_nbytes in raw_records:
             if name in records:
                 raise ValueError(f"duplicate MFQ tensor record: {name}: {p}")
             records[name] = MMapTensorRecord(
-                name, dtype, blob_off, blob_nbytes, source_index
+                name=name,
+                dtype=canonical_dtype(stored_dtype),
+                offset=blob_off,
+                nbytes=blob_nbytes,
+                source_index=source_index,
+                stored_dtype=stored_dtype,
             )
             blob_off += blob_nbytes
         if blob_off != mm.size():
@@ -1865,11 +1822,12 @@ def open_mmap(path: str | Path, *, cache: bool = False) -> MMapTensorStore:
         if split_no:
             first_records = {
                 name: MMapTensorRecord(
-                    record.name,
-                    record.dtype,
-                    record.offset,
-                    record.nbytes,
-                    split_no,
+                    name=record.name,
+                    dtype=record.dtype,
+                    offset=record.offset,
+                    nbytes=record.nbytes,
+                    source_index=split_no,
+                    stored_dtype=record.stored_dtype,
                 )
                 for name, record in first_records.items()
             }

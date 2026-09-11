@@ -18,7 +18,6 @@ from mfq.formats.nint import (
 )
 from mfq.quantize.nint_quant import NintTensor
 
-
 _IMATRIX_SUPERBLOCK = 256
 _IMATRIX_PRIORITY_GROUPS = 64
 _IMATRIX_PRIORITY_RADIUS = 8
@@ -894,11 +893,14 @@ def quantize_axis0(
     use_metal_imatrix_kernels: bool = True,
     row_sub_bits: np.ndarray | None = None,
     row_q_bits: np.ndarray | None = None,
-) -> NintTensor | tuple[NintTensor, torch.Tensor]:
+    row_sse_only: bool = False,
+) -> NintTensor | tuple[NintTensor, torch.Tensor] | torch.Tensor:
     """Quantize a 2D ``[out, in]`` tensor with axis=0 on GPU."""
 
     if weight.dim() != 2:
         raise ValueError(f"quantize_axis0 expects a 2D tensor, got {tuple(weight.shape)}")
+    if row_sse_only and not return_row_sse:
+        raise ValueError("row_sse_only requires return_row_sse")
     W = weight.to(device=device, dtype=torch.float32, non_blocking=True).contiguous()
     out, neuron_len = (int(W.shape[0]), int(W.shape[1]))
     selected_q_bits = normalize_row_q_bits(spec, row_q_bits, out)
@@ -907,6 +909,8 @@ def quantize_axis0(
         np.any(selected_q_bits != int(spec.bits))
         or np.any(selected_sub_bits != int(spec.sub_bits))
     ):
+        if row_sse_only:
+            raise ValueError("row_sse_only requires one uniform NINT profile")
         importance_rows = (
             None
             if importance is None
@@ -1166,6 +1170,9 @@ def quantize_axis0(
         if importance is not None:
             error = error * importance_rows
         row_sse = error.sum(dim=1)
+
+    if row_sse_only:
+        return row_sse
 
     sub_dtype = _uint_dtype(K)
     q_dtype = _uint_dtype(nmax)

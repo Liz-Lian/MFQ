@@ -31,7 +31,7 @@ class TensorRecord:
     """Location and precision metadata for one tensor in the file."""
 
     name: str
-    dtype: str          # "NINT4" / "NINT5" ...
+    dtype: str          # Canonical public dtype, e.g. "NINT", "MFE", "BF16"
     shape: tuple[int, ...]
     offset: int         # Byte offset of the weight blob in the file
     nbytes: int         # Size of the weight blob in bytes

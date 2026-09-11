@@ -1276,7 +1276,12 @@ void test_fixture(const Fixture& fixture) {
 
 int main() {
     try {
-        constexpr std::array<std::string_view, 18> public_dtypes{
+        constexpr std::array<std::string_view, 3> public_dtypes{
+            "NVQ",
+            "NPQ",
+            "NEPQ",
+        };
+        constexpr std::array<std::string_view, 18> legacy_dtypes{
             "NVQ2",
             "NVQ2J",
             "NVQ2J-L",
@@ -1305,9 +1310,7 @@ int main() {
         }
         for (const auto invalid : {
                  "",
-                 "NVQ",
                  "NVQ4",
-                 "NPQ",
                  "NEPQ2-S",
                  "nvq2",
              }) {
@@ -1319,7 +1322,7 @@ int main() {
         }
 
         auto all = fixtures();
-        if (all.size() != public_dtypes.size()) {
+        if (all.size() != legacy_dtypes.size()) {
             throw std::runtime_error(
                 "native VQ test matrix is incomplete");
         }
@@ -1402,17 +1405,17 @@ int main() {
         require_throws(
             [&]() {
                 (void)mfq::metal::inspect_vq_blob(
-                    "NVQ3",
+                    "NPQ",
                     wrong_dtype.blob);
             },
-            "VQ metadata dtype/blob mismatch");
+            "VQ metadata family/blob mismatch");
         require_throws(
             [&]() {
                 (void)mfq::metal::MlxVqWeight::from_blob(
-                    "NVQ3",
+                    "NPQ",
                     wrong_dtype.blob);
             },
-            "VQ dtype/blob mismatch");
+            "VQ family/blob mismatch");
         auto trailing = all.front();
         trailing.blob.push_back(0);
         require_throws(
@@ -1424,7 +1427,7 @@ int main() {
             "VQ trailing bytes");
 
         std::cout
-            << "MFQ native C++/MLX VQ 18-dtype "
+            << "MFQ native C++/MLX VQ profile "
                "dequant/embedding/GEMV/MMQ/GEMM tests passed\n";
         return 0;
     } catch (const std::exception& error) {

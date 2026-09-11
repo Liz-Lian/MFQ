@@ -1,5 +1,6 @@
 #include "mlx_vq.h"
 
+#include "../../../core/compat/mfq_format_compat.h"
 #include "nvq_codebooks.generated.h"
 #include "mlx_staging_allocator.h"
 
@@ -1685,7 +1686,6 @@ std::string expected_nvq_dtype(
 }
 
 CanonicalVq parse_nvq(
-    std::string_view dtype,
     std::span<const std::uint8_t> blob) {
     constexpr std::uint8_t kIndexParity = 0x80;
     constexpr std::uint8_t kCustomCodebook = 0x40;
@@ -1708,12 +1708,6 @@ CanonicalVq parse_nvq(
     const auto profile = nvq_profile(id);
     const auto expected_dtype =
         expected_nvq_dtype(profile, jsc);
-    if (dtype != expected_dtype) {
-        throw std::runtime_error(
-            "MFQ dtype/blob mismatch: "
-            + std::string(dtype)
-            + " contains " + expected_dtype);
-    }
     if (index_parity && profile.id != 1) {
         throw std::runtime_error(
             "NVQ index-parity signs require e8_256");
@@ -1956,12 +1950,7 @@ CanonicalVq parse_nvq(
 }
 
 CanonicalVq parse_nvq1_l(
-    std::string_view dtype,
     std::span<const std::uint8_t> blob) {
-    if (dtype != "NVQ1-L") {
-        throw std::runtime_error(
-            "MFQ dtype/blob mismatch for NVQ1-L");
-    }
     BlobCursor cursor(blob);
     const auto magic = cursor.magic("NVQ1-L magic");
     if (!magic_is(magic, "NQ1L")) {
@@ -2060,12 +2049,7 @@ CanonicalVq parse_nvq1_l(
 }
 
 CanonicalVq parse_nvq1_s(
-    std::string_view dtype,
     std::span<const std::uint8_t> blob) {
-    if (dtype != "NVQ1-S") {
-        throw std::runtime_error(
-            "MFQ dtype/blob mismatch for NVQ1-S");
-    }
     BlobCursor cursor(blob);
     const auto magic = cursor.magic("NVQ1-S magic");
     if (!magic_is(magic, "NQ1S")) {
@@ -2159,16 +2143,10 @@ CanonicalVq parse_nvq1_s(
 }
 
 CanonicalVq parse_npq(
-    std::string_view dtype,
     std::span<const std::uint8_t> blob,
     bool short_profile) {
     const auto expected_dtype =
         short_profile ? "NPQ0-S" : "NPQ0-L";
-    if (dtype != expected_dtype) {
-        throw std::runtime_error(
-            "MFQ dtype/blob mismatch for "
-            + std::string(expected_dtype));
-    }
     BlobCursor cursor(blob);
     const auto magic = cursor.magic("NPQ magic");
     if (!magic_is(
@@ -2347,7 +2325,6 @@ detail::StagingVector<std::int8_t> parse_rotation_payload(
 }
 
 CanonicalVq parse_nepq(
-    std::string_view dtype,
     std::span<const std::uint8_t> blob,
     std::span<const std::uint8_t> runtime_payload) {
     BlobCursor cursor(blob);
@@ -2378,12 +2355,6 @@ CanonicalVq parse_nepq(
         cursor.scalar<std::uint64_t>("NEPQ rotation seed");
 
     const auto profile = nepq_profile(profile_id);
-    if (dtype != profile.label) {
-        throw std::runtime_error(
-            "MFQ dtype/blob mismatch: "
-            + std::string(dtype)
-            + " contains " + profile.label);
-    }
     if (version != 1 ||
         groups_per_super != 4 ||
         (flags & ~std::uint8_t{1}) != 0 ||
@@ -2727,11 +2698,10 @@ VqTensorMetadata inspect_matrix_vq_header(
     const auto header = read_matrix_header(
         cursor,
         magic);
+    std::string profile_label;
 
-    if (dtype == "NVQ1-L") {
-        if (!magic_is(magic, "NQ1L") ||
-            (header.profile != 1 &&
-             header.profile != 2) ||
+    if (dtype == mfq::kNvqDtype && magic_is(magic, "NQ1L")) {
+        if ((header.profile != 1 && header.profile != 2) ||
             header.bits == 0 ||
             header.bits > 8 ||
             header.group_size == 0 ||
@@ -2739,23 +2709,21 @@ VqTensorMetadata inspect_matrix_vq_header(
             throw std::runtime_error(
                 "unsupported NVQ1-L header");
         }
-    } else if (dtype == "NVQ1-S") {
-        if (!magic_is(magic, "NQ1S") ||
-            header.profile != 1 ||
+        profile_label = "NVQ1-L";
+    } else if (dtype == mfq::kNvqDtype && magic_is(magic, "NQ1S")) {
+        if (header.profile != 1 ||
             header.bits != 4 ||
             header.group_size != 24 ||
             header.input_size % 8 != 0) {
             throw std::runtime_error(
                 "unsupported NVQ1-S header");
         }
-    } else if (dtype == "NPQ0-S" ||
-               dtype == "NPQ0-L") {
+        profile_label = "NVQ1-S";
+    } else if (dtype == mfq::kNpqDtype &&
+               (magic_is(magic, "NPQS") || magic_is(magic, "NPQL"))) {
         const bool short_profile =
-            dtype == "NPQ0-S";
-        if (!magic_is(
-                magic,
-                short_profile ? "NPQS" : "NPQL") ||
-            header.profile !=
+            magic_is(magic, "NPQS");
+        if (header.profile !=
                 static_cast<std::uint8_t>(
                     short_profile ? 2 : 1) ||
             header.bits !=
@@ -2765,15 +2733,12 @@ VqTensorMetadata inspect_matrix_vq_header(
             throw std::runtime_error(
                 "unsupported NPQ header");
         }
-    } else {
+        profile_label = short_profile ? "NPQ0-S" : "NPQ0-L";
+    } else if (dtype == mfq::kNvqDtype &&
+               (magic_is(magic, "NVQ1") || magic_is(magic, "NIQ1"))) {
         constexpr std::uint8_t kIndexParity = 0x80;
         constexpr std::uint8_t kCustomCodebook = 0x40;
         constexpr std::uint8_t kJsc = 0x20;
-        if (!magic_is(magic, "NVQ1") &&
-            !magic_is(magic, "NIQ1")) {
-            throw std::runtime_error(
-                "invalid NVQ matrix magic");
-        }
         const bool index_parity =
             (header.profile & kIndexParity) != 0;
         const bool custom =
@@ -2785,8 +2750,7 @@ VqTensorMetadata inspect_matrix_vq_header(
         const auto profile = nvq_profile(id);
         const auto expected =
             expected_nvq_dtype(profile, jsc);
-        if (dtype != expected ||
-            (index_parity && profile.id != 1) ||
+        if ((index_parity && profile.id != 1) ||
             header.bits == 0 ||
             header.bits > 8 ||
             header.group_size == 0 ||
@@ -2803,12 +2767,17 @@ VqTensorMetadata inspect_matrix_vq_header(
             throw std::runtime_error(
                 "unsupported NVQ matrix header");
         }
+        profile_label = expected;
+    } else {
+        throw std::runtime_error(
+            "MFQ VQ family/payload mismatch: "
+            + std::string(dtype));
     }
 
     const int output_size =
         checked_int(header.output_size, "output size");
     return {
-        std::string(dtype),
+        std::move(profile_label),
         {output_size},
         checked_int(
             static_cast<std::uint64_t>(
@@ -2852,8 +2821,7 @@ VqTensorMetadata inspect_nepq_header(
     const auto rotation_seed =
         cursor.scalar<std::uint64_t>("NEPQ rotation seed");
     const auto profile = nepq_profile(profile_id);
-    if (dtype != profile.label ||
-        version != 1 ||
+    if (dtype != mfq::kNepqDtype || version != 1 ||
         groups_per_super != 4 ||
         (flags & ~std::uint8_t{1}) != 0 ||
         ((flags & 1u) != 0) !=
@@ -2921,44 +2889,41 @@ CanonicalVq parse_vq(
     std::string_view dtype,
     std::span<const std::uint8_t> blob,
     std::span<const std::uint8_t> runtime_payload) {
-    if (dtype == "NVQ1-L") {
-        if (!runtime_payload.empty()) {
-            throw std::runtime_error(
-                "unexpected NVQ1-L runtime metadata");
-        }
-        return parse_nvq1_l(dtype, blob);
-    }
-    if (dtype == "NVQ1-S") {
-        if (!runtime_payload.empty()) {
-            throw std::runtime_error(
-                "unexpected NVQ1-S runtime metadata");
-        }
-        return parse_nvq1_s(dtype, blob);
-    }
-    if (dtype == "NPQ0-S" || dtype == "NPQ0-L") {
+    BlobCursor cursor(blob);
+    const auto magic = cursor.magic("VQ payload magic");
+    if (dtype == mfq::kNpqDtype) {
         if (!runtime_payload.empty()) {
             throw std::runtime_error(
                 "unexpected NPQ runtime metadata");
         }
-        return parse_npq(dtype, blob, dtype == "NPQ0-S");
+        if (magic_is(magic, "NPQS")) {
+            return parse_npq(blob, true);
+        }
+        if (magic_is(magic, "NPQL")) {
+            return parse_npq(blob, false);
+        }
+        throw std::runtime_error("invalid NPQ payload magic");
     }
-    if (dtype == "NEPQ0-S" || dtype == "NEPQ0-L" ||
-        dtype == "NEPQ1-S" || dtype == "NEPQ1-L" ||
-        dtype == "NEPQ0-A" || dtype == "NEPQ1-A") {
+    if (dtype == mfq::kNepqDtype) {
         return parse_nepq(
-            dtype,
             blob,
             runtime_payload);
     }
-    if (dtype == "NVQ2" || dtype == "NVQ3" ||
-        dtype == "NVQ2J" || dtype == "NVQ2J-L" ||
-        dtype == "NVQ2J-XL" || dtype == "NVQ3J" ||
-        dtype == "NVQ3J-512" || dtype == "NVQ3J-L") {
+    if (dtype == mfq::kNvqDtype) {
         if (!runtime_payload.empty()) {
             throw std::runtime_error(
                 "unexpected NVQ runtime metadata");
         }
-        return parse_nvq(dtype, blob);
+        if (magic_is(magic, "NQ1L")) {
+            return parse_nvq1_l(blob);
+        }
+        if (magic_is(magic, "NQ1S")) {
+            return parse_nvq1_s(blob);
+        }
+        if (magic_is(magic, "NVQ1") || magic_is(magic, "NIQ1")) {
+            return parse_nvq(blob);
+        }
+        throw std::runtime_error("invalid NVQ payload magic");
     }
     throw std::runtime_error(
         "unsupported native Metal VQ dtype: "
@@ -3311,50 +3276,29 @@ VqTensorMetadata inspect_vq_blob(
     std::string_view dtype,
     std::span<const std::uint8_t> blob,
     std::span<const std::uint8_t> runtime_payload) {
-    if (!is_vq_dtype(dtype)) {
+    const auto canonical = mfq::canonical_format_dtype(dtype);
+    if (!is_vq_dtype(canonical)) {
         throw std::runtime_error(
             "unsupported native Metal VQ dtype: "
             + std::string(dtype));
     }
-    if (dtype == "NEPQ0-S" || dtype == "NEPQ0-L" ||
-        dtype == "NEPQ1-S" || dtype == "NEPQ1-L" ||
-        dtype == "NEPQ0-A" || dtype == "NEPQ1-A") {
+    if (canonical == mfq::kNepqDtype) {
         return inspect_nepq_header(
-            dtype,
+            canonical,
             blob,
             runtime_payload);
     }
     return inspect_matrix_vq_header(
-        dtype,
+        canonical,
         blob,
         runtime_payload);
 }
 
 bool is_vq_dtype(std::string_view dtype) noexcept {
-    constexpr std::array<std::string_view, 18> dtypes{
-        "NVQ2",
-        "NVQ2J",
-        "NVQ2J-L",
-        "NVQ2J-XL",
-        "NVQ3",
-        "NVQ3J",
-        "NVQ3J-512",
-        "NVQ3J-L",
-        "NVQ1-L",
-        "NVQ1-S",
-        "NPQ0-L",
-        "NPQ0-S",
-        "NEPQ0-L",
-        "NEPQ0-S",
-        "NEPQ1-L",
-        "NEPQ1-S",
-        "NEPQ0-A",
-        "NEPQ1-A",
-    };
-    return std::find(
-        dtypes.begin(),
-        dtypes.end(),
-        dtype) != dtypes.end();
+    const auto canonical = mfq::canonical_format_dtype(dtype);
+    return canonical == mfq::kNvqDtype ||
+        canonical == mfq::kNpqDtype ||
+        canonical == mfq::kNepqDtype;
 }
 
 MlxVqWeight::MlxVqWeight(
@@ -3438,7 +3382,7 @@ MlxVqWeight MlxVqWeight::from_blob(
     std::span<const std::uint8_t> blob,
     std::span<const std::uint8_t> runtime_payload) {
     auto parsed = parse_vq(
-        dtype,
+        mfq::canonical_format_dtype(dtype),
         blob,
         runtime_payload);
     auto rotations = parsed.rotation_signs;

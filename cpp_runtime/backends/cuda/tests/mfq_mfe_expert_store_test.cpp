@@ -1,4 +1,4 @@
-#include "nintm_expert_store.h"
+#include "mfe_expert_store.h"
 
 #include <array>
 #include <cstdint>
@@ -89,7 +89,7 @@ struct TempFile {
 
     explicit TempFile(const std::vector<std::uint8_t>& record) {
         path = std::filesystem::temp_directory_path() /
-            "mfq-cuda-nintm-expert-store-test.bin";
+            "mfq-cuda-mfe-expert-store-test.bin";
         std::ofstream stream(path, std::ios::binary | std::ios::trunc);
         const std::array<std::uint8_t, 7> prefix{9, 8, 7, 6, 5, 4, 3};
         stream.write(
@@ -110,9 +110,9 @@ struct TempFile {
 void test_exact_ranges() {
     const auto blob = make_record();
     TempFile file(blob);
-    mfq::cuda::NintMxfp4ExpertStore store({
+    mfq::cuda::MfeMxfp4ExpertStore store({
         "model.block.0.mlp.experts.gate.weight",
-        "NINTM",
+        "MFE",
         file.path.string(),
         7,
         blob.size(),
@@ -129,10 +129,10 @@ void test_exact_ranges() {
         std::vector<std::uint8_t> values(32);
         std::vector<std::uint8_t> scales(2);
         store.read_part_into(
-            store.part(expert, mfq::cuda::NintMxfp4ExpertStore::values),
+            store.part(expert, mfq::cuda::MfeMxfp4ExpertStore::values),
             values);
         store.read_part_into(
-            store.part(expert, mfq::cuda::NintMxfp4ExpertStore::scales),
+            store.part(expert, mfq::cuda::MfeMxfp4ExpertStore::scales),
             scales);
         require(values.front() == 17 * expert, "expert value range is wrong");
         require(values[16] == 17 * expert + 3, "expert row range is wrong");
@@ -146,9 +146,9 @@ void test_unsupported_cohort() {
     TempFile file(blob);
     bool rejected = false;
     try {
-        (void)mfq::cuda::NintMxfp4ExpertStore({
-            "experts.up.weight", "NINTM", file.path.string(), 7, blob.size()});
-    } catch (const mfq::cuda::NintMxfp4Unsupported&) {
+        (void)mfq::cuda::MfeMxfp4ExpertStore({
+            "experts.up.weight", "MFE", file.path.string(), 7, blob.size()});
+    } catch (const mfq::cuda::MfeMxfp4Unsupported&) {
         rejected = true;
     }
     require(rejected, "non-MXFP4 cohort was accepted by the range store");
@@ -157,27 +157,27 @@ void test_unsupported_cohort() {
 void test_parallel_read_batch() {
     const auto blob = make_record();
     TempFile file(blob);
-    mfq::cuda::NintMxfp4ExpertStore store({
-        "experts.down.weight", "NINTM", file.path.string(), 7, blob.size()});
+    mfq::cuda::MfeMxfp4ExpertStore store({
+        "experts.down.weight", "MFE", file.path.string(), 7, blob.size()});
     std::array<std::vector<std::uint8_t>, 3> values;
     std::array<std::vector<std::uint8_t>, 3> scales;
-    std::vector<mfq::cuda::NintMxfp4ReadRequest> requests;
+    std::vector<mfq::cuda::MfeMxfp4ReadRequest> requests;
     requests.reserve(6);
     for (int expert = 0; expert < 3; ++expert) {
         values[expert].resize(32);
         scales[expert].resize(2);
         requests.push_back({
             &store,
-            &store.part(expert, mfq::cuda::NintMxfp4ExpertStore::values),
+            &store.part(expert, mfq::cuda::MfeMxfp4ExpertStore::values),
             values[expert],
         });
         requests.push_back({
             &store,
-            &store.part(expert, mfq::cuda::NintMxfp4ExpertStore::scales),
+            &store.part(expert, mfq::cuda::MfeMxfp4ExpertStore::scales),
             scales[expert],
         });
     }
-    mfq::cuda::NintMxfp4ReadPool pool(3);
+    mfq::cuda::MfeMxfp4ReadPool pool(3);
     auto ticket = pool.submit(requests);
     require(ticket.valid(), "asynchronous read ticket is empty");
     const auto stats = ticket.wait();
@@ -195,20 +195,20 @@ void test_parallel_read_batch() {
                 "parallel expert scale range is wrong");
     }
 
-    mfq::cuda::NintMxfp4ReadPool serial(1);
+    mfq::cuda::MfeMxfp4ReadPool serial(1);
     const auto first = serial.read(requests);
     const auto second = serial.read(requests);
     require(first.file_opens == 1, "serial worker did not open its source once");
     require(second.file_opens == 0, "serial worker did not reuse its file handle");
 
     std::array<std::uint8_t, 32> destructor_values{};
-    const std::array<mfq::cuda::NintMxfp4ReadRequest, 1>
+    const std::array<mfq::cuda::MfeMxfp4ReadRequest, 1>
         destructor_requests{{
             {
                 &store,
                 &store.part(
                     2,
-                    mfq::cuda::NintMxfp4ExpertStore::values),
+                    mfq::cuda::MfeMxfp4ExpertStore::values),
                 destructor_values,
             },
         }};
@@ -223,37 +223,37 @@ void test_parallel_read_batch() {
 void test_concurrent_read_batches() {
     const auto blob = make_record();
     TempFile file(blob);
-    mfq::cuda::NintMxfp4ExpertStore store({
-        "experts.gate.weight", "NINTM", file.path.string(), 7, blob.size()});
+    mfq::cuda::MfeMxfp4ExpertStore store({
+        "experts.gate.weight", "MFE", file.path.string(), 7, blob.size()});
     std::array<std::uint8_t, 32> first_values{};
     std::array<std::uint8_t, 2> first_scales{};
     std::array<std::uint8_t, 32> second_values{};
     std::array<std::uint8_t, 2> second_scales{};
-    const std::array<mfq::cuda::NintMxfp4ReadRequest, 2> first_requests{{
+    const std::array<mfq::cuda::MfeMxfp4ReadRequest, 2> first_requests{{
         {
             &store,
-            &store.part(0, mfq::cuda::NintMxfp4ExpertStore::values),
+            &store.part(0, mfq::cuda::MfeMxfp4ExpertStore::values),
             first_values,
         },
         {
             &store,
-            &store.part(0, mfq::cuda::NintMxfp4ExpertStore::scales),
+            &store.part(0, mfq::cuda::MfeMxfp4ExpertStore::scales),
             first_scales,
         },
     }};
-    const std::array<mfq::cuda::NintMxfp4ReadRequest, 2> second_requests{{
+    const std::array<mfq::cuda::MfeMxfp4ReadRequest, 2> second_requests{{
         {
             &store,
-            &store.part(1, mfq::cuda::NintMxfp4ExpertStore::values),
+            &store.part(1, mfq::cuda::MfeMxfp4ExpertStore::values),
             second_values,
         },
         {
             &store,
-            &store.part(1, mfq::cuda::NintMxfp4ExpertStore::scales),
+            &store.part(1, mfq::cuda::MfeMxfp4ExpertStore::scales),
             second_scales,
         },
     }};
-    mfq::cuda::NintMxfp4ReadPool pool(3);
+    mfq::cuda::MfeMxfp4ReadPool pool(3);
     auto first = std::async(std::launch::async, [&] {
         return pool.read(first_requests);
     });
@@ -276,10 +276,10 @@ int main() {
         test_unsupported_cohort();
         test_parallel_read_batch();
         test_concurrent_read_batches();
-        std::cout << "cuda_nintm_expert_store_tests=4 passed=4\n";
+        std::cout << "cuda_mfe_expert_store_tests=4 passed=4\n";
         return 0;
     } catch (const std::exception& error) {
-        std::cerr << "cuda_nintm_expert_store_test failure="
+        std::cerr << "cuda_mfe_expert_store_test failure="
                   << error.what() << "\n";
         return 1;
     }

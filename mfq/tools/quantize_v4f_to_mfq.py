@@ -1058,15 +1058,15 @@ def _plans(
                     ),
                     shape=shape,
                     source_dtype="MXFP4",
-                    target_dtype="NINTM",
+                    target_dtype="MFE",
                     expert_shape=shape,
                     expert_precisions=selection.precisions,
                     transform=f"v4f_{projection}",
                 )
             )
             del source
-    normal = [item for item in plans if item.target_dtype != "NINTM"]
-    routed = [item for item in plans if item.target_dtype == "NINTM"]
+    normal = [item for item in plans if item.target_dtype != "MFE"]
+    routed = [item for item in plans if item.target_dtype == "MFE"]
     normal.sort(
         key=lambda item: (
             item.shard,
@@ -1176,7 +1176,7 @@ def convert(args) -> None:
             if partial_blob.exists():
                 partial_blob.unlink()
             item_started = time.perf_counter()
-            if item.target_dtype == "NINTM":
+            if item.target_dtype == "MFE":
                 if item.expert_shape is None or item.expert_precisions is None:
                     raise ValueError(f"invalid V4F routed plan: {item.name}")
                 layer = int(item.name.split(".")[1])

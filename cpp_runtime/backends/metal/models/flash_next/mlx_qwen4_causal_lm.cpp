@@ -132,19 +132,19 @@ float scalar_float(const MfqContainer& model, const std::string& name) {
     return value.data<float>()[0];
 }
 
-MlxNintMoeWeight moe_weight(
+MlxMfeWeight moe_weight(
     const MfqContainer& model,
     const std::string& name) {
-    if (model.record(name).dtype != "NINTM") {
+    if (model.record(name).dtype != "MFE") {
         throw std::runtime_error(
-            "Qwen4 routed expert tensor must use NINTM: " + name);
+            "Qwen4 routed expert tensor must use MFE: " + name);
     }
     const auto mapped = model.map_record(name);
-    return MlxNintMoeWeight::from_blob(mapped.view());
+    return MlxMfeWeight::from_blob(mapped.view());
 }
 
 // A canonical routed projection may be stored either as a heterogeneous
-// NINTM container or as one dense [experts,out,in] tensor. Predictor heads
+// MFE container or as one dense [experts,out,in] tensor. Predictor heads
 // are intentionally left dense by the standard presets, so the model adapter
 // must dispatch by record representation rather than by architecture role.
 class Qwen4RoutedWeight {
@@ -152,7 +152,7 @@ public:
     static Qwen4RoutedWeight load(
         const MfqContainer& model,
         const std::string& name) {
-        if (model.record(name).dtype == "NINTM") {
+        if (model.record(name).dtype == "MFE") {
             return Qwen4RoutedWeight(moe_weight(model, name));
         }
         auto values = dense(model, name);
@@ -172,8 +172,8 @@ public:
         if (model.contains(combined)) return load(model, combined);
         const auto gate = prefix + ".experts.gate.weight";
         const auto up = prefix + ".experts.up.weight";
-        if (model.record(gate).dtype == "NINTM" &&
-            model.record(up).dtype == "NINTM") {
+        if (model.record(gate).dtype == "MFE" &&
+            model.record(up).dtype == "MFE") {
             return Qwen4RoutedWeight(
                 load_routed_gate_up_weight(model, prefix));
         }
@@ -263,7 +263,7 @@ public:
     }
 
 private:
-    explicit Qwen4RoutedWeight(MlxNintMoeWeight packed)
+    explicit Qwen4RoutedWeight(MlxMfeWeight packed)
         : packed_(std::move(packed)) {}
     explicit Qwen4RoutedWeight(array dense_values)
         : dense_(std::move(dense_values)) {}
@@ -321,7 +321,7 @@ private:
             Shape{token_rows, routes_per_row, out_per_expert()});
     }
 
-    std::optional<MlxNintMoeWeight> packed_;
+    std::optional<MlxMfeWeight> packed_;
     std::optional<array> dense_;
 };
 

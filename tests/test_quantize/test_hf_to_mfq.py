@@ -23,7 +23,7 @@ from mfq.formats.assets import (
 )
 from mfq.formats.header import FileHeader
 from mfq.formats.io import is_bfloat16_array, load_mmap, open_mmap, save, unpack_dense
-from mfq.formats.moe import NintMoePool, NintMoeTensor
+from mfq.formats.mfe import MfePool, MfeTensor
 from mfq.formats.mx import unpack_mx
 from mfq.formats.nint import NintSpec
 from mfq.formats.shards import format_shard_path
@@ -275,7 +275,7 @@ def test_standard_preset_always_uses_nint8_for_shared_expert_weights(
     assert by_name["model.block.0.mlp.shared_expert.router.weight"].target_dtype == "BF16"
 
 
-def test_standard_preset_only_treats_schema_expert_banks_as_nintm() -> None:
+def test_standard_preset_only_treats_schema_expert_banks_as_mfe() -> None:
     plans = [
         _standard_plan("model.block.0.linear_attention.conv.weight", (16, 1, 4)),
         _standard_plan("model.block.0.mlp.experts.down.weight", (8, 16, 48)),
@@ -287,7 +287,7 @@ def test_standard_preset_only_treats_schema_expert_banks_as_nintm() -> None:
     )
 
     assert mapped[0].target_dtype == "BF16"
-    assert mapped[1].target_dtype == "NINTM"
+    assert mapped[1].target_dtype == "MFE"
 
 
 def test_standard_preset_quantizes_vision_and_predictor_only_with_opt_in() -> None:
@@ -323,7 +323,7 @@ def test_standard_preset_quantizes_stage_predictor_expert_banks_with_opt_in() ->
                 shard="model.safetensors",
                 shape=(16, 2048, 4096),
                 source_dtype="MXFP4",
-                target_dtype="NINTM",
+                target_dtype="MFE",
                 expert_shape=(16, 2048, 4096),
                 expert_precisions=(ExpertPrecision("MXFP4"),) * 16,
             )
@@ -333,12 +333,15 @@ def test_standard_preset_quantizes_stage_predictor_expert_banks_with_opt_in() ->
         quantize_mtp=True,
     )
 
-    assert mapped[0].target_dtype == "NINTM"
+    assert mapped[0].target_dtype == "MFE"
     assert mapped[0].expert_shape == (16, 2048, 4096)
-    assert {value.family for value in mapped[0].expert_precisions or ()} == {"NINT4"}
+    assert {value.family for value in mapped[0].expert_precisions or ()} == {"NINT"}
+    assert {
+        value.nint_spec for value in mapped[0].expert_precisions or ()
+    } == {NintSpec(4, 24, 6)}
 
 
-def test_normalize_hf_expert_storage_preserves_mixed_nintm_plan() -> None:
+def test_normalize_hf_expert_storage_preserves_mixed_mfe_plan() -> None:
     precisions = (
         ExpertPrecision("NINT2", nint_spec=NintSpec(2, 16, 5)),
         ExpertPrecision("NINT5", nint_spec=NintSpec(5, 24, 7)),
@@ -348,7 +351,7 @@ def test_normalize_hf_expert_storage_preserves_mixed_nintm_plan() -> None:
         shard="model.safetensors",
         shape=(2, 3, 48),
         source_dtype="BF16",
-        target_dtype="NINTM",
+        target_dtype="MFE",
         expert_shape=(2, 3, 48),
         expert_precisions=precisions,
     )
@@ -366,7 +369,7 @@ def test_balanced_random_expert_mix_is_reproducible_and_projection_independent()
             shard="model.safetensors",
             shape=(8, rows, 48),
             source_dtype="F8_E4M3",
-            target_dtype="NINTM",
+            target_dtype="MFE",
             expert_shape=(8, rows, 48),
             expert_precisions=(ExpertPrecision("NINT4", NintSpec(4, 24, 6)),) * 8,
         )
@@ -381,8 +384,16 @@ def test_balanced_random_expert_mix_is_reproducible_and_projection_independent()
     assignments = [item.expert_precisions for item in mixed]
     assert len(set(assignments)) == len(assignments)
     for assignment in assignments:
+        labels = [
+            (
+                f"NINT{value.nint_spec.bits}"
+                if value.family == "NINT" and value.nint_spec is not None
+                else value.family
+            )
+            for value in assignment or ()
+        ]
         counts = {
-            family: sum(value.family == family for value in assignment or ())
+            family: labels.count(family)
             for family in ("NINT2", "NINT4", "NVQ2J")
         }
         assert max(counts.values()) - min(counts.values()) <= 1
@@ -395,12 +406,12 @@ def test_parse_expert_mix_profiles_uses_runtime_nint_specs() -> None:
     )
 
     assert [value.family for value in profiles] == [
-        "NINT2",
-        "NINT3",
-        "NINT4",
-        "NINT5",
-        "NINT6",
-        "NINT8",
+        "NINT",
+        "NINT",
+        "NINT",
+        "NINT",
+        "NINT",
+        "NINT",
         "NVQ2J",
         "NVQ3J",
         "MXFP4",
@@ -1071,7 +1082,7 @@ def test_qwen35_mtp_augmentation_copies_base_and_mirrors_backbone_policy(tmp_pat
         assert graph["optional_components"]["predictor"] is True
 
 
-def test_qwen4_mtp_plan_mirrors_mixed_nintm_expert_policy(tmp_path):
+def test_qwen4_mtp_plan_mirrors_mixed_mfe_expert_policy(tmp_path):
     hidden = 8
     expert_hidden = 4
     experts = 2
@@ -1156,7 +1167,7 @@ def test_qwen4_mtp_plan_mirrors_mixed_nintm_expert_policy(tmp_path):
                 shard="model.safetensors",
                 shape=gate_up_shape,
                 source_dtype="F8_E4M3",
-                target_dtype="NINTM",
+                target_dtype="MFE",
                 expert_shape=gate_up_shape,
                 expert_precisions=(ExpertPrecision("NINT4", NintSpec(4, 8, 6)),) * experts,
             ),
@@ -1165,7 +1176,7 @@ def test_qwen4_mtp_plan_mirrors_mixed_nintm_expert_policy(tmp_path):
                 shard="model.safetensors",
                 shape=down_shape,
                 source_dtype="F8_E4M3",
-                target_dtype="NINTM",
+                target_dtype="MFE",
                 expert_shape=down_shape,
                 expert_precisions=(ExpertPrecision("NINT4", NintSpec(4, 4, 6)),) * experts,
             ),
@@ -1175,18 +1186,18 @@ def test_qwen4_mtp_plan_mirrors_mixed_nintm_expert_policy(tmp_path):
     low = NintSpec(2, 8, 5)
     high = NintSpec(4, 8, 6)
 
-    def mixed(shape: tuple[int, int, int]) -> NintMoeTensor:
+    def mixed(shape: tuple[int, int, int]) -> MfeTensor:
         rng = np.random.default_rng(sum(shape))
         pools = []
         for expert, spec in enumerate((low, high)):
             values = rng.normal(size=(shape[1], shape[2])).astype(np.float32)
             pools.append(
-                NintMoePool(
+                MfePool(
                     np.asarray([expert], dtype=np.int32),
                     quantize_nint(values, spec),
                 )
             )
-        return NintMoeTensor(shape, tuple(pools))
+        return MfeTensor(shape, tuple(pools))
 
     base_tensors: dict[str, object] = {
         MODEL_CONFIG_ASSET: json.dumps(config).encode(),
@@ -1210,7 +1221,7 @@ def test_qwen4_mtp_plan_mirrors_mixed_nintm_expert_policy(tmp_path):
     assert set(selected_by_name) == {item.name for item in plan}
     for name in (gate_up_name, down_name):
         item = selected_by_name[name]
-        assert item.target_dtype == "NINTM"
+        assert item.target_dtype == "MFE"
         assert item.expert_precisions is not None
         assert tuple(value.nint_spec for value in item.expert_precisions) == (low, high)
 
@@ -1529,7 +1540,7 @@ def test_hf_imatrix_binds_expert_wise_entries(tmp_path):
         shard="model.safetensors",
         shape=(2, 3, 4),
         source_dtype="BF16",
-        target_dtype="NINTM",
+        target_dtype="MFE",
         gguf_name="blk.4.ffn_down_exps.weight",
         expert_shape=(2, 3, 4),
         expert_precisions=(
@@ -1818,7 +1829,7 @@ def test_hf_convert_writes_an_ordinary_vq_tensor_via_precision_override(
 
     header, store = load_mmap(output)
     try:
-        assert store.records["model.block.0.mlp.down.weight"].dtype == "NVQ2"
+        assert store.records["model.block.0.mlp.down.weight"].dtype == "NVQ"
         assert header.extra["target_counts"] == {"NVQ2": 1}
         assert header.extra["tensor_precision_overrides"] == {"blk.0.ffn_down.weight": "NVQ2"}
     finally:
@@ -1877,7 +1888,7 @@ def test_hf_convert_trains_and_writes_tensorwise_jsc_vq(tmp_path):
 
     header, store = load_mmap(output)
     try:
-        assert store.records["model.block.0.mlp.down.weight"].dtype == "NVQ2J"
+        assert store.records["model.block.0.mlp.down.weight"].dtype == "NVQ"
         result = header.extra["nvq_codebooks"]["model.block.0.mlp.down.weight"]
         assert result["loaded"] is False
         assert Path(result["artifact"]).is_file()
@@ -2053,7 +2064,7 @@ def test_glm_dsa_plan_derives_headwise_mla_and_streamed_experts(tmp_path):
     try:
         assert {name for name in store.records if not is_asset_record(name)} == set(by_name)
         assert all(
-            record.dtype == "NINTM"
+            record.dtype == "MFE"
             for record in store.records.values()
             if not is_asset_record(record.name)
         )
@@ -2141,7 +2152,7 @@ def test_separate_expert_plan_dequantizes_fp8_without_coupling_projections(
         canonical_prefix + ".down.weight",
         canonical_metadata,
     }
-    assert all(item.target_dtype == "NINTM" for item in plan if item.name != canonical_metadata)
+    assert all(item.target_dtype == "MFE" for item in plan if item.name != canonical_metadata)
     assert next(item for item in plan if item.name == canonical_metadata).target_dtype == "I64"
     assert not any("scale_inv" in item.name for item in plan)
 

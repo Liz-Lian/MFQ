@@ -3,7 +3,7 @@
 #include "mlx_deepseek_v4_attention.h"
 #include "mlx_eval_timing.h"
 #include "mlx_legacy_tensor_compat.h"
-#include "nintm_expert_store.h"
+#include "mfe_expert_store.h"
 
 #include <algorithm>
 #include <chrono>

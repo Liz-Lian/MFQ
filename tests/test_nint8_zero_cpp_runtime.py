@@ -14,7 +14,7 @@ if not torch.cuda.is_available():
 
 from mfq.formats import io  # noqa: E402
 from mfq.formats.header import FileHeader  # noqa: E402
-from mfq.formats.moe import NintMoePool, NintMoeTensor  # noqa: E402
+from mfq.formats.mfe import MfePool, MfeTensor  # noqa: E402
 from mfq.formats.nint8_zero import (  # noqa: E402
     Nint8ZeroTensor,
     dequantize_nint8_zero,
@@ -142,10 +142,10 @@ def test_cpp_nint8_zero_moe_paths_match_dense_reference(tmp_path, tokens):
     executable = _executable()
     experts, rows, neuron_len, routes = 4, 5, 96, 2
     tensor = _tensor(experts * rows, neuron_len, 20260726)
-    container = NintMoeTensor(
+    container = MfeTensor(
         (experts, rows, neuron_len),
         (
-            NintMoePool(
+            MfePool(
                 np.arange(experts, dtype=np.int32),
                 tensor,
             ),
@@ -162,13 +162,13 @@ def test_cpp_nint8_zero_moe_paths_match_dense_reference(tmp_path, tokens):
             str(executable),
             "--mfq",
             str(model_path),
-            "--check-nintm-tensor",
+            "--check-mfe-tensor",
             "experts.weight",
-            "--check-nintm-tokens",
+            "--check-mfe-tokens",
             str(tokens),
-            "--check-nintm-routes",
+            "--check-mfe-routes",
             str(routes),
-            "--check-nintm-reps",
+            "--check-mfe-reps",
             "2",
         ],
         check=True,
@@ -180,7 +180,7 @@ def test_cpp_nint8_zero_moe_paths_match_dense_reference(tmp_path, tokens):
     line = next(
         value
         for value in completed.stdout.splitlines()
-        if value.startswith("nintm_tensor_check ")
+        if value.startswith("mfe_tensor_check ")
     )
     fields = dict(part.split("=", 1) for part in line.split()[1:])
     actual = torch.tensor(

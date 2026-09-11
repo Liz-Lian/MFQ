@@ -1,14 +1,11 @@
-"""Stable, architecture-neutral contract for scalar-grid weight solvers.
+"""Private scalar-grid helpers shared by the legacy-style GPTQ/GSQ functions.
 
-The classes in this module are intentionally smaller than the MFQ Core v2
-workflow layer.  They are leaf components that can live on ``master`` while a
-larger workflow migration proceeds independently.  Core v2 can use a
-``WeightSolver`` directly as its WSolver implementation.
+This is an implementation module, not a workflow or solver API.  Public
+quantization entry points accept tensors and ordinary quantizer arguments.
 """
 
 from __future__ import annotations
 
-import hashlib
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
@@ -19,7 +16,7 @@ import numpy as np
 import torch
 
 
-class ImportanceMap(Protocol):
+class _ImportanceView(Protocol):
     @property
     def shape(self) -> tuple[int, int]: ...
 
@@ -29,7 +26,75 @@ class ImportanceMap(Protocol):
 
     def element_importance(self, rows) -> np.ndarray: ...
 
-    def fingerprint(self) -> str: ...
+
+@dataclass(frozen=True)
+class _ArrayImportanceView:
+    input_factors: np.ndarray
+    neuron_factors: np.ndarray
+
+    @property
+    def shape(self) -> tuple[int, int]:
+        return (int(self.neuron_factors.size), int(self.input_factors.shape[-1]))
+
+    def channel_importance(self, rows) -> np.ndarray:
+        selected_neurons = np.asarray(self.neuron_factors[rows]).reshape(-1)
+        if self.input_factors.ndim == 1:
+            return np.broadcast_to(
+                self.input_factors, (selected_neurons.size, self.shape[1])
+            )
+        return np.ascontiguousarray(self.input_factors[rows], dtype=np.float32)
+
+    def neuron_importance(self, rows) -> np.ndarray:
+        return np.ascontiguousarray(self.neuron_factors[rows], dtype=np.float32)
+
+    def element_importance(self, rows) -> np.ndarray:
+        return np.ascontiguousarray(
+            self.channel_importance(rows) * self.neuron_importance(rows)[:, None],
+            dtype=np.float32,
+        )
+
+
+def _build_importance_view(
+    importance: torch.Tensor | np.ndarray | None,
+    neuron_importance: torch.Tensor | np.ndarray | None,
+    shape: tuple[int, int],
+) -> _ImportanceView | None:
+    if importance is None and neuron_importance is None:
+        return None
+    rows, columns = shape
+    if importance is None:
+        input_factors = np.ones(columns, dtype=np.float32)
+    else:
+        input_factors = np.asarray(
+            importance.detach().cpu().numpy()
+            if isinstance(importance, torch.Tensor)
+            else importance,
+            dtype=np.float32,
+        )
+        if input_factors.shape not in {(columns,), (rows, columns)}:
+            raise ValueError("importance must have shape [input] or [output, input]")
+    if neuron_importance is None:
+        neuron_factors = np.ones(rows, dtype=np.float32)
+    else:
+        neuron_factors = np.asarray(
+            neuron_importance.detach().cpu().numpy()
+            if isinstance(neuron_importance, torch.Tensor)
+            else neuron_importance,
+            dtype=np.float32,
+        ).reshape(-1)
+        if neuron_factors.shape != (rows,):
+            raise ValueError("neuron importance must have shape [output]")
+    if (
+        not np.isfinite(input_factors).all()
+        or np.any(input_factors < 0)
+        or not np.isfinite(neuron_factors).all()
+        or np.any(neuron_factors < 0)
+    ):
+        raise ValueError("importance values must be finite and non-negative")
+    return _ArrayImportanceView(
+        np.ascontiguousarray(input_factors),
+        np.ascontiguousarray(neuron_factors),
+    )
 
 
 def _as_float_tensor(value: torch.Tensor | np.ndarray, *, name: str) -> torch.Tensor:
@@ -42,21 +107,17 @@ def _as_float_tensor(value: torch.Tensor | np.ndarray, *, name: str) -> torch.Te
 
 
 @dataclass(frozen=True)
-class WeightSolverProblem:
-    """One canonical matrix and the evidence available to a weight solver."""
+class _QuantizationInput:
+    """Validated inputs shared privately by the GPTQ and GSQ implementations."""
 
-    tensor_key: str
     weight: torch.Tensor | np.ndarray
     calibration_inputs: torch.Tensor | np.ndarray | None = None
     hessian: torch.Tensor | np.ndarray | None = None
-    metadata: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        if not self.tensor_key:
-            raise ValueError("weight solver problems require a canonical tensor key")
         weight = _as_float_tensor(self.weight, name="weight")
         if weight.ndim != 2 or not weight.shape[0] or not weight.shape[1]:
-            raise ValueError("weight solver problems require a non-empty [out, in] matrix")
+            raise ValueError("quantization requires a non-empty [out, in] matrix")
         inputs = self.calibration_inputs
         if inputs is not None:
             inputs = _as_float_tensor(inputs, name="calibration inputs")
@@ -71,33 +132,32 @@ class WeightSolverProblem:
             if tuple(hessian.shape) != expected:
                 raise ValueError(f"Hessian shape {tuple(hessian.shape)} != {expected}")
             if not torch.allclose(hessian, hessian.mT, rtol=1e-4, atol=1e-6):
-                raise ValueError("weight solver Hessian must be symmetric")
+                raise ValueError("quantization Hessian must be symmetric")
         object.__setattr__(self, "weight", weight)
         object.__setattr__(self, "calibration_inputs", inputs)
         object.__setattr__(self, "hessian", hessian)
-        object.__setattr__(self, "metadata", MappingProxyType(dict(self.metadata)))
 
 
 @dataclass(frozen=True)
-class ObjectiveValue:
+class _ErrorValue:
     total: float
     components: Mapping[str, float] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not np.isfinite(self.total):
-            raise ValueError("objective values must be finite")
+            raise ValueError("reconstruction errors must be finite")
         object.__setattr__(self, "components", MappingProxyType(dict(self.components)))
 
 
-class ReconstructionObjective(ABC):
-    """Executable reconstruction criterion; it owns no update algorithm."""
+class _ReconstructionError(ABC):
+    """Private reconstruction-error implementation shared by both algorithms."""
 
     @abstractmethod
     def row_losses(
         self,
-        problem: WeightSolverProblem,
+        problem: _QuantizationInput,
         candidate: torch.Tensor,
-        imap: ImportanceMap | None = None,
+        imap: _ImportanceView | None = None,
         *,
         row_start: int = 0,
     ) -> torch.Tensor:
@@ -105,9 +165,9 @@ class ReconstructionObjective(ABC):
 
     def loss(
         self,
-        problem: WeightSolverProblem,
+        problem: _QuantizationInput,
         candidate: torch.Tensor,
-        imap: ImportanceMap | None = None,
+        imap: _ImportanceView | None = None,
         *,
         row_start: int = 0,
     ) -> torch.Tensor:
@@ -115,21 +175,16 @@ class ReconstructionObjective(ABC):
 
     def evaluate(
         self,
-        problem: WeightSolverProblem,
+        problem: _QuantizationInput,
         candidate: torch.Tensor,
-        imap: ImportanceMap | None = None,
-    ) -> ObjectiveValue:
+        imap: _ImportanceView | None = None,
+    ) -> _ErrorValue:
         with torch.no_grad():
             rows = self.row_losses(problem, candidate, imap)
             total = float(rows.sum().detach().cpu())
-            return ObjectiveValue(total, {"mean_row_loss": float(rows.mean().cpu())})
+            return _ErrorValue(total, {"mean_row_loss": float(rows.mean().cpu())})
 
-    @abstractmethod
-    def fingerprint(self) -> str:
-        """Return stable executable-semantics provenance."""
-
-
-class QuadraticReconstructionObjective(ReconstructionObjective):
+class _QuadraticReconstructionError(_ReconstructionError):
     """Layer-output reconstruction with NAQ factorized-SSE fallback.
 
     A supplied full Hessian or activation matrix evaluates the usual GPTQ/GSQ
@@ -143,7 +198,7 @@ class QuadraticReconstructionObjective(ReconstructionObjective):
 
     def hessian(
         self,
-        problem: WeightSolverProblem,
+        problem: _QuantizationInput,
         *,
         device: torch.device,
         dtype: torch.dtype,
@@ -160,8 +215,8 @@ class QuadraticReconstructionObjective(ReconstructionObjective):
 
     def gptq_hessian(
         self,
-        problem: WeightSolverProblem,
-        imap: ImportanceMap | None,
+        problem: _QuantizationInput,
+        imap: _ImportanceView | None,
         *,
         device: torch.device,
         dtype: torch.dtype,
@@ -181,9 +236,9 @@ class QuadraticReconstructionObjective(ReconstructionObjective):
 
     def row_losses(
         self,
-        problem: WeightSolverProblem,
+        problem: _QuantizationInput,
         candidate: torch.Tensor,
-        imap: ImportanceMap | None = None,
+        imap: _ImportanceView | None = None,
         *,
         row_start: int = 0,
     ) -> torch.Tensor:
@@ -230,12 +285,7 @@ class QuadraticReconstructionObjective(ReconstructionObjective):
         )
         return (importance * error.square()).sum(dim=1)
 
-    def fingerprint(self) -> str:
-        payload = f"mfq.quadratic-reconstruction.v1:normalize={int(self.normalize)}"
-        return hashlib.sha256(payload.encode("ascii")).hexdigest()
-
-
-def normalize_q_bits(q_bits: int | np.ndarray | torch.Tensor, rows: int) -> torch.Tensor:
+def _normalize_q_bits(q_bits: int | np.ndarray | torch.Tensor, rows: int) -> torch.Tensor:
     values = torch.as_tensor(q_bits, dtype=torch.int64).reshape(-1)
     if values.numel() == 1:
         values = values.expand(rows).clone()
@@ -245,7 +295,7 @@ def normalize_q_bits(q_bits: int | np.ndarray | torch.Tensor, rows: int) -> torc
 
 
 @dataclass(frozen=True)
-class ScalarGridTensor:
+class _ScalarGrid:
     """Integer codes plus a possibly tied affine grid parameterization.
 
     Parameter indices and multipliers express both ordinary independent
@@ -388,10 +438,10 @@ class ScalarGridTensor:
         )
         return values.reshape(self.rows, self.padded_count)[:, : self.value_count]
 
-    def with_values(self, **changes: Any) -> ScalarGridTensor:
+    def with_values(self, **changes: Any) -> _ScalarGrid:
         return replace(self, **changes)
 
-    def clone(self) -> ScalarGridTensor:
+    def clone(self) -> _ScalarGrid:
         return replace(
             self,
             codes=self.codes.clone(),
@@ -405,26 +455,26 @@ class ScalarGridTensor:
         )
 
 
-class ScalarGridCodec(ABC):
+class _ScalarGridCodec(ABC):
     """Format-specific construction and sealing around a common scalar grid."""
 
     @abstractmethod
     def initialize(
         self,
-        problem: WeightSolverProblem,
-        imap: ImportanceMap | None = None,
-    ) -> ScalarGridTensor: ...
+        problem: _QuantizationInput,
+        imap: _ImportanceView | None = None,
+    ) -> _ScalarGrid: ...
 
-    def canonicalize(self, grid: ScalarGridTensor) -> ScalarGridTensor:
+    def canonicalize(self, grid: _ScalarGrid) -> _ScalarGrid:
         """Project parameters to the exact values representable by the format."""
 
         return grid
 
     @abstractmethod
-    def finalize(self, grid: ScalarGridTensor) -> Any: ...
+    def finalize(self, grid: _ScalarGrid) -> Any: ...
 
 
-class UniformAffineCodec(ScalarGridCodec):
+class _UniformAffineCodec(_ScalarGridCodec):
     """Independent affine or signed-symmetric scalar groups."""
 
     def __init__(
@@ -444,12 +494,12 @@ class UniformAffineCodec(ScalarGridCodec):
 
     def initialize(
         self,
-        problem: WeightSolverProblem,
-        imap: ImportanceMap | None = None,
-    ) -> ScalarGridTensor:
+        problem: _QuantizationInput,
+        imap: _ImportanceView | None = None,
+    ) -> _ScalarGrid:
         weight = problem.weight.to(torch.float32)
         rows, columns = map(int, weight.shape)
-        q_bits = normalize_q_bits(self.q_bits, rows).to(weight.device)
+        q_bits = _normalize_q_bits(self.q_bits, rows).to(weight.device)
         padding = (-columns) % self.group_size
         padded = torch.nn.functional.pad(weight, (0, padding)) if padding else weight
         groups = int(padded.shape[1] // self.group_size)
@@ -524,7 +574,7 @@ class UniformAffineCodec(ScalarGridCodec):
 
         indices = torch.arange(groups, device=weight.device, dtype=torch.int64)[None, :].expand(rows, -1)
         ones = torch.ones((rows, groups), device=weight.device, dtype=torch.float32)
-        return ScalarGridTensor(
+        return _ScalarGrid(
             codes=levels.reshape(rows, -1).to(torch.int16),
             q_bits=q_bits,
             group_size=self.group_size,
@@ -540,17 +590,17 @@ class UniformAffineCodec(ScalarGridCodec):
             metadata={"codec": "uniform-affine-v1", "symmetric": self.symmetric},
         )
 
-    def finalize(self, grid: ScalarGridTensor) -> ScalarGridTensor:
+    def finalize(self, grid: _ScalarGrid) -> _ScalarGrid:
         return grid
 
 
 @dataclass(frozen=True)
-class WeightSolverResult:
+class QuantizationResult:
     encoded: Any
-    grid: ScalarGridTensor
+    grid: _ScalarGrid
     reconstruction: torch.Tensor
-    objective: ObjectiveValue
-    baseline: ObjectiveValue
+    loss: _ErrorValue
+    baseline_loss: _ErrorValue
     row_losses: torch.Tensor
     metrics: Mapping[str, float] = field(default_factory=dict)
 
@@ -558,32 +608,6 @@ class WeightSolverResult:
         object.__setattr__(self, "metrics", MappingProxyType(dict(self.metrics)))
 
 
-class WeightSolver(ABC):
-    """Updates encoded weights while q widths and group size stay fixed."""
-
-    objective: ReconstructionObjective
-
-    @abstractmethod
-    def solve(
-        self,
-        problem: WeightSolverProblem,
-        codec: ScalarGridCodec,
-        imap: ImportanceMap | None = None,
-        *,
-        initial: ScalarGridTensor | None = None,
-    ) -> WeightSolverResult: ...
-
-
 __all__ = [
-    "ImportanceMap",
-    "ObjectiveValue",
-    "QuadraticReconstructionObjective",
-    "ReconstructionObjective",
-    "ScalarGridCodec",
-    "ScalarGridTensor",
-    "UniformAffineCodec",
-    "WeightSolver",
-    "WeightSolverProblem",
-    "WeightSolverResult",
-    "normalize_q_bits",
+    "QuantizationResult",
 ]

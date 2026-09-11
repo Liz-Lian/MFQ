@@ -162,7 +162,7 @@ std::vector<std::uint8_t> zero_nint_blob(
     return blob;
 }
 
-std::vector<std::uint8_t> zero_nintm_blob(
+std::vector<std::uint8_t> zero_mfe_blob(
     int output_per_expert,
     int input) {
     auto payload = zero_nint_blob(
@@ -215,7 +215,7 @@ std::vector<std::uint8_t> zero_nintm_blob(
     return blob;
 }
 
-std::vector<std::uint8_t> zero_tpq_nintm_blob(
+std::vector<std::uint8_t> zero_tpq_mfe_blob(
     int output_per_expert,
     int input) {
     constexpr int vector_size = 8;
@@ -225,7 +225,7 @@ std::vector<std::uint8_t> zero_tpq_nintm_blob(
         output_per_expert > 0 &&
             input > 0 &&
             input % vector_size == 0,
-        "invalid synthetic TPQ NINTM shape");
+        "invalid synthetic TPQ MFE shape");
     const std::string dtype = "TPQ-X";
     std::vector<std::uint8_t> blob{
         'N', 'I', 'M', '2',
@@ -428,14 +428,14 @@ void write_causal_lm_container(
             records.push_back(
                 {
                     binding.name,
-                    "NINTM",
+                    "MFE",
                     streamed_experts
-                    ? zero_tpq_nintm_blob(
+                    ? zero_tpq_mfe_blob(
                           static_cast<int>(
                               binding.shape.at(1)),
                           static_cast<int>(
                               binding.shape.at(2)))
-                    : zero_nintm_blob(
+                    : zero_mfe_blob(
                           static_cast<int>(
                               binding.shape.at(1)),
                           static_cast<int>(
@@ -750,11 +750,11 @@ MlxDeepseekV4Moe make_moe(
                 kHidden,
                 kIntermediate)),
         MlxRoutedLinear::from_blob(
-            zero_nintm_blob(
+            zero_mfe_blob(
                 2 * kIntermediate,
                 kHidden)),
         MlxRoutedLinear::from_blob(
-            zero_nintm_blob(
+            zero_mfe_blob(
                 kHidden,
                 kIntermediate)),
         mlx::core::zeros(

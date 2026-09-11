@@ -120,8 +120,8 @@ def _linear_attention_model() -> MlxCausalLM:
 
 def test_mlx_causal_lm_prefill_shape_and_finite_logits():
     model = _model()
-    assert model.layers[0].qkv.uses_grouped_kernel
-    assert model.layers[0].ffn.gate_up.uses_grouped_kernel
+    assert not model.layers[0].qkv.uses_grouped_kernel
+    assert not model.layers[0].ffn.gate_up.uses_grouped_kernel
     logits = _array(model(np.asarray([[1, 7, 3]], dtype=np.int32)))
     assert logits.shape == (1, 3, 32)
     assert np.isfinite(logits).all()

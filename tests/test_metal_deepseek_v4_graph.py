@@ -14,7 +14,7 @@ except RuntimeError:
 from mfq.formats import io  # noqa: E402
 from mfq.formats.tpq import TPQ_V, TpqPqTensor  # noqa: E402
 from mfq.formats.header import FileHeader  # noqa: E402
-from mfq.formats.moe import NintMoePool, NintMoeTensor  # noqa: E402
+from mfq.formats.mfe import MfePool, MfeTensor  # noqa: E402
 from mfq.formats.nint import NintSpec  # noqa: E402
 from mfq.quantize.nint_quant import quantize  # noqa: E402
 from mfq.runtime import load_tpq_model  # noqa: E402
@@ -86,7 +86,7 @@ def _expert(
     experts: int,
     output: int,
     width: int,
-) -> NintMoeTensor:
+) -> MfeTensor:
     tensor = quantize(
         rng.normal(
             0.0,
@@ -95,10 +95,10 @@ def _expert(
         ).astype(np.float32),
         NintSpec(4, 8, 6),
     )
-    return NintMoeTensor(
+    return MfeTensor(
         shape=(experts, output, width),
         pools=(
-            NintMoePool(
+            MfePool(
                 expert_ids=np.arange(experts, dtype=np.int32),
                 tensor=tensor,
             ),
@@ -112,7 +112,7 @@ def _tpq_expert(
     experts: int,
     output: int,
     width: int,
-) -> NintMoeTensor:
+) -> MfeTensor:
     rows = experts * output
     tensor = TpqPqTensor(
         spec=TPQ_V,
@@ -131,10 +131,10 @@ def _tpq_expert(
             size=(TPQ_V.codebook_entries, TPQ_V.vector_size),
         ).astype(np.float32),
     )
-    return NintMoeTensor(
+    return MfeTensor(
         shape=(experts, output, width),
         pools=(
-            NintMoePool(
+            MfePool(
                 expert_ids=np.arange(experts, dtype=np.int32),
                 tensor=tensor,
             ),

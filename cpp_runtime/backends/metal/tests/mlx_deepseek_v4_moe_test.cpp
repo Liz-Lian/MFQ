@@ -1167,13 +1167,13 @@ streamed_model_records(
         {
             layer(
                 "mlp.experts.gate_up.weight"),
-            "NINTM",
+            "MFE",
             fixture.routed_gate_up.blob,
         },
         {
             layer(
                 "mlp.experts.down.weight"),
-            "NINTM",
+            "MFE",
             fixture.routed_down.blob,
         },
         {
@@ -1213,7 +1213,7 @@ split_model_records(
             static_cast<std::ptrdiff_t>(position),
         {
             "model.block.0.mlp.experts.gate.weight",
-            "NINTM",
+            "MFE",
             fixture.routed_gate.blob,
         });
     records.insert(
@@ -1221,7 +1221,7 @@ split_model_records(
             static_cast<std::ptrdiff_t>(position + 1),
         {
             "model.block.0.mlp.experts.up.weight",
-            "NINTM",
+            "MFE",
             fixture.routed_up.blob,
         });
     (void)ew_names;
@@ -1907,7 +1907,7 @@ void test_split_gate_up_eager_load_and_forward() {
         availability_array(kAvailable));
     require(
         !moe.uses_streamed_experts(),
-        "split NINTM Gate/Up unexpectedly selected offload");
+        "split MFE Gate/Up unexpectedly selected offload");
 
     const auto run = [&](int rows, int salt) {
         const auto input = input_values(rows, salt);
@@ -2226,7 +2226,7 @@ void test_named_dspark_moe_reuses_streamed_tpq_cache() {
         "deepseek_v4-tpq-mfq");
     const mfq::metal::MfqContainer model(file.path());
     auto residency = std::make_shared<
-        mfq::metal::MlxNintMoeOffloadCache>(
+        mfq::metal::MlxMfeOffloadCache>(
             model,
             0,
             kExperts);

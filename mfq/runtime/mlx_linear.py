@@ -20,8 +20,9 @@ except ModuleNotFoundError as exc:  # pragma: no cover - optional dependency
     ) from exc
 
 from mfq.formats import io
+from mfq.formats.compat import NEPQ_DTYPE, NPQ_DTYPE, NVQ_DTYPE, is_nint_dtype
 from mfq.formats.io import MfqTensor
-from mfq.formats.moe import NintMoeTensor
+from mfq.formats.mfe import MfeTensor
 from mfq.formats.mx import MxTensor
 from mfq.formats.nepq import NepqTensor
 from mfq.formats.nint import NintTensor
@@ -82,24 +83,9 @@ _VQ_TENSOR_TYPES = (
     NepqTensor,
 )
 _VQ_DTYPES = {
-    "NVQ2",
-    "NVQ2J",
-    "NVQ2J-L",
-    "NVQ2J-XL",
-    "NVQ3",
-    "NVQ3J",
-    "NVQ3J-512",
-    "NVQ3J-L",
-    "NVQ1-L",
-    "NVQ1-S",
-    "NPQ0-L",
-    "NPQ0-S",
-    "NEPQ0-L",
-    "NEPQ0-S",
-    "NEPQ1-L",
-    "NEPQ1-S",
-    "NEPQ0-A",
-    "NEPQ1-A",
+    NVQ_DTYPE,
+    NPQ_DTYPE,
+    NEPQ_DTYPE,
 }
 
 
@@ -571,9 +557,14 @@ class MlxLinearGroup:
             and weight.residual_position_bits > 0
             for weight in packed
         )
+        contains_nint = any(
+            isinstance(weight, MetalNintWeight) for weight in packed
+        )
         self.grouped_weight = (
             MetalLinearGroupWeight.from_weights(tuple(packed))
-            if len(packed) == len(self.layers) and not residual_vq
+            if len(packed) == len(self.layers)
+            and not residual_vq
+            and not contains_nint
             else None
         )
         if int(grouped_min_rows) <= 0:
@@ -783,7 +774,7 @@ class MlxNintModel:
             if name not in self.tensors.records:
                 raise KeyError(f"tensor {name!r} is not present in the MFQ model")
             record = self.tensors.records[name]
-            if record.dtype == "NINTM":
+            if record.dtype == "MFE":
                 view = self.tensors.blob_view(record)
                 try:
                     try:
@@ -796,11 +787,11 @@ class MlxNintModel:
                     if callable(evict_blob):
                         evict_blob(record)
         tensor = self._require(name)
-        if isinstance(tensor, NintMoeTensor):
+        if isinstance(tensor, MfeTensor):
             return MlxRoutedLinear(tensor)
         if isinstance(tensor, np.ndarray) and tensor.ndim == 3:
             return MlxDenseRoutedLinear(tensor)
-        raise TypeError(f"tensor {name!r} must use NINTM or a dense 3D expert bank")
+        raise TypeError(f"tensor {name!r} must use MFE or a dense 3D expert bank")
 
     def close(self) -> None:
         close = getattr(self.tensors, "close", None)
@@ -819,7 +810,7 @@ class MlxNintModel:
         if name not in self.tensors.records:
             raise KeyError(f"tensor {name!r} is not present in the MFQ model")
         record = self.tensors.records[name]
-        if not (record.dtype.startswith("NINT") and record.dtype[4:].isdigit()):
+        if not is_nint_dtype(record.dtype):
             return None
         return MetalNintWeight.from_blob(self.tensors.read_blob(name))
 

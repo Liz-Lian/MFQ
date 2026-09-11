@@ -18,7 +18,7 @@ from mfq.formats.tpq import (  # noqa: E402
     TpqPqSpec,
     TpqPqTensor,
 )
-from mfq.formats.moe import NintMoePool, NintMoeTensor  # noqa: E402
+from mfq.formats.mfe import MfePool, MfeTensor  # noqa: E402
 from mfq.kernels.metal.tpq import (  # noqa: E402
     MetalTpqInt4Weight,
     MetalTpqMoeWeight,
@@ -337,11 +337,11 @@ def test_tpq_heterogeneous_moe_uses_one_u8_u16_dispatch():
         columns,
         wide=True,
     )
-    tensor = NintMoeTensor(
+    tensor = MfeTensor(
         shape=(4, output, columns),
         pools=(
-            NintMoePool(expert_ids=ids8, tensor=tensor8),
-            NintMoePool(expert_ids=ids16, tensor=tensor16),
+            MfePool(expert_ids=ids8, tensor=tensor8),
+            MfePool(expert_ids=ids16, tensor=tensor16),
         ),
     )
     weight = MetalTpqMoeWeight.from_tensor(tensor)
@@ -395,11 +395,11 @@ def test_tpq_heterogeneous_moe_keeps_p12_p14_streams_packed():
         columns,
         bits=14,
     )
-    tensor = NintMoeTensor(
+    tensor = MfeTensor(
         shape=(4, output, columns),
         pools=(
-            NintMoePool(expert_ids=ids12, tensor=tensor12),
-            NintMoePool(expert_ids=ids14, tensor=tensor14),
+            MfePool(expert_ids=ids12, tensor=tensor12),
+            MfePool(expert_ids=ids14, tensor=tensor14),
         ),
     )
     weight = MetalTpqMoeWeight.from_tensor(tensor)

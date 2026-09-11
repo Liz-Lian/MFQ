@@ -1,4 +1,4 @@
-#include "nintm_expert_store.h"
+#include "mfe_expert_store.h"
 
 #include <algorithm>
 #include <chrono>
@@ -20,7 +20,7 @@ namespace {
 template <typename T>
 T little(std::span<const std::uint8_t> bytes, std::size_t offset) {
     if (offset > bytes.size() || sizeof(T) > bytes.size() - offset) {
-        throw std::runtime_error("truncated NINTM expert metadata");
+        throw std::runtime_error("truncated MFE expert metadata");
     }
     using Unsigned = std::make_unsigned_t<T>;
     Unsigned result{};
@@ -54,16 +54,18 @@ std::uint64_t checked_product(
 
 } // namespace
 
-NintMxfp4ExpertStore::NintMxfp4ExpertStore(MfqRecordRange record)
+MfeMxfp4ExpertStore::MfeMxfp4ExpertStore(MfqRecordRange record)
     : record_(std::move(record)) {
-    if (record_.dtype != "NINTM" || record_.nbytes < 20) {
-        throw NintMxfp4Unsupported(
-            "exact-range expert projection is not NINTM: " + record_.name);
+    if (record_.dtype != "MFE" || record_.nbytes < 20) {
+        throw MfeMxfp4Unsupported(
+            "exact-range expert projection is not MFE: " + record_.name);
     }
     const auto header = read_range(0, 20);
-    if (std::memcmp(header.data(), "NIM2", 4) != 0) {
-        throw NintMxfp4Unsupported(
-            "exact-range expert projection is not NIM2: " + record_.name);
+    if (std::memcmp(header.data(), "MFE1", 4) != 0 &&
+        std::memcmp(header.data(), "NIM2", 4) != 0) {
+        throw MfeMxfp4Unsupported(
+            "exact-range expert projection is not MFE1 or legacy NIM2: " +
+            record_.name);
     }
     const auto experts = little<std::uint32_t>(header, 4);
     const auto output = little<std::uint32_t>(header, 8);
@@ -75,10 +77,10 @@ NintMxfp4ExpertStore::NintMxfp4ExpertStore(MfqRecordRange record)
         output > static_cast<std::uint32_t>(std::numeric_limits<int>::max()) ||
         input > static_cast<std::uint32_t>(std::numeric_limits<int>::max())) {
         throw std::runtime_error(
-            "invalid exact-range NINTM geometry: " + record_.name);
+            "invalid exact-range MFE geometry: " + record_.name);
     }
     if (input % 32 != 0) {
-        throw NintMxfp4Unsupported(
+        throw MfeMxfp4Unsupported(
             "exact-range MXFP4 geometry is not block aligned: " +
             record_.name);
     }
@@ -92,7 +94,7 @@ NintMxfp4ExpertStore::NintMxfp4ExpertStore(MfqRecordRange record)
     for (std::uint32_t pool = 0; pool < pools; ++pool) {
         if (cursor > record_.nbytes || 24 > record_.nbytes - cursor) {
             throw std::runtime_error(
-                "truncated exact-range NINTM pool: " + record_.name);
+                "truncated exact-range MFE pool: " + record_.name);
         }
         const auto pool_header = read_range(cursor, 24);
         const auto count = little<std::uint32_t>(pool_header, 0);
@@ -102,35 +104,35 @@ NintMxfp4ExpertStore::NintMxfp4ExpertStore(MfqRecordRange record)
         if (count == 0 || count > experts || dtype_bytes == 0 ||
             dtype_bytes > 32) {
             throw std::runtime_error(
-                "invalid exact-range NINTM pool metadata: " + record_.name);
+                "invalid exact-range MFE pool metadata: " + record_.name);
         }
         if (runtime_bytes != 0) {
-            throw NintMxfp4Unsupported(
+            throw MfeMxfp4Unsupported(
                 "exact-range MXFP4 pools cannot carry runtime metadata: " +
                 record_.name);
         }
-        cursor = checked_add(cursor, 24, "NINTM pool offset");
+        cursor = checked_add(cursor, 24, "MFE pool offset");
         const auto ids_bytes = checked_product(
-            count, sizeof(std::int32_t), "NINTM expert IDs");
+            count, sizeof(std::int32_t), "MFE expert IDs");
         const auto metadata_bytes = checked_add(
-            ids_bytes, dtype_bytes, "NINTM pool metadata");
+            ids_bytes, dtype_bytes, "MFE pool metadata");
         if (cursor > record_.nbytes || metadata_bytes > record_.nbytes - cursor) {
             throw std::runtime_error(
-                "truncated exact-range NINTM metadata: " + record_.name);
+                "truncated exact-range MFE metadata: " + record_.name);
         }
         const auto metadata = read_range(cursor, metadata_bytes);
         const std::string dtype(
             reinterpret_cast<const char*>(metadata.data() + ids_bytes),
             dtype_bytes);
         if (dtype != "MXFP4") {
-            throw NintMxfp4Unsupported(
-                "exact-range cache requires MXFP4 NINTM experts: " +
+            throw MfeMxfp4Unsupported(
+                "exact-range cache requires MXFP4 MFE experts: " +
                 record_.name);
         }
         const auto payload_offset = checked_add(
-            cursor, metadata_bytes, "NINTM payload offset");
+            cursor, metadata_bytes, "MFE payload offset");
         const auto payload_end = checked_add(
-            payload_offset, payload_bytes, "NINTM payload end");
+            payload_offset, payload_bytes, "MFE payload end");
         if (payload_end > record_.nbytes || payload_bytes < 56) {
             throw std::runtime_error(
                 "truncated exact-range MXFP4 payload: " + record_.name);
@@ -213,63 +215,63 @@ NintMxfp4ExpertStore::NintMxfp4ExpertStore(MfqRecordRange record)
     if (cursor != record_.nbytes ||
         std::find(present.begin(), present.end(), 0) != present.end()) {
         throw std::runtime_error(
-            "exact-range NINTM expert coverage or tail mismatch: " +
+            "exact-range MFE expert coverage or tail mismatch: " +
             record_.name);
     }
 }
 
-int NintMxfp4ExpertStore::num_experts() const noexcept {
+int MfeMxfp4ExpertStore::num_experts() const noexcept {
     return num_experts_;
 }
 
-int NintMxfp4ExpertStore::out_per_expert() const noexcept {
+int MfeMxfp4ExpertStore::out_per_expert() const noexcept {
     return out_per_expert_;
 }
 
-int NintMxfp4ExpertStore::neuron_len() const noexcept {
+int MfeMxfp4ExpertStore::neuron_len() const noexcept {
     return neuron_len_;
 }
 
-std::uint64_t NintMxfp4ExpertStore::values_bytes_per_expert() const noexcept {
+std::uint64_t MfeMxfp4ExpertStore::values_bytes_per_expert() const noexcept {
     return values_bytes_per_expert_;
 }
 
-std::uint64_t NintMxfp4ExpertStore::scales_bytes_per_expert() const noexcept {
+std::uint64_t MfeMxfp4ExpertStore::scales_bytes_per_expert() const noexcept {
     return scales_bytes_per_expert_;
 }
 
-std::uint64_t NintMxfp4ExpertStore::payload_bytes() const noexcept {
+std::uint64_t MfeMxfp4ExpertStore::payload_bytes() const noexcept {
     return payload_bytes_;
 }
 
-const MfqRecordRange& NintMxfp4ExpertStore::record() const noexcept {
+const MfqRecordRange& MfeMxfp4ExpertStore::record() const noexcept {
     return record_;
 }
 
-const NintMxfp4ExpertPart& NintMxfp4ExpertStore::part(
+const MfeMxfp4ExpertPart& MfeMxfp4ExpertStore::part(
     int expert,
     std::size_t field) const {
     if (expert < 0 || expert >= num_experts_ || field >= field_count) {
-        throw std::out_of_range("exact-range NINTM expert part out of range");
+        throw std::out_of_range("exact-range MFE expert part out of range");
     }
     return experts_[static_cast<std::size_t>(expert)][field];
 }
 
-void NintMxfp4ExpertStore::read_part_into(
-    const NintMxfp4ExpertPart& part,
+void MfeMxfp4ExpertStore::read_part_into(
+    const MfeMxfp4ExpertPart& part,
     std::span<std::uint8_t> destination) const {
     if (destination.size() != part.nbytes) {
         throw std::runtime_error(
-            "exact-range NINTM expert destination size mismatch");
+            "exact-range MFE expert destination size mismatch");
     }
     read_range_into(part.offset, destination);
 }
 
-std::vector<std::uint8_t> NintMxfp4ExpertStore::read_blob() const {
+std::vector<std::uint8_t> MfeMxfp4ExpertStore::read_blob() const {
     return read_range(0, record_.nbytes);
 }
 
-std::vector<std::uint8_t> NintMxfp4ExpertStore::read_range(
+std::vector<std::uint8_t> MfeMxfp4ExpertStore::read_range(
     std::uint64_t offset,
     std::uint64_t nbytes) const {
     if (nbytes > std::numeric_limits<std::size_t>::max()) {
@@ -280,7 +282,7 @@ std::vector<std::uint8_t> NintMxfp4ExpertStore::read_range(
     return result;
 }
 
-void NintMxfp4ExpertStore::read_range_into(
+void MfeMxfp4ExpertStore::read_range_into(
     std::uint64_t offset,
     std::span<std::uint8_t> destination) const {
     const auto nbytes = static_cast<std::uint64_t>(destination.size());
@@ -316,7 +318,7 @@ void NintMxfp4ExpertStore::read_range_into(
     }
 }
 
-struct NintMxfp4ReadState {
+struct MfeMxfp4ReadState {
     std::mutex mutex;
     std::condition_variable condition;
     std::size_t remaining = 0;
@@ -328,15 +330,15 @@ struct NintMxfp4ReadState {
     std::exception_ptr error;
 };
 
-NintMxfp4ReadTicket::NintMxfp4ReadTicket(
-    std::shared_ptr<NintMxfp4ReadState> state)
+MfeMxfp4ReadTicket::MfeMxfp4ReadTicket(
+    std::shared_ptr<MfeMxfp4ReadState> state)
     : state_(std::move(state)) {}
 
-NintMxfp4ReadTicket::NintMxfp4ReadTicket(
-    NintMxfp4ReadTicket&&) noexcept = default;
+MfeMxfp4ReadTicket::MfeMxfp4ReadTicket(
+    MfeMxfp4ReadTicket&&) noexcept = default;
 
-NintMxfp4ReadTicket& NintMxfp4ReadTicket::operator=(
-    NintMxfp4ReadTicket&& other) noexcept {
+MfeMxfp4ReadTicket& MfeMxfp4ReadTicket::operator=(
+    MfeMxfp4ReadTicket&& other) noexcept {
     if (this == &other) return *this;
     if (state_) {
         try {
@@ -348,7 +350,7 @@ NintMxfp4ReadTicket& NintMxfp4ReadTicket::operator=(
     return *this;
 }
 
-NintMxfp4ReadTicket::~NintMxfp4ReadTicket() {
+MfeMxfp4ReadTicket::~MfeMxfp4ReadTicket() {
     if (!state_) return;
     try {
         (void)wait();
@@ -356,11 +358,11 @@ NintMxfp4ReadTicket::~NintMxfp4ReadTicket() {
     }
 }
 
-bool NintMxfp4ReadTicket::valid() const noexcept {
+bool MfeMxfp4ReadTicket::valid() const noexcept {
     return static_cast<bool>(state_);
 }
 
-NintMxfp4ReadBatchStats NintMxfp4ReadTicket::wait() {
+MfeMxfp4ReadBatchStats MfeMxfp4ReadTicket::wait() {
     if (!state_) {
         throw std::runtime_error("exact-range read ticket is empty");
     }
@@ -369,7 +371,7 @@ NintMxfp4ReadBatchStats NintMxfp4ReadTicket::wait() {
     state->condition.wait(lock, [&state] {
         return state->remaining == 0;
     });
-    NintMxfp4ReadBatchStats result;
+    MfeMxfp4ReadBatchStats result;
     result.bytes = state->bytes;
     result.calls = state->calls;
     result.file_opens = state->file_opens;
@@ -382,11 +384,11 @@ NintMxfp4ReadBatchStats NintMxfp4ReadTicket::wait() {
     return result;
 }
 
-struct NintMxfp4ReadPool::Impl {
+struct MfeMxfp4ReadPool::Impl {
 
     struct Task {
-        NintMxfp4ReadRequest request;
-        std::shared_ptr<NintMxfp4ReadState> batch;
+        MfeMxfp4ReadRequest request;
+        std::shared_ptr<MfeMxfp4ReadState> batch;
     };
 
     explicit Impl(std::size_t requested_workers)
@@ -424,7 +426,7 @@ struct NintMxfp4ReadPool::Impl {
         std::unordered_map<std::string, std::unique_ptr<std::ifstream>>;
 
     void execute(
-        const NintMxfp4ReadRequest& request,
+        const MfeMxfp4ReadRequest& request,
         StreamCache& streams,
         bool& opened) {
         if (request.store == nullptr || request.part == nullptr ||
@@ -524,18 +526,18 @@ struct NintMxfp4ReadPool::Impl {
     bool stopping = false;
 };
 
-NintMxfp4ReadPool::NintMxfp4ReadPool(std::size_t workers)
+MfeMxfp4ReadPool::MfeMxfp4ReadPool(std::size_t workers)
     : impl_(std::make_unique<Impl>(workers)) {}
 
-NintMxfp4ReadPool::~NintMxfp4ReadPool() = default;
+MfeMxfp4ReadPool::~MfeMxfp4ReadPool() = default;
 
-std::size_t NintMxfp4ReadPool::workers() const noexcept {
+std::size_t MfeMxfp4ReadPool::workers() const noexcept {
     return impl_->worker_count;
 }
 
-NintMxfp4ReadTicket NintMxfp4ReadPool::submit(
-    std::span<const NintMxfp4ReadRequest> requests) {
-    auto batch = std::make_shared<NintMxfp4ReadState>();
+MfeMxfp4ReadTicket MfeMxfp4ReadPool::submit(
+    std::span<const MfeMxfp4ReadRequest> requests) {
+    auto batch = std::make_shared<MfeMxfp4ReadState>();
     batch->started = std::chrono::steady_clock::now();
     for (const auto& request : requests) {
         if (request.store == nullptr || request.part == nullptr ||
@@ -550,7 +552,7 @@ NintMxfp4ReadTicket NintMxfp4ReadPool::submit(
     batch->remaining = requests.size();
     if (requests.empty()) {
         batch->completed = batch->started;
-        return NintMxfp4ReadTicket(std::move(batch));
+        return MfeMxfp4ReadTicket(std::move(batch));
     }
     std::list<Impl::Task> tasks;
     for (const auto& request : requests) {
@@ -564,11 +566,11 @@ NintMxfp4ReadTicket NintMxfp4ReadPool::submit(
         impl_->tasks.splice(impl_->tasks.end(), tasks);
     }
     impl_->condition.notify_all();
-    return NintMxfp4ReadTicket(std::move(batch));
+    return MfeMxfp4ReadTicket(std::move(batch));
 }
 
-NintMxfp4ReadBatchStats NintMxfp4ReadPool::read(
-    std::span<const NintMxfp4ReadRequest> requests) {
+MfeMxfp4ReadBatchStats MfeMxfp4ReadPool::read(
+    std::span<const MfeMxfp4ReadRequest> requests) {
     return submit(requests).wait();
 }
 

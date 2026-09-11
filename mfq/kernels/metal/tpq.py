@@ -18,7 +18,7 @@ except ModuleNotFoundError as exc:  # pragma: no cover - optional dependency
     ) from exc
 
 from mfq.formats.tpq import TpqInt4Tensor, TpqPqTensor
-from mfq.formats.moe import NintMoeTensor
+from mfq.formats.mfe import MfeTensor
 
 _PQ_INDEX_HEADER = r"""
 template <typename I>
@@ -534,7 +534,7 @@ class MetalTpqMoeWeight:
     neuron_len: int
 
     @classmethod
-    def from_tensor(cls, tensor: NintMoeTensor) -> MetalTpqMoeWeight:
+    def from_tensor(cls, tensor: MfeTensor) -> MetalTpqMoeWeight:
         descriptors = np.zeros((tensor.n_experts, 6), dtype=np.int32)
         streams8: list[mx.array] = []
         streams16: list[mx.array] = []

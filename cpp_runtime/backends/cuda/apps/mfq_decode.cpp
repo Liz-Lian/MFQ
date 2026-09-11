@@ -2,6 +2,7 @@
 #include "mfq/kernels/cuda/deepseek_v4_attention.h"
 #include "mfq/kernels/cuda/deepseek_v4_hc.h"
 #include "mfq/kernels/cuda/deepseek_v41.h"
+#include "mfq/kernels/cuda/mxfp4_sq.h"
 #include "mfq_cuda_model_plan.h"
 #include "mfq_cuda_mtp.h"
 #include "mfq_cuda_paged_kv.h"
@@ -19,11 +20,12 @@
 #include "mfq/server.h"
 #include "mfq_legacy_model_graph.h"
 #include "mfq_legacy_tensor_names.h"
+#include "mfq_format_compat.h"
 #include "mfq_paged_prefix_cache.h"
 #include "moe_cache_transfer.h"
 #include "moe_cache_policy.h"
 #include "moe_cache_profile.h"
-#include "nintm_expert_store.h"
+#include "mfe_expert_store.h"
 #include "tensor_parallel.h"
 #include "nvq_codebooks.generated.h"
 #include "nlohmann/json.hpp"
@@ -250,71 +252,7 @@ std::vector<mfq_tensor_backend::Tensor> moe_build_expert_map_cuda(
 std::vector<mfq_tensor_backend::Tensor> moe_build_expert_maps_cuda(
     mfq_tensor_backend::Tensor ids, int64_t n_experts, int64_t tile_m,
     int64_t secondary_tile_m, int64_t tertiary_tile_m);
-void nint_moe_quantize_input_ws_cuda(
-    mfq_tensor_backend::Tensor x, int64_t gs, mfq_tensor_backend::Tensor qx, mfq_tensor_backend::Tensor xscale);
-void nint_moe_quantize_24_28_ws_cuda(
-    mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor qx24, mfq_tensor_backend::Tensor xscale24,
-    mfq_tensor_backend::Tensor qx28, mfq_tensor_backend::Tensor xscale28);
-void nint_moe_quantize_multi_ws_cuda(
-    mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor output_ptrs,
-    mfq_tensor_backend::Tensor output_params, mfq_tensor_backend::Tensor group_plan);
-void nint_moe_quantize_swiglu_input_ws_cuda(
-    mfq_tensor_backend::Tensor gate_up, int64_t gs, mfq_tensor_backend::Tensor qx, mfq_tensor_backend::Tensor xscale);
-void nint_moe_quantize_swiglu_clamped_input_ws_cuda(
-    mfq_tensor_backend::Tensor gate_up, int64_t gs, double limit,
-    mfq_tensor_backend::Tensor qx, mfq_tensor_backend::Tensor xscale);
-void nint_moe_quantize_swiglu_24_28_ws_cuda(
-    mfq_tensor_backend::Tensor gate_up, mfq_tensor_backend::Tensor qx24, mfq_tensor_backend::Tensor xscale24,
-    mfq_tensor_backend::Tensor qx28, mfq_tensor_backend::Tensor xscale28);
-void nint_moe_quantize_geglu_input_ws_cuda(
-    mfq_tensor_backend::Tensor gate_up, int64_t gs, mfq_tensor_backend::Tensor qx, mfq_tensor_backend::Tensor xscale);
-void nint_moe_quantize_geglu_24_28_ws_cuda(
-    mfq_tensor_backend::Tensor gate_up, mfq_tensor_backend::Tensor qx24, mfq_tensor_backend::Tensor xscale24,
-    mfq_tensor_backend::Tensor qx28, mfq_tensor_backend::Tensor xscale28);
-void nint_moe_quantize_glu_multi_ws_cuda(
-    mfq_tensor_backend::Tensor gate_up, mfq_tensor_backend::Tensor output_ptrs,
-    mfq_tensor_backend::Tensor output_params, mfq_tensor_backend::Tensor group_plan,
-    bool gelu);
-mfq_tensor_backend::Tensor nint_moe_grouped_matmul_hetero_qx_cuda(
-    mfq_tensor_backend::Tensor weight_ptrs, mfq_tensor_backend::Tensor pool_params, mfq_tensor_backend::Tensor activation_ptrs,
-    mfq_tensor_backend::Tensor expert_pool, mfq_tensor_backend::Tensor expert_local, mfq_tensor_backend::Tensor ids,
-    int64_t profile_mask, int64_t n_experts, int64_t out_per_expert,
-    int64_t input_width, bool routed_input, mfq_tensor_backend::Tensor out,
-    mfq_tensor_backend::Tensor ids_dst, mfq_tensor_backend::Tensor expert_bounds, mfq_tensor_backend::Tensor tile_bounds,
-    mfq_tensor_backend::Tensor tile_experts);
-mfq_tensor_backend::Tensor nint_moe_grouped_matmul_hetero_glu_qx_cuda(
-    mfq_tensor_backend::Tensor weight_ptrs, mfq_tensor_backend::Tensor pool_params, mfq_tensor_backend::Tensor activation_ptrs,
-    mfq_tensor_backend::Tensor expert_pool, mfq_tensor_backend::Tensor expert_local, mfq_tensor_backend::Tensor ids,
-    int64_t profile_mask, int64_t n_experts, int64_t hidden_width,
-    bool gelu, mfq_tensor_backend::Tensor out);
-mfq_tensor_backend::Tensor nint_moe_grouped_matmul_hetero_f16_cuda(
-    mfq_tensor_backend::Tensor weight_ptrs, mfq_tensor_backend::Tensor pool_params,
-    mfq_tensor_backend::Tensor expert_pool, mfq_tensor_backend::Tensor expert_local,
-    mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor ids,
-    int64_t n_experts, int64_t out_per_expert, int64_t input_width,
-    bool routed_input, mfq_tensor_backend::Tensor out,
-    mfq_tensor_backend::Tensor ids_dst, mfq_tensor_backend::Tensor expert_bounds, mfq_tensor_backend::Tensor tile_bounds,
-    mfq_tensor_backend::Tensor tile_experts, int64_t route_tile_m);
-mfq_tensor_backend::Tensor nint_moe_grouped_matmul_hetero_f16_slice_cuda(
-    mfq_tensor_backend::Tensor weight_ptrs, mfq_tensor_backend::Tensor pool_params,
-    mfq_tensor_backend::Tensor expert_pool, mfq_tensor_backend::Tensor expert_local,
-    mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor ids,
-    int64_t n_experts, int64_t out_per_expert, int64_t input_width,
-    bool routed_input, mfq_tensor_backend::Tensor out,
-    mfq_tensor_backend::Tensor ids_dst, mfq_tensor_backend::Tensor expert_bounds, mfq_tensor_backend::Tensor tile_bounds,
-    mfq_tensor_backend::Tensor tile_experts, int64_t route_tile_m,
-    int64_t weight_out_stride,
-    int64_t weight_row_offset);
-mfq_tensor_backend::Tensor nint_moe_grouped_matmul_pool_ws_cuda(
-    mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor sub_scale, mfq_tensor_backend::Tensor sub_min,
-    mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor neuron_min, mfq_tensor_backend::Tensor x,
-    mfq_tensor_backend::Tensor ids, mfq_tensor_backend::Tensor expert_local, int64_t n_experts,
-    int64_t n_local_experts, int64_t out_per_expert, int64_t gs, int64_t bits,
-    bool route_map_ready, bool input_quantized, mfq_tensor_backend::Tensor out,
-    mfq_tensor_backend::Tensor qx, mfq_tensor_backend::Tensor xscale, mfq_tensor_backend::Tensor counts,
-    mfq_tensor_backend::Tensor cursors, mfq_tensor_backend::Tensor ids_dst, mfq_tensor_backend::Tensor expert_bounds,
-    mfq_tensor_backend::Tensor tile_bounds, mfq_tensor_backend::Tensor tile_experts);
-mfq_tensor_backend::Tensor nint_moe_grouped_matmul_pool_mixed_q_ws_cuda(
+mfq_tensor_backend::Tensor mfe_nint_matmul_ws_cuda(
     mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor row_q_bits,
     mfq_tensor_backend::Tensor row_q_bit_offsets,
     mfq_tensor_backend::Tensor sub_scale, mfq_tensor_backend::Tensor sub_min,
@@ -399,7 +337,7 @@ mfq_tensor_backend::Tensor moe_add_shared_gate_cuda(
 mfq_tensor_backend::Tensor moe_weighted_reduce_shared_gate_cuda(
     mfq_tensor_backend::Tensor pair_output, mfq_tensor_backend::Tensor weights,
     mfq_tensor_backend::Tensor shared, mfq_tensor_backend::Tensor gate_logits);
-void nint_moe_set_small_mmq_cuda(int64_t mode);
+void mfe_set_small_mmq_cuda(int64_t mode);
 std::vector<mfq_tensor_backend::Tensor> gdn_cuda(mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k, mfq_tensor_backend::Tensor v,
                                     mfq_tensor_backend::Tensor g, mfq_tensor_backend::Tensor beta, MfqOptional<mfq_tensor_backend::Tensor> state);
 std::vector<mfq_tensor_backend::Tensor> gdn_inplace_cuda(mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k, mfq_tensor_backend::Tensor v,
@@ -429,15 +367,7 @@ std::vector<mfq_tensor_backend::Tensor> linear_conv_qkv_decode_cuda(
 std::vector<mfq_tensor_backend::Tensor> linear_conv_qkv_prefill_cuda(
     mfq_tensor_backend::Tensor state, mfq_tensor_backend::Tensor qk, mfq_tensor_backend::Tensor v, mfq_tensor_backend::Tensor weight, mfq_tensor_backend::Tensor bias,
     int64_t nk, int64_t nv, int64_t dk, int64_t dv, double eps);
-mfq_tensor_backend::Tensor nint_embedding_lookup_packed_compact_cuda(
-    mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor sub_scale, mfq_tensor_backend::Tensor sub_min,
-    mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor neuron_min, mfq_tensor_backend::Tensor token_ids,
-    int64_t neuron_len, int64_t gs);
-mfq_tensor_backend::Tensor nint_embedding_lookup_packed_compact_bits_cuda(
-    mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor sub_scale, mfq_tensor_backend::Tensor sub_min,
-    mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor neuron_min, mfq_tensor_backend::Tensor token_ids,
-    int64_t neuron_len, int64_t gs, int64_t bits);
-mfq_tensor_backend::Tensor nint_embedding_lookup_packed_mixed_q_cuda(
+mfq_tensor_backend::Tensor nint_embedding_cuda(
     mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor row_q_bits,
     mfq_tensor_backend::Tensor row_q_bit_offsets,
     mfq_tensor_backend::Tensor sub_scale, mfq_tensor_backend::Tensor sub_min,
@@ -454,173 +384,27 @@ void sample_token_counts_add_cuda(mfq_tensor_backend::Tensor counts, mfq_tensor_
 mfq_tensor_backend::Tensor sample_apply_penalties_cuda(
     mfq_tensor_backend::Tensor logits, mfq_tensor_backend::Tensor counts,
     double presence_penalty, double frequency_penalty, double repetition_penalty);
-mfq_tensor_backend::Tensor nint_gemv_packed_ws_cuda(
-    mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor sub_scale, mfq_tensor_backend::Tensor sub_min,
-    mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor neuron_min, mfq_tensor_backend::Tensor x, int64_t gs,
-    mfq_tensor_backend::Tensor qx, mfq_tensor_backend::Tensor xscale, mfq_tensor_backend::Tensor xsum);
-mfq_tensor_backend::Tensor nint4_gs24_gemv_bf16_ws_cuda(
-    mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor sub_scale,
-    mfq_tensor_backend::Tensor sub_min, mfq_tensor_backend::Tensor neuron_scale,
-    mfq_tensor_backend::Tensor neuron_min, mfq_tensor_backend::Tensor x,
-    mfq_tensor_backend::Tensor qx, mfq_tensor_backend::Tensor xscale, mfq_tensor_backend::Tensor xsum);
-mfq_tensor_backend::Tensor nint_gemv_packed_qx_ws_cuda(
-    mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor sub_scale, mfq_tensor_backend::Tensor sub_min,
-    mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor neuron_min, int64_t gs,
-    mfq_tensor_backend::Tensor qx, mfq_tensor_backend::Tensor xscale, mfq_tensor_backend::Tensor xsum);
-void nint4_gs24_quantize_input_ws_cuda(
-    mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor qx,
-    mfq_tensor_backend::Tensor xscale, mfq_tensor_backend::Tensor xsum);
-std::vector<mfq_tensor_backend::Tensor> nint4_gs24_gemv_multi_qx_ws_cuda(
-    const std::vector<mfq_tensor_backend::Tensor> & q_packed,
-    const std::vector<mfq_tensor_backend::Tensor> & sub_scale,
-    const std::vector<mfq_tensor_backend::Tensor> & sub_min,
-    const std::vector<mfq_tensor_backend::Tensor> & neuron_scale,
-    const std::vector<mfq_tensor_backend::Tensor> & neuron_min,
-    mfq_tensor_backend::Tensor qx, mfq_tensor_backend::Tensor xscale, mfq_tensor_backend::Tensor xsum,
-    bool output_bf16);
-mfq_tensor_backend::Tensor nint_gemv_packed_batch_ws_cuda(
-    mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor sub_scale, mfq_tensor_backend::Tensor sub_min,
-    mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor neuron_min, mfq_tensor_backend::Tensor x, int64_t gs,
-    mfq_tensor_backend::Tensor qx, mfq_tensor_backend::Tensor xscale, mfq_tensor_backend::Tensor xsum);
-mfq_tensor_backend::Tensor nint_gemv_packed_gate_ws_cuda(
-    mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor sub_scale, mfq_tensor_backend::Tensor sub_min,
-    mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor neuron_min, mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor gate,
-    int64_t gs, int64_t mode, mfq_tensor_backend::Tensor qx, mfq_tensor_backend::Tensor xscale, mfq_tensor_backend::Tensor xsum);
-mfq_tensor_backend::Tensor nint_gemv_packed_swiglu_ws_cuda(
-    mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor sub_scale, mfq_tensor_backend::Tensor sub_min,
-    mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor neuron_min, mfq_tensor_backend::Tensor x,
-    int64_t gs, mfq_tensor_backend::Tensor qx, mfq_tensor_backend::Tensor xscale, mfq_tensor_backend::Tensor xsum);
-mfq_tensor_backend::Tensor nint_gemv_packed_geglu_ws_cuda(
-    mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor sub_scale, mfq_tensor_backend::Tensor sub_min,
-    mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor neuron_min, mfq_tensor_backend::Tensor x,
-    int64_t gs, mfq_tensor_backend::Tensor qx, mfq_tensor_backend::Tensor xscale, mfq_tensor_backend::Tensor xsum);
-mfq_tensor_backend::Tensor nint_mmq_gs24_group32_ws_cuda(
-    mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor sub_scale, mfq_tensor_backend::Tensor sub_min,
-    mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor neuron_min, mfq_tensor_backend::Tensor x,
-    mfq_tensor_backend::Tensor qx_mmq, mfq_tensor_backend::Tensor xscale, mfq_tensor_backend::Tensor xsum,
-    int64_t split_k, mfq_tensor_backend::Tensor partial);
-mfq_tensor_backend::Tensor nint_mmq_gs24_f16_nint3_cuda(
-    mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor sub_scale, mfq_tensor_backend::Tensor sub_min,
-    mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor neuron_min, mfq_tensor_backend::Tensor x);
-mfq_tensor_backend::Tensor nint_mmq_gs24_f16_nint4_cuda(
-    mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor sub_scale, mfq_tensor_backend::Tensor sub_min,
-    mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor neuron_min, mfq_tensor_backend::Tensor x);
-mfq_tensor_backend::Tensor nint_mmq_gs24_f16_nint6_split4_ws_cuda(
-    mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor sub_scale, mfq_tensor_backend::Tensor sub_min,
-    mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor neuron_min, mfq_tensor_backend::Tensor x,
-    mfq_tensor_backend::Tensor partial);
 std::vector<mfq_tensor_backend::Tensor> nint8_one_quantize_reconstruct_cuda(
     mfq_tensor_backend::Tensor x);
-mfq_tensor_backend::Tensor nint_mmq_f16_packed_cuda(
-    mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor sub_scale, mfq_tensor_backend::Tensor sub_min,
-    mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor neuron_min, mfq_tensor_backend::Tensor x,
-    int64_t gs, int64_t bits);
-mfq_tensor_backend::Tensor nint_mmq_f32_packed_cuda(
-    mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor sub_scale, mfq_tensor_backend::Tensor sub_min,
-    mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor neuron_min, mfq_tensor_backend::Tensor x,
-    int64_t gs, int64_t bits);
 mfq_tensor_backend::Tensor nint8_zero_mmq_f16_packed_cuda(
     mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor scale, mfq_tensor_backend::Tensor x,
     int64_t neuron_len);
 mfq_tensor_backend::Tensor nint8_zero_mmq_f32_packed_cuda(
     mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor scale, mfq_tensor_backend::Tensor x,
     int64_t neuron_len);
-mfq_tensor_backend::Tensor nint_gemv_packed_bits_ws_cuda(
-    mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor sub_scale, mfq_tensor_backend::Tensor sub_min,
-    mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor neuron_min, mfq_tensor_backend::Tensor x, int64_t gs,
-    int64_t bits, mfq_tensor_backend::Tensor qx, mfq_tensor_backend::Tensor xscale, mfq_tensor_backend::Tensor xsum);
-mfq_tensor_backend::Tensor nint_gemv_packed_mixed_q_ws_cuda(
+mfq_tensor_backend::Tensor nint_matmul_ws_cuda(
     mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor row_q_bits,
     mfq_tensor_backend::Tensor row_q_bit_offsets,
     mfq_tensor_backend::Tensor sub_scale, mfq_tensor_backend::Tensor sub_min,
     mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor neuron_min,
     mfq_tensor_backend::Tensor x, int64_t gs,
-    mfq_tensor_backend::Tensor qx, mfq_tensor_backend::Tensor xscale,
-    mfq_tensor_backend::Tensor xsum);
-mfq_tensor_backend::Tensor nint_gemv_packed_int6_ws_cuda(
-    mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor sub_scale, mfq_tensor_backend::Tensor sub_min,
-    mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor neuron_min, mfq_tensor_backend::Tensor x, int64_t gs,
-    mfq_tensor_backend::Tensor qx, mfq_tensor_backend::Tensor xscale, mfq_tensor_backend::Tensor xsum);
-mfq_tensor_backend::Tensor nint_gemv_packed_bits_qx_ws_cuda(
-    mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor sub_scale, mfq_tensor_backend::Tensor sub_min,
-    mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor neuron_min, int64_t gs, int64_t bits,
-    mfq_tensor_backend::Tensor qx, mfq_tensor_backend::Tensor xscale, mfq_tensor_backend::Tensor xsum);
-mfq_tensor_backend::Tensor nint_gemv_packed_bits_swiglu_ws_cuda(
-    mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor sub_scale, mfq_tensor_backend::Tensor sub_min,
-    mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor neuron_min, mfq_tensor_backend::Tensor x, int64_t gs,
-    int64_t bits, mfq_tensor_backend::Tensor qx, mfq_tensor_backend::Tensor xscale, mfq_tensor_backend::Tensor xsum);
-mfq_tensor_backend::Tensor nint_gemv_packed_bits_geglu_ws_cuda(
-    mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor sub_scale, mfq_tensor_backend::Tensor sub_min,
-    mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor neuron_min, mfq_tensor_backend::Tensor x, int64_t gs,
-    int64_t bits, mfq_tensor_backend::Tensor qx, mfq_tensor_backend::Tensor xscale, mfq_tensor_backend::Tensor xsum);
-void nint_ffn_gate_up_swiglu_quant_ws_cuda(
-    mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor sub_scale, mfq_tensor_backend::Tensor sub_min,
-    mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor neuron_min, mfq_tensor_backend::Tensor x,
-    int64_t gu_gs, int64_t gu_bits, int64_t down_gs,
-    mfq_tensor_backend::Tensor gu_qx, mfq_tensor_backend::Tensor gu_xscale, mfq_tensor_backend::Tensor gu_xsum,
-    mfq_tensor_backend::Tensor down_qx, mfq_tensor_backend::Tensor down_xscale, mfq_tensor_backend::Tensor down_xsum);
-void nint_ffn_gate_up_geglu_quant_ws_cuda(
-    mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor sub_scale, mfq_tensor_backend::Tensor sub_min,
-    mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor neuron_min, mfq_tensor_backend::Tensor x,
-    int64_t gu_gs, int64_t gu_bits, int64_t down_gs,
-    mfq_tensor_backend::Tensor gu_qx, mfq_tensor_backend::Tensor gu_xscale, mfq_tensor_backend::Tensor gu_xsum,
-    mfq_tensor_backend::Tensor down_qx, mfq_tensor_backend::Tensor down_xscale, mfq_tensor_backend::Tensor down_xsum);
-mfq_tensor_backend::Tensor nint_gemv_packed_bits_argmax_ws_cuda(
-    mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor sub_scale, mfq_tensor_backend::Tensor sub_min,
-    mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor neuron_min, mfq_tensor_backend::Tensor x, int64_t gs,
-    int64_t bits, mfq_tensor_backend::Tensor qx, mfq_tensor_backend::Tensor xscale, mfq_tensor_backend::Tensor xsum,
-    mfq_tensor_backend::Tensor block_vals, mfq_tensor_backend::Tensor block_idxs);
-mfq_tensor_backend::Tensor nint5_gs28_q5_repack_cuda(
-    mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor sub_scale, mfq_tensor_backend::Tensor sub_min);
-mfq_tensor_backend::Tensor nint5_gs28_q5_dequant_cuda(
-    mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor neuron_min,
-    int64_t neuron_len);
-mfq_tensor_backend::Tensor nint5_gs28_q5_gemv_ws_cuda(
-    mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor neuron_min,
-    mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor qx, mfq_tensor_backend::Tensor xscale, mfq_tensor_backend::Tensor xsum);
-mfq_tensor_backend::Tensor nint_gemv_packed_bits_m1_out_ws_cuda(
-    mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor sub_scale, mfq_tensor_backend::Tensor sub_min,
-    mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor neuron_min, mfq_tensor_backend::Tensor x, int64_t gs,
-    int64_t bits, mfq_tensor_backend::Tensor qx, mfq_tensor_backend::Tensor xscale, mfq_tensor_backend::Tensor xsum,
-    mfq_tensor_backend::Tensor out);
-mfq_tensor_backend::Tensor nint_gemv_packed_bits_linear_out_norm_gate_ws_cuda(
-    mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor sub_scale, mfq_tensor_backend::Tensor sub_min,
-    mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor neuron_min,
-    mfq_tensor_backend::Tensor y, mfq_tensor_backend::Tensor z, mfq_tensor_backend::Tensor norm_weight,
-    int64_t gs, int64_t bits, int64_t dv, double eps,
-    mfq_tensor_backend::Tensor qx, mfq_tensor_backend::Tensor xscale, mfq_tensor_backend::Tensor xsum, mfq_tensor_backend::Tensor rinv);
-mfq_tensor_backend::Tensor nint_gemv_packed_bits_gate_ws_cuda(
-    mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor sub_scale, mfq_tensor_backend::Tensor sub_min,
-    mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor neuron_min, mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor gate,
-    int64_t gs, int64_t bits, int64_t mode, mfq_tensor_backend::Tensor qx, mfq_tensor_backend::Tensor xscale, mfq_tensor_backend::Tensor xsum);
-mfq_tensor_backend::Tensor nint_gemv_packed_u8_ws_cuda(
-    mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor sub_scale, mfq_tensor_backend::Tensor sub_min,
-    mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor neuron_min, mfq_tensor_backend::Tensor x, int64_t gs,
-    mfq_tensor_backend::Tensor qx, mfq_tensor_backend::Tensor xscale, mfq_tensor_backend::Tensor xsum);
-mfq_tensor_backend::Tensor nint_gemv_packed_u8_groupwise_ws_cuda(
-    mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor sub_scale, mfq_tensor_backend::Tensor sub_min,
-    mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor neuron_min, mfq_tensor_backend::Tensor x,
-    int64_t gs, int64_t groups, mfq_tensor_backend::Tensor qx, mfq_tensor_backend::Tensor xscale,
-    mfq_tensor_backend::Tensor xsum);
-mfq_tensor_backend::Tensor nint_mmq_packed_u8_ws_cuda(
-    mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor sub_scale, mfq_tensor_backend::Tensor sub_min,
-    mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor neuron_min, mfq_tensor_backend::Tensor x, int64_t gs,
-    mfq_tensor_backend::Tensor qx, mfq_tensor_backend::Tensor xscale, mfq_tensor_backend::Tensor xsum);
-mfq_tensor_backend::Tensor nint8_zero_gemv_ws_cuda(
-    mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor scale, mfq_tensor_backend::Tensor x,
     mfq_tensor_backend::Tensor qx, mfq_tensor_backend::Tensor xscale);
-mfq_tensor_backend::Tensor nint8_zero_mmq_ws_cuda(
+mfq_tensor_backend::Tensor nint8_zero_gemv_ws_cuda(
     mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor scale, mfq_tensor_backend::Tensor x,
     mfq_tensor_backend::Tensor qx, mfq_tensor_backend::Tensor xscale);
 mfq_tensor_backend::Tensor nint8_zero_dequant_cuda(
     mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor scale, int64_t neuron_len);
-mfq_tensor_backend::Tensor nint_dequant_full_packed_compact_cuda(
-    mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor sub_scale, mfq_tensor_backend::Tensor sub_min,
-    mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor neuron_min, int64_t neuron_len, int64_t gs);
-mfq_tensor_backend::Tensor nint_dequant_full_packed_compact_bits_cuda(
-    mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor sub_scale, mfq_tensor_backend::Tensor sub_min,
-    mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor neuron_min, int64_t neuron_len, int64_t gs, int64_t bits);
-mfq_tensor_backend::Tensor nint_dequant_full_packed_mixed_q_cuda(
+mfq_tensor_backend::Tensor nint_decode_cuda(
     mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor row_q_bits,
     mfq_tensor_backend::Tensor row_q_bit_offsets,
     mfq_tensor_backend::Tensor sub_scale, mfq_tensor_backend::Tensor sub_min,
@@ -1700,7 +1484,7 @@ static void report_cuda_memory(const char * stage) {
               << " ooms=" << stats.ooms << "\n";
 }
 
-static bool moe_small_hetero_enabled(int tokens) {
+static bool moe_small_glu_path_enabled(int tokens) {
     static const bool disabled = [] {
         const char * value = std::getenv("MFQ_DISABLE_MOE_SMALL_HETERO");
         return value != nullptr && std::atoi(value) != 0;
@@ -1809,6 +1593,7 @@ static std::vector<uint8_t> unpack_bits(const std::vector<uint8_t> & blob, size_
 struct Record {
     std::string name;
     std::string dtype;
+    std::string stored_dtype;
     std::string source_path;
     uint64_t offset = 0;
     uint64_t nbytes = 0;
@@ -1956,7 +1741,9 @@ struct MfqFile {
             for (uint32_t i = 0; i < nrec; ++i) {
                 Record r;
                 r.name = read_str(is);
-                r.dtype = read_str(is);
+                r.stored_dtype = read_str(is);
+                r.dtype = std::string(
+                    mfq::canonical_format_dtype(r.stored_dtype));
                 r.source_path = source;
                 r.nbytes = read_u64(is);
                 raw.push_back(std::move(r));
@@ -2080,9 +1867,9 @@ struct MfqFile {
                         "sharded MFQ expert overlays are not supported");
                 }
                 for (const auto & item : expert_overlays) {
-                    if (item.second.dtype != "NINTMD" ||
+                    if (item.second.dtype != "MFED" ||
                         records.find(item.first) == records.end() ||
-                        records.at(item.first).dtype != "NINTM") {
+                        records.at(item.first).dtype != "MFE") {
                         throw std::runtime_error(
                             "invalid expert overlay record: " + item.first);
                     }
@@ -2230,8 +2017,6 @@ struct NintCpu {
     std::vector<int64_t> shape;
     int out = 0;
     int ng = 0;
-    int qbytes = 0;
-    bool mixed_q = false;
     std::vector<uint8_t> q_packed;
     std::vector<uint8_t> row_q_bits;
     std::vector<int64_t> row_q_bit_offsets;
@@ -2250,7 +2035,6 @@ static NintCpu unpack_nint(const std::vector<uint8_t> & blob) {
     size_t off = 0;
     const int raw_bits = blob[off++];
     const bool is_nint_v2 = (raw_bits & 0x80) != 0;
-    t.mixed_q = is_nint_v2;
     t.bits = raw_bits & 0x7f;
     t.sub_bits = blob[off++];
     t.gs = read_i32_from(blob, off);
@@ -2355,7 +2139,7 @@ static NintCpu unpack_nint(const std::vector<uint8_t> & blob) {
         t.sub_scale = unpack_bits(blob, off, sub_count, t.sub_bits);
         t.sub_min = unpack_bits(blob, off, sub_count, t.sub_bits);
     }
-    if (t.mixed_q) {
+    if (is_nint_v2) {
         constexpr int selector_bits = 3;
         const auto selectors = unpack_bits(
             blob, off, static_cast<size_t>(t.out), selector_bits);
@@ -2406,43 +2190,36 @@ static NintCpu unpack_nint(const std::vector<uint8_t> & blob) {
             }
         }
         t.q_packed.insert(t.q_packed.end(), 8, 0);
-        t.qbytes = 0;
     } else {
-        const int64_t qbytes64 =
-            (static_cast<int64_t>(t.gs) * t.bits + 7) / 8;
-        if (qbytes64 > std::numeric_limits<int>::max()) {
-            throw std::runtime_error("NINT packed row size overflow");
-        }
-        t.qbytes = static_cast<int>(qbytes64);
         if (q_count >
                 (std::numeric_limits<size_t>::max() - 7) /
                     static_cast<size_t>(t.bits)) {
             throw std::runtime_error("NINT packed value size overflow");
         }
-        size_t compact_q_nbytes = (q_count * (size_t)t.bits + 7) / 8;
-        size_t row_bits = (size_t)t.gs * t.bits;
-        size_t nrows = (size_t)t.out * t.ng;
-        if ((row_bits & 7u) == 0) {
-            if (off > blob.size() || compact_q_nbytes > blob.size() - off) {
-                throw std::runtime_error("truncated NINT packed values");
-            }
-            t.q_packed.resize(compact_q_nbytes);
-            std::memcpy(t.q_packed.data(), blob.data() + off, compact_q_nbytes);
-        } else {
-            if (off > blob.size() || compact_q_nbytes > blob.size() - off) {
-                throw std::runtime_error("truncated NINT packed values");
-            }
-            t.q_packed.assign(nrows * (size_t)t.qbytes, 0);
-            for (size_t row = 0; row < nrows; ++row) {
-                size_t src_bit0 = row * row_bits;
-                size_t dst_byte0 = row * (size_t)t.qbytes;
-                for (size_t bit = 0; bit < row_bits; ++bit) {
-                    uint8_t v = (blob[off + (src_bit0 + bit) / 8] >> ((src_bit0 + bit) & 7)) & 1u;
-                    if (v) t.q_packed[dst_byte0 + bit / 8] |= (uint8_t)(1u << (bit & 7));
-                }
-            }
+        const size_t compact_q_nbytes =
+            (q_count * static_cast<size_t>(t.bits) + 7) / 8;
+        if (off > blob.size() || compact_q_nbytes > blob.size() - off) {
+            throw std::runtime_error("truncated NINT packed values");
         }
+        t.q_packed.assign(
+            blob.begin() + static_cast<ptrdiff_t>(off),
+            blob.begin() + static_cast<ptrdiff_t>(off + compact_q_nbytes));
         off += compact_q_nbytes;
+        t.row_q_bits.assign(static_cast<size_t>(t.out),
+                            static_cast<uint8_t>(t.bits));
+        t.row_q_bit_offsets.resize(static_cast<size_t>(t.out));
+        const uint64_t row_bits =
+            static_cast<uint64_t>(t.ng) * static_cast<uint64_t>(t.gs) *
+            static_cast<uint64_t>(t.bits);
+        for (size_t row = 0; row < static_cast<size_t>(t.out); ++row) {
+            const uint64_t bit_offset = static_cast<uint64_t>(row) * row_bits;
+            if (bit_offset >
+                    static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
+                throw std::runtime_error("NINT row offset overflow");
+            }
+            t.row_q_bit_offsets[row] = static_cast<int64_t>(bit_offset);
+        }
+        t.q_packed.insert(t.q_packed.end(), 8, 0);
     }
     if (off != blob.size()) {
         throw std::runtime_error("invalid NINT trailing bytes");
@@ -2529,6 +2306,151 @@ static void require_tp_row_major_weight(
     }
 }
 
+static uint64_t nint_row_payload_bits(
+        int ng, int gs, int bits) {
+    if (ng <= 0 || gs <= 0 || bits < 1 || bits > 8 ||
+            static_cast<uint64_t>(ng) >
+                std::numeric_limits<uint64_t>::max() /
+                    static_cast<uint64_t>(gs) /
+                    static_cast<uint64_t>(bits)) {
+        throw std::runtime_error("invalid NINT row bit geometry");
+    }
+    return static_cast<uint64_t>(ng) *
+        static_cast<uint64_t>(gs) * static_cast<uint64_t>(bits);
+}
+
+static void copy_nint_packed_bits(
+        const std::vector<uint8_t> & source,
+        uint64_t source_bit,
+        std::vector<uint8_t> & destination,
+        uint64_t destination_bit,
+        uint64_t bit_count) {
+    const uint64_t source_capacity =
+        static_cast<uint64_t>(source.size()) * 8u;
+    const uint64_t destination_capacity =
+        static_cast<uint64_t>(destination.size()) * 8u;
+    if (source_bit > source_capacity ||
+            bit_count > source_capacity - source_bit ||
+            destination_bit > destination_capacity ||
+            bit_count > destination_capacity - destination_bit) {
+        throw std::runtime_error("NINT packed bit range is out of bounds");
+    }
+    if (((source_bit | destination_bit | bit_count) & 7u) == 0u) {
+        std::memcpy(
+            destination.data() + static_cast<size_t>(destination_bit >> 3),
+            source.data() + static_cast<size_t>(source_bit >> 3),
+            static_cast<size_t>(bit_count >> 3));
+        return;
+    }
+    while (bit_count != 0) {
+        const int source_shift = static_cast<int>(source_bit & 7u);
+        const int destination_shift = static_cast<int>(destination_bit & 7u);
+        const int chunk = static_cast<int>(std::min<uint64_t>(
+            bit_count,
+            static_cast<uint64_t>(std::min(
+                8 - source_shift, 8 - destination_shift))));
+        const uint8_t mask = static_cast<uint8_t>((1u << chunk) - 1u);
+        const uint8_t value = static_cast<uint8_t>(
+            (source[static_cast<size_t>(source_bit >> 3)] >> source_shift) &
+            mask);
+        destination[static_cast<size_t>(destination_bit >> 3)] |=
+            static_cast<uint8_t>(value << destination_shift);
+        source_bit += static_cast<uint64_t>(chunk);
+        destination_bit += static_cast<uint64_t>(chunk);
+        bit_count -= static_cast<uint64_t>(chunk);
+    }
+}
+
+static void require_canonical_nint_cpu(const NintCpu & source) {
+    if (source.out <= 0 ||
+            source.row_q_bits.size() != static_cast<size_t>(source.out) ||
+            source.row_q_bit_offsets.size() != static_cast<size_t>(source.out) ||
+            source.q_packed.size() < 8) {
+        throw std::runtime_error("NINT storage is missing canonical row metadata");
+    }
+    const uint64_t payload_capacity =
+        static_cast<uint64_t>(source.q_packed.size() - 8) * 8u;
+    for (int row = 0; row < source.out; ++row) {
+        const int bits = source.row_q_bits[static_cast<size_t>(row)];
+        const int64_t signed_offset =
+            source.row_q_bit_offsets[static_cast<size_t>(row)];
+        const uint64_t row_bits =
+            nint_row_payload_bits(source.ng, source.gs, bits);
+        if (signed_offset < 0 ||
+                static_cast<uint64_t>(signed_offset) > payload_capacity ||
+                row_bits > payload_capacity -
+                    static_cast<uint64_t>(signed_offset)) {
+            throw std::runtime_error("invalid canonical NINT row metadata");
+        }
+    }
+}
+
+static NintCpu repack_nint_cpu_rows(
+        const NintCpu & source,
+        const std::vector<int64_t> & rows) {
+    require_canonical_nint_cpu(source);
+    if (rows.empty()) {
+        throw std::runtime_error("cannot create an empty NINT row selection");
+    }
+    uint64_t total_bits = 0;
+    for (int64_t row : rows) {
+        if (row < 0 || row >= source.out) {
+            throw std::runtime_error("NINT selected row is out of range");
+        }
+        const uint64_t row_bits = nint_row_payload_bits(
+            source.ng, source.gs,
+            source.row_q_bits[static_cast<size_t>(row)]);
+        if (row_bits > std::numeric_limits<uint64_t>::max() - total_bits) {
+            throw std::runtime_error("NINT selected row payload is too large");
+        }
+        total_bits += row_bits;
+    }
+    if (total_bits > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) ||
+            (total_bits + 7u) / 8u >
+            static_cast<uint64_t>(std::numeric_limits<size_t>::max() - 8)) {
+        throw std::runtime_error("NINT selected row payload is too large");
+    }
+    NintCpu result = source;
+    result.out = static_cast<int>(rows.size());
+    result.shape[0] = result.out;
+    result.q_packed.assign(static_cast<size_t>((total_bits + 7u) / 8u) + 8, 0);
+    result.row_q_bits.resize(rows.size());
+    result.row_q_bit_offsets.resize(rows.size());
+    result.sub_scale.resize(rows.size() * static_cast<size_t>(source.ng));
+    result.sub_min.resize(rows.size() * static_cast<size_t>(source.ng));
+    result.neuron_scale_h.resize(rows.size());
+    result.neuron_min_h.resize(rows.size());
+    uint64_t destination_bit = 0;
+    for (size_t destination = 0; destination < rows.size(); ++destination) {
+        const size_t source_row = static_cast<size_t>(rows[destination]);
+        const int bits = source.row_q_bits[source_row];
+        const uint64_t row_bits =
+            nint_row_payload_bits(source.ng, source.gs, bits);
+        result.row_q_bits[destination] = static_cast<uint8_t>(bits);
+        result.row_q_bit_offsets[destination] =
+            static_cast<int64_t>(destination_bit);
+        copy_nint_packed_bits(
+            source.q_packed,
+            static_cast<uint64_t>(source.row_q_bit_offsets[source_row]),
+            result.q_packed, destination_bit, row_bits);
+        const size_t source_group = source_row * static_cast<size_t>(source.ng);
+        const size_t destination_group =
+            destination * static_cast<size_t>(source.ng);
+        std::copy_n(
+            source.sub_scale.begin() + static_cast<ptrdiff_t>(source_group),
+            source.ng,
+            result.sub_scale.begin() + static_cast<ptrdiff_t>(destination_group));
+        std::copy_n(
+            source.sub_min.begin() + static_cast<ptrdiff_t>(source_group),
+            source.ng,
+            result.sub_min.begin() + static_cast<ptrdiff_t>(destination_group));
+        result.neuron_scale_h[destination] = source.neuron_scale_h[source_row];
+        result.neuron_min_h[destination] = source.neuron_min_h[source_row];
+        destination_bit += row_bits;
+    }
+    return result;
+}
+
 static NintCpu slice_nint_cpu_output(
         const NintCpu & source, int64_t begin, int64_t end) {
     require_tp_row_major_weight(
@@ -2537,34 +2459,9 @@ static NintCpu slice_nint_cpu_output(
     if (begin < 0 || begin >= end || end > source.out) {
         throw std::runtime_error("invalid NINT output shard");
     }
-    NintCpu result = source;
-    result.out = static_cast<int>(end - begin);
-    result.shape[0] = result.out;
-    const size_t first_group =
-        static_cast<size_t>(begin) * source.ng;
-    const size_t group_count =
-        static_cast<size_t>(result.out) * source.ng;
-    result.q_packed.assign(
-        source.q_packed.begin() +
-            static_cast<ptrdiff_t>(first_group * source.qbytes),
-        source.q_packed.begin() +
-            static_cast<ptrdiff_t>(
-                (first_group + group_count) * source.qbytes));
-    result.sub_scale.assign(
-        source.sub_scale.begin() + static_cast<ptrdiff_t>(first_group),
-        source.sub_scale.begin() +
-            static_cast<ptrdiff_t>(first_group + group_count));
-    result.sub_min.assign(
-        source.sub_min.begin() + static_cast<ptrdiff_t>(first_group),
-        source.sub_min.begin() +
-            static_cast<ptrdiff_t>(first_group + group_count));
-    result.neuron_scale_h.assign(
-        source.neuron_scale_h.begin() + static_cast<ptrdiff_t>(begin),
-        source.neuron_scale_h.begin() + static_cast<ptrdiff_t>(end));
-    result.neuron_min_h.assign(
-        source.neuron_min_h.begin() + static_cast<ptrdiff_t>(begin),
-        source.neuron_min_h.begin() + static_cast<ptrdiff_t>(end));
-    return result;
+    std::vector<int64_t> rows(static_cast<size_t>(end - begin));
+    std::iota(rows.begin(), rows.end(), begin);
+    return repack_nint_cpu_rows(source, rows);
 }
 
 static NintCpu slice_nint_cpu_input_groups(
@@ -2575,6 +2472,7 @@ static NintCpu slice_nint_cpu_input_groups(
     if (begin < 0 || begin >= end || end > source.ng) {
         throw std::runtime_error("invalid NINT input shard");
     }
+    require_canonical_nint_cpu(source);
     NintCpu result = source;
     result.ng = static_cast<int>(end - begin);
     const int64_t element_begin = begin * source.gs;
@@ -2582,24 +2480,48 @@ static NintCpu slice_nint_cpu_input_groups(
         std::min<int64_t>(end * source.gs, source.neuron_len);
     result.neuron_len = static_cast<int>(element_end - element_begin);
     result.shape[1] = result.neuron_len;
-    result.q_packed.resize(
-        static_cast<size_t>(source.out) * result.ng * source.qbytes);
+    uint64_t total_bits = 0;
+    for (int row = 0; row < source.out; ++row) {
+        const uint64_t row_bits = nint_row_payload_bits(
+            result.ng, source.gs,
+            source.row_q_bits[static_cast<size_t>(row)]);
+        if (row_bits > std::numeric_limits<uint64_t>::max() - total_bits) {
+            throw std::runtime_error("NINT input shard payload is too large");
+        }
+        total_bits += row_bits;
+    }
+    if (total_bits > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) ||
+            (total_bits + 7u) / 8u >
+            static_cast<uint64_t>(std::numeric_limits<size_t>::max() - 8)) {
+        throw std::runtime_error("NINT input shard payload is too large");
+    }
+    result.q_packed.assign(static_cast<size_t>((total_bits + 7u) / 8u) + 8, 0);
+    result.row_q_bit_offsets.resize(static_cast<size_t>(source.out));
     result.sub_scale.resize(
         static_cast<size_t>(source.out) * result.ng);
     result.sub_min.resize(
         static_cast<size_t>(source.out) * result.ng);
+    uint64_t destination_bit = 0;
     for (int row = 0; row < source.out; ++row) {
+        const int bits = source.row_q_bits[static_cast<size_t>(row)];
+        const uint64_t row_bits =
+            nint_row_payload_bits(result.ng, source.gs, bits);
+        const uint64_t source_bit = static_cast<uint64_t>(
+            source.row_q_bit_offsets[static_cast<size_t>(row)]) +
+            static_cast<uint64_t>(begin) *
+                static_cast<uint64_t>(source.gs) *
+                static_cast<uint64_t>(bits);
+        result.row_q_bit_offsets[static_cast<size_t>(row)] =
+            static_cast<int64_t>(destination_bit);
+        copy_nint_packed_bits(
+            source.q_packed, source_bit,
+            result.q_packed, destination_bit, row_bits);
+        destination_bit += row_bits;
         const size_t source_group =
             static_cast<size_t>(row) * source.ng +
             static_cast<size_t>(begin);
         const size_t destination_group =
             static_cast<size_t>(row) * result.ng;
-        std::memcpy(
-            result.q_packed.data() +
-                destination_group * source.qbytes,
-            source.q_packed.data() +
-                source_group * source.qbytes,
-            static_cast<size_t>(result.ng) * source.qbytes);
         std::memcpy(
             result.sub_scale.data() + destination_group,
             source.sub_scale.data() + source_group,
@@ -2852,6 +2774,73 @@ static Mxfp4Cpu select_mxfp4_cpu_rows(
             source.scales.data() + static_cast<size_t>(source_row) * scale_row,
             scale_row);
     }
+    return result;
+}
+
+static std::vector<uint8_t> select_mxfp4_sq_payload_rows(
+        const std::vector<uint8_t> & source,
+        const std::vector<int64_t> & rows) {
+    const auto src = mfq::sq::parse(source.data(), source.size());
+    if (rows.empty()) {
+        throw std::runtime_error(
+            "cannot create an empty MXFP4-SQ MoE shard");
+    }
+    const auto dst = mfq::sq::layout(
+        src.bits,
+        static_cast<int64_t>(rows.size()),
+        src.width,
+        src.base);
+    std::vector<uint8_t> result(dst.bytes, 0);
+    result[0] = 'S';
+    result[1] = 'Q';
+    result[2] = static_cast<uint8_t>('0' + src.bits);
+    result[3] = 0;
+    result[4] = 1;
+    result[5] = static_cast<uint8_t>(src.base);
+    const auto write_u64 = [&](size_t offset, uint64_t value) {
+        for (int byte = 0; byte < 8; ++byte) {
+            result[offset + static_cast<size_t>(byte)] =
+                static_cast<uint8_t>(value >> (byte * 8));
+        }
+    };
+    write_u64(8, rows.size());
+    write_u64(16, static_cast<uint64_t>(src.width));
+    const auto copy_row_bits = [&](
+            size_t source_offset,
+            size_t destination_offset,
+            size_t bits_per_row) {
+        for (size_t destination_row = 0;
+             destination_row < rows.size();
+             ++destination_row) {
+            const int64_t source_row = rows[destination_row];
+            if (source_row < 0 || source_row >= src.outputs) {
+                throw std::runtime_error(
+                    "MXFP4-SQ selected row is out of range");
+            }
+            for (size_t bit = 0; bit < bits_per_row; ++bit) {
+                const size_t source_bit =
+                    static_cast<size_t>(source_row) * bits_per_row + bit;
+                if (((source[source_offset + source_bit / 8]
+                        >> (source_bit & 7)) & 1u) == 0u) {
+                    continue;
+                }
+                const size_t destination_bit =
+                    destination_row * bits_per_row + bit;
+                result[destination_offset + destination_bit / 8] |=
+                    static_cast<uint8_t>(1u << (destination_bit & 7));
+            }
+        }
+    };
+    copy_row_bits(
+        src.symbols,
+        dst.symbols,
+        static_cast<size_t>(src.width) * src.bits);
+    copy_row_bits(
+        src.selectors,
+        dst.selectors,
+        static_cast<size_t>(src.width / 32));
+    copy_row_bits(src.scales, dst.scales, 16);
+    copy_row_bits(src.palettes, dst.palettes, 40);
     return result;
 }
 
@@ -3322,16 +3311,8 @@ static Mxfp8Weight to_cuda_device_mxfp8(
 struct Workspace {
     int M = 0;
     int K_pad = 0;
-    int argmax_blocks = 0;
     mfq_tensor_backend::Tensor qx;
     mfq_tensor_backend::Tensor xscale;
-    mfq_tensor_backend::Tensor xsum;
-    mfq_tensor_backend::Tensor argmax_vals;
-    mfq_tensor_backend::Tensor argmax_idxs;
-    mfq_tensor_backend::Tensor out_buf;
-    mfq_tensor_backend::Tensor rinv;
-    mfq_tensor_backend::Tensor mmq_partial;
-    mfq_tensor_backend::Tensor mmq_qx;
 };
 
 struct NintWeight {
@@ -3347,10 +3328,8 @@ struct NintWeight {
     int64_t ng = 0;
     int64_t gs = 0;
     int64_t bits = 0;
-    int64_t qbytes = 0;
     int64_t neuron_len = 0;
-    bool mixed_q = false;
-    bool q5_exec = false;
+    int64_t q_expert_stride = 0;
     bool q8_zero = false;
     std::vector<int64_t> shape;
     mutable std::unordered_map<int, Workspace> workspaces;
@@ -3367,178 +3346,26 @@ struct NintWeight {
             {M, K_pad}, workspace_options.dtype(mfq_tensor_backend::kInt8));
         ws.xscale = mfq_tensor_backend::empty(
             {M, ng}, workspace_options.dtype(mfq_tensor_backend::kFloat32));
-        ws.xsum = mfq_tensor_backend::empty(
-            {M, ng}, workspace_options.dtype(mfq_tensor_backend::kInt32));
         auto res = workspaces.emplace(M, std::move(ws));
         return res.first->second;
     }
 
-    void ensure_argmax_workspace(Workspace & ws) const {
-        int nb = (int)((out + 3) / 4);
-        if (ws.argmax_vals.defined() && ws.argmax_blocks >= nb) return;
-        ws.argmax_blocks = nb;
-        ws.argmax_vals = mfq_tensor_backend::empty(
-            {nb}, q_packed.options().dtype(mfq_tensor_backend::kFloat32));
-        ws.argmax_idxs = mfq_tensor_backend::empty(
-            {nb}, q_packed.options().dtype(mfq_tensor_backend::kInt32));
-    }
-
-    void ensure_output_workspace(Workspace & ws) const {
-        if (ws.out_buf.defined() && ws.out_buf.size(0) == 1 && ws.out_buf.size(1) == out) return;
-        ws.out_buf = mfq_tensor_backend::empty(
-            {1, out}, q_packed.options().dtype(mfq_tensor_backend::kFloat16));
-    }
-
-    void ensure_rinv_workspace(Workspace & ws, int64_t n) const {
-        if (ws.rinv.defined() && ws.rinv.numel() >= n) return;
-        ws.rinv = mfq_tensor_backend::empty(
-            {n}, q_packed.options().dtype(mfq_tensor_backend::kFloat32));
-    }
-
-    void ensure_mmq_partial_workspace(Workspace & ws, int64_t n) const {
-        if (ws.mmq_partial.defined() && ws.mmq_partial.numel() >= n) return;
-        ws.mmq_partial = mfq_tensor_backend::empty(
-            {n}, q_packed.options().dtype(mfq_tensor_backend::kFloat32));
-    }
-
-    void ensure_mmq_qx_workspace(Workspace & ws, int M) const {
-        const int kStride = bits == 2 && gs == 16 ? 36 : 68;
-        int m_pad = ((M + 15) / 16) * 16;
-        int nchunks = ((int)ng + 7) / 8;
-        int64_t n = (int64_t)nchunks * m_pad * kStride;
-        if (ws.mmq_qx.defined() && ws.mmq_qx.numel() >= n) return;
-        ws.mmq_qx = mfq_tensor_backend::empty(
-            {n}, q_packed.options().dtype(mfq_tensor_backend::kInt32));
-    }
 };
-
-struct NintPrefillWorkspaceSlot {
-    int64_t ng = 0;
-    int64_t kstride = 0;
-    uint64_t last_use = 0;
-    Workspace workspace;
-};
-
-struct NintPrefillWorkspaceRing {
-    uint64_t clock = 0;
-    std::vector<NintPrefillWorkspaceSlot> slots;
-};
-
-struct NintPrefillStreamKey {
-    int device = 0;
-    std::uintptr_t stream = 0;
-
-    bool operator==(const NintPrefillStreamKey & other) const {
-        return device == other.device && stream == other.stream;
-    }
-};
-
-struct NintPrefillStreamKeyHash {
-    size_t operator()(const NintPrefillStreamKey & key) const {
-        const size_t device_hash = std::hash<int>{}(key.device);
-        const size_t stream_hash =
-            std::hash<std::uintptr_t>{}(key.stream);
-        return device_hash ^
-            (stream_hash + 0x9e3779b9U +
-             (device_hash << 6) + (device_hash >> 2));
-    }
-};
-
-static Workspace & nint_prefill_mmq_workspace(
-        const NintWeight & weight,
-        const mfq_tensor_backend::Tensor & x,
-        int M) {
-    constexpr size_t kWorkspaceSlots = 3;
-    thread_local std::unordered_map<
-        NintPrefillStreamKey,
-        NintPrefillWorkspaceRing,
-        NintPrefillStreamKeyHash> rings;
-
-    const auto cuda_stream =
-        mfq_get_current_cuda_stream().stream();
-    const NintPrefillStreamKey key{
-        x.get_device(),
-        reinterpret_cast<std::uintptr_t>(cuda_stream)};
-    auto & ring = rings[key];
-    const uint64_t use = ++ring.clock;
-    const int64_t kstride =
-        weight.bits == 2 && weight.gs == 16 ? 36 : 68;
-
-    NintPrefillWorkspaceSlot * selected = nullptr;
-    for (auto & slot : ring.slots) {
-        if (slot.ng == weight.ng && slot.kstride == kstride) {
-            selected = &slot;
-            break;
-        }
-    }
-    if (selected == nullptr && ring.slots.size() < kWorkspaceSlots) {
-        ring.slots.emplace_back();
-        selected = &ring.slots.back();
-    }
-    if (selected == nullptr) {
-        selected = &*std::min_element(
-            ring.slots.begin(), ring.slots.end(),
-            [](const auto & lhs, const auto & rhs) {
-                return lhs.last_use < rhs.last_use;
-            });
-        selected->workspace = Workspace{};
-    }
-
-    selected->ng = weight.ng;
-    selected->kstride = kstride;
-    selected->last_use = use;
-    Workspace & workspace = selected->workspace;
-    workspace.M = std::max(workspace.M, M);
-    workspace.K_pad = static_cast<int>(weight.ng * weight.gs);
-    const int64_t rows = std::max<int64_t>(
-        M,
-        workspace.xscale.defined()
-            ? workspace.xscale.size(0)
-            : 0);
-    if (!workspace.xscale.defined() ||
-            workspace.xscale.size(0) < M ||
-            workspace.xscale.size(1) != weight.ng) {
-        const auto float_options =
-            x.options().dtype(mfq_tensor_backend::kFloat32);
-        workspace.xscale = mfq_tensor_backend::empty(
-            {rows, weight.ng}, float_options);
-        workspace.xsum = mfq_tensor_backend::empty(
-            {rows, weight.ng},
-            x.options().dtype(mfq_tensor_backend::kInt32));
-    }
-    return workspace;
-}
-
-static const char * nint6_mmq_mode_name(Nint6MmqMode mode) {
-    return mode == Nint6MmqMode::Int8 ? "int8" : "fp16";
-}
 
 static NintWeight to_device_nint(const NintCpu & c, bool cuda) {
     if (c.bits < 1 || c.bits > 8) throw std::runtime_error("unsupported NINT bits");
-    int qbytes = (c.gs * c.bits + 7) / 8;
-    if (!c.mixed_q && qbytes != c.qbytes) throw std::runtime_error("NINT qbytes mismatch");
-    if (c.mixed_q &&
-            (c.row_q_bits.size() != static_cast<size_t>(c.out) ||
-             c.row_q_bit_offsets.size() != static_cast<size_t>(c.out))) {
-        throw std::runtime_error("NINT mixed-q row metadata mismatch");
-    }
+    require_canonical_nint_cpu(c);
     NintWeight w;
     w.out = c.out;
     w.ng = c.ng;
     w.gs = c.gs;
     w.bits = c.bits;
-    w.qbytes = c.mixed_q ? 0 : qbytes;
     w.neuron_len = c.neuron_len;
-    w.mixed_q = c.mixed_q;
     w.shape = c.shape;
-    if (c.mixed_q) {
-        w.q_packed = cpu_u8_tensor(
-            c.q_packed, {static_cast<int64_t>(c.q_packed.size())});
-        w.row_q_bits = cpu_u8_tensor(c.row_q_bits, {c.out});
-        w.row_q_bit_offsets = cpu_i64_tensor(c.row_q_bit_offsets, {c.out});
-    } else {
-        w.q_packed = cpu_u8_tensor(c.q_packed, {c.out, c.ng, qbytes});
-    }
+    w.q_packed = cpu_u8_tensor(
+        c.q_packed, {static_cast<int64_t>(c.q_packed.size())});
+    w.row_q_bits = cpu_u8_tensor(c.row_q_bits, {c.out});
+    w.row_q_bit_offsets = cpu_i64_tensor(c.row_q_bit_offsets, {c.out});
     w.sub_scale = cpu_u8_tensor(c.sub_scale, {c.out, c.ng});
     w.sub_min = cpu_u8_tensor(c.sub_min, {c.out, c.ng});
     w.neuron_scale = cpu_f16_to_f32_tensor(c.neuron_scale_h, c.out);
@@ -3547,10 +3374,8 @@ static NintWeight to_device_nint(const NintCpu & c, bool cuda) {
         const auto target = mfq_tensor_backend::Device(
             mfq_tensor_backend::kCUDA, mfq_current_cuda_device());
         w.q_packed = w.q_packed.to(target).contiguous();
-        if (w.mixed_q) {
-            w.row_q_bits = w.row_q_bits.to(target).contiguous();
-            w.row_q_bit_offsets = w.row_q_bit_offsets.to(target).contiguous();
-        }
+        w.row_q_bits = w.row_q_bits.to(target).contiguous();
+        w.row_q_bit_offsets = w.row_q_bit_offsets.to(target).contiguous();
         w.sub_scale = w.sub_scale.to(target).contiguous();
         w.sub_min = w.sub_min.to(target).contiguous();
         w.neuron_scale = w.neuron_scale.to(target).contiguous();
@@ -3573,6 +3398,82 @@ static NintWeight to_cpu_nint(const NintCpu & c) {
     return to_device_nint(c, false);
 }
 
+static NintWeight to_device_mfe_nint(
+        const NintCpu & source,
+        int local_experts,
+        int out_per_expert,
+        bool cuda) {
+    require_canonical_nint_cpu(source);
+    if (local_experts <= 0 || out_per_expert <= 0 ||
+            source.out != local_experts * out_per_expert) {
+        throw std::runtime_error("invalid MFE NINT expert geometry");
+    }
+    uint64_t maximum_payload_bits = 0;
+    for (int expert = 0; expert < local_experts; ++expert) {
+        uint64_t payload_bits = 0;
+        for (int local_row = 0; local_row < out_per_expert; ++local_row) {
+            const size_t row = static_cast<size_t>(expert) * out_per_expert +
+                static_cast<size_t>(local_row);
+            const uint64_t row_bits = nint_row_payload_bits(
+                source.ng, source.gs, source.row_q_bits[row]);
+            if (row_bits > std::numeric_limits<uint64_t>::max() - payload_bits) {
+                throw std::runtime_error("MFE NINT expert payload is too large");
+            }
+            payload_bits += row_bits;
+        }
+        maximum_payload_bits = std::max(maximum_payload_bits, payload_bits);
+    }
+    const uint64_t stride_u64 = (maximum_payload_bits + 7u) / 8u + 8u;
+    if (stride_u64 > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) ||
+            static_cast<uint64_t>(local_experts) >
+                static_cast<uint64_t>(std::numeric_limits<size_t>::max()) /
+                    stride_u64) {
+        throw std::runtime_error("MFE NINT expert payload is too large");
+    }
+    const size_t stride = static_cast<size_t>(stride_u64);
+    std::vector<uint8_t> expert_stream(
+        static_cast<size_t>(local_experts) * stride, 0);
+    std::vector<int64_t> relative_offsets(static_cast<size_t>(source.out));
+    for (int expert = 0; expert < local_experts; ++expert) {
+        uint64_t destination_bit = 0;
+        for (int local_row = 0; local_row < out_per_expert; ++local_row) {
+            const size_t row = static_cast<size_t>(expert) * out_per_expert +
+                static_cast<size_t>(local_row);
+            const int bits = source.row_q_bits[row];
+            const uint64_t row_bits =
+                nint_row_payload_bits(source.ng, source.gs, bits);
+            relative_offsets[row] = static_cast<int64_t>(destination_bit);
+            copy_nint_packed_bits(
+                source.q_packed,
+                static_cast<uint64_t>(source.row_q_bit_offsets[row]),
+                expert_stream,
+                static_cast<uint64_t>(expert) * stride_u64 * 8u +
+                    destination_bit,
+                row_bits);
+            destination_bit += row_bits;
+        }
+    }
+    NintWeight result = to_device_nint(source, false);
+    result.q_expert_stride = static_cast<int64_t>(stride);
+    result.q_packed = cpu_u8_tensor(
+        expert_stream, {local_experts, static_cast<int64_t>(stride)});
+    result.row_q_bit_offsets = cpu_i64_tensor(
+        relative_offsets, {source.out});
+    if (cuda) {
+        const auto target = mfq_tensor_backend::Device(
+            mfq_tensor_backend::kCUDA, mfq_current_cuda_device());
+        result.q_packed = result.q_packed.to(target).contiguous();
+        result.row_q_bits = result.row_q_bits.to(target).contiguous();
+        result.row_q_bit_offsets =
+            result.row_q_bit_offsets.to(target).contiguous();
+        result.sub_scale = result.sub_scale.to(target).contiguous();
+        result.sub_min = result.sub_min.to(target).contiguous();
+        result.neuron_scale = result.neuron_scale.to(target).contiguous();
+        result.neuron_min = result.neuron_min.to(target).contiguous();
+    }
+    return result;
+}
+
 static NintWeight to_device_nint8_zero(
         const Nint8ZeroCpu & c, bool cuda) {
     NintWeight w;
@@ -3580,7 +3481,6 @@ static NintWeight to_device_nint8_zero(
     w.ng = c.ng;
     w.gs = 32;
     w.bits = 8;
-    w.qbytes = 32;
     w.neuron_len = c.neuron_len;
     w.q8_zero = true;
     w.shape = c.shape;
@@ -3616,7 +3516,7 @@ static NintWeight load_nint_gpu(const MfqFile & mfq, const std::string & name) {
     return to_gpu_nint(unpack_nint(mfq.read_blob(name)));
 }
 
-struct NintMoeCpuPool {
+struct MfeCpuPool {
     std::vector<int32_t> expert_ids;
     std::string dtype;
     std::vector<uint8_t> payload;
@@ -3627,43 +3527,46 @@ struct NintMoeCpuPool {
     TpqCpu tpq;
 };
 
-struct NintMoeCpu {
+struct MfeCpu {
     int n_experts = 0;
     int out_per_expert = 0;
     int neuron_len = 0;
-    std::vector<NintMoeCpuPool> pools;
+    std::vector<MfeCpuPool> pools;
 };
 
-static NintMoeCpu unpack_nint_moe_impl(
+static MfeCpu unpack_mfe_impl(
         const std::vector<uint8_t> & blob,
         bool allow_partial) {
     if (blob.size() < 20) {
-        throw std::runtime_error("invalid NINTM header");
+        throw std::runtime_error("invalid MFE header");
     }
     const bool version1 = std::memcmp(blob.data(), "NIM1", 4) == 0;
-    const bool delta = std::memcmp(blob.data(), "NID2", 4) == 0;
+    const bool delta =
+        std::memcmp(blob.data(), "MFD1", 4) == 0 ||
+        std::memcmp(blob.data(), "NID2", 4) == 0;
     const bool version2 =
+        std::memcmp(blob.data(), "MFE1", 4) == 0 ||
         std::memcmp(blob.data(), "NIM2", 4) == 0 || delta;
-    if (!version1 && !version2) throw std::runtime_error("invalid NINTM header");
+    if (!version1 && !version2) throw std::runtime_error("invalid MFE header");
     if (delta && !allow_partial) {
-        throw std::runtime_error("NINTM delta cannot be loaded as a full tensor");
+        throw std::runtime_error("MFE delta cannot be loaded as a full tensor");
     }
     size_t off = 4;
-    NintMoeCpu result;
+    MfeCpu result;
     result.n_experts = (int)read_u32_from(blob, off);
     result.out_per_expert = (int)read_u32_from(blob, off);
     result.neuron_len = (int)read_u32_from(blob, off);
     int pool_count = (int)read_u32_from(blob, off);
     if (result.n_experts <= 0 || result.out_per_expert <= 0 || result.neuron_len <= 0 ||
         pool_count <= 0 || pool_count > result.n_experts) {
-        throw std::runtime_error("invalid NINTM dimensions");
+        throw std::runtime_error("invalid MFE dimensions");
     }
     std::vector<int> owners((size_t)result.n_experts, -1);
     result.pools.reserve((size_t)pool_count);
     for (int pool_index = 0; pool_index < pool_count; ++pool_index) {
         const size_t pool_header_bytes = version1 ? 12 : 24;
         if (off + pool_header_bytes > blob.size()) {
-            throw std::runtime_error("truncated NINTM pool header");
+            throw std::runtime_error("truncated MFE pool header");
         }
         uint32_t expert_count = read_u32_from(blob, off);
         uint32_t dtype_nbytes = version1 ? 0 : read_u32_from(blob, off);
@@ -3673,39 +3576,41 @@ static NintMoeCpu unpack_nint_moe_impl(
                 expert_count > static_cast<uint32_t>(
                     std::numeric_limits<int>::max() / result.out_per_expert) ||
                 dtype_nbytes > 32) {
-            throw std::runtime_error("invalid NINTM pool dimensions");
+            throw std::runtime_error("invalid MFE pool dimensions");
         }
         size_t ids_nbytes = (size_t)expert_count * sizeof(int32_t);
         size_t remaining = blob.size() - off;
         if (ids_nbytes > remaining) {
-            throw std::runtime_error("truncated NINTM pool payload");
+            throw std::runtime_error("truncated MFE pool payload");
         }
         remaining -= ids_nbytes;
         if (dtype_nbytes > remaining) {
-            throw std::runtime_error("truncated NINTM pool payload");
+            throw std::runtime_error("truncated MFE pool payload");
         }
         remaining -= dtype_nbytes;
         if (runtime_nbytes > remaining) {
-            throw std::runtime_error("truncated NINTM pool payload");
+            throw std::runtime_error("truncated MFE pool payload");
         }
         remaining -= static_cast<size_t>(runtime_nbytes);
         if (payload_nbytes > remaining) {
-            throw std::runtime_error("truncated NINTM pool payload");
+            throw std::runtime_error("truncated MFE pool payload");
         }
-        NintMoeCpuPool pool;
+        MfeCpuPool pool;
         pool.expert_ids.resize(expert_count);
         std::memcpy(pool.expert_ids.data(), blob.data() + off, ids_nbytes);
         off += ids_nbytes;
         for (int32_t expert : pool.expert_ids) {
             if (expert < 0 || expert >= result.n_experts || owners[(size_t)expert] >= 0) {
-                throw std::runtime_error("invalid or duplicate NINTM expert id");
+                throw std::runtime_error("invalid or duplicate MFE expert id");
             }
             owners[(size_t)expert] = pool_index;
         }
         if (version2) {
-            if (dtype_nbytes == 0) throw std::runtime_error("empty NINTM pool dtype");
+            if (dtype_nbytes == 0) throw std::runtime_error("empty MFE pool dtype");
             pool.dtype.assign(
                 reinterpret_cast<const char *>(blob.data() + off), dtype_nbytes);
+            pool.dtype = std::string(
+                mfq::canonical_format_dtype(pool.dtype));
             off += dtype_nbytes;
             pool.runtime_payload.assign(
                 blob.begin() + (ptrdiff_t)off,
@@ -3716,14 +3621,28 @@ static NintMoeCpu unpack_nint_moe_impl(
         pool.payload.assign(
             blob.begin() + (ptrdiff_t)off, blob.begin() + (ptrdiff_t)payload_end);
         off = payload_end;
-        if (!version1 && pool.dtype == "MXFP4") {
+        if (!version1 && pool.dtype == "MXFP4-SQ") {
+            if (!pool.runtime_payload.empty()) {
+                throw std::runtime_error(
+                    "unexpected MFE MXFP4-SQ runtime metadata");
+            }
+            const auto layout = mfq::sq::parse(
+                pool.payload.data(), pool.payload.size());
+            const int expected_rows =
+                static_cast<int>(expert_count) * result.out_per_expert;
+            if (layout.outputs != expected_rows ||
+                    layout.width != result.neuron_len) {
+                throw std::runtime_error(
+                    "MFE MXFP4-SQ pool weight shape mismatch");
+            }
+        } else if (!version1 && pool.dtype == "MXFP4") {
             pool.mxfp4 = unpack_mxfp4(pool.payload);
             const int expected_rows =
                 static_cast<int>(expert_count) * result.out_per_expert;
             if (pool.mxfp4.out != expected_rows ||
                     pool.mxfp4.neuron_len != result.neuron_len) {
                 throw std::runtime_error(
-                    "NINTM MXFP4 pool weight shape mismatch");
+                    "MFE MXFP4 pool weight shape mismatch");
             }
         } else if (!version1 && is_tpq_pq_dtype(pool.dtype)) {
             pool.tpq = unpack_tpq_pq(pool.payload, pool.dtype);
@@ -3732,7 +3651,7 @@ static NintMoeCpu unpack_nint_moe_impl(
             if (pool.tpq.out != expected_rows ||
                     pool.tpq.neuron_len != result.neuron_len) {
                 throw std::runtime_error(
-                    "NINTM TPQ-PQ pool weight shape mismatch");
+                    "MFE TPQ-PQ pool weight shape mismatch");
             }
         } else if (!version1 && pool.dtype == "NINT8-0") {
             pool.q8_zero = unpack_nint8_zero(pool.payload);
@@ -3745,20 +3664,18 @@ static NintMoeCpu unpack_nint_moe_impl(
                 pool.q8_zero.shape[0] != expected_rows ||
                 pool.q8_zero.shape[1] != result.neuron_len) {
                 throw std::runtime_error(
-                    "NINTM NINT8-0 pool weight shape mismatch");
+                    "MFE NINT8-0 pool weight shape mismatch");
             }
-        } else if (version1 ||
-                   (pool.dtype != "NINTM" &&
-                    pool.dtype.rfind("NINT", 0) == 0)) {
+        } else if (version1 || pool.dtype == "NINT") {
             pool.weight = unpack_nint(pool.payload);
-            if (version1) pool.dtype = "NINT" + std::to_string(pool.weight.bits);
+            if (version1) pool.dtype = "NINT";
             int expected_rows = (int)expert_count * result.out_per_expert;
             if (pool.weight.axis != 0 || pool.weight.out != expected_rows ||
                 pool.weight.neuron_len != result.neuron_len ||
                 pool.weight.shape.size() != 2 ||
                 pool.weight.shape[0] != expected_rows ||
                 pool.weight.shape[1] != result.neuron_len) {
-                throw std::runtime_error("NINTM pool weight shape mismatch");
+                throw std::runtime_error("MFE pool weight shape mismatch");
             }
         }
         result.pools.push_back(std::move(pool));
@@ -3766,37 +3683,25 @@ static NintMoeCpu unpack_nint_moe_impl(
     if (off != blob.size() ||
         (!allow_partial &&
          std::find(owners.begin(), owners.end(), -1) != owners.end())) {
-        throw std::runtime_error("NINTM expert coverage or tail mismatch");
+        throw std::runtime_error("MFE expert coverage or tail mismatch");
     }
     return result;
 }
 
-static NintMoeCpu unpack_nint_moe(const std::vector<uint8_t> & blob) {
-    return unpack_nint_moe_impl(blob, false);
+static MfeCpu unpack_mfe(const std::vector<uint8_t> & blob) {
+    return unpack_mfe_impl(blob, false);
 }
 
-static NintMoeCpu unpack_nint_moe_delta(
+static MfeCpu unpack_mfe_delta(
         const std::vector<uint8_t> & blob) {
-    return unpack_nint_moe_impl(blob, true);
+    return unpack_mfe_impl(blob, true);
 }
 
-struct NintMoePoolWeight {
+struct MfePoolWeight {
     NintWeight weight;
     mfq_tensor_backend::Tensor expert_local;
     int local_experts = 0;
-    int profile_code = -1;
 };
-
-static int nint_moe_profile_code(int bits, int gs) {
-    if (bits == 2 && gs == 16) return 6;
-    if (bits == 3 && gs == 24) return 5;
-    if (bits == 4 && gs == 24) return 0;
-    if (bits == 5 && gs == 28) return 1;
-    if (bits == 6 && gs == 24) return 2;
-    if (bits == 8 && gs == 48) return 3;
-    if (bits == 8 && gs == 24) return 4;
-    return -1;
-}
 
 struct MoeActivationKey {
     int input_rows = 0;
@@ -3831,6 +3736,41 @@ struct Mxfp4Weight {
     int64_t neuron_len = 0;
 };
 
+struct Mxfp4SqWeight {
+    mfq_tensor_backend::Tensor blob;
+    int64_t bits = 0;
+    int64_t out = 0;
+    int64_t neuron_len = 0;
+    int64_t matrix_scale_base = 0;
+};
+
+static Mxfp4SqWeight to_device_mxfp4_sq(
+        const std::vector<uint8_t> & payload,
+        bool cuda,
+        int device = -1) {
+    const auto layout = mfq::sq::parse(payload.data(), payload.size());
+    Mxfp4SqWeight result;
+    result.bits = layout.bits;
+    result.out = layout.outputs;
+    result.neuron_len = layout.width;
+    result.matrix_scale_base = layout.base;
+    result.blob = cpu_u8_tensor(
+        payload,
+        {static_cast<int64_t>(payload.size())});
+    if (cuda) {
+        const int target_device = device >= 0
+            ? device : mfq_current_cuda_device();
+        MfqCudaGuard guard(target_device);
+        result.blob = result.blob.to(
+            mfq_tensor_backend::Device(
+                mfq_tensor_backend::kCUDA,
+                target_device),
+            false,
+            false).contiguous();
+    }
+    return result;
+}
+
 static Mxfp4Weight to_device_mxfp4(
         const Mxfp4Cpu & source, bool cuda, int device = -1) {
     Mxfp4Weight result;
@@ -3862,15 +3802,6 @@ struct MoeActivationGeometry {
             transform_block == other.transform_block &&
             transform_seed == other.transform_seed;
     }
-};
-
-struct MoeHeteroWorkspace {
-    std::vector<mfq_tensor_backend::Tensor> qx;
-    std::vector<mfq_tensor_backend::Tensor> xscale;
-    mfq_tensor_backend::Tensor activation_ptrs;
-    mfq_tensor_backend::Tensor quantize_ptrs;
-    mfq_tensor_backend::Tensor quantize_params;
-    mfq_tensor_backend::Tensor quantize_group_plan;
 };
 
 struct MoeRoutePlan {
@@ -4045,27 +3976,18 @@ static MoeRoutePlan build_moe_route_plan(mfq_tensor_backend::Tensor ids, int n_e
 static mfq_tensor_backend::Tensor reduce_model_parallel_outputs(
     std::vector<mfq_tensor_backend::Tensor> outputs);
 
-struct NintMoeWeight {
+struct MfeWeight {
     struct ExpertParallelShard {
         int device = 0;
         int64_t expert_begin = 0;
         int64_t expert_end = 0;
-        std::shared_ptr<NintMoeWeight> weight;
+        std::shared_ptr<MfeWeight> weight;
     };
 
     int n_experts = 0;
     int out_per_expert = 0;
     int neuron_len = 0;
-    std::vector<NintMoePoolWeight> pools;
-    bool hetero_supported = false;
-    mfq_tensor_backend::Tensor weight_ptrs;
-    mfq_tensor_backend::Tensor pool_params;
-    mfq_tensor_backend::Tensor expert_pool;
-    mfq_tensor_backend::Tensor expert_local;
-    std::vector<int> quantize_pool_indices;
-    int gs24_quantize_index = -1;
-    int gs28_quantize_index = -1;
-    int profile_mask = 0;
+    std::vector<MfePoolWeight> pools;
     int64_t mixed_weight_bytes = 0;
     bool partial_experts = false;
     std::vector<ExpertParallelShard>
@@ -4081,7 +4003,6 @@ struct NintMoeWeight {
         mfq_tensor_backend::Tensor, const MoeRoutePlan &, bool)> mixed_glu_forward;
     std::function<mfq_tensor_backend::Tensor(
         mfq_tensor_backend::Tensor, const MoeRoutePlan &, double)> mixed_clamped_swiglu_forward;
-    mutable std::unordered_map<int, MoeHeteroWorkspace> hetero_workspaces;
     std::vector<MoeActivationGeometry> activation_geometries;
     int activation_workspace_domain = 0;
     std::shared_ptr<MoeCachedSource> cached_source;
@@ -4105,77 +4026,6 @@ struct NintMoeWeight {
             {input_rows, groups}, x.options().dtype(mfq_tensor_backend::kFloat32));
         return shared_activation_workspaces.emplace(
             key, std::move(workspace)).first->second;
-    }
-
-    MoeHeteroWorkspace & hetero_workspace(mfq_tensor_backend::Tensor x, int input_rows) const {
-        auto found = hetero_workspaces.find(input_rows);
-        if (found != hetero_workspaces.end()) return found->second;
-        MoeHeteroWorkspace workspace;
-        workspace.qx.reserve(pools.size());
-        workspace.xscale.reserve(pools.size());
-        std::vector<int64_t> pointers;
-        pointers.reserve(pools.size() * 2);
-        for (const auto & pool : pools) {
-            const int groups = static_cast<int>(pool.weight.ng);
-            const int gs = static_cast<int>(pool.weight.gs);
-            auto & activation = activation_workspace(x, input_rows, groups, gs);
-            workspace.qx.push_back(activation.qx);
-            workspace.xscale.push_back(activation.xscale);
-            pointers.push_back(static_cast<int64_t>(
-                reinterpret_cast<uintptr_t>(activation.qx.data_ptr<int8_t>())));
-            pointers.push_back(static_cast<int64_t>(
-                reinterpret_cast<uintptr_t>(activation.xscale.data_ptr<float>())));
-        }
-        workspace.activation_ptrs = mfq_tensor_backend::from_blob(
-            pointers.data(), {static_cast<int64_t>(pools.size()), 2},
-            mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt64)).clone().to(x.device()).contiguous();
-        std::vector<int64_t> quantize_ptrs;
-        std::vector<int32_t> quantize_params;
-        std::vector<int32_t> quantize_group_plan;
-        quantize_ptrs.reserve(quantize_pool_indices.size() * 2);
-        quantize_params.reserve(quantize_pool_indices.size() * 2);
-        for (int geometry = 0;
-                geometry < static_cast<int>(quantize_pool_indices.size());
-                ++geometry) {
-            const int pool_index = quantize_pool_indices.at(
-                static_cast<size_t>(geometry));
-            const auto & pool = pools.at(static_cast<size_t>(pool_index));
-            const int groups = static_cast<int>(pool.weight.ng);
-            const int gs = static_cast<int>(pool.weight.gs);
-            quantize_ptrs.push_back(static_cast<int64_t>(
-                reinterpret_cast<uintptr_t>(workspace.qx.at(
-                    static_cast<size_t>(pool_index)).data_ptr<int8_t>())));
-            quantize_ptrs.push_back(static_cast<int64_t>(
-                reinterpret_cast<uintptr_t>(workspace.xscale.at(
-                    static_cast<size_t>(pool_index)).data_ptr<float>())));
-            quantize_params.push_back(groups);
-            quantize_params.push_back(gs);
-            for (int group = 0; group < groups; ++group) {
-                quantize_group_plan.push_back(geometry);
-                quantize_group_plan.push_back(group);
-            }
-        }
-        workspace.quantize_ptrs = mfq_tensor_backend::from_blob(
-            quantize_ptrs.data(),
-            {static_cast<int64_t>(quantize_pool_indices.size()), 2},
-            mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt64))
-            .clone().to(x.device()).contiguous();
-        workspace.quantize_params = mfq_tensor_backend::from_blob(
-            quantize_params.data(),
-            {static_cast<int64_t>(quantize_pool_indices.size()), 2},
-            mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt32))
-            .clone().to(x.device()).contiguous();
-        workspace.quantize_group_plan = mfq_tensor_backend::from_blob(
-            quantize_group_plan.data(),
-            {static_cast<int64_t>(quantize_group_plan.size() / 2), 2},
-            mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt32))
-            .clone().to(x.device()).contiguous();
-        return hetero_workspaces.emplace(input_rows, std::move(workspace)).first->second;
-    }
-
-    bool supports_dual_quant() const {
-        return quantize_pool_indices.size() == 2 &&
-            gs24_quantize_index >= 0 && gs28_quantize_index >= 0;
     }
 
     bool expert_parallel() const {
@@ -4223,11 +4073,11 @@ struct NintMoeWeight {
 
     bool supports_prequantized_input() const {
         return !expert_parallel() &&
-            (hetero_supported || static_cast<bool>(mixed_prequantized_forward));
+            (!pools.empty() || static_cast<bool>(mixed_prequantized_forward));
     }
 
     bool can_reuse_activation_for(
-            const NintMoeWeight & consumer) const {
+            const MfeWeight & consumer) const {
         if (!supports_prequantized_input() ||
                 !consumer.supports_prequantized_input() ||
                 neuron_len != consumer.neuron_len ||
@@ -4274,7 +4124,7 @@ struct NintMoeWeight {
             }
             return forward_expert_parallel(
                 x, route,
-                [](const NintMoeWeight & shard,
+                [](const MfeWeight & shard,
                    mfq_tensor_backend::Tensor local_x,
                    const MoeRoutePlan & local_route) {
                     return shard.forward(
@@ -4285,19 +4135,15 @@ struct NintMoeWeight {
             return mixed_prequantized_forward(x, route);
         }
         if (mixed_forward) return mixed_forward(x, route);
-        if (input_prequantized && !hetero_supported) {
-            throw std::runtime_error(
-                "prequantized MoE activation reuse requires heterogeneous NINT dispatch");
-        }
         if (!x.is_cuda() || !x.is_contiguous() || x.scalar_type() != mfq_tensor_backend::kFloat16 ||
             (x.dim() != 2 && x.dim() != 3) || x.size(-1) != neuron_len) {
-            throw std::runtime_error("NINTM input must be contiguous CUDA f16 with exact K");
+            throw std::runtime_error("MFE input must be contiguous CUDA f16 with exact K");
         }
         int tokens = (int)route.ids.size(0);
         int routes = (int)route.ids.size(1);
         if (route.n_experts != n_experts || x.size(0) != tokens ||
             (x.dim() == 3 && x.size(1) != routes)) {
-            throw std::runtime_error("NINTM input and route shape mismatch");
+            throw std::runtime_error("MFE input and route shape mismatch");
         }
         int input_rows = x.dim() == 3 ? tokens * routes : tokens;
         auto output = partial_experts
@@ -4307,87 +4153,6 @@ struct NintMoeWeight {
             : mfq_tensor_backend::empty(
                 {tokens, routes, out_per_expert},
                 x.options().dtype(mfq_tensor_backend::kFloat16));
-        if (g_kl_mmq_mode != KlMmqMode::Default) {
-            MFQ_RUNTIME_CHECK(
-                hetero_supported && route.map_ready &&
-                route.ids_dst.numel() == route.ids.numel(),
-                "KLD common MMQ requires the routed packed-FP16 path");
-            auto prepared = kl_mmq_prepare_activation(x);
-            ++g_kl_mmq_moe_calls;
-            return nint_moe_grouped_matmul_hetero_f16_cuda(
-                weight_ptrs, pool_params, expert_pool, expert_local,
-                prepared, route.ids, n_experts, out_per_expert,
-                neuron_len, x.dim() == 3, output, route.ids_dst,
-                route.expert_bounds, route.mma_tile_bounds,
-                route.mma_tile_experts, route.mma_tile_m);
-        }
-        static const bool disable_prefill_mma = [] {
-            const char * value = std::getenv("MFQ_DISABLE_MOE_PREFILL_MMA");
-            return value != nullptr && std::atoi(value) != 0;
-        }();
-        static const int prefill_mma_min_tokens = [] {
-            const char * value = std::getenv("MFQ_MOE_PREFILL_MMA_MIN_TOKENS");
-            return value == nullptr ? 256 : std::max(9, std::atoi(value));
-        }();
-        if (!disable_prefill_mma && !g_force_moe_prefill_mma_off && hetero_supported &&
-                tokens >= prefill_mma_min_tokens &&
-                route.map_ready && route.ids_dst.numel() == route.ids.numel()) {
-            return nint_moe_grouped_matmul_hetero_f16_cuda(
-                weight_ptrs, pool_params, expert_pool, expert_local, x, route.ids,
-                n_experts, out_per_expert, neuron_len, x.dim() == 3, output,
-                route.ids_dst, route.expert_bounds, route.mma_tile_bounds,
-                route.mma_tile_experts, route.mma_tile_m);
-        }
-        if (hetero_supported && moe_small_hetero_enabled(tokens) &&
-                hetero_workspaces.find(input_rows) == hetero_workspaces.end()) {
-            cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
-            MFQ_CUDA_CHECK(cudaStreamIsCapturing(
-                mfq_get_current_cuda_stream().stream(), &capture_status));
-            if (capture_status == cudaStreamCaptureStatusNone) {
-                hetero_workspace(x, input_rows);
-            }
-        }
-        static const int hetero_min_k = [] {
-            const char * value = std::getenv("MFQ_MOE_HETERO_MIN_K");
-            return value == nullptr ? 0 : std::max(0, std::atoi(value));
-        }();
-        bool use_hetero = !g_force_moe_pool_path && hetero_supported &&
-            moe_small_hetero_enabled(tokens) && routes <= 8 &&
-            neuron_len >= hetero_min_k;
-        if (use_hetero) {
-            auto & workspace = hetero_workspace(x, input_rows);
-            static const bool disable_dual_quant = [] {
-                const char * value = std::getenv("MFQ_DISABLE_MOE_DUAL_QUANT");
-                return value != nullptr && std::atoi(value) != 0;
-            }();
-            if (!input_prequantized) {
-                if (!disable_dual_quant && supports_dual_quant()) {
-                    nint_moe_quantize_24_28_ws_cuda(
-                        x,
-                        workspace.qx.at(static_cast<size_t>(gs24_quantize_index)),
-                        workspace.xscale.at(static_cast<size_t>(gs24_quantize_index)),
-                        workspace.qx.at(static_cast<size_t>(gs28_quantize_index)),
-                        workspace.xscale.at(static_cast<size_t>(gs28_quantize_index)));
-                } else if (quantize_pool_indices.size() > 1 &&
-                        !supports_dual_quant()) {
-                    nint_moe_quantize_multi_ws_cuda(
-                        x, workspace.quantize_ptrs, workspace.quantize_params,
-                        workspace.quantize_group_plan);
-                } else {
-                    for (int pool_index : quantize_pool_indices) {
-                        const auto & pool = pools.at(static_cast<size_t>(pool_index));
-                        nint_moe_quantize_input_ws_cuda(
-                            x, pool.weight.gs,
-                            workspace.qx.at(static_cast<size_t>(pool_index)),
-                            workspace.xscale.at(static_cast<size_t>(pool_index)));
-                    }
-                }
-            }
-            return nint_moe_grouped_matmul_hetero_qx_cuda(
-                weight_ptrs, pool_params, workspace.activation_ptrs, expert_pool, expert_local,
-                route.ids, profile_mask, n_experts, out_per_expert, neuron_len, x.dim() == 3, output,
-                route.ids_dst, route.expert_bounds, route.tile_bounds, route.tile_experts);
-        }
         std::unordered_set<MoeActivationKey, MoeActivationKeyHash> quantized;
         for (const auto & pool : pools) {
             int groups = (int)pool.weight.ng;
@@ -4396,23 +4161,13 @@ struct NintMoeWeight {
             auto & workspace = activation_workspace(x, input_rows, groups, gs);
             bool input_quantized = input_prequantized ||
                 quantized.find(key) != quantized.end();
-            if (pool.weight.mixed_q) {
-                nint_moe_grouped_matmul_pool_mixed_q_ws_cuda(
-                    pool.weight.q_packed, pool.weight.row_q_bits,
-                    pool.weight.row_q_bit_offsets, pool.weight.sub_scale,
-                    pool.weight.sub_min, pool.weight.neuron_scale,
-                    pool.weight.neuron_min, x, route.ids, pool.expert_local,
-                    n_experts, pool.local_experts, out_per_expert, gs,
-                    input_quantized, output, workspace.qx, workspace.xscale);
-            } else {
-                nint_moe_grouped_matmul_pool_ws_cuda(
-                    pool.weight.q_packed, pool.weight.sub_scale, pool.weight.sub_min,
-                    pool.weight.neuron_scale, pool.weight.neuron_min, x, route.ids,
-                    pool.expert_local, n_experts, pool.local_experts, out_per_expert,
-                    gs, pool.weight.bits, route.map_ready, input_quantized, output,
-                    workspace.qx, workspace.xscale, route.counts, route.cursors,
-                    route.ids_dst, route.expert_bounds, route.tile_bounds, route.tile_experts);
-            }
+            mfe_nint_matmul_ws_cuda(
+                pool.weight.q_packed, pool.weight.row_q_bits,
+                pool.weight.row_q_bit_offsets, pool.weight.sub_scale,
+                pool.weight.sub_min, pool.weight.neuron_scale,
+                pool.weight.neuron_min, x, route.ids, pool.expert_local,
+                n_experts, pool.local_experts, out_per_expert, gs,
+                input_quantized, output, workspace.qx, workspace.xscale);
             quantized.insert(key);
         }
         return output;
@@ -4424,7 +4179,7 @@ struct NintMoeWeight {
             return forward_expert_parallel(
                 x, route,
                 [gelu](
-                    const NintMoeWeight & shard,
+                    const MfeWeight & shard,
                     mfq_tensor_backend::Tensor local_x,
                     const MoeRoutePlan & local_route) {
                     return shard.forward_glu_output(
@@ -4434,49 +4189,10 @@ struct NintMoeWeight {
         if (mixed_glu_output_forward) {
             return mixed_glu_output_forward(x, route, gelu);
         }
-        if (!hetero_supported || !x.is_cuda() || !x.is_contiguous() ||
-            x.scalar_type() != mfq_tensor_backend::kFloat16 || x.dim() != 2 ||
-            x.size(0) < 1 || x.size(0) > 4 ||
-            x.size(1) != neuron_len || out_per_expert <= 0 || out_per_expert % 2 != 0 ||
-            route.ids.size(0) != x.size(0) || route.n_experts != n_experts) {
-            throw std::runtime_error(
-                "fused NINTM gate/up GLU requires 1-4 contiguous CUDA f16 tokens");
-        }
-        const int tokens = static_cast<int>(x.size(0));
-        const int hidden_width = out_per_expert / 2;
-        const int routes = static_cast<int>(route.ids.size(1));
-        auto output = partial_experts
-            ? mfq_tensor_backend::zeros(
-                {tokens, routes, hidden_width},
-                x.options().dtype(mfq_tensor_backend::kFloat16))
-            : mfq_tensor_backend::empty(
-                {tokens, routes, hidden_width},
-                x.options().dtype(mfq_tensor_backend::kFloat16));
-        auto & workspace = hetero_workspace(x, tokens);
-        if (supports_dual_quant()) {
-            nint_moe_quantize_24_28_ws_cuda(
-                x,
-                workspace.qx.at(static_cast<size_t>(gs24_quantize_index)),
-                workspace.xscale.at(static_cast<size_t>(gs24_quantize_index)),
-                workspace.qx.at(static_cast<size_t>(gs28_quantize_index)),
-                workspace.xscale.at(static_cast<size_t>(gs28_quantize_index)));
-        } else if (quantize_pool_indices.size() > 1) {
-            nint_moe_quantize_multi_ws_cuda(
-                x, workspace.quantize_ptrs, workspace.quantize_params,
-                workspace.quantize_group_plan);
-        } else {
-            for (int pool_index : quantize_pool_indices) {
-                const auto & pool = pools.at(static_cast<size_t>(pool_index));
-                nint_moe_quantize_input_ws_cuda(
-                    x, pool.weight.gs,
-                    workspace.qx.at(static_cast<size_t>(pool_index)),
-                    workspace.xscale.at(static_cast<size_t>(pool_index)));
-            }
-        }
-        return nint_moe_grouped_matmul_hetero_glu_qx_cuda(
-            weight_ptrs, pool_params, workspace.activation_ptrs,
-            expert_pool, expert_local, route.ids, profile_mask, n_experts,
-            hidden_width, gelu, output);
+        auto gate_up = forward(x, route);
+        return gelu
+            ? moe_geglu_split_cuda(gate_up)
+            : moe_swiglu_split_cuda(gate_up);
     }
 
     mfq_tensor_backend::Tensor forward_glu(
@@ -4485,7 +4201,7 @@ struct NintMoeWeight {
             return forward_expert_parallel(
                 gate_up, route,
                 [gelu](
-                    const NintMoeWeight & shard,
+                    const MfeWeight & shard,
                     mfq_tensor_backend::Tensor local_gate_up,
                     const MoeRoutePlan & local_route) {
                     return shard.forward_glu(
@@ -4496,64 +4212,15 @@ struct NintMoeWeight {
         if (mixed_glu_forward) {
             return mixed_glu_forward(gate_up, route, gelu);
         }
-        if (!hetero_supported || !gate_up.is_cuda() || !gate_up.is_contiguous() ||
-            gate_up.scalar_type() != mfq_tensor_backend::kFloat16 || gate_up.dim() != 3 ||
-            gate_up.size(2) != 2 * neuron_len) {
-            throw std::runtime_error("fused NINTM GLU input has an unsupported layout");
+        if (!gate_up.is_cuda() || !gate_up.is_contiguous() ||
+                gate_up.scalar_type() != mfq_tensor_backend::kFloat16 ||
+                gate_up.dim() != 3 || gate_up.size(2) != 2 * neuron_len) {
+            throw std::runtime_error("fused MFE GLU input has an unsupported layout");
         }
-        const int tokens = static_cast<int>(route.ids.size(0));
-        const int routes = static_cast<int>(route.ids.size(1));
-        if (tokens > 8 || routes > 8 || route.n_experts != n_experts ||
-            gate_up.size(0) != tokens || gate_up.size(1) != routes) {
-            throw std::runtime_error("fused NINTM GLU only supports M<=8 and up to eight routes");
-        }
-        const int input_rows = tokens * routes;
-        auto output = partial_experts
-            ? mfq_tensor_backend::zeros(
-                {tokens, routes, out_per_expert},
-                gate_up.options().dtype(mfq_tensor_backend::kFloat16))
-            : mfq_tensor_backend::empty(
-                {tokens, routes, out_per_expert},
-                gate_up.options().dtype(mfq_tensor_backend::kFloat16));
-        auto & workspace = hetero_workspace(gate_up, input_rows);
-        if (supports_dual_quant() && neuron_len <= 4096) {
-            if (gelu) {
-                nint_moe_quantize_geglu_24_28_ws_cuda(
-                    gate_up,
-                    workspace.qx.at(static_cast<size_t>(gs24_quantize_index)),
-                    workspace.xscale.at(static_cast<size_t>(gs24_quantize_index)),
-                    workspace.qx.at(static_cast<size_t>(gs28_quantize_index)),
-                    workspace.xscale.at(static_cast<size_t>(gs28_quantize_index)));
-            } else {
-                nint_moe_quantize_swiglu_24_28_ws_cuda(
-                    gate_up,
-                    workspace.qx.at(static_cast<size_t>(gs24_quantize_index)),
-                    workspace.xscale.at(static_cast<size_t>(gs24_quantize_index)),
-                    workspace.qx.at(static_cast<size_t>(gs28_quantize_index)),
-                    workspace.xscale.at(static_cast<size_t>(gs28_quantize_index)));
-            }
-        } else if (quantize_pool_indices.size() > 1) {
-            nint_moe_quantize_glu_multi_ws_cuda(
-                gate_up, workspace.quantize_ptrs, workspace.quantize_params,
-                workspace.quantize_group_plan, gelu);
-        } else {
-            for (int pool_index : quantize_pool_indices) {
-                const auto & pool = pools.at(static_cast<size_t>(pool_index));
-                if (gelu) {
-                    nint_moe_quantize_geglu_input_ws_cuda(
-                        gate_up, pool.weight.gs, workspace.qx.at(static_cast<size_t>(pool_index)),
-                        workspace.xscale.at(static_cast<size_t>(pool_index)));
-                } else {
-                    nint_moe_quantize_swiglu_input_ws_cuda(
-                        gate_up, pool.weight.gs, workspace.qx.at(static_cast<size_t>(pool_index)),
-                        workspace.xscale.at(static_cast<size_t>(pool_index)));
-                }
-            }
-        }
-        return nint_moe_grouped_matmul_hetero_qx_cuda(
-            weight_ptrs, pool_params, workspace.activation_ptrs, expert_pool, expert_local,
-            route.ids, profile_mask, n_experts, out_per_expert, neuron_len, true, output,
-            route.ids_dst, route.expert_bounds, route.tile_bounds, route.tile_experts);
+        auto activation = gelu
+            ? moe_geglu_split_cuda(gate_up)
+            : moe_swiglu_split_cuda(gate_up);
+        return forward(activation, route);
     }
 
     mfq_tensor_backend::Tensor forward_swiglu(mfq_tensor_backend::Tensor gate_up, const MoeRoutePlan & route) const {
@@ -4571,7 +4238,8 @@ struct NintMoeWeight {
                             ->supports_clamped_swiglu();
                 });
         }
-        return static_cast<bool>(mixed_clamped_swiglu_forward);
+        return !pools.empty() ||
+            static_cast<bool>(mixed_clamped_swiglu_forward);
     }
 
     mfq_tensor_backend::Tensor forward_clamped_swiglu(
@@ -4582,7 +4250,7 @@ struct NintMoeWeight {
             return forward_expert_parallel(
                 gate_up, route,
                 [limit](
-                    const NintMoeWeight & shard,
+                    const MfeWeight & shard,
                     mfq_tensor_backend::Tensor local_gate_up,
                     const MoeRoutePlan & local_route) {
                     return shard.forward_clamped_swiglu(
@@ -4590,11 +4258,30 @@ struct NintMoeWeight {
                         local_route, limit);
                 });
         }
-        if (!mixed_clamped_swiglu_forward) {
-            throw std::runtime_error(
-                "clamped SwiGLU is unavailable for this NINTM tensor");
+        if (mixed_clamped_swiglu_forward) {
+            return mixed_clamped_swiglu_forward(
+                gate_up, route, limit);
         }
-        return mixed_clamped_swiglu_forward(gate_up, route, limit);
+        if (pools.empty() || !gate_up.is_cuda() ||
+                !gate_up.is_contiguous() ||
+                gate_up.scalar_type() != mfq_tensor_backend::kFloat16 ||
+                gate_up.dim() != 3 ||
+                gate_up.size(2) != 2 * neuron_len || limit <= 0.0) {
+            throw std::runtime_error(
+                "clamped SwiGLU is unavailable for this MFE tensor");
+        }
+        const int64_t width = gate_up.size(2) / 2;
+        auto gate = mfq_tensor_backend::clamp_max(
+            gate_up.slice(2, 0, width)
+                .to(mfq_tensor_backend::kFloat32),
+            limit);
+        auto up = mfq_tensor_backend::clamp(
+            gate_up.slice(2, width, 2 * width)
+                .to(mfq_tensor_backend::kFloat32),
+            -limit, limit);
+        auto activation = (mfq_tensor_backend::silu(gate) * up)
+            .to(mfq_tensor_backend::kFloat16).contiguous();
+        return forward(activation, route);
     }
 
     mfq_tensor_backend::Tensor forward_geglu(mfq_tensor_backend::Tensor gate_up, const MoeRoutePlan & route) const {
@@ -4602,36 +4289,22 @@ struct NintMoeWeight {
     }
 };
 
-static void initialize_nint_moe_dispatch(
-        NintMoeWeight & result,
-        const std::vector<int32_t> & expert_pool,
-        const std::vector<int32_t> & expert_local) {
-    result.quantize_pool_indices.clear();
+static void initialize_mfe_nint_runtime(MfeWeight & result) {
+    if (result.pools.empty()) {
+        throw std::runtime_error("MFE NINT runtime requires at least one pool");
+    }
     result.activation_geometries.clear();
     result.activation_workspace_domain = 1;
-    result.gs24_quantize_index = -1;
-    result.gs28_quantize_index = -1;
-    result.profile_mask = 0;
-    bool hetero_supported = true;
     std::unordered_set<int64_t> quantized_shapes;
-    for (int pool_index = 0;
-         pool_index < static_cast<int>(result.pools.size());
-         ++pool_index) {
-        auto & pool = result.pools.at(static_cast<size_t>(pool_index));
-        pool.profile_code = pool.weight.mixed_q
-            ? -1
-            : nint_moe_profile_code(
-                static_cast<int>(pool.weight.bits),
-                static_cast<int>(pool.weight.gs));
-        hetero_supported =
-            hetero_supported && pool.profile_code >= 0;
-        if (pool.profile_code >= 0) {
-            result.profile_mask |= 1 << pool.profile_code;
-        }
+    const auto target = result.pools.front().weight.q_packed.device();
+    for (const auto & pool : result.pools) {
+        MFQ_RUNTIME_CHECK(
+            pool.weight.q_packed.is_cuda() &&
+            pool.weight.q_packed.device() == target,
+            "MFE NINT pools must share one CUDA device");
         const int64_t activation_key =
             (pool.weight.gs << 32) ^ pool.weight.ng;
         if (quantized_shapes.insert(activation_key).second) {
-            result.quantize_pool_indices.push_back(pool_index);
             result.activation_geometries.push_back({
                 static_cast<int>(pool.weight.ng),
                 static_cast<int>(pool.weight.gs),
@@ -4640,112 +4313,34 @@ static void initialize_nint_moe_dispatch(
             });
         }
     }
-    for (int pool_index : result.quantize_pool_indices) {
-        const int gs = static_cast<int>(
-            result.pools.at(
-                static_cast<size_t>(pool_index)).weight.gs);
-        if (gs == 24) result.gs24_quantize_index = pool_index;
-        if (gs == 28) result.gs28_quantize_index = pool_index;
-    }
-    const char * disable_hetero =
-        std::getenv("MFQ_DISABLE_MOE_HETERO");
-    result.hetero_supported = hetero_supported &&
-        !(disable_hetero != nullptr &&
-          std::atoi(disable_hetero) != 0);
-    if (!result.hetero_supported) return;
-    MFQ_RUNTIME_CHECK(
-        !result.pools.empty() &&
-        result.pools.front().weight.q_packed.is_cuda(),
-        "NINT MoE dispatch requires CUDA pools");
-    const auto target =
-        result.pools.front().weight.q_packed.device();
-    for (const auto & pool : result.pools) {
-        MFQ_RUNTIME_CHECK(
-            pool.weight.q_packed.device() == target,
-            "NINT MoE pools must share one CUDA device");
-    }
-
-    std::vector<int64_t> weight_ptrs;
-    std::vector<int32_t> pool_params;
-    weight_ptrs.reserve(result.pools.size() * 5);
-    pool_params.reserve(result.pools.size() * 2);
-    for (const auto & pool : result.pools) {
-        weight_ptrs.push_back(static_cast<int64_t>(
-            reinterpret_cast<uintptr_t>(
-                pool.weight.q_packed.data_ptr<uint8_t>())));
-        weight_ptrs.push_back(static_cast<int64_t>(
-            reinterpret_cast<uintptr_t>(
-                pool.weight.sub_scale.data_ptr<uint8_t>())));
-        weight_ptrs.push_back(static_cast<int64_t>(
-            reinterpret_cast<uintptr_t>(
-                pool.weight.sub_min.data_ptr<uint8_t>())));
-        weight_ptrs.push_back(static_cast<int64_t>(
-            reinterpret_cast<uintptr_t>(
-                pool.weight.neuron_scale.data_ptr<float>())));
-        weight_ptrs.push_back(static_cast<int64_t>(
-            reinterpret_cast<uintptr_t>(
-                pool.weight.neuron_min.data_ptr<float>())));
-        pool_params.push_back(pool.profile_code);
-        pool_params.push_back(
-            static_cast<int32_t>(pool.weight.ng));
-    }
-    result.weight_ptrs = mfq_tensor_backend::from_blob(
-        weight_ptrs.data(),
-        {static_cast<int64_t>(result.pools.size()), 5},
-        mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt64))
-        .clone().to(target).contiguous();
-    result.pool_params = mfq_tensor_backend::from_blob(
-        pool_params.data(),
-        {static_cast<int64_t>(result.pools.size()), 2},
-        mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt32))
-        .clone().to(target).contiguous();
-    result.expert_pool = mfq_tensor_backend::from_blob(
-        const_cast<int32_t *>(expert_pool.data()),
-        {static_cast<int64_t>(expert_pool.size())},
-        mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt32))
-        .clone().to(target).contiguous();
-    result.expert_local = mfq_tensor_backend::from_blob(
-        const_cast<int32_t *>(expert_local.data()),
-        {static_cast<int64_t>(expert_local.size())},
-        mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt32))
-        .clone().to(target).contiguous();
 }
 
-static NintMoeWeight to_gpu_nint_moe(const NintMoeCpu & cpu) {
-    NintMoeWeight result;
+static MfeWeight to_gpu_mfe(const MfeCpu & cpu) {
+    MfeWeight result;
     result.n_experts = cpu.n_experts;
     result.out_per_expert = cpu.out_per_expert;
     result.neuron_len = cpu.neuron_len;
     result.pools.reserve(cpu.pools.size());
-    std::vector<int32_t> expert_pool(
-        static_cast<size_t>(cpu.n_experts), -1);
-    std::vector<int32_t> expert_local(
-        static_cast<size_t>(cpu.n_experts), -1);
-    for (int pool_index = 0;
-         pool_index < static_cast<int>(cpu.pools.size());
-         ++pool_index) {
-        const auto & source_pool = cpu.pools.at(static_cast<size_t>(pool_index));
-        if (source_pool.dtype == "NINTM" ||
-            source_pool.dtype.rfind("NINT", 0) != 0) {
+    for (const auto & source_pool : cpu.pools) {
+        if (source_pool.dtype != "NINT") {
             throw std::runtime_error("non-NINT cohort reached the NINT-only loader");
         }
-        NintMoePoolWeight pool;
-        pool.weight = to_gpu_nint(source_pool.weight);
+        MfePoolWeight pool;
         pool.local_experts = (int)source_pool.expert_ids.size();
+        pool.weight = to_device_mfe_nint(
+            source_pool.weight, pool.local_experts,
+            cpu.out_per_expert, true);
         std::vector<int32_t> local((size_t)cpu.n_experts, -1);
         for (int index = 0; index < pool.local_experts; ++index) {
             const int expert = source_pool.expert_ids.at(static_cast<size_t>(index));
             local[static_cast<size_t>(expert)] = index;
-            expert_pool[static_cast<size_t>(expert)] = pool_index;
-            expert_local[static_cast<size_t>(expert)] = index;
         }
         pool.expert_local = mfq_tensor_backend::from_blob(
             local.data(), {(int64_t)local.size()}, mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt32))
             .clone().to(pool.weight.q_packed.device()).contiguous();
         result.pools.push_back(std::move(pool));
     }
-    initialize_nint_moe_dispatch(
-        result, expert_pool, expert_local);
+    initialize_mfe_nint_runtime(result);
     return result;
 }
 
@@ -4754,14 +4349,14 @@ plan_moe_expert_parallel_slices(
     int64_t extent,
     const std::string & name);
 
-static NintMoeWeight load_nint_moe_gpu(
+static MfeWeight load_mfe_gpu(
     const MfqFile & mfq, const std::string & name,
     bool cacheable = false,
     int layer_id = -1,
     const std::string & projection_role = {});
 
-static std::vector<mfq_tensor_backend::Tensor> nint_moe_ffn_forward(
-        const NintMoeWeight & gate_up, const NintMoeWeight & down,
+static std::vector<mfq_tensor_backend::Tensor> mfe_ffn_forward(
+        const MfeWeight & gate_up, const MfeWeight & down,
         mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor router_logits,
         int top_k, bool use_sigmoid, bool use_sqrt_softplus,
         bool normalize, bool delayed_softmax,
@@ -4769,7 +4364,7 @@ static std::vector<mfq_tensor_backend::Tensor> nint_moe_ffn_forward(
     if (gate_up.n_experts != down.n_experts ||
         gate_up.out_per_expert != 2 * down.neuron_len ||
         down.out_per_expert != gate_up.neuron_len) {
-        throw std::runtime_error("incompatible fused gate_up/down NINTM tensors");
+        throw std::runtime_error("incompatible fused gate_up/down MFE tensors");
     }
     auto selected = moe_topk_cuda(
         router_logits.contiguous(), top_k, use_sigmoid, use_sqrt_softplus,
@@ -5144,33 +4739,51 @@ static void store_compact_bits_cpu(
 static NvqCpu unpack_nvq(const std::vector<uint8_t> & blob, const std::string & dtype) {
     if (blob.size() < 20) throw std::runtime_error("truncated NVQ header");
     NvqCpu t;
-    if (dtype == "NVQ1-L") t.format = 1;
-    else if (dtype == "NVQ2" || dtype == "NIQ2") t.format = 2;
-    else if (dtype == "NVQ3" || dtype == "NIQ3") t.format = 3;
-    else if (dtype == "NVQ2J" || dtype == "NIQ2J") t.format = 5;
-    else if (dtype == "NVQ2J-L") t.format = 13;
-    else if (dtype == "NVQ2J-XL") t.format = 14;
-    else if (dtype == "NVQ3J") t.format = 10;
-    else if (dtype == "NVQ3J-512") t.format = 12;
-    else if (dtype == "NVQ3J-L") t.format = 15;
-    else if (dtype == "NPQ0-L") t.format = 7;
-    else if (dtype == "NVQ1-S") t.format = 8;
-    else if (dtype == "NPQ0-S") t.format = 9;
-    else throw std::runtime_error("unsupported compact VQ dtype: " + dtype);
-
-    const uint8_t expected4 = (t.format == 1 || t.format == 7)
-        ? (uint8_t)'L' : ((t.format == 8 || t.format == 9) ? (uint8_t)'S' : (uint8_t)'1');
-    const bool nvq_magic = blob[0] == 'N' && blob[1] == 'V' && blob[2] == 'Q';
-    const bool niq_magic = blob[0] == 'N' && blob[1] == 'I' && blob[2] == 'Q';
-    const bool npq_magic = blob[0] == 'N' && blob[1] == 'P' && blob[2] == 'Q';
-    const bool nvq1_l_magic = blob[0] == 'N' && blob[1] == 'Q' && blob[2] == '1';
-    const bool valid_magic = (t.format == 7 || t.format == 9) ? npq_magic :
-        ((t.format == 1 || t.format == 8) ? nvq1_l_magic : (nvq_magic || niq_magic));
-    if (!valid_magic || blob[3] != expected4) {
-        throw std::runtime_error("bad compact VQ blob magic for " + dtype);
+    const bool nvq_family = dtype == "NVQ";
+    const bool npq_family = dtype == "NPQ";
+    const bool nvq_magic =
+        (std::memcmp(blob.data(), "NVQ1", 4) == 0) ||
+        (std::memcmp(blob.data(), "NIQ1", 4) == 0);
+    const bool nvq1_l_magic = std::memcmp(blob.data(), "NQ1L", 4) == 0;
+    const bool nvq1_s_magic = std::memcmp(blob.data(), "NQ1S", 4) == 0;
+    const bool npq0_l_magic = std::memcmp(blob.data(), "NPQL", 4) == 0;
+    const bool npq0_s_magic = std::memcmp(blob.data(), "NPQS", 4) == 0;
+    if ((nvq_family && !(nvq_magic || nvq1_l_magic || nvq1_s_magic)) ||
+        (npq_family && !(npq0_l_magic || npq0_s_magic)) ||
+        (!nvq_family && !npq_family)) {
+        throw std::runtime_error("compact VQ family/payload mismatch: " + dtype);
     }
     size_t off = 4;
     const uint8_t profile = blob[off++];
+    if (nvq1_l_magic) {
+        t.format = 1;
+    } else if (nvq1_s_magic) {
+        t.format = 8;
+    } else if (npq0_l_magic) {
+        t.format = 7;
+    } else if (npq0_s_magic) {
+        t.format = 9;
+    } else {
+        constexpr uint8_t kIndexParity = 0x80;
+        constexpr uint8_t kCustom = 0x40;
+        constexpr uint8_t kJsc = 0x20;
+        const bool jsc = (profile & kJsc) != 0;
+        const int codebook_id = profile & ~(kIndexParity | kCustom | kJsc);
+        if (jsc) {
+            t.format = codebook_id == 1 ? 5 :
+                (codebook_id == 2 ? 10 :
+                 (codebook_id == 3 ? 12 :
+                  (codebook_id == 4 ? 13 :
+                   (codebook_id == 5 ? 14 :
+                    (codebook_id == 6 ? 15 : 0)))));
+        } else {
+            t.format = codebook_id == 1 ? 2 :
+                (codebook_id == 2 ? 3 : 0);
+        }
+        if (t.format == 0) {
+            throw std::runtime_error("unsupported NVQ payload profile");
+        }
+    }
     t.sub_bits = blob[off++];
     t.gs = (int)read_u16_from(blob, off);
     t.axis = read_i32_from(blob, off);
@@ -5218,7 +4831,7 @@ static NvqCpu unpack_nvq(const std::vector<uint8_t> & blob, const std::string & 
               ((t.format == 2 || t.format == 5)
                ? 1
                : (t.format == 12 ? 3 : 2))));
-        if (codebook_id != expected_id) throw std::runtime_error("NVQ dtype/codebook mismatch");
+        if (codebook_id != expected_id) throw std::runtime_error("NVQ payload profile/codebook mismatch");
         t.sign_mode = (profile & kIndexParity) ? 1 : 0;
         if (t.sign_mode && t.format != 2) throw std::runtime_error("NVQ index parity requires NVQ2");
         custom = (profile & kCustom) != 0;
@@ -5228,7 +4841,7 @@ static NvqCpu unpack_nvq(const std::vector<uint8_t> & blob, const std::string & 
                 throw std::runtime_error("invalid NVQ-JSC profile flags");
             }
         } else if (jsc) {
-            throw std::runtime_error("NVQ-JSC blob requires an NVQ2J/NVQ3J dtype");
+            throw std::runtime_error("NVQ-JSC flag requires a JSC payload profile");
         }
     }
 
@@ -5961,8 +5574,8 @@ static std::vector<uint16_t> unpack_nepq_u16_bits(
     return result;
 }
 
-static void configure_nepq_profile(NepqCpu & value, const std::string & dtype) {
-    if (dtype == "NEPQ0-S") {
+static void configure_nepq_profile(NepqCpu & value, int profile) {
+    if (profile == 0) {
         value.profile = 0;
         value.format = 9;
         value.state_bits = 2;
@@ -5970,7 +5583,7 @@ static void configure_nepq_profile(NepqCpu & value, const std::string & dtype) {
         value.aux_bits = 0;
         value.table_bytes = 320;
         value.runtime_table_bytes = 320;
-    } else if (dtype == "NEPQ0-L") {
+    } else if (profile == 1) {
         value.profile = 1;
         value.format = 7;
         value.state_bits = 3;
@@ -5978,7 +5591,7 @@ static void configure_nepq_profile(NepqCpu & value, const std::string & dtype) {
         value.aux_bits = 0;
         value.table_bytes = 832;
         value.runtime_table_bytes = 832;
-    } else if (dtype == "NEPQ1-S") {
+    } else if (profile == 2) {
         value.profile = 2;
         value.format = 8;
         value.state_bits = 4;
@@ -5986,7 +5599,7 @@ static void configure_nepq_profile(NepqCpu & value, const std::string & dtype) {
         value.aux_bits = 1;
         value.table_bytes = 2048;
         value.runtime_table_bytes = 1024 * 8;
-    } else if (dtype == "NEPQ1-L") {
+    } else if (profile == 3) {
         value.profile = 3;
         value.format = 1;
         value.state_bits = 3;
@@ -5994,7 +5607,7 @@ static void configure_nepq_profile(NepqCpu & value, const std::string & dtype) {
         value.aux_bits = 1;
         value.table_bytes = 4096;
         value.runtime_table_bytes = 2048 * 8;
-    } else if (dtype == "NEPQ0-A") {
+    } else if (profile == 4) {
         value.profile = 4;
         value.format = 9;
         value.state_bits = 2;
@@ -6006,7 +5619,7 @@ static void configure_nepq_profile(NepqCpu & value, const std::string & dtype) {
         value.residual_position_bits = 5;
         value.residual_record_bits = 15;
         value.residual_block_vectors = 24;
-    } else if (dtype == "NEPQ1-A") {
+    } else if (profile == 5) {
         value.profile = 5;
         value.format = 8;
         value.state_bits = 4;
@@ -6020,7 +5633,7 @@ static void configure_nepq_profile(NepqCpu & value, const std::string & dtype) {
         value.residual_record_bits = 14;
         value.residual_block_vectors = 16;
     } else {
-        throw std::runtime_error("unsupported NEPQ cohort dtype: " + dtype);
+        throw std::runtime_error("unsupported NEPQ cohort profile");
     }
 }
 
@@ -6064,11 +5677,14 @@ static NepqCpu unpack_nepq(
     if (blob.size() < 36 || std::memcmp(blob.data(), "NEP1", 4) != 0) {
         throw std::runtime_error("invalid NEPQ cohort header");
     }
+    if (dtype != "NEPQ") {
+        throw std::runtime_error("unsupported NEPQ cohort dtype: " + dtype);
+    }
     NepqCpu value;
-    configure_nepq_profile(value, dtype);
     size_t off = 4;
     const uint8_t version = blob[off++];
     const uint8_t profile = blob[off++];
+    configure_nepq_profile(value, profile);
     const uint8_t groups_per_supergroup = blob[off++];
     const uint8_t flags = blob[off++];
     value.n_experts = (int)read_u32_from(blob, off);
@@ -6448,116 +6064,7 @@ static NintCpu select_nint_cpu_rows(
     require_tp_row_major_weight(
         source.shape, source.axis, source.out,
         source.neuron_len, "NINT");
-    if (rows.empty()) {
-        throw std::runtime_error(
-            "cannot create an empty NINT MoE shard");
-    }
-    NintCpu result = source;
-    result.out = static_cast<int>(rows.size());
-    result.shape[0] = result.out;
-    const size_t q_row_bytes =
-        static_cast<size_t>(source.ng) *
-        source.qbytes;
-    if (source.mixed_q) {
-        result.q_packed.clear();
-        result.row_q_bits.resize(rows.size());
-        result.row_q_bit_offsets.resize(rows.size());
-    } else {
-        result.q_packed.resize(rows.size() * q_row_bytes);
-    }
-    result.sub_scale.resize(
-        rows.size() * source.ng);
-    result.sub_min.resize(
-        rows.size() * source.ng);
-    result.neuron_scale_h.resize(rows.size());
-    result.neuron_min_h.resize(rows.size());
-    for (size_t destination = 0;
-         destination < rows.size(); ++destination) {
-        const int64_t source_row = rows[destination];
-        if (source_row < 0 ||
-            source_row >= source.out) {
-            throw std::runtime_error(
-                "NINT MoE shard row is out of range");
-        }
-        if (!source.mixed_q) {
-            std::memcpy(
-                result.q_packed.data() +
-                    destination * q_row_bytes,
-                source.q_packed.data() +
-                    static_cast<size_t>(source_row) *
-                        q_row_bytes,
-                q_row_bytes);
-        }
-        std::memcpy(
-            result.sub_scale.data() +
-                destination * source.ng,
-            source.sub_scale.data() +
-                static_cast<size_t>(source_row) *
-                    source.ng,
-            static_cast<size_t>(source.ng));
-        std::memcpy(
-            result.sub_min.data() +
-                destination * source.ng,
-            source.sub_min.data() +
-                static_cast<size_t>(source_row) *
-                    source.ng,
-            static_cast<size_t>(source.ng));
-        result.neuron_scale_h[destination] =
-            source.neuron_scale_h[
-                static_cast<size_t>(source_row)];
-        result.neuron_min_h[destination] =
-            source.neuron_min_h[
-                static_cast<size_t>(source_row)];
-    }
-    if (source.mixed_q) {
-        const uint64_t values_per_row =
-            static_cast<uint64_t>(source.ng) *
-            static_cast<uint64_t>(source.gs);
-        for (int bits = 1; bits <= 8; ++bits) {
-            std::vector<size_t> selected;
-            for (size_t destination = 0;
-                 destination < rows.size(); ++destination) {
-                const size_t source_row = static_cast<size_t>(rows[destination]);
-                if (source.row_q_bits[source_row] == bits) {
-                    selected.push_back(destination);
-                }
-            }
-            if (selected.empty()) continue;
-            const uint64_t row_bits =
-                values_per_row * static_cast<uint64_t>(bits);
-            const uint64_t cohort_start =
-                static_cast<uint64_t>(result.q_packed.size()) * 8u;
-            const uint64_t cohort_bits =
-                row_bits * static_cast<uint64_t>(selected.size());
-            const size_t cohort_bytes =
-                static_cast<size_t>((cohort_bits + 7u) / 8u);
-            const size_t old_size = result.q_packed.size();
-            result.q_packed.resize(old_size + cohort_bytes, 0);
-            for (size_t local = 0; local < selected.size(); ++local) {
-                const size_t destination = selected[local];
-                const size_t source_row = static_cast<size_t>(rows[destination]);
-                const uint64_t source_start = static_cast<uint64_t>(
-                    source.row_q_bit_offsets[source_row]);
-                const uint64_t destination_start =
-                    cohort_start + static_cast<uint64_t>(local) * row_bits;
-                result.row_q_bits[destination] = static_cast<uint8_t>(bits);
-                result.row_q_bit_offsets[destination] =
-                    static_cast<int64_t>(destination_start);
-                for (uint64_t bit = 0; bit < row_bits; ++bit) {
-                    const uint8_t value = static_cast<uint8_t>(
-                        (source.q_packed[static_cast<size_t>((source_start + bit) >> 3)] >>
-                         ((source_start + bit) & 7u)) & 1u);
-                    if (value != 0) {
-                        result.q_packed[static_cast<size_t>((destination_start + bit) >> 3)] |=
-                            static_cast<uint8_t>(1u << ((destination_start + bit) & 7u));
-                    }
-                }
-            }
-        }
-        result.q_packed.insert(result.q_packed.end(), 8, 0);
-        result.qbytes = 0;
-    }
-    return result;
+    return repack_nint_cpu_rows(source, rows);
 }
 
 static Nint8ZeroCpu select_nint8_zero_cpu_rows(
@@ -6922,6 +6429,7 @@ enum class MixedMoeFamily {
     Nint,
     Nint8Zero,
     Mxfp4,
+    Mxfp4Sq,
     Tpq,
     Nvq,
     Nepq,
@@ -6932,6 +6440,7 @@ struct MixedMoePool {
     NintWeight nint;
     NintWeight q8_zero;
     Mxfp4Weight mxfp4;
+    Mxfp4SqWeight mxfp4_sq;
     TpqWeight tpq;
     NvqWeight nvq;
     NepqWeight nepq;
@@ -6995,7 +6504,6 @@ struct MixedMoeRuntime {
     int neuron_len = 0;
     bool partial_experts = false;
     std::vector<MixedMoePool> pools;
-    std::shared_ptr<NintMoeWeight> nint_dispatch;
     std::shared_ptr<MixedNvqDispatch> nvq_dispatch;
     MoeActivationWorkspace & activation_workspace(
             mfq_tensor_backend::Tensor x, int input_rows, int groups, int gs,
@@ -7033,6 +6541,7 @@ struct MixedMoeRuntime {
                 groups = static_cast<int>(pool.nvq.ng);
                 gs = static_cast<int>(pool.nvq.gs);
             } else if (pool.family == MixedMoeFamily::Mxfp4 ||
+                    pool.family == MixedMoeFamily::Mxfp4Sq ||
                     pool.family == MixedMoeFamily::Tpq) {
                 continue;
             } else {
@@ -7057,13 +6566,13 @@ struct MixedMoeRuntime {
             x.scalar_type() != mfq_tensor_backend::kFloat16 ||
             (x.dim() != 2 && x.dim() != 3) || x.size(-1) != neuron_len) {
             throw std::runtime_error(
-                "mixed NINTM input must be contiguous CUDA f16 with exact K");
+                "mixed MFE input must be contiguous CUDA f16 with exact K");
         }
         const int tokens = (int)route.ids.size(0);
         const int routes = (int)route.ids.size(1);
         if (route.n_experts != n_experts || x.size(0) != tokens ||
             (x.dim() == 3 && x.size(1) != routes)) {
-            throw std::runtime_error("mixed NINTM input and route shape mismatch");
+            throw std::runtime_error("mixed MFE input and route shape mismatch");
         }
         const int input_rows = x.dim() == 3 ? tokens * routes : tokens;
         auto output = partial_experts
@@ -7108,12 +6617,6 @@ struct MixedMoeRuntime {
             tokens >= prefill_mma_min_tokens && route.map_ready &&
             route.ids_dst.numel() == route.ids.numel();
         const bool use_kl_mmq = g_kl_mmq_mode != KlMmqMode::Default;
-        const bool use_nint_prefill =
-            use_f16_mma && !use_kl_mmq && nint_dispatch &&
-            nint_dispatch->hetero_supported;
-        const bool use_nint_decode =
-            !use_f16_mma && !use_kl_mmq && nint_dispatch &&
-            nint_dispatch->hetero_supported;
         const bool nvq_hetero_prefill_ready = nvq_dispatch &&
             (nvq_dispatch->pool_count > 1 ||
              (out_per_expert >= 128 &&
@@ -7136,22 +6639,6 @@ struct MixedMoeRuntime {
                 "KLD mixed routed FP16 requires the compact route map");
         }
 
-        if (use_nint_prefill) {
-            nint_moe_grouped_matmul_hetero_f16_cuda(
-                nint_dispatch->weight_ptrs,
-                nint_dispatch->pool_params,
-                nint_dispatch->expert_pool,
-                nint_dispatch->expert_local,
-                x, route.ids, n_experts, out_per_expert,
-                neuron_len, x.dim() == 3, output,
-                route.ids_dst, route.expert_bounds,
-                route.mma_tile_bounds, route.mma_tile_experts,
-                route.mma_tile_m);
-        } else if (use_nint_decode) {
-            output = input_prequantized
-                ? nint_dispatch->forward_prequantized(x, route)
-                : nint_dispatch->forward(x, route);
-        }
         if (use_nvq_prefill) {
             const int routed_rows_per_expert = std::max(
                 1, (tokens * routes + n_experts - 1) / n_experts);
@@ -7175,27 +6662,6 @@ struct MixedMoeRuntime {
                 nvq_tile_bounds, nvq_tile_experts);
         }
 
-        mfq_tensor_backend::Tensor shared_nint_qx;
-        mfq_tensor_backend::Tensor shared_nint_xscale;
-        int shared_nint_groups = 0;
-        int shared_nint_gs = 0;
-        if (use_nint_decode) {
-            const auto found =
-                nint_dispatch->hetero_workspaces.find(input_rows);
-            if (found != nint_dispatch->hetero_workspaces.end()) {
-                for (size_t index = 0;
-                        index < nint_dispatch->pools.size(); ++index) {
-                    const auto & weight =
-                        nint_dispatch->pools[index].weight;
-                    if (weight.gs != 24) continue;
-                    shared_nint_qx = found->second.qx[index];
-                    shared_nint_xscale = found->second.xscale[index];
-                    shared_nint_groups = static_cast<int>(weight.ng);
-                    shared_nint_gs = static_cast<int>(weight.gs);
-                    break;
-                }
-            }
-        }
         if (use_nvq_decode) {
             const int groups = (neuron_len + 23) / 24;
             const MixedMoeActivationKey activation_key{
@@ -7205,12 +6671,6 @@ struct MixedMoeRuntime {
             auto qx = workspace.qx;
             auto xscale = workspace.xscale;
             bool input_quantized = input_prequantized;
-            if (shared_nint_qx.defined() &&
-                    shared_nint_groups == groups && shared_nint_gs == 24) {
-                qx = shared_nint_qx;
-                xscale = shared_nint_xscale;
-                input_quantized = true;
-            }
             nvq_moe_grouped_matmul_hetero_ws_cuda(
                 nvq_dispatch->weight_ptrs,
                 nvq_dispatch->weight_sizes,
@@ -7223,10 +6683,6 @@ struct MixedMoeRuntime {
         }
 
         for (const auto & pool : pools) {
-            if (pool.family == MixedMoeFamily::Nint &&
-                    (use_nint_prefill || use_nint_decode)) {
-                continue;
-            }
             if (pool.family == MixedMoeFamily::Nvq &&
                     (use_nvq_prefill || use_nvq_decode)) {
                 continue;
@@ -7245,6 +6701,7 @@ struct MixedMoeRuntime {
                 gs = (int)pool.nvq.gs;
                 groups = (int)pool.nvq.ng;
             } else if (pool.family == MixedMoeFamily::Mxfp4 ||
+                    pool.family == MixedMoeFamily::Mxfp4Sq ||
                     pool.family == MixedMoeFamily::Tpq) {
                 groups = 0;
             } else {
@@ -7278,6 +6735,15 @@ struct MixedMoeRuntime {
                         pool.local_experts, out_per_expert, neuron_len,
                         output, route.ids_dst, route.expert_bounds,
                         route.tile_bounds, route.tile_experts);
+                    continue;
+                }
+                if (pool.family == MixedMoeFamily::Mxfp4Sq) {
+                    mxfp4_sq_moe_matmul_cuda(
+                        pool.mxfp4_sq.blob, value, route.ids,
+                        pool.expert_local, pool.mxfp4_sq.bits,
+                        n_experts, pool.local_experts, out_per_expert,
+                        neuron_len, pool.mxfp4_sq.matrix_scale_base,
+                        output);
                     continue;
                 }
                 if (pool.family == MixedMoeFamily::Tpq) {
@@ -7338,6 +6804,15 @@ struct MixedMoeRuntime {
                     route.tile_bounds, route.tile_experts);
                 continue;
             }
+            if (pool.family == MixedMoeFamily::Mxfp4Sq) {
+                mxfp4_sq_moe_matmul_cuda(
+                    pool.mxfp4_sq.blob, value, route.ids,
+                    pool.expert_local, pool.mxfp4_sq.bits,
+                    n_experts, pool.local_experts, out_per_expert,
+                    neuron_len, pool.mxfp4_sq.matrix_scale_base,
+                    output);
+                continue;
+            }
             if (pool.family == MixedMoeFamily::Tpq) {
                 tpq_pq_moe_grouped_matmul_pool_f16_cuda(
                     pool.tpq.packed, pool.tpq.codebook, value,
@@ -7368,24 +6843,15 @@ struct MixedMoeRuntime {
                 quantized.find(activation_key) != quantized.end();
             auto qx = workspace.qx;
             auto xscale = workspace.xscale;
-            if (pool.family == MixedMoeFamily::Nvq &&
-                    shared_nint_qx.defined() &&
-                    groups == shared_nint_groups &&
-                    gs == shared_nint_gs) {
-                qx = shared_nint_qx;
-                xscale = shared_nint_xscale;
-                input_quantized = true;
-            }
             if (pool.family == MixedMoeFamily::Nint) {
-                nint_moe_grouped_matmul_pool_ws_cuda(
-                    pool.nint.q_packed, pool.nint.sub_scale, pool.nint.sub_min,
-                    pool.nint.neuron_scale, pool.nint.neuron_min, value,
-                    route.ids, pool.expert_local, n_experts,
-                    pool.local_experts, out_per_expert, gs, pool.nint.bits,
-                    route.map_ready, input_quantized, output,
-                    qx, xscale, route.counts, route.cursors,
-                    route.ids_dst, route.expert_bounds, route.tile_bounds,
-                    route.tile_experts);
+                mfe_nint_matmul_ws_cuda(
+                    pool.nint.q_packed, pool.nint.row_q_bits,
+                    pool.nint.row_q_bit_offsets, pool.nint.sub_scale,
+                    pool.nint.sub_min, pool.nint.neuron_scale,
+                    pool.nint.neuron_min, value, route.ids,
+                    pool.expert_local, n_experts, pool.local_experts,
+                    out_per_expert, gs, input_quantized, output,
+                    qx, xscale);
             } else if (pool.family == MixedMoeFamily::Nint8Zero) {
                 nint8_zero_moe_grouped_matmul_pool_ws_cuda(
                     pool.q8_zero.q_packed, pool.q8_zero.q8_zero_scale, value,
@@ -7434,17 +6900,7 @@ struct MixedMoeRuntime {
     }
 
     bool supports_clamped_swiglu() const {
-        return std::all_of(
-            pools.begin(), pools.end(), [](const MixedMoePool & pool) {
-                if (pool.family == MixedMoeFamily::Nepq ||
-                    pool.family == MixedMoeFamily::Nint8Zero ||
-                    pool.family == MixedMoeFamily::Mxfp4 ||
-                    pool.family == MixedMoeFamily::Tpq) return false;
-                const int gs = pool.family == MixedMoeFamily::Nint
-                    ? static_cast<int>(pool.nint.gs)
-                    : static_cast<int>(pool.nvq.gs);
-                return gs == 24 || gs == 28 || gs == 48;
-            });
+        return !pools.empty();
     }
 
     mfq_tensor_backend::Tensor forward_clamped_swiglu(
@@ -7456,126 +6912,24 @@ struct MixedMoeRuntime {
             gate_up.scalar_type() != mfq_tensor_backend::kFloat16 ||
             gate_up.dim() != 3 || gate_up.size(2) != 2 * neuron_len) {
             throw std::runtime_error(
-                "mixed NINTM clamped SwiGLU input is unsupported");
+                "mixed MFE clamped SwiGLU input is unsupported");
         }
         const int tokens = static_cast<int>(route.ids.size(0));
         const int routes = static_cast<int>(route.ids.size(1));
         if (route.n_experts != n_experts ||
             gate_up.size(0) != tokens || gate_up.size(1) != routes) {
             throw std::runtime_error(
-                "mixed NINTM clamped SwiGLU route shape mismatch");
+                "mixed MFE clamped SwiGLU route shape mismatch");
         }
-        const int input_rows = tokens * routes;
-        auto output = partial_experts
-            ? mfq_tensor_backend::zeros(
-                {tokens, routes, out_per_expert},
-                gate_up.options().dtype(mfq_tensor_backend::kFloat16))
-            : mfq_tensor_backend::empty(
-                {tokens, routes, out_per_expert},
-                gate_up.options().dtype(mfq_tensor_backend::kFloat16));
-        const MixedMoeTransformKey identity{};
-        std::unordered_set<
-            MixedMoeActivationKey, MixedMoeActivationKeyHash> quantized;
-
-        for (const auto & pool : pools) {
-            const int gs = pool.family == MixedMoeFamily::Nint
-                ? static_cast<int>(pool.nint.gs)
-                : pool.family == MixedMoeFamily::Nint8Zero
-                    ? 32
-                    : static_cast<int>(pool.nvq.gs);
-            const int groups = pool.family == MixedMoeFamily::Nint
-                ? static_cast<int>(pool.nint.ng)
-                : pool.family == MixedMoeFamily::Nint8Zero
-                    ? static_cast<int>(pool.q8_zero.ng)
-                    : static_cast<int>(pool.nvq.ng);
-            const MixedMoeActivationKey activation_key{
-                input_rows, groups, gs, gate_up.get_device(), identity};
-            auto & workspace = activation_workspace(
-                gate_up, input_rows, groups, gs, identity);
-            if (quantized.insert(activation_key).second) {
-                nint_moe_quantize_swiglu_clamped_input_ws_cuda(
-                    gate_up, gs, limit, workspace.qx, workspace.xscale);
-            }
-            if (pool.family == MixedMoeFamily::Nint) {
-                nint_moe_grouped_matmul_pool_ws_cuda(
-                    pool.nint.q_packed, pool.nint.sub_scale, pool.nint.sub_min,
-                    pool.nint.neuron_scale, pool.nint.neuron_min, gate_up,
-                    route.ids, pool.expert_local, n_experts,
-                    pool.local_experts, out_per_expert, gs, pool.nint.bits,
-                    route.map_ready, true, output,
-                    workspace.qx, workspace.xscale, route.counts, route.cursors,
-                    route.ids_dst, route.expert_bounds, route.tile_bounds,
-                    route.tile_experts);
-            } else if (pool.family == MixedMoeFamily::Nint8Zero) {
-                nint8_zero_moe_grouped_matmul_pool_ws_cuda(
-                    pool.q8_zero.q_packed, pool.q8_zero.q8_zero_scale, gate_up,
-                    route.ids, pool.expert_local, n_experts,
-                    pool.local_experts, out_per_expert, route.map_ready,
-                    true, false, output, workspace.qx, workspace.xscale,
-                    route.counts, route.cursors, route.ids_dst,
-                    route.expert_bounds, route.tile_bounds, route.tile_experts);
-            } else {
-                nvq_moe_grouped_matmul_pool_ws_cuda(
-                    pool.nvq.indices_packed, pool.nvq.aux_packed,
-                    pool.nvq.sub_scale_packed, pool.nvq.neuron_scale,
-                    pool.nvq.codebook, gate_up, route.ids, pool.expert_local,
-                    n_experts, pool.local_experts, out_per_expert, neuron_len,
-                    pool.nvq.gs, pool.nvq.sub_bits, pool.nvq.kernel_format,
-                    pool.nvq.sign_mode, true, output,
-                    workspace.qx, workspace.xscale, route.ids_dst,
-                    route.expert_bounds, route.tile_bounds, route.tile_experts);
-            }
-        }
-        return output;
+        auto parts = gate_up.split_with_sizes(
+            {neuron_len, neuron_len}, -1);
+        auto gate = mfq_tensor_backend::clamp_max(parts[0], limit);
+        auto up = mfq_tensor_backend::clamp(parts[1], -limit, limit);
+        auto activation =
+            (mfq_tensor_backend::silu(gate) * up).contiguous();
+        return forward(activation, route);
     }
 };
-
-static void initialize_mixed_nint_dispatch(
-        MixedMoeRuntime & runtime) {
-    runtime.nint_dispatch.reset();
-
-    std::vector<int32_t> expert_pool(
-        static_cast<size_t>(runtime.n_experts), -1);
-    std::vector<int32_t> expert_local(
-        static_cast<size_t>(runtime.n_experts), -1);
-    NintMoeWeight dispatch;
-    dispatch.n_experts = runtime.n_experts;
-    dispatch.out_per_expert = runtime.out_per_expert;
-    dispatch.neuron_len = runtime.neuron_len;
-    dispatch.partial_experts = true;
-    int dispatch_pool = 0;
-    for (const auto & pool : runtime.pools) {
-        if (pool.family != MixedMoeFamily::Nint) continue;
-        NintMoePoolWeight dispatch_weight;
-        dispatch_weight.weight = pool.nint;
-        dispatch_weight.expert_local = pool.expert_local;
-        dispatch_weight.local_experts = pool.local_experts;
-        dispatch.pools.push_back(std::move(dispatch_weight));
-
-        auto local_host = pool.expert_local
-            .to(mfq_tensor_backend::kCPU,
-                mfq_tensor_backend::kInt32)
-            .contiguous();
-        const int32_t * local = local_host.data_ptr<int32_t>();
-        for (int expert = 0; expert < runtime.n_experts; ++expert) {
-            if (local[expert] < 0) continue;
-            if (local[expert] >= pool.local_experts ||
-                    expert_pool[static_cast<size_t>(expert)] >= 0) {
-                throw std::runtime_error(
-                    "mixed NINT prefill has invalid expert ownership");
-            }
-            expert_pool[static_cast<size_t>(expert)] = dispatch_pool;
-            expert_local[static_cast<size_t>(expert)] = local[expert];
-        }
-        ++dispatch_pool;
-    }
-    if (dispatch.pools.empty()) return;
-    initialize_nint_moe_dispatch(
-        dispatch, expert_pool, expert_local);
-    if (!dispatch.hetero_supported) return;
-    runtime.nint_dispatch =
-        std::make_shared<NintMoeWeight>(std::move(dispatch));
-}
 
 static void initialize_mixed_nvq_dispatch(
         MixedMoeRuntime & runtime) {
@@ -7705,12 +7059,6 @@ static int64_t tensor_storage_bytes(const mfq_tensor_backend::Tensor & value) {
 
 static int64_t mixed_moe_storage_bytes(const MixedMoeRuntime & runtime) {
     int64_t bytes = 0;
-    if (runtime.nint_dispatch) {
-        bytes += tensor_storage_bytes(runtime.nint_dispatch->weight_ptrs);
-        bytes += tensor_storage_bytes(runtime.nint_dispatch->pool_params);
-        bytes += tensor_storage_bytes(runtime.nint_dispatch->expert_pool);
-        bytes += tensor_storage_bytes(runtime.nint_dispatch->expert_local);
-    }
     if (runtime.nvq_dispatch) {
         bytes += tensor_storage_bytes(runtime.nvq_dispatch->weight_ptrs);
         bytes += tensor_storage_bytes(runtime.nvq_dispatch->weight_sizes);
@@ -7722,6 +7070,8 @@ static int64_t mixed_moe_storage_bytes(const MixedMoeRuntime & runtime) {
         bytes += tensor_storage_bytes(pool.expert_local);
         if (pool.family == MixedMoeFamily::Nint) {
             bytes += tensor_storage_bytes(pool.nint.q_packed);
+            bytes += tensor_storage_bytes(pool.nint.row_q_bits);
+            bytes += tensor_storage_bytes(pool.nint.row_q_bit_offsets);
             bytes += tensor_storage_bytes(pool.nint.sub_scale);
             bytes += tensor_storage_bytes(pool.nint.sub_min);
             bytes += tensor_storage_bytes(pool.nint.neuron_scale);
@@ -7732,6 +7082,8 @@ static int64_t mixed_moe_storage_bytes(const MixedMoeRuntime & runtime) {
         } else if (pool.family == MixedMoeFamily::Mxfp4) {
             bytes += tensor_storage_bytes(pool.mxfp4.values);
             bytes += tensor_storage_bytes(pool.mxfp4.scales);
+        } else if (pool.family == MixedMoeFamily::Mxfp4Sq) {
+            bytes += tensor_storage_bytes(pool.mxfp4_sq.blob);
         } else if (pool.family == MixedMoeFamily::Tpq) {
             bytes += tensor_storage_bytes(pool.tpq.packed);
             bytes += tensor_storage_bytes(pool.tpq.codebook);
@@ -7759,7 +7111,7 @@ static int64_t mixed_moe_storage_bytes(const MixedMoeRuntime & runtime) {
 }
 
 static std::shared_ptr<MixedMoeRuntime> make_mixed_moe_runtime(
-        const NintMoeCpu & cpu, bool cuda) {
+        const MfeCpu & cpu, bool cuda) {
     auto runtime = std::make_shared<MixedMoeRuntime>();
     runtime->n_experts = cpu.n_experts;
     runtime->out_per_expert = cpu.out_per_expert;
@@ -7802,6 +7154,15 @@ static std::shared_ptr<MixedMoeRuntime> make_mixed_moe_runtime(
                 throw std::runtime_error(
                     "mixed MXFP4 cohort shape mismatch");
             }
+        } else if (source.dtype == "MXFP4-SQ") {
+            pool.family = MixedMoeFamily::Mxfp4Sq;
+            pool.mxfp4_sq = to_device_mxfp4_sq(
+                source.payload, cuda);
+            if (pool.mxfp4_sq.out != expected_rows ||
+                    pool.mxfp4_sq.neuron_len != cpu.neuron_len) {
+                throw std::runtime_error(
+                    "mixed MXFP4-SQ cohort shape mismatch");
+            }
         } else if (is_tpq_pq_dtype(source.dtype)) {
             pool.family = MixedMoeFamily::Tpq;
             pool.tpq = to_device_tpq(source.tpq, cuda);
@@ -7810,17 +7171,16 @@ static std::shared_ptr<MixedMoeRuntime> make_mixed_moe_runtime(
                 throw std::runtime_error(
                     "mixed TPQ-PQ cohort shape mismatch");
             }
-        } else if (source.dtype != "NINTM" &&
-                   source.dtype.rfind("NINT", 0) == 0) {
+        } else if (source.dtype == "NINT") {
             pool.family = MixedMoeFamily::Nint;
-            pool.nint = cuda
-                ? to_gpu_nint(source.weight)
-                : to_cpu_nint(source.weight);
+            pool.nint = to_device_mfe_nint(
+                source.weight, pool.local_experts,
+                cpu.out_per_expert, cuda);
             if (pool.nint.out != expected_rows ||
                 pool.nint.neuron_len != cpu.neuron_len) {
                 throw std::runtime_error("mixed NINT cohort shape mismatch");
             }
-        } else if (source.dtype.rfind("NEPQ", 0) == 0) {
+        } else if (source.dtype == "NEPQ") {
             pool.family = MixedMoeFamily::Nepq;
             auto parsed = unpack_nepq(
                 source.payload, source.dtype, source.runtime_payload);
@@ -7845,20 +7205,18 @@ static std::shared_ptr<MixedMoeRuntime> make_mixed_moe_runtime(
         runtime->pools.push_back(std::move(pool));
     }
     if (cuda) {
-        initialize_mixed_nint_dispatch(*runtime);
         initialize_mixed_nvq_dispatch(*runtime);
     }
     return runtime;
 }
 
-static NintMoeWeight wrap_mixed_moe_runtime(
+static MfeWeight wrap_mixed_moe_runtime(
         const std::shared_ptr<MixedMoeRuntime> & runtime) {
-    NintMoeWeight result;
+    MfeWeight result;
     result.n_experts = runtime->n_experts;
     result.out_per_expert = runtime->out_per_expert;
     result.neuron_len = runtime->neuron_len;
     result.partial_experts = runtime->partial_experts;
-    result.hetero_supported = false;
     result.mixed_weight_bytes = mixed_moe_storage_bytes(*runtime);
     result.activation_geometries = runtime->activation_geometry();
     result.activation_workspace_domain = 2;
@@ -7881,12 +7239,12 @@ static NintMoeWeight wrap_mixed_moe_runtime(
     return result;
 }
 
-static NintMoeWeight to_gpu_mixed_moe(const NintMoeCpu & cpu) {
+static MfeWeight to_gpu_mixed_moe(const MfeCpu & cpu) {
     return wrap_mixed_moe_runtime(make_mixed_moe_runtime(cpu, true));
 }
 
-static NintMoeWeight to_cuda_device_moe_expert_slice(
-        const NintMoeCpu & cpu,
+static MfeWeight to_cuda_device_moe_expert_slice(
+        const MfeCpu & cpu,
         int64_t expert_begin,
         int64_t expert_end,
         int device) {
@@ -7897,17 +7255,15 @@ static NintMoeWeight to_cuda_device_moe_expert_slice(
     }
     const bool all_nint = std::all_of(
         cpu.pools.begin(), cpu.pools.end(),
-        [](const NintMoeCpuPool & pool) {
-            return pool.dtype != "NINTM" &&
-                pool.dtype != "NINT8-0" &&
-                pool.dtype.rfind("NINT", 0) == 0;
+        [](const MfeCpuPool & pool) {
+            return pool.dtype == "NINT";
         });
     MfqCudaGuard guard(device);
     if (all_nint) {
-        NintMoeCpu sliced = cpu;
+        MfeCpu sliced = cpu;
         sliced.pools.clear();
         for (const auto & source : cpu.pools) {
-            NintMoeCpuPool destination = source;
+            MfeCpuPool destination = source;
             destination.expert_ids.clear();
             std::vector<int64_t> rows;
             for (size_t local = 0;
@@ -7925,7 +7281,7 @@ static NintMoeWeight to_cuda_device_moe_expert_slice(
                 source.weight, rows);
             sliced.pools.push_back(std::move(destination));
         }
-        auto result = to_gpu_nint_moe(sliced);
+        auto result = to_gpu_mfe(sliced);
         result.partial_experts = true;
         return result;
     }
@@ -7969,20 +7325,25 @@ static NintMoeWeight to_cuda_device_moe_expert_slice(
             pool.family = MixedMoeFamily::Nint8Zero;
             pool.q8_zero = to_gpu_nint8_zero(
                 select_nint8_zero_cpu_rows(source.q8_zero, rows));
-        } else if (source.dtype != "NINTM" &&
-                source.dtype.rfind("NINT", 0) == 0) {
+        } else if (source.dtype == "NINT") {
             pool.family = MixedMoeFamily::Nint;
-            pool.nint = to_gpu_nint(
-                select_nint_cpu_rows(source.weight, rows));
+            const auto selected = select_nint_cpu_rows(source.weight, rows);
+            pool.nint = to_device_mfe_nint(
+                selected, pool.local_experts,
+                cpu.out_per_expert, true);
         } else if (source.dtype == "MXFP4") {
             pool.family = MixedMoeFamily::Mxfp4;
             pool.mxfp4 = to_device_mxfp4(
                 select_mxfp4_cpu_rows(source.mxfp4, rows), true);
+        } else if (source.dtype == "MXFP4-SQ") {
+            pool.family = MixedMoeFamily::Mxfp4Sq;
+            pool.mxfp4_sq = to_device_mxfp4_sq(
+                select_mxfp4_sq_payload_rows(source.payload, rows), true);
         } else if (is_tpq_pq_dtype(source.dtype)) {
             pool.family = MixedMoeFamily::Tpq;
             pool.tpq = to_device_tpq(
                 select_tpq_cpu_rows(source.tpq, rows), true);
-        } else if (source.dtype.rfind("NEPQ", 0) == 0) {
+        } else if (source.dtype == "NEPQ") {
             pool.family = MixedMoeFamily::Nepq;
             auto parsed = unpack_nepq(
                 source.payload, source.dtype, source.runtime_payload);
@@ -8001,7 +7362,6 @@ static NintMoeWeight to_cuda_device_moe_expert_slice(
         throw std::runtime_error(
             "expert-parallel MoE shard has no owned experts");
     }
-    initialize_mixed_nint_dispatch(*runtime);
     initialize_mixed_nvq_dispatch(*runtime);
     return wrap_mixed_moe_runtime(runtime);
 }
@@ -8019,6 +7379,9 @@ static NintWeight copy_cpu_nint_to_cuda(const NintWeight & source) {
     NintWeight result = source;
     result.workspaces.clear();
     result.q_packed = copy_cpu_weight_to_cuda(source.q_packed);
+    result.row_q_bits = copy_cpu_weight_to_cuda(source.row_q_bits);
+    result.row_q_bit_offsets =
+        copy_cpu_weight_to_cuda(source.row_q_bit_offsets);
     result.q8_zero_scale =
         copy_cpu_weight_to_cuda(source.q8_zero_scale);
     result.sub_scale = copy_cpu_weight_to_cuda(source.sub_scale);
@@ -8026,64 +7389,6 @@ static NintWeight copy_cpu_nint_to_cuda(const NintWeight & source) {
     result.neuron_scale =
         copy_cpu_weight_to_cuda(source.neuron_scale);
     result.neuron_min = copy_cpu_weight_to_cuda(source.neuron_min);
-    return result;
-}
-
-static NintMoeWeight stage_cpu_nint_moe(
-        const std::shared_ptr<MixedMoeRuntime> & cpu) {
-    if (!cpu) throw std::runtime_error("missing CPU-offloaded MoE state");
-    NintMoeWeight result;
-    result.n_experts = cpu->n_experts;
-    result.out_per_expert = cpu->out_per_expert;
-    result.neuron_len = cpu->neuron_len;
-    result.pools.reserve(cpu->pools.size());
-    std::vector<int32_t> expert_pool(
-        static_cast<size_t>(cpu->n_experts), -1);
-    std::vector<int32_t> expert_local(
-        static_cast<size_t>(cpu->n_experts), -1);
-    for (int pool_index = 0;
-         pool_index < static_cast<int>(cpu->pools.size());
-         ++pool_index) {
-        const auto & source =
-            cpu->pools.at(static_cast<size_t>(pool_index));
-        if (source.family != MixedMoeFamily::Nint ||
-                !source.expert_local.is_cpu() ||
-                !source.expert_local.is_contiguous() ||
-                source.expert_local.scalar_type() != mfq_tensor_backend::kInt32 ||
-                source.expert_local.numel() != cpu->n_experts) {
-            throw std::runtime_error(
-                "pure NINT MoE staging received an incompatible pool");
-        }
-        NintMoePoolWeight pool;
-        pool.weight = copy_cpu_nint_to_cuda(source.nint);
-        pool.expert_local =
-            copy_cpu_weight_to_cuda(source.expert_local);
-        pool.local_experts = source.local_experts;
-        const auto * local =
-            source.expert_local.data_ptr<int32_t>();
-        for (int expert = 0; expert < cpu->n_experts; ++expert) {
-            const int local_index = local[expert];
-            if (local_index < 0) continue;
-            if (local_index >= source.local_experts ||
-                    expert_pool.at(static_cast<size_t>(expert)) >= 0) {
-                throw std::runtime_error(
-                    "pure NINT MoE staging has invalid expert ownership");
-            }
-            expert_pool.at(static_cast<size_t>(expert)) =
-                pool_index;
-            expert_local.at(static_cast<size_t>(expert)) =
-                local_index;
-        }
-        result.pools.push_back(std::move(pool));
-    }
-    if (std::any_of(
-            expert_pool.begin(), expert_pool.end(),
-            [](int value) { return value < 0; })) {
-        throw std::runtime_error(
-            "pure NINT MoE staging does not cover every expert");
-    }
-    initialize_nint_moe_dispatch(
-        result, expert_pool, expert_local);
     return result;
 }
 
@@ -8105,6 +7410,13 @@ static Mxfp4Weight copy_cpu_mxfp4_to_cuda(const Mxfp4Weight & source) {
     Mxfp4Weight result = source;
     result.values = copy_cpu_weight_to_cuda(source.values);
     result.scales = copy_cpu_weight_to_cuda(source.scales);
+    return result;
+}
+
+static Mxfp4SqWeight copy_cpu_mxfp4_sq_to_cuda(
+        const Mxfp4SqWeight & source) {
+    Mxfp4SqWeight result = source;
+    result.blob = copy_cpu_weight_to_cuda(source.blob);
     return result;
 }
 
@@ -8142,7 +7454,7 @@ static NepqWeight copy_cpu_nepq_to_cuda(const NepqWeight & source) {
     return result;
 }
 
-static NintMoeWeight stage_cpu_mixed_moe(
+static MfeWeight stage_cpu_mixed_moe(
         const std::shared_ptr<MixedMoeRuntime> & cpu) {
     if (!cpu) throw std::runtime_error("missing CPU-offloaded MoE state");
     auto runtime = std::make_shared<MixedMoeRuntime>();
@@ -8162,6 +7474,9 @@ static NintMoeWeight stage_cpu_mixed_moe(
             pool.q8_zero = copy_cpu_nint_to_cuda(source.q8_zero);
         } else if (pool.family == MixedMoeFamily::Mxfp4) {
             pool.mxfp4 = copy_cpu_mxfp4_to_cuda(source.mxfp4);
+        } else if (pool.family == MixedMoeFamily::Mxfp4Sq) {
+            pool.mxfp4_sq = copy_cpu_mxfp4_sq_to_cuda(
+                source.mxfp4_sq);
         } else if (pool.family == MixedMoeFamily::Tpq) {
             pool.tpq = copy_cpu_tpq_to_cuda(source.tpq);
         } else if (pool.family == MixedMoeFamily::Nvq) {
@@ -8171,32 +7486,30 @@ static NintMoeWeight stage_cpu_mixed_moe(
         }
         runtime->pools.push_back(std::move(pool));
     }
-    initialize_mixed_nint_dispatch(*runtime);
     initialize_mixed_nvq_dispatch(*runtime);
     return wrap_mixed_moe_runtime(runtime);
 }
 
-static NintMoeWeight cpu_mixed_moe_metadata(
+static MfeWeight cpu_mixed_moe_metadata(
         const std::shared_ptr<MixedMoeRuntime> & runtime) {
-    NintMoeWeight result;
+    MfeWeight result;
     result.n_experts = runtime->n_experts;
     result.out_per_expert = runtime->out_per_expert;
     result.neuron_len = runtime->neuron_len;
-    result.hetero_supported = false;
     result.mixed_weight_bytes = mixed_moe_storage_bytes(*runtime);
     result.activation_geometries = runtime->activation_geometry();
     result.activation_workspace_domain = 2;
     return result;
 }
 
-static NintMoeCpu load_nint_moe_cpu(
+static MfeCpu load_mfe_cpu(
         const MfqFile & mfq, const std::string & name) {
-    if (mfq.record(name).dtype != "NINTM") {
-        throw std::runtime_error("expert tensor must use NINTM: " + name);
+    if (mfq.record(name).dtype != "MFE") {
+        throw std::runtime_error("expert tensor must use MFE: " + name);
     }
-    auto cpu = unpack_nint_moe(mfq.read_blob(name));
+    auto cpu = unpack_mfe(mfq.read_blob(name));
     if (mfq.has_expert_overlay(name)) {
-        auto delta = unpack_nint_moe_delta(
+        auto delta = unpack_mfe_delta(
             mfq.read_expert_overlay(name));
         if (delta.n_experts != cpu.n_experts ||
             delta.out_per_expert != cpu.out_per_expert ||
@@ -8213,7 +7526,7 @@ static NintMoeCpu load_nint_moe_cpu(
 }
 
 static std::shared_ptr<MixedMoeRuntime> make_mxfp4_range_runtime(
-        const mfq::cuda::NintMxfp4ExpertStore & store) {
+        const mfq::cuda::MfeMxfp4ExpertStore & store) {
     auto runtime = std::make_shared<MixedMoeRuntime>();
     runtime->n_experts = store.num_experts();
     runtime->out_per_expert = store.out_per_expert();
@@ -8241,8 +7554,8 @@ struct MoeCacheTransfer {
     int64_t nbytes = 0;
     bool packed_weight = false;
     const uint8_t * mapped_source = nullptr;
-    const mfq::cuda::NintMxfp4ExpertStore * range_store = nullptr;
-    const mfq::cuda::NintMxfp4ExpertPart * range_part = nullptr;
+    const mfq::cuda::MfeMxfp4ExpertStore * range_store = nullptr;
+    const mfq::cuda::MfeMxfp4ExpertPart * range_part = nullptr;
 };
 
 struct MoeCacheNewLease {
@@ -8274,6 +7587,8 @@ static std::vector<mfq_tensor_backend::Tensor> moe_cache_fields(
     if (pool.family == MixedMoeFamily::Nint) {
         return {
             pool.nint.q_packed,
+            pool.nint.row_q_bits,
+            pool.nint.row_q_bit_offsets,
             pool.nint.sub_scale,
             pool.nint.sub_min,
             pool.nint.neuron_scale,
@@ -8446,7 +7761,8 @@ static std::string moe_cache_signature(
         stream << ":b" << pool.nint.bits
                << ":g" << pool.nint.gs
                << ":n" << pool.nint.ng
-               << ":q" << pool.nint.qbytes;
+               << ":s" << pool.nint.q_expert_stride
+               << ":v2";
     } else if (pool.family == MixedMoeFamily::Nint8Zero) {
         stream << ":g32:n" << pool.q8_zero.ng;
     } else if (pool.family == MixedMoeFamily::Mxfp4) {
@@ -8502,7 +7818,7 @@ struct MoePendingRangeRead {
     std::vector<MoeCacheTransfer> transfers;
     std::vector<std::pair<mfq::MoeCacheSlotBook *, int>> held_slots;
     std::vector<MoeCacheNewLease> new_leases;
-    mfq::cuda::NintMxfp4ReadTicket ticket;
+    mfq::cuda::MfeMxfp4ReadTicket ticket;
     bool replaced_occupied = false;
 };
 
@@ -8514,7 +7830,6 @@ struct MoeCacheStats {
     int64_t evictions = 0;
     int64_t h2d_bytes = 0;
     int64_t route_d2h_bytes = 0;
-    int64_t hetero_dispatches = 0;
     int64_t full_projection_fallbacks = 0;
     int64_t h2d_submissions = 0;
     int64_t h2d_descriptors = 0;
@@ -8571,7 +7886,7 @@ public:
                 1, std::min(64, std::atoi(workers)));
         }
         range_read_pool_ =
-            std::make_unique<mfq::cuda::NintMxfp4ReadPool>(range_workers);
+            std::make_unique<mfq::cuda::MfeMxfp4ReadPool>(range_workers);
         const char * disable_overlap =
             std::getenv("MFQ_DISABLE_MOE_SSD_OVERLAP");
         range_overlap_enabled_ =
@@ -8617,7 +7932,7 @@ public:
     std::shared_ptr<MoeCachedSource> register_range_source(
         const std::string & name,
         std::shared_ptr<MixedMoeRuntime> metadata,
-        std::shared_ptr<mfq::cuda::NintMxfp4ExpertStore> store,
+        std::shared_ptr<mfq::cuda::MfeMxfp4ExpertStore> store,
         int minimum_slots,
         int layer_id,
         std::string projection_role);
@@ -8901,10 +8216,6 @@ public:
         ++stats_.full_projection_fallbacks;
     }
 
-    void count_hetero_dispatch() {
-        ++stats_.hetero_dispatches;
-    }
-
     void print_stats(std::ostream & stream) const {
         stream << "moe_cache_stats"
                << " budget_bytes=" << budget_bytes_
@@ -8918,8 +8229,6 @@ public:
                << " h2d_bytes=" << stats_.h2d_bytes
                << " route_d2h_bytes="
                << stats_.route_d2h_bytes
-               << " hetero_dispatches="
-               << stats_.hetero_dispatches
                << " full_projection_fallbacks="
                << stats_.full_projection_fallbacks
                << " h2d_submissions="
@@ -8977,7 +8286,7 @@ private:
     void finish_deferred_range_read(MoeCachedSource & source);
 
     void record_range_read(
-        const mfq::cuda::NintMxfp4ReadBatchStats & range_stats) {
+        const mfq::cuda::MfeMxfp4ReadBatchStats & range_stats) {
         stats_.range_read_bytes += static_cast<int64_t>(range_stats.bytes);
         stats_.range_read_calls += static_cast<int64_t>(range_stats.calls);
         stats_.range_file_opens +=
@@ -9056,7 +8365,7 @@ private:
             const std::vector<MoeCacheTransfer> & transfers,
             bool waits_for_compute,
             bool wait_on_compute_stream) {
-        std::vector<mfq::cuda::NintMxfp4ReadRequest> range_requests;
+        std::vector<mfq::cuda::MfeMxfp4ReadRequest> range_requests;
         auto materialize_source = [&range_requests](
                 const MoeCacheTransfer & transfer,
                 uint8_t * destination) {
@@ -9323,7 +8632,7 @@ private:
     int64_t mapped_registered_bytes_ = 0;
     std::vector<RegisteredHostField> registered_host_fields_;
     std::unordered_map<void *, const uint8_t *> mapped_host_lookup_;
-    std::unique_ptr<mfq::cuda::NintMxfp4ReadPool> range_read_pool_;
+    std::unique_ptr<mfq::cuda::MfeMxfp4ReadPool> range_read_pool_;
     std::unordered_map<int, std::unique_ptr<MoePendingRangeRead>>
         pending_range_reads_;
     bool range_overlap_enabled_ = true;
@@ -9338,7 +8647,7 @@ struct MoeCachedCohort {
     std::vector<int64_t> bytes_per_expert;
     std::vector<int32_t> expert_to_local;
     std::vector<int32_t> host_map;
-    std::shared_ptr<mfq::cuda::NintMxfp4ExpertStore> range_store;
+    std::shared_ptr<mfq::cuda::MfeMxfp4ExpertStore> range_store;
     bool map_dirty = false;
     MixedMoePool active;
 };
@@ -9353,7 +8662,7 @@ public:
             int minimum_slots,
             int layer_id,
             std::string projection_role,
-            std::shared_ptr<mfq::cuda::NintMxfp4ExpertStore> range_store)
+            std::shared_ptr<mfq::cuda::MfeMxfp4ExpertStore> range_store)
         : cache_(cache),
           id_(id),
           name_(std::move(name)),
@@ -9481,24 +8790,6 @@ public:
             throw std::runtime_error(
                 "MoE cache source does not cover every expert");
         }
-        const char * disable_hetero =
-            std::getenv("MFQ_DISABLE_MOE_HETERO");
-        pure_nint_candidate_ =
-            (disable_hetero == nullptr ||
-             std::atoi(disable_hetero) == 0) &&
-            std::all_of(
-                cpu_->pools.begin(),
-                cpu_->pools.end(),
-                [](const MixedMoePool & pool) {
-                    return pool.family == MixedMoeFamily::Nint &&
-                        nint_moe_profile_code(
-                            static_cast<int>(pool.nint.bits),
-                            static_cast<int>(pool.nint.gs)) >= 0;
-                });
-        if (pure_nint_candidate_) {
-            hetero_host_map_.assign(
-                static_cast<size_t>(cpu_->n_experts), -1);
-        }
     }
 
     int id() const noexcept {
@@ -9582,6 +8873,8 @@ public:
             if (pool.family == MixedMoeFamily::Nint) {
                 pool.nint.workspaces.clear();
                 pool.nint.q_packed = arena.fields.at(field++);
+                pool.nint.row_q_bits = arena.fields.at(field++);
+                pool.nint.row_q_bit_offsets = arena.fields.at(field++);
                 pool.nint.sub_scale = arena.fields.at(field++);
                 pool.nint.sub_min = arena.fields.at(field++);
                 pool.nint.neuron_scale = arena.fields.at(field++);
@@ -9661,36 +8954,6 @@ public:
             cohort.active = std::move(pool);
             active_->pools.push_back(cohort.active);
         }
-        if (pure_nint_candidate_) {
-            NintMoeWeight value;
-            value.n_experts = cpu_->n_experts;
-            value.out_per_expert = cpu_->out_per_expert;
-            value.neuron_len = cpu_->neuron_len;
-            value.pools.reserve(active_->pools.size());
-            for (const auto & active_pool : active_->pools) {
-                if (active_pool.family != MixedMoeFamily::Nint) {
-                    throw std::runtime_error(
-                        "cached NINT heterogeneous dispatch received "
-                        "a non-NINT cohort");
-                }
-                NintMoePoolWeight pool;
-                pool.weight = active_pool.nint;
-                pool.expert_local = active_pool.expert_local;
-                pool.local_experts = active_pool.local_experts;
-                value.pools.push_back(std::move(pool));
-            }
-            std::vector<int32_t> expert_pool(
-                expert_to_cohort_.begin(),
-                expert_to_cohort_.end());
-            initialize_nint_moe_dispatch(
-                value, expert_pool, hetero_host_map_);
-            if (!value.hetero_supported) {
-                throw std::runtime_error(
-                    "cached NINT heterogeneous dispatch initialization failed");
-            }
-            pure_nint_ =
-                std::make_shared<NintMoeWeight>(std::move(value));
-        }
     }
 
     void invalidate(int cohort_index, int expert, int slot) {
@@ -9705,13 +8968,6 @@ public:
         if (cohort.host_map[static_cast<size_t>(expert)] == slot) {
             cohort.host_map[static_cast<size_t>(expert)] = -1;
             cohort.map_dirty = true;
-        }
-        if (pure_nint_candidate_ &&
-                hetero_host_map_.at(
-                    static_cast<size_t>(expert)) == slot) {
-            hetero_host_map_.at(
-                static_cast<size_t>(expert)) = -1;
-            hetero_map_dirty_ = true;
         }
     }
 
@@ -9749,13 +9005,7 @@ public:
             auto staged = stage_fallback_runtime();
             return staged.forward(x, route);
         }
-        mfq_tensor_backend::Tensor output;
-        if (pure_nint_) {
-            cache_->count_hetero_dispatch();
-            output = pure_nint_->forward(x, route);
-        } else {
-            output = active_->forward(x, route);
-        }
+        auto output = active_->forward(x, route);
         cache_->record_compute_use();
         return output;
     }
@@ -9773,13 +9023,7 @@ public:
             auto staged = stage_fallback_runtime();
             return staged.forward(x, route);
         }
-        mfq_tensor_backend::Tensor output;
-        if (pure_nint_) {
-            cache_->count_hetero_dispatch();
-            output = pure_nint_->forward_prequantized(x, route);
-        } else {
-            output = active_->forward(x, route, true);
-        }
+        auto output = active_->forward(x, route, true);
         cache_->record_compute_use();
         return output;
     }
@@ -9794,44 +9038,20 @@ public:
             mfq_tensor_backend::Tensor x,
             const MoeRoutePlan & route,
             bool gelu) {
-        if (!pure_nint_) {
-            throw std::runtime_error(
-                "cached heterogeneous GLU output requires pure NINT cohorts");
-        }
-        if (!cache_->prepare(
-                *this, route_experts(route), false)) {
-            cache_->count_full_projection_fallback();
-            auto staged = stage_cpu_nint_moe(cpu_);
-            return staged.forward_glu_output(
-                x, route, gelu);
-        }
-        cache_->count_hetero_dispatch();
-        auto output =
-            pure_nint_->forward_glu_output(x, route, gelu);
-        cache_->record_compute_use();
-        return output;
+        auto gate_up = forward(x, route);
+        return gelu
+            ? moe_geglu_split_cuda(gate_up)
+            : moe_swiglu_split_cuda(gate_up);
     }
 
     mfq_tensor_backend::Tensor forward_glu(
             mfq_tensor_backend::Tensor gate_up,
             const MoeRoutePlan & route,
             bool gelu) {
-        if (!pure_nint_) {
-            throw std::runtime_error(
-                "cached heterogeneous GLU input requires pure NINT cohorts");
-        }
-        if (!cache_->prepare(
-                *this, route_experts(route), false)) {
-            cache_->count_full_projection_fallback();
-            auto staged = stage_cpu_nint_moe(cpu_);
-            return staged.forward_glu(
-                gate_up, route, gelu);
-        }
-        cache_->count_hetero_dispatch();
-        auto output =
-            pure_nint_->forward_glu(gate_up, route, gelu);
-        cache_->record_compute_use();
-        return output;
+        auto activation = gelu
+            ? moe_geglu_split_cuda(gate_up)
+            : moe_swiglu_split_cuda(gate_up);
+        return forward(activation, route);
     }
 
     mfq_tensor_backend::Tensor forward_clamped_swiglu(
@@ -9860,10 +9080,6 @@ public:
 
     bool supports_clamped_swiglu() const {
         return cpu_->supports_clamped_swiglu();
-    }
-
-    bool supports_nint_hetero() const noexcept {
-        return pure_nint_candidate_;
     }
 
     static bool prefetch_bundle(
@@ -9914,16 +9130,14 @@ private:
         std::lock_guard<std::mutex> guard(fallback_mutex_);
         if (!fallback_cpu_) {
             fallback_cpu_ = make_mixed_moe_runtime(
-                unpack_nint_moe(range_store_->read_blob()), false);
+                unpack_mfe(range_store_->read_blob()), false);
         }
         return fallback_cpu_;
     }
 
-    NintMoeWeight stage_fallback_runtime() {
+    MfeWeight stage_fallback_runtime() {
         auto runtime = fallback_runtime();
-        return pure_nint_candidate_
-            ? stage_cpu_nint_moe(runtime)
-            : stage_cpu_mixed_moe(runtime);
+        return stage_cpu_mixed_moe(runtime);
     }
 
     MoeExpertCache * cache_ = nullptr;
@@ -9932,17 +9146,13 @@ private:
     int layer_id_ = -1;
     std::string projection_role_;
     std::shared_ptr<MixedMoeRuntime> cpu_;
-    std::shared_ptr<mfq::cuda::NintMxfp4ExpertStore> range_store_;
+    std::shared_ptr<mfq::cuda::MfeMxfp4ExpertStore> range_store_;
     std::mutex fallback_mutex_;
     std::shared_ptr<MixedMoeRuntime> fallback_cpu_;
     std::vector<MoeCachedCohort> cohorts_;
     std::vector<int> expert_to_cohort_;
     std::vector<int> expert_to_local_;
     std::shared_ptr<MixedMoeRuntime> active_;
-    bool pure_nint_candidate_ = false;
-    std::vector<int32_t> hetero_host_map_;
-    bool hetero_map_dirty_ = false;
-    std::shared_ptr<NintMoeWeight> pure_nint_;
 };
 
 std::shared_ptr<MoeCachedSource> MoeExpertCache::register_source(
@@ -9963,7 +9173,7 @@ std::shared_ptr<MoeCachedSource> MoeExpertCache::register_source(
 std::shared_ptr<MoeCachedSource> MoeExpertCache::register_range_source(
         const std::string & name,
         std::shared_ptr<MixedMoeRuntime> metadata,
-        std::shared_ptr<mfq::cuda::NintMxfp4ExpertStore> store,
+        std::shared_ptr<mfq::cuda::MfeMxfp4ExpertStore> store,
         int minimum_slots,
         int layer_id,
         std::string projection_role) {
@@ -10431,13 +9641,6 @@ void MoeExpertCache::append_source_transfers(
                 static_cast<size_t>(expert)] = lease.slot;
             cohort.map_dirty = true;
         }
-        if (source.pure_nint_candidate_ &&
-                source.hetero_host_map_.at(
-                    static_cast<size_t>(expert)) != lease.slot) {
-            source.hetero_host_map_.at(
-                static_cast<size_t>(expert)) = lease.slot;
-            source.hetero_map_dirty_ = true;
-        }
     }
 
     for (auto & cohort : source.cohorts_) {
@@ -10456,24 +9659,6 @@ void MoeExpertCache::append_source_transfers(
             false,
         });
         cohort.map_dirty = false;
-    }
-    if (source.hetero_map_dirty_) {
-        if (!source.pure_nint_ ||
-                !source.pure_nint_->expert_local.defined()) {
-            throw std::runtime_error(
-                "cached NINT heterogeneous map is unavailable");
-        }
-        transfers.push_back({
-            reinterpret_cast<const uint8_t *>(
-                source.hetero_host_map_.data()),
-            reinterpret_cast<uint8_t *>(
-                source.pure_nint_->expert_local.data_ptr<int32_t>()),
-            static_cast<int64_t>(
-                source.hetero_host_map_.size() *
-                sizeof(int32_t)),
-            false,
-        });
-        source.hetero_map_dirty_ = false;
     }
 }
 
@@ -10582,7 +9767,7 @@ bool MoeExpertCache::begin_deferred_range_read(
                 .dtype(mfq_tensor_backend::kUInt8)
                 .pinned_memory(true));
         auto * staging = pending->host.data_ptr<uint8_t>();
-        std::vector<mfq::cuda::NintMxfp4ReadRequest> requests;
+        std::vector<mfq::cuda::MfeMxfp4ReadRequest> requests;
         requests.reserve(range_count);
         int64_t offset = 0;
         for (auto & transfer : pending->transfers) {
@@ -10790,16 +9975,12 @@ bool MoeExpertCache::prepare_bundle_deferred(
     return begin_deferred_range_read(deferred_source, experts);
 }
 
-static NintMoeWeight wrap_cached_moe_source(
+static MfeWeight wrap_cached_moe_source(
         const std::shared_ptr<MoeCachedSource> & source,
         const std::shared_ptr<MixedMoeRuntime> & cpu) {
-    NintMoeWeight result =
+    MfeWeight result =
         cpu_mixed_moe_metadata(cpu);
     result.mixed_weight_bytes = source->logical_weight_bytes();
-    result.hetero_supported =
-        source->supports_nint_hetero();
-    result.activation_workspace_domain =
-        source->supports_nint_hetero() ? 1 : 2;
     result.cached_source = source;
     result.cache_prefetch = [source](
             const MoeRoutePlan & route) {
@@ -10819,22 +10000,20 @@ static NintMoeWeight wrap_cached_moe_source(
             const MoeRoutePlan & route) {
         return source->forward_prequantized(x, route);
     };
-    if (source->supports_nint_hetero()) {
-        result.mixed_glu_output_forward = [source](
-                mfq_tensor_backend::Tensor x,
-                const MoeRoutePlan & route,
-                bool gelu) {
-            return source->forward_glu_output(
-                x, route, gelu);
-        };
-        result.mixed_glu_forward = [source](
-                mfq_tensor_backend::Tensor gate_up,
-                const MoeRoutePlan & route,
-                bool gelu) {
-            return source->forward_glu(
-                gate_up, route, gelu);
-        };
-    }
+    result.mixed_glu_output_forward = [source](
+            mfq_tensor_backend::Tensor x,
+            const MoeRoutePlan & route,
+            bool gelu) {
+        return source->forward_glu_output(
+            x, route, gelu);
+    };
+    result.mixed_glu_forward = [source](
+            mfq_tensor_backend::Tensor gate_up,
+            const MoeRoutePlan & route,
+            bool gelu) {
+        return source->forward_glu(
+            gate_up, route, gelu);
+    };
     if (source->supports_clamped_swiglu()) {
         result.mixed_clamped_swiglu_forward = [source](
                 mfq_tensor_backend::Tensor gate_up,
@@ -10848,9 +10027,9 @@ static NintMoeWeight wrap_cached_moe_source(
 }
 
 static bool prefetch_cached_moe_projection_bundle(
-        const NintMoeWeight & gate,
-        const NintMoeWeight & up,
-        const NintMoeWeight & down,
+        const MfeWeight & gate,
+        const MfeWeight & up,
+        const MfeWeight & down,
         const MoeRoutePlan & route) {
     if (!gate.cached_source ||
             !up.cached_source ||
@@ -10863,8 +10042,8 @@ static bool prefetch_cached_moe_projection_bundle(
 }
 
 static bool prefetch_cached_moe_projection_bundle(
-        const NintMoeWeight & gate_up,
-        const NintMoeWeight & down,
+        const MfeWeight & gate_up,
+        const MfeWeight & down,
         const MoeRoutePlan & route) {
     if (!gate_up.cached_source || !down.cached_source) {
         return false;
@@ -10873,7 +10052,7 @@ static bool prefetch_cached_moe_projection_bundle(
         {gate_up.cached_source, down.cached_source}, route);
 }
 
-static NintMoeWeight load_nint_moe_gpu(
+static MfeWeight load_mfe_gpu(
         const MfqFile & mfq, const std::string & name,
         bool cacheable,
         int layer_id,
@@ -10887,7 +10066,7 @@ static NintMoeWeight load_nint_moe_gpu(
         const auto & record = mfq.record(name);
         try {
             auto store =
-                std::make_shared<mfq::cuda::NintMxfp4ExpertStore>(
+                std::make_shared<mfq::cuda::MfeMxfp4ExpertStore>(
                     mfq::cuda::MfqRecordRange{
                         name,
                         record.dtype,
@@ -10906,30 +10085,30 @@ static NintMoeWeight load_nint_moe_gpu(
                 layer_id,
                 projection_role);
             return wrap_cached_moe_source(source, runtime);
-        } catch (const mfq::cuda::NintMxfp4Unsupported &) {
+        } catch (const mfq::cuda::MfeMxfp4Unsupported &) {
         }
     }
-    auto cpu = load_nint_moe_cpu(mfq, name);
+    auto cpu = load_mfe_cpu(mfq, name);
+    const bool has_mxfp4_sq = std::any_of(
+        cpu.pools.begin(), cpu.pools.end(), [](const MfeCpuPool & pool) {
+            return pool.dtype == "MXFP4-SQ";
+        });
     if (moe_parallel_config().enabled()) {
         auto slices = plan_moe_expert_parallel_slices(
             cpu.n_experts, name);
-        NintMoeWeight result;
+        MfeWeight result;
         result.n_experts = cpu.n_experts;
         result.out_per_expert =
             cpu.out_per_expert;
         result.neuron_len =
             cpu.neuron_len;
-        result.hetero_supported = true;
         for (const auto & slice : slices) {
             auto shard =
-                std::make_shared<NintMoeWeight>(
+                std::make_shared<MfeWeight>(
                     to_cuda_device_moe_expert_slice(
                         cpu, slice.begin,
                         slice.end,
                         slice.device));
-            result.hetero_supported =
-                result.hetero_supported &&
-                shard->hetero_supported;
             result.expert_parallel_shards.push_back({
                 slice.device,
                 slice.begin,
@@ -10939,7 +10118,7 @@ static NintMoeWeight load_nint_moe_gpu(
         }
         return result;
     }
-    if (g_moe_expert_cache && cacheable) {
+    if (g_moe_expert_cache && cacheable && !has_mxfp4_sq) {
         auto runtime =
             make_mixed_moe_runtime(cpu, false);
         auto source = g_moe_expert_cache->register_source(
@@ -10952,35 +10131,15 @@ static NintMoeWeight load_nint_moe_gpu(
         return wrap_cached_moe_source(source, runtime);
     }
     const bool all_nint = std::all_of(
-        cpu.pools.begin(), cpu.pools.end(), [](const NintMoeCpuPool & pool) {
-            return pool.dtype != "NINTM" && pool.dtype != "NINT8-0" &&
-                   pool.dtype.rfind("NINT", 0) == 0;
+        cpu.pools.begin(), cpu.pools.end(), [](const MfeCpuPool & pool) {
+            return pool.dtype == "NINT";
         });
-    return all_nint ? to_gpu_nint_moe(cpu) : to_gpu_mixed_moe(cpu);
+    return all_nint ? to_gpu_mfe(cpu) : to_gpu_mixed_moe(cpu);
 }
 
-static std::shared_ptr<MixedMoeRuntime> load_nint_moe_cpu_offloaded(
+static std::shared_ptr<MixedMoeRuntime> load_mfe_cpu_offloaded(
         const MfqFile & mfq, const std::string & name) {
-    return make_mixed_moe_runtime(load_nint_moe_cpu(mfq, name), false);
-}
-
-static void enable_nint5_q5_exec(NintWeight & w) {
-    if (w.bits != 5 || w.gs != 28 || w.qbytes != 18 || w.q5_exec) {
-        throw std::runtime_error("NINT5 Q5 execution layout requires NINT5 gs28 source weights");
-    }
-    auto q_exec = nint5_gs28_q5_repack_cuda(w.q_packed, w.sub_scale, w.sub_min);
-    mfq_cuda_synchronize();
-    w.q_packed = std::move(q_exec);
-    w.sub_scale = mfq_tensor_backend::Tensor();
-    w.sub_min = mfq_tensor_backend::Tensor();
-    w.qbytes = 20;
-    w.q5_exec = true;
-    mfq_cuda_empty_cache();
-}
-
-static bool nint5_q5_exec_enabled() {
-    const char * disable = std::getenv("MFQ_DISABLE_NINT5_Q5_EXEC");
-    return disable == nullptr || disable[0] != '1';
+    return make_mixed_moe_runtime(load_mfe_cpu(mfq, name), false);
 }
 
 static NvqWeight load_nvq_gpu(const MfqFile & mfq, const std::string & name) {
@@ -11052,7 +10211,7 @@ static mfq_tensor_backend::Tensor load_dense_gpu(const MfqFile & mfq, const std:
         }
         return dense;
     }
-    if (rec.dtype != "NINTM" && rec.dtype.rfind("NINT", 0) == 0) {
+    if (rec.dtype == "NINT") {
         auto dense = dequant_nint_dense_f32(load_nint_gpu(mfq, name));
         return g_loading_cpu_layer
             ? dense.cpu().contiguous()
@@ -11140,19 +10299,16 @@ static mfq_tensor_backend::Tensor load_dense_linear_gpu(
 static NintWeight cat_weights(const std::vector<NintWeight> & ws) {
     if (ws.empty()) throw std::runtime_error("empty NINT group");
     const auto & a = ws[0];
-    if (a.q5_exec) throw std::runtime_error("NINT5 Q5 execution weights cannot be concatenated");
     std::vector<mfq_tensor_backend::Tensor> qp, rqb, rqoff, q8s, ss, sm, ns, nm;
     int64_t out = 0;
     int64_t q_bit_base = 0;
     for (const auto & w : ws) {
-        if (w.q5_exec) throw std::runtime_error("NINT5 Q5 execution weights cannot be concatenated");
-        if (w.ng != a.ng || w.gs != a.gs || w.bits != a.bits ||
-            w.qbytes != a.qbytes || w.neuron_len != a.neuron_len ||
-            w.q8_zero != a.q8_zero || w.mixed_q != a.mixed_q) {
+        if (w.ng != a.ng || w.gs != a.gs ||
+            w.neuron_len != a.neuron_len || w.q8_zero != a.q8_zero) {
             throw std::runtime_error("cannot group NINT tensors with different input layout");
         }
         qp.push_back(w.q_packed);
-        if (w.mixed_q) {
+        if (!w.q8_zero) {
             rqb.push_back(w.row_q_bits);
             rqoff.push_back(w.row_q_bit_offsets + q_bit_base);
             q_bit_base += w.q_packed.numel() * 8;
@@ -11173,14 +10329,12 @@ static NintWeight cat_weights(const std::vector<NintWeight> & ws) {
     g.ng = a.ng;
     g.gs = a.gs;
     g.bits = a.bits;
-    g.qbytes = a.qbytes;
     g.neuron_len = a.neuron_len;
-    g.mixed_q = a.mixed_q;
     g.q8_zero = a.q8_zero;
     g.shape = a.shape;
     g.shape[0] = out;
     g.q_packed = mfq_tensor_backend::cat(qp, 0).contiguous();
-    if (a.mixed_q) {
+    if (!a.q8_zero) {
         g.row_q_bits = mfq_tensor_backend::cat(rqb, 0).contiguous();
         g.row_q_bit_offsets = mfq_tensor_backend::cat(rqoff, 0).contiguous();
     }
@@ -11723,7 +10877,6 @@ static mfq_tensor_backend::Tensor nint_matmul_cpu(
         mfq_tensor_backend::Tensor x) {
     MFQ_RUNTIME_CHECK(!x.is_cuda(), "CPU NINT GEMV requires CPU activations");
     MFQ_RUNTIME_CHECK(!w.q_packed.is_cuda(), "CPU NINT GEMV requires CPU-resident weights");
-    MFQ_RUNTIME_CHECK(!w.q5_exec, "CPU NINT GEMV requires the compact MFQ layout");
     auto activation = cpu_quantize_activation(
         std::move(x), w.neuron_len, w.gs, true);
     const int64_t rows = activation.rows;
@@ -11734,23 +10887,21 @@ static mfq_tensor_backend::Tensor nint_matmul_cpu(
         mfq_tensor_backend::TensorOptions().device(mfq_tensor_backend::kCPU).dtype(mfq_tensor_backend::kFloat16));
     mfq_half * output = result.data_ptr<mfq_half>();
     const uint8_t * quant = w.q_packed.data_ptr<uint8_t>();
-    const int64_t qbytes = w.qbytes;
-    const uint8_t * row_q_bits = w.mixed_q
-        ? w.row_q_bits.data_ptr<uint8_t>() : nullptr;
-    const int64_t * row_q_bit_offsets = w.mixed_q
-        ? w.row_q_bit_offsets.data_ptr<int64_t>() : nullptr;
+    const uint8_t * row_q_bits = w.q8_zero
+        ? nullptr : w.row_q_bits.data_ptr<uint8_t>();
+    const int64_t * row_q_bit_offsets = w.q8_zero
+        ? nullptr : w.row_q_bit_offsets.data_ptr<int64_t>();
     mfq_parallel_for(0, outputs, 1, [&](int64_t begin, int64_t end) {
         std::vector<float> accumulators(static_cast<size_t>(rows));
         for (int64_t neuron = begin; neuron < end; ++neuron) {
             std::fill(accumulators.begin(), accumulators.end(), 0.0f);
-            const int neuron_bits = w.mixed_q
-                ? static_cast<int>(row_q_bits[neuron])
-                : static_cast<int>(w.bits);
+            const int neuron_bits = w.q8_zero
+                ? 8 : static_cast<int>(row_q_bits[neuron]);
             for (int64_t group = 0; group < w.ng; ++group) {
                 const int64_t meta = neuron * w.ng + group;
-                const uint8_t * packed = w.mixed_q
-                    ? quant
-                    : quant + meta * qbytes;
+                const uint8_t * packed = w.q8_zero
+                    ? quant + meta * 32
+                    : quant;
                 float scale = 0.0f;
                 float minimum = 0.0f;
                 if (w.q8_zero) {
@@ -11769,19 +10920,13 @@ static mfq_tensor_backend::Tensor nint_matmul_cpu(
                     std::fill(weights, weights + 64, static_cast<uint8_t>(0));
                     std::memcpy(weights, packed, static_cast<size_t>(valid));
                 } else {
-                    if (w.mixed_q) {
-                        const uint64_t bit_offset =
-                            static_cast<uint64_t>(row_q_bit_offsets[neuron]) +
-                            static_cast<uint64_t>(group * w.gs) *
-                                static_cast<uint64_t>(neuron_bits);
-                        cpu_unpack_nint_group_at_bit_offset(
-                            packed, bit_offset, neuron_bits,
-                            static_cast<int>(valid), weights);
-                    } else {
-                        cpu_unpack_nint_group(
-                            packed, neuron_bits,
-                            static_cast<int>(valid), weights);
-                    }
+                    const uint64_t bit_offset =
+                        static_cast<uint64_t>(row_q_bit_offsets[neuron]) +
+                        static_cast<uint64_t>(group * w.gs) *
+                            static_cast<uint64_t>(neuron_bits);
+                    cpu_unpack_nint_group_at_bit_offset(
+                        packed, bit_offset, neuron_bits,
+                        static_cast<int>(valid), weights);
                 }
                 for (int64_t row = 0; row < rows; ++row) {
                     const int64_t activation_group =
@@ -12042,124 +11187,55 @@ static mfq_tensor_backend::Tensor nvq_embedding(const NvqWeight & w, mfq_tensor_
         w.sub_bits, w.kernel_format, w.sign_mode);
 }
 
-static bool nint_gs24_group32_use_m(int M) {
-    return M == 16 || M == 32;
-}
-
-static bool nint2_group32_use_m(int64_t out, int M) {
-    if (out < 2048 || M < 9) return false;
-    return M <= (out < 8192 ? 64 : 128);
-}
-
-static int nint_gs24_group32_split_k(int64_t out) {
-    return out <= 8192 ? 2 : 1;
-}
-
-static int nint4_batch_gemv_max_m() {
-    const char * env = std::getenv("MFQ_NINT4_BATCH_GEMV_MAX_M");
-    if (env == nullptr) return 16;
-    return std::max(1, std::atoi(env));
-}
-
-static int nint_hi_gemv_max_m() {
-    const char * env = std::getenv("MFQ_NINT_HI_GEMV_MAX_M");
-    if (env == nullptr) return 8;
-    return std::max(1, std::atoi(env));
-}
-
-static bool nint6_batch_gemv() {
-    const char * env = std::getenv("MFQ_NINT6_BATCH_GEMV");
-    return env != nullptr && env[0] == '1';
-}
-
-enum class Nint3PrefillPath {
-    Group32,
-    F16Packed,
-    DequantCublas,
-};
-
-static Nint3PrefillPath nint3_prefill_path() {
-    const char * env = std::getenv("MFQ_NINT3_PREFILL_PATH");
-    if (env == nullptr || env[0] == '\0' || std::strcmp(env, "group32") == 0) {
-        return Nint3PrefillPath::Group32;
-    }
-    if (std::strcmp(env, "f16") == 0) {
-        return Nint3PrefillPath::F16Packed;
-    }
-    if (std::strcmp(env, "dequant") == 0) {
-        return Nint3PrefillPath::DequantCublas;
-    }
-    throw std::runtime_error(
-        "MFQ_NINT3_PREFILL_PATH must be group32, f16, or dequant");
-}
-
 static mfq_tensor_backend::Tensor nint_matmul(const NintWeight & w, mfq_tensor_backend::Tensor x) {
     if (!x.is_cuda()) return nint_matmul_cpu(w, std::move(x));
     x = x.contiguous().to(mfq_tensor_backend::kFloat16);
     x = pad_last(x, w.neuron_len);
     int M = (int)x.size(0);
-    if (w.mixed_q) {
+    if (!w.q8_zero) {
         if (M <= 8) {
             Workspace & ws = w.workspace(M);
-            return g_profiler.measure("nint.mixed_q_gemv", [&]() {
-                return nint_gemv_packed_mixed_q_ws_cuda(
+            return g_profiler.measure("nint.matmul", [&]() {
+                return nint_matmul_ws_cuda(
                     w.q_packed, w.row_q_bits, w.row_q_bit_offsets,
                     w.sub_scale, w.sub_min, w.neuron_scale, w.neuron_min,
-                    x, w.gs, ws.qx, ws.xscale, ws.xsum);
+                    x, w.gs, ws.qx, ws.xscale);
             });
         }
-        auto dense = g_profiler.measure("nint.mixed_q_dequant", [&]() {
-            return nint_dequant_full_packed_mixed_q_cuda(
+        auto dense = g_profiler.measure("nint.dequant", [&]() {
+            return nint_decode_cuda(
                 w.q_packed, w.row_q_bits, w.row_q_bit_offsets,
                 w.sub_scale, w.sub_min, w.neuron_scale, w.neuron_min,
                 w.neuron_len, w.gs);
         });
-        return g_profiler.measure("nint.mixed_q_gemm", [&]() {
+        return g_profiler.measure("nint.gemm", [&]() {
             return mfq_tensor_backend::matmul(x, dense.transpose(0, 1));
         });
     }
     if (g_kl_mmq_mode != KlMmqMode::Default) {
         const int original_m = M;
-        MFQ_RUNTIME_CHECK(original_m > 0, "KLD common MMQ requires activation rows");
+        MFQ_RUNTIME_CHECK(original_m > 0, "KLD NINT8-0 MMQ requires activation rows");
         if (M < 16) {
             auto padding = mfq_tensor_backend::zeros(
                 {16 - M, x.size(1)}, x.options());
             x = mfq_tensor_backend::cat({x, padding}, 0).contiguous();
             M = 16;
         }
-        MFQ_RUNTIME_CHECK(
-            !w.q5_exec,
-            "KLD common MMQ requires original NINT5 packed weights");
         x = kl_mmq_prepare_activation(x);
         ++g_kl_mmq_dense_calls;
-        mfq_tensor_backend::Tensor result;
-        if (w.q8_zero) {
-            result = g_profiler.measure("kld_mmq.nint8_zero.fp16", [&]() {
-                return nint8_zero_mmq_f16_packed_cuda(
-                    w.q_packed, w.q8_zero_scale, x, w.neuron_len);
-            });
-        } else {
-            result = g_profiler.measure("kld_mmq.nint.fp16", [&]() {
-                return nint_mmq_f16_packed_cuda(
-                    w.q_packed, w.sub_scale, w.sub_min,
-                    w.neuron_scale, w.neuron_min, x, w.gs, w.bits);
-            });
-        }
+        auto result = g_profiler.measure("kld_mmq.nint8_zero.fp16", [&]() {
+            return nint8_zero_mmq_f16_packed_cuda(
+                w.q_packed, w.q8_zero_scale, x, w.neuron_len);
+        });
         return original_m < 16
             ? result.index({Slice(0, original_m)}).contiguous()
             : result;
     }
     if (w.q8_zero) {
-        Workspace & ws = w.workspace(M);
         if (M <= 8) {
+            Workspace & ws = w.workspace(M);
             return g_profiler.measure("nint8_zero.gemv", [&]() {
                 return nint8_zero_gemv_ws_cuda(
-                    w.q_packed, w.q8_zero_scale, x, ws.qx, ws.xscale);
-            });
-        }
-        if (M <= 64) {
-            return g_profiler.measure("nint8_zero.mmq", [&]() {
-                return nint8_zero_mmq_ws_cuda(
                     w.q_packed, w.q8_zero_scale, x, ws.qx, ws.xscale);
             });
         }
@@ -12168,167 +11244,14 @@ static mfq_tensor_backend::Tensor nint_matmul(const NintWeight & w, mfq_tensor_b
                 w.q_packed, w.q8_zero_scale, x, w.neuron_len);
         });
     }
-    if (w.q5_exec) {
-        if (M <= 8) {
-            Workspace & ws = w.workspace(M);
-            return g_profiler.measure("nint.q5_exec_gemv", [&]() {
-                return nint5_gs28_q5_gemv_ws_cuda(
-                    w.q_packed, w.neuron_scale, w.neuron_min,
-                    x, ws.qx, ws.xscale, ws.xsum);
-            });
-        }
-        auto ww = g_profiler.measure("nint.q5_exec_dequant", [&]() {
-            return nint5_gs28_q5_dequant_cuda(
-                w.q_packed, w.neuron_scale, w.neuron_min, w.neuron_len);
-        });
-        return g_profiler.measure("nint.q5_exec_gemm", [&]() {
-            return mfq_tensor_backend::matmul(x, ww.transpose(0, 1));
-        });
-    }
-    const Nint3PrefillPath nint3_path =
-        w.bits == 3 ? nint3_prefill_path() : Nint3PrefillPath::Group32;
-    if (w.out >= 1024 &&
-            ((w.bits == 2 && w.gs == 16 && nint2_group32_use_m(w.out, M)) ||
-             (w.bits == 3 && w.gs == 24 && M >= 9 &&
-              nint3_path == Nint3PrefillPath::Group32) ||
-             (w.bits == 4 && w.gs == 24 && nint_gs24_group32_use_m(M)) ||
-             (w.bits == 6 && w.gs == 24 && M >= 9 &&
-              g_nint6_mmq_mode == Nint6MmqMode::Int8))) {
-        Workspace & ws =
-            w.bits == 6 && M >= 128
-            ? nint_prefill_mmq_workspace(w, x, M)
-            : w.workspace(M);
-        w.ensure_mmq_qx_workspace(ws, M);
-        const int split_k =
-            w.bits == 6 && M >= 128
-            ? 1
-            : nint_gs24_group32_split_k(w.out);
-        if (split_k > 1) {
-            w.ensure_mmq_partial_workspace(ws, (int64_t)split_k * M * w.out);
-        }
-        return g_profiler.measure("nint.mma_group32", [&]() {
-            return nint_mmq_gs24_group32_ws_cuda(
-                w.q_packed, w.sub_scale, w.sub_min, w.neuron_scale, w.neuron_min,
-                x, ws.mmq_qx, ws.xscale, ws.xsum, split_k, ws.mmq_partial);
-        });
-    }
-    if (w.gs == 24 && w.bits == 6 && w.out <= 8192 && M >= 16 && M <= 32) {
-        constexpr int split_k = 4;
-        Workspace & ws = w.workspace(M);
-        w.ensure_mmq_partial_workspace(ws, (int64_t)split_k * M * w.out);
-        return g_profiler.measure("nint.f16mmq24_nint6_split4", [&]() {
-            return nint_mmq_gs24_f16_nint6_split4_ws_cuda(
-                w.q_packed, w.sub_scale, w.sub_min, w.neuron_scale, w.neuron_min,
-                x, ws.mmq_partial);
-        });
-    }
-    if (w.gs == 24 && w.bits == 6 && M >= 16) {
-        return g_profiler.measure("nint.f16mmq24_nint6", [&]() {
-            return nint_mmq_f16_packed_cuda(
-                w.q_packed, w.sub_scale, w.sub_min,
-                w.neuron_scale, w.neuron_min, x, w.gs, w.bits);
-        });
-    }
-    if (w.gs == 24 && w.bits == 4 && w.out >= 8192 && M >= 16 && M <= 32) {
-        return g_profiler.measure("nint.f16mmq24_nint4", [&]() {
-            return nint_mmq_gs24_f16_nint4_cuda(
-                w.q_packed, w.sub_scale, w.sub_min, w.neuron_scale, w.neuron_min, x);
-        });
-    }
-    if (w.bits != 4) {
-        if (w.bits == 3 && w.gs == 24 && M > 8 &&
-                nint3_path != Nint3PrefillPath::DequantCublas) {
-            return g_profiler.measure("nint.f16mmq24_nint3", [&]() {
-                return nint_mmq_gs24_f16_nint3_cuda(
-                    w.q_packed, w.sub_scale, w.sub_min,
-                    w.neuron_scale, w.neuron_min, x);
-            });
-        }
-        if (w.bits == 6 && w.gs == 24 && M <= 16) {
-            Workspace & ws = w.workspace(M);
-            return nint_gemv_packed_int6_ws_cuda(w.q_packed, w.sub_scale, w.sub_min, w.neuron_scale, w.neuron_min,
-                                                 x, w.gs, ws.qx, ws.xscale, ws.xsum);
-        }
-        if (M <= nint_hi_gemv_max_m()) {
-            Workspace & ws = w.workspace(M);
-            if (w.bits == 8) {
-                return nint_gemv_packed_u8_ws_cuda(w.q_packed, w.sub_scale, w.sub_min, w.neuron_scale, w.neuron_min,
-                                                   x, w.gs, ws.qx, ws.xscale, ws.xsum);
-            }
-            if (w.bits == 6 && (w.gs % 4) == 0 && (M == 1 || !nint6_batch_gemv())) {
-                return nint_gemv_packed_int6_ws_cuda(w.q_packed, w.sub_scale, w.sub_min, w.neuron_scale, w.neuron_min,
-                                                     x, w.gs, ws.qx, ws.xscale, ws.xsum);
-            }
-            return nint_gemv_packed_bits_ws_cuda(w.q_packed, w.sub_scale, w.sub_min, w.neuron_scale, w.neuron_min,
-                                                 x, w.gs, w.bits, ws.qx, ws.xscale, ws.xsum);
-        }
-        const char * nint8_prefill_mmq_env =
-            std::getenv("MFQ_NINT8_PREFILL_MMQ");
-        if (w.bits == 8 &&
-                (M <= 64 ||
-                 (nint8_prefill_mmq_env != nullptr &&
-                  nint8_prefill_mmq_env[0] == '1'))) {
-            Workspace & ws = w.workspace(M);
-            return nint_mmq_packed_u8_ws_cuda(w.q_packed, w.sub_scale, w.sub_min, w.neuron_scale, w.neuron_min,
-                                              x, w.gs, ws.qx, ws.xscale, ws.xsum);
-        }
-        auto ww = g_profiler.measure("nint.dequant_hi", [&]() {
-            return nint_dequant_full_packed_compact_bits_cuda(w.q_packed, w.sub_scale, w.sub_min,
-                                                               w.neuron_scale, w.neuron_min,
-                                                               w.neuron_len, w.gs, w.bits);
-        });
-        return g_profiler.measure("nint.gemm_hi", [&]() { return mfq_tensor_backend::matmul(x, ww.transpose(0, 1)); });
-    }
-    // Small verification batches must use the decode reduction order. Tiny
-    // projection differences can cross INT8 rounding boundaries in later layers.
-    if (M == 1 || (w.gs == 24 && M >= 2 && M <= 6)) {
-        Workspace & ws = w.workspace(M);
-        return nint_gemv_packed_ws_cuda(w.q_packed, w.sub_scale, w.sub_min, w.neuron_scale, w.neuron_min,
-                                        x, w.gs, ws.qx, ws.xscale, ws.xsum);
-    }
-    const int batch_gemv_max_m = nint4_batch_gemv_max_m();
-    if (M <= batch_gemv_max_m && (M <= 8 || w.gs == 24)) {
-        Workspace & ws = w.workspace(M);
-        return nint_gemv_packed_batch_ws_cuda(w.q_packed, w.sub_scale, w.sub_min, w.neuron_scale, w.neuron_min,
-                                              x, w.gs, ws.qx, ws.xscale, ws.xsum);
-    }
-    auto ww = g_profiler.measure("nint.dequant4", [&]() {
-        return nint_dequant_full_packed_compact_cuda(w.q_packed, w.sub_scale, w.sub_min,
-                                                     w.neuron_scale, w.neuron_min,
-                                                     w.neuron_len, w.gs);
-    });
-    return g_profiler.measure("nint.gemm4", [&]() { return nint_cublas_gemm_nt_f32acc_cuda(x, ww); });
 }
 
 static mfq_tensor_backend::Tensor nint_matmul_bf16_output(
         const NintWeight & w, mfq_tensor_backend::Tensor x) {
     auto shape = x.sizes().vec();
     auto flat = x.reshape({-1, x.size(-1)});
-    const char * disabled = std::getenv(
-        "MFQ_DISABLE_DECODE_NINT_BF16_OUTPUT");
-    const bool enabled =
-        disabled == nullptr || disabled[0] != '1';
-    if (!enabled || !flat.is_cuda() || flat.size(0) != 1 ||
-            w.mixed_q || w.bits != 4 || w.gs != 24 || w.q8_zero || w.q5_exec) {
-        auto fallback = nint_matmul(w, flat)
-            .to(mfq_tensor_backend::kBFloat16).contiguous();
-        shape.back() = fallback.size(-1);
-        return fallback.reshape(shape);
-    }
-    const char * disable_bf16_input = std::getenv(
-        "MFQ_DISABLE_DECODE_NINT_BF16_INPUT_QUANT");
-    flat = flat.contiguous();
-    if (flat.scalar_type() != mfq_tensor_backend::kBFloat16 ||
-            (disable_bf16_input != nullptr &&
-             disable_bf16_input[0] == '1')) {
-        flat = flat.to(mfq_tensor_backend::kFloat16);
-    }
-    flat = pad_last(flat, w.neuron_len);
-    Workspace & workspace = w.workspace(1);
-    auto output = nint4_gs24_gemv_bf16_ws_cuda(
-        w.q_packed, w.sub_scale, w.sub_min,
-        w.neuron_scale, w.neuron_min, flat,
-        workspace.qx, workspace.xscale, workspace.xsum);
+    auto output = nint_matmul(w, flat)
+        .to(mfq_tensor_backend::kBFloat16).contiguous();
     shape.back() = output.size(-1);
     return output.reshape(shape);
 }
@@ -12341,30 +11264,18 @@ static mfq_tensor_backend::Tensor nint_matmul_f32_kld(
     x = pad_last(
         x.contiguous().to(mfq_tensor_backend::kFloat16),
         w.neuron_len);
-    if (w.mixed_q) {
+    if (!w.q8_zero) {
         return nint_matmul(w, x).to(mfq_tensor_backend::kFloat32);
     }
     MFQ_RUNTIME_CHECK(
         x.size(0) >= 16,
         "FP32-output NINT MMQ requires at least 16 activation rows");
-    MFQ_RUNTIME_CHECK(
-        !w.q5_exec,
-        "FP32-output NINT MMQ requires original NINT5 packed weights");
     ++g_kl_mmq_dense_calls;
-    if (w.q8_zero) {
-        return g_profiler.measure(
-            "kld_mmq.nint8_zero.fp32_output", [&]() {
-                return nint8_zero_mmq_f32_packed_cuda(
-                    w.q_packed, w.q8_zero_scale,
-                    x, w.neuron_len);
-            });
-    }
     return g_profiler.measure(
-        "kld_mmq.nint.fp32_output", [&]() {
-            return nint_mmq_f32_packed_cuda(
-                w.q_packed, w.sub_scale, w.sub_min,
-                w.neuron_scale, w.neuron_min,
-                x, w.gs, w.bits);
+        "kld_mmq.nint8_zero.fp32_output", [&]() {
+            return nint8_zero_mmq_f32_packed_cuda(
+                w.q_packed, w.q8_zero_scale,
+                x, w.neuron_len);
         });
 }
 
@@ -12404,17 +11315,28 @@ static mfq_tensor_backend::Tensor nint_matmul_groupwise_u8(
         w.out % groups == 0,
         "groupwise NINT projection output rows must divide groups");
     x = x.contiguous().to(mfq_tensor_backend::kFloat16);
-    const int input_rows = (int)(x.size(0) * groups);
-    Workspace & ws = w.workspace(input_rows);
-    return g_profiler.measure("nint.groupwise_u8", [&]() {
-        return nint_gemv_packed_u8_groupwise_ws_cuda(
-            w.q_packed, w.sub_scale, w.sub_min,
-            w.neuron_scale, w.neuron_min, x, w.gs, groups,
-            ws.qx, ws.xscale, ws.xsum);
+    auto dense = g_profiler.measure("nint.groupwise_dequant", [&]() {
+        return nint_decode_cuda(
+            w.q_packed, w.row_q_bits, w.row_q_bit_offsets,
+            w.sub_scale, w.sub_min, w.neuron_scale, w.neuron_min,
+            w.neuron_len, w.gs);
+    });
+    const int64_t rows_per_group = w.out / groups;
+    return g_profiler.measure("nint.groupwise_gemm", [&]() {
+        return mfq_tensor_backend::bmm(
+            x.transpose(0, 1),
+            dense.reshape({groups, rows_per_group, w.neuron_len})
+                .transpose(1, 2))
+            .transpose(0, 1)
+            .contiguous()
+            .reshape({x.size(0), w.out});
     });
 }
 
 static mfq_tensor_backend::Tensor nint_matmul_input_mul(const NintWeight & w, mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor gate, int mode) {
+    MFQ_RUNTIME_CHECK(
+        mode == 1 || mode == 2,
+        "NINT input gate mode must be sigmoid or SiLU");
     if (!x.is_cuda()) {
         x = x.contiguous().to(mfq_tensor_backend::kFloat16);
         gate = gate.contiguous().to(mfq_tensor_backend::kFloat16);
@@ -12428,104 +11350,22 @@ static mfq_tensor_backend::Tensor nint_matmul_input_mul(const NintWeight & w, mf
     gate = gate.contiguous().to(mfq_tensor_backend::kFloat16);
     x = pad_last(x, w.neuron_len);
     gate = pad_last(gate, w.neuron_len);
-    int M = (int)x.size(0);
-    if (w.q8_zero || w.mixed_q) {
-        if (mode == 1) return nint_matmul(w, x * mfq_tensor_backend::sigmoid(gate));
-        return nint_matmul(w, x * mfq_tensor_backend::silu(gate));
-    }
-    if (w.bits == 4 && M >= 1 && M <= 6) {
-        Workspace & ws = w.workspace(M);
-        return nint_gemv_packed_gate_ws_cuda(w.q_packed, w.sub_scale, w.sub_min, w.neuron_scale, w.neuron_min,
-                                             x, gate, w.gs, mode, ws.qx, ws.xscale, ws.xsum);
-    }
-    if ((w.bits == 2 || w.bits == 3 || w.bits == 5 || w.bits == 6 || w.bits == 8) && M <= 8) {
-        Workspace & ws = w.workspace(M);
-        return nint_gemv_packed_bits_gate_ws_cuda(w.q_packed, w.sub_scale, w.sub_min, w.neuron_scale, w.neuron_min,
-                                                  x, gate, w.gs, w.bits, mode, ws.qx, ws.xscale, ws.xsum);
-    }
     if (mode == 1) return nint_matmul(w, x * mfq_tensor_backend::sigmoid(gate));
     return nint_matmul(w, x * mfq_tensor_backend::silu(gate));
-}
-
-static mfq_tensor_backend::Tensor nint_matmul_qx(const NintWeight & w, Workspace & ws) {
-    if (w.q8_zero || w.mixed_q) {
-        throw std::runtime_error(
-            "this NINT layout does not support the prequantized activation path");
-    }
-    int M = (int)ws.qx.size(0);
-    if (w.bits == 4) {
-        return nint_gemv_packed_qx_ws_cuda(w.q_packed, w.sub_scale, w.sub_min, w.neuron_scale, w.neuron_min,
-                                           w.gs, ws.qx, ws.xscale, ws.xsum);
-    }
-    if (w.bits == 2 || w.bits == 3 || w.bits == 5 || w.bits == 6 || w.bits == 8) {
-        if (M > 8) throw std::runtime_error("NINT packed-bits prequantized GEMV supports only M<=8");
-        return nint_gemv_packed_bits_qx_ws_cuda(w.q_packed, w.sub_scale, w.sub_min, w.neuron_scale, w.neuron_min,
-                                                w.gs, w.bits, ws.qx, ws.xscale, ws.xsum);
-    }
-    throw std::runtime_error("NINT prequantized GEMV unsupported bit width");
-}
-
-static bool nint_small_m_qx_compatible(
-        const NintWeight & source,
-        const NintWeight & target) {
-    const auto supported = [](const NintWeight & weight) {
-        return !weight.mixed_q && !weight.q8_zero && !weight.q5_exec &&
-            weight.gs == 24 &&
-            (weight.bits == 4 || weight.bits == 6);
-    };
-    return supported(source) && supported(target) &&
-        source.neuron_len == target.neuron_len &&
-        source.q_packed.get_device() == target.q_packed.get_device();
 }
 
 static mfq_tensor_backend::Tensor nint_matmul_swiglu(const NintWeight & w, mfq_tensor_backend::Tensor x) {
     x = x.contiguous().to(mfq_tensor_backend::kFloat16);
     x = pad_last(x, w.neuron_len);
-    int M = (int)x.size(0);
-    if (w.q8_zero || w.mixed_q) {
-        auto parts = nint_matmul(w, x).chunk(2, -1);
-        return mfq_tensor_backend::silu(parts[0]) * parts[1];
-    }
-    if (M < 1 || M > 6) {
-        throw std::runtime_error("NINT SwiGLU fusion supports M in [1,6]");
-    }
-    Workspace & ws = w.workspace(M);
-    if (w.bits == 4) {
-        return nint_gemv_packed_swiglu_ws_cuda(
-            w.q_packed, w.sub_scale, w.sub_min, w.neuron_scale, w.neuron_min,
-            x, w.gs, ws.qx, ws.xscale, ws.xsum);
-    }
-    if (w.bits == 2 || w.bits == 3 || w.bits == 5 || w.bits == 6 || w.bits == 8) {
-        return nint_gemv_packed_bits_swiglu_ws_cuda(
-            w.q_packed, w.sub_scale, w.sub_min, w.neuron_scale, w.neuron_min,
-            x, w.gs, w.bits, ws.qx, ws.xscale, ws.xsum);
-    }
-    throw std::runtime_error("NINT SwiGLU fusion unsupported bit width");
+    auto parts = nint_matmul(w, x).chunk(2, -1);
+    return mfq_tensor_backend::silu(parts[0]) * parts[1];
 }
 
 static mfq_tensor_backend::Tensor nint_matmul_geglu(const NintWeight & w, mfq_tensor_backend::Tensor x) {
     x = x.contiguous().to(mfq_tensor_backend::kFloat16);
     x = pad_last(x, w.neuron_len);
-    int M = (int)x.size(0);
-    if (w.q8_zero || w.mixed_q) {
-        auto parts = nint_matmul(w, x).chunk(2, -1);
-        return gelu_mul_cuda(parts[0].contiguous(), parts[1].contiguous());
-    }
-    if (M != 1) {
-        throw std::runtime_error("NINT GeGLU fusion supports only decode M=1");
-    }
-    Workspace & ws = w.workspace(M);
-    if (w.bits == 4) {
-        return nint_gemv_packed_geglu_ws_cuda(
-            w.q_packed, w.sub_scale, w.sub_min, w.neuron_scale, w.neuron_min,
-            x, w.gs, ws.qx, ws.xscale, ws.xsum);
-    }
-    if (w.bits == 2 || w.bits == 3 || w.bits == 5 || w.bits == 6 || w.bits == 8) {
-        return nint_gemv_packed_bits_geglu_ws_cuda(
-            w.q_packed, w.sub_scale, w.sub_min, w.neuron_scale, w.neuron_min,
-            x, w.gs, w.bits, ws.qx, ws.xscale, ws.xsum);
-    }
-    throw std::runtime_error("NINT GeGLU fusion unsupported bit width");
+    auto parts = nint_matmul(w, x).chunk(2, -1);
+    return gelu_mul_cuda(parts[0].contiguous(), parts[1].contiguous());
 }
 
 struct NintLinear {
@@ -12540,14 +11380,6 @@ struct NintLinear {
     }
     mfq_tensor_backend::Tensor forward_bf16_output(mfq_tensor_backend::Tensor x) const {
         return nint_matmul_bf16_output(w, x);
-    }
-    mfq_tensor_backend::Tensor forward_qx(
-            mfq_tensor_backend::Tensor x,
-            Workspace & workspace) const {
-        auto shape = x.sizes().vec();
-        auto y = nint_matmul_qx(w, workspace);
-        shape.back() = y.size(-1);
-        return y.reshape(shape);
     }
     mfq_tensor_backend::Tensor forward_input_mul(mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor gate, int mode) const {
         auto shape = x.sizes().vec();
@@ -12699,28 +11531,6 @@ struct NintLinearGroup {
     mutable std::shared_ptr<CudaIndependentBranchExecutor>
         branch_executor =
             std::make_shared<CudaIndependentBranchExecutor>();
-    const NintWeight * shared_qx_weight() const {
-        return split_w.empty() && !w.mixed_q && !w.q8_zero && !w.q5_exec &&
-                w.gs == 24 && (w.bits == 4 || w.bits == 6)
-            ? &w
-            : nullptr;
-    }
-    std::vector<mfq_tensor_backend::Tensor> forward_qx(
-            mfq_tensor_backend::Tensor x,
-            Workspace & workspace) const {
-        MFQ_RUNTIME_CHECK(
-            shared_qx_weight() != nullptr,
-            "shared-qx NINT group requires one compatible packed weight");
-        auto shape = x.sizes().vec();
-        auto y = nint_matmul_qx(w, workspace);
-        auto parts = y.split_with_sizes(outs, -1);
-        for (auto & part : parts) {
-            auto part_shape = shape;
-            part_shape.back() = part.size(-1);
-            part = part.reshape(part_shape);
-        }
-        return parts;
-    }
     std::vector<mfq_tensor_backend::Tensor> forward(mfq_tensor_backend::Tensor x) const {
         auto shape = x.sizes().vec();
         std::vector<mfq_tensor_backend::Tensor> parts;
@@ -12787,10 +11597,8 @@ static NintLinearGroup make_linear_group(const std::vector<NintWeight> & ws) {
     bool same = !ws.empty();
     for (size_t i = 1; i < ws.size(); ++i) {
         if (ws[i].ng != ws[0].ng || ws[i].gs != ws[0].gs ||
-            ws[i].bits != ws[0].bits || ws[i].qbytes != ws[0].qbytes ||
             ws[i].neuron_len != ws[0].neuron_len ||
-            ws[i].q8_zero != ws[0].q8_zero ||
-            ws[i].mixed_q != ws[0].mixed_q) {
+            ws[i].q8_zero != ws[0].q8_zero) {
             same = false;
             break;
         }
@@ -12827,11 +11635,9 @@ static NintLinearGroup make_linear_group(const std::vector<NintWeight> & ws) {
         };
         for (const auto & w : ws) {
             bool append = !cur.empty() &&
-                w.ng == cur[0].ng && w.gs == cur[0].gs && w.bits == cur[0].bits &&
-                w.qbytes == cur[0].qbytes &&
+                w.ng == cur[0].ng && w.gs == cur[0].gs &&
                 w.neuron_len == cur[0].neuron_len &&
-                w.q8_zero == cur[0].q8_zero &&
-                w.mixed_q == cur[0].mixed_q;
+                w.q8_zero == cur[0].q8_zero;
             if (!append) flush();
             cur.push_back(w);
             cur_outs.push_back(w.out);
@@ -13255,6 +12061,38 @@ struct Mxfp4Linear {
     }
 };
 
+struct Mxfp4SqLinear {
+    Mxfp4SqWeight weight;
+
+    mfq_tensor_backend::Tensor forward(
+            mfq_tensor_backend::Tensor x) const {
+        MFQ_RUNTIME_CHECK(
+            weight.blob.is_cuda(),
+            "MXFP4-SQ does not support dense CPU-layer offload");
+        auto shape = x.sizes().vec();
+        const auto original_dtype = x.scalar_type();
+        auto source = x.reshape({-1, x.size(-1)});
+        if (source.scalar_type() != mfq_tensor_backend::kFloat16 &&
+                source.scalar_type() != mfq_tensor_backend::kFloat32) {
+            source = source.to(mfq_tensor_backend::kFloat16).contiguous();
+        } else {
+            source = source.contiguous();
+        }
+        auto output = mxfp4_sq_matmul_cuda(
+            weight.blob,
+            source,
+            weight.bits,
+            weight.out,
+            weight.neuron_len,
+            weight.matrix_scale_base);
+        if (original_dtype == mfq_tensor_backend::kBFloat16) {
+            output = output.to(original_dtype).contiguous();
+        }
+        shape.back() = output.size(-1);
+        return output.reshape(shape);
+    }
+};
+
 struct Mxfp8Linear {
     Mxfp8Weight weight;
 
@@ -13271,6 +12109,7 @@ enum class QuantLinearKind {
     Nint,
     Nvq,
     Mxfp4,
+    Mxfp4Sq,
     Mxfp8,
     Tpq,
     Dense,
@@ -13610,6 +12449,7 @@ struct QuantLinear {
     NintLinear nint;
     NvqLinear nvq;
     Mxfp4Linear mxfp4;
+    Mxfp4SqLinear mxfp4_sq;
     Mxfp8Linear mxfp8;
     TpqLinear tpq;
     mfq_tensor_backend::Tensor dense;
@@ -13627,27 +12467,10 @@ struct QuantLinear {
     bool is_nint() const { return kind == QuantLinearKind::Nint; }
     bool is_nvq() const { return kind == QuantLinearKind::Nvq; }
     bool is_mxfp4() const { return kind == QuantLinearKind::Mxfp4; }
+    bool is_mxfp4_sq() const { return kind == QuantLinearKind::Mxfp4Sq; }
     bool is_mxfp8() const { return kind == QuantLinearKind::Mxfp8; }
     bool is_tpq() const { return kind == QuantLinearKind::Tpq; }
     bool is_dense() const { return kind == QuantLinearKind::Dense; }
-
-    const NintWeight * shared_qx_weight() const {
-        return !tensor_parallel() && is_nint() &&
-                !nint.w.q8_zero && !nint.w.q5_exec &&
-                nint.w.gs == 24 &&
-                (nint.w.bits == 4 || nint.w.bits == 6)
-            ? &nint.w
-            : nullptr;
-    }
-
-    mfq_tensor_backend::Tensor forward_qx(
-            mfq_tensor_backend::Tensor x,
-            Workspace & workspace) const {
-        MFQ_RUNTIME_CHECK(
-            shared_qx_weight() != nullptr,
-            "shared-qx projection requires one local NINT weight");
-        return nint.forward_qx(x, workspace);
-    }
 
     mfq_tensor_backend::Tensor forward_tensor_parallel_flat(
             mfq_tensor_backend::Tensor x,
@@ -13752,6 +12575,7 @@ struct QuantLinear {
         if (is_nint()) return nint.forward(x);
         if (is_nvq()) return nvq.forward(x);
         if (is_mxfp4()) return mxfp4.forward(x);
+        if (is_mxfp4_sq()) return mxfp4_sq.forward(x);
         if (is_tpq()) return tpq.forward(x);
         if (is_dense()) return forward_dense(x);
         return mxfp8.forward(x);
@@ -13818,7 +12642,7 @@ struct QuantLinear {
             return forward_dense(gated);
         }
         throw std::runtime_error(
-            "MXFP4/MXFP8/TPQ linear does not support input gating");
+            "MXFP4/MXFP4-SQ/MXFP8/TPQ linear does not support input gating");
     }
     mfq_tensor_backend::Tensor forward_input_mul_f32_kld(
             mfq_tensor_backend::Tensor x,
@@ -13831,23 +12655,24 @@ struct QuantLinear {
             x, gate, mode);
     }
     int64_t out() const {
-        return tensor_parallel()
-            ? logical_out
-            : (is_nint() ? nint.w.out
-               : (is_nvq() ? nvq.w.out
-                  : (is_mxfp4() ? mxfp4.weight.out
-                     : (is_tpq() ? tpq.weight.out
-                        : (is_dense() ? dense.size(0) : mxfp8.weight.out)))));
+        if (tensor_parallel()) return logical_out;
+        if (is_nint()) return nint.w.out;
+        if (is_nvq()) return nvq.w.out;
+        if (is_mxfp4()) return mxfp4.weight.out;
+        if (is_mxfp4_sq()) return mxfp4_sq.weight.out;
+        if (is_tpq()) return tpq.weight.out;
+        if (is_dense()) return dense.size(0);
+        return mxfp8.weight.out;
     }
     int64_t neuron_len() const {
-        return tensor_parallel()
-            ? logical_neuron_len
-            : (is_nint() ? nint.w.neuron_len
-               : (is_nvq() ? nvq.w.neuron_len
-                  : (is_mxfp4() ? mxfp4.weight.neuron_len
-                     : (is_tpq() ? tpq.weight.neuron_len
-                        : (is_dense() ? dense.size(1)
-                           : mxfp8.weight.neuron_len)))));
+        if (tensor_parallel()) return logical_neuron_len;
+        if (is_nint()) return nint.w.neuron_len;
+        if (is_nvq()) return nvq.w.neuron_len;
+        if (is_mxfp4()) return mxfp4.weight.neuron_len;
+        if (is_mxfp4_sq()) return mxfp4_sq.weight.neuron_len;
+        if (is_tpq()) return tpq.weight.neuron_len;
+        if (is_dense()) return dense.size(1);
+        return mxfp8.weight.neuron_len;
     }
 };
 
@@ -13873,36 +12698,16 @@ static mfq_tensor_backend::Tensor quant_embedding_lookup(
                 embedding.nint.w.q8_zero_scale,
                 token_ids, embedding.nint.w.neuron_len);
         }
-        if (embedding.nint.w.mixed_q) {
-            return nint_embedding_lookup_packed_mixed_q_cuda(
-                embedding.nint.w.q_packed,
-                embedding.nint.w.row_q_bits,
-                embedding.nint.w.row_q_bit_offsets,
-                embedding.nint.w.sub_scale,
-                embedding.nint.w.sub_min,
-                embedding.nint.w.neuron_scale,
-                embedding.nint.w.neuron_min,
-                token_ids, embedding.nint.w.neuron_len,
-                embedding.nint.w.gs);
-        }
-        if (embedding.nint.w.bits == 4) {
-            return nint_embedding_lookup_packed_compact_cuda(
-                embedding.nint.w.q_packed,
-                embedding.nint.w.sub_scale,
-                embedding.nint.w.sub_min,
-                embedding.nint.w.neuron_scale,
-                embedding.nint.w.neuron_min,
-                token_ids, embedding.nint.w.neuron_len,
-                embedding.nint.w.gs);
-        }
-        return nint_embedding_lookup_packed_compact_bits_cuda(
+        return nint_embedding_cuda(
             embedding.nint.w.q_packed,
+            embedding.nint.w.row_q_bits,
+            embedding.nint.w.row_q_bit_offsets,
             embedding.nint.w.sub_scale,
             embedding.nint.w.sub_min,
             embedding.nint.w.neuron_scale,
             embedding.nint.w.neuron_min,
             token_ids, embedding.nint.w.neuron_len,
-            embedding.nint.w.gs, embedding.nint.w.bits);
+            embedding.nint.w.gs);
     }
     if (embedding.is_mxfp4()) {
         return mxfp4_embedding_lookup_cuda(
@@ -13914,6 +12719,9 @@ static mfq_tensor_backend::Tensor quant_embedding_lookup(
             embedding.mxfp8.weight.values,
             embedding.mxfp8.weight.scales, token_ids);
     }
+    MFQ_RUNTIME_CHECK(
+        !embedding.is_mxfp4_sq(),
+        "MXFP4-SQ tensors do not support embedding lookup");
     MFQ_RUNTIME_CHECK(embedding.is_tpq(), "unsupported quantized embedding kind");
     if (embedding.tpq.weight.int4) {
         return tpq_int4_embedding_lookup_cuda(
@@ -14070,15 +12878,9 @@ struct QuantLinearGroup {
     bool nint_grouped = false;
     bool nvq_prefix2 = false;
     bool decode_branch_parallel = true;
-    bool decode_nint_qx_reuse = false;
     NintLinearGroup nint;
     std::vector<QuantLinear> layers;
     std::vector<int64_t> outs;
-    std::vector<mfq_tensor_backend::Tensor> nint_q_packed;
-    std::vector<mfq_tensor_backend::Tensor> nint_sub_scale;
-    std::vector<mfq_tensor_backend::Tensor> nint_sub_min;
-    std::vector<mfq_tensor_backend::Tensor> nint_neuron_scale;
-    std::vector<mfq_tensor_backend::Tensor> nint_neuron_min;
     mutable std::shared_ptr<CudaIndependentBranchExecutor>
         branch_executor =
             std::make_shared<CudaIndependentBranchExecutor>();
@@ -14104,19 +12906,6 @@ struct QuantLinearGroup {
             x, tensor_parallel_output_projections());
     }
 
-    const NintWeight * shared_qx_weight() const {
-        return nint_grouped ? nint.shared_qx_weight() : nullptr;
-    }
-
-    std::vector<mfq_tensor_backend::Tensor> forward_qx(
-            mfq_tensor_backend::Tensor x,
-            Workspace & workspace) const {
-        MFQ_RUNTIME_CHECK(
-            shared_qx_weight() != nullptr,
-            "shared-qx projection group requires local packed NINT weights");
-        return nint.forward_qx(x, workspace);
-    }
-
     std::vector<mfq_tensor_backend::Tensor> forward(mfq_tensor_backend::Tensor x) const {
         if (!x.is_cuda()) {
             MFQ_RUNTIME_CHECK(
@@ -14134,71 +12923,6 @@ struct QuantLinearGroup {
             return forward_tensor_parallel_output_group(x);
         }
         if (nint_grouped) return nint.forward(x);
-        const char * disable_qx_reuse =
-            std::getenv("MFQ_DISABLE_DECODE_NINT_QX_REUSE");
-        if (g_kl_mmq_mode == KlMmqMode::Default &&
-                decode_nint_qx_reuse &&
-                x.numel() / x.size(-1) == 1 &&
-                (disable_qx_reuse == nullptr ||
-                 disable_qx_reuse[0] != '1')) {
-            auto shape = x.sizes().vec();
-            auto flat = x.reshape({1, x.size(-1)});
-            const char * disable_multi =
-                std::getenv("MFQ_DISABLE_DECODE_NINT_MULTI_GEMV");
-            if (disable_multi == nullptr || disable_multi[0] != '1') {
-                const char * disable_bf16_output = std::getenv(
-                    "MFQ_DISABLE_DECODE_NINT_MULTI_BF16_OUTPUT");
-                const bool output_bf16 =
-                    x.scalar_type() == mfq_tensor_backend::kBFloat16 &&
-                    (disable_bf16_output == nullptr ||
-                     disable_bf16_output[0] != '1');
-                const char * disable_bf16_input = std::getenv(
-                    "MFQ_DISABLE_DECODE_NINT_BF16_INPUT_QUANT");
-                auto quantized_input = flat.contiguous();
-                if (quantized_input.scalar_type() != mfq_tensor_backend::kBFloat16 ||
-                        (disable_bf16_input != nullptr &&
-                         disable_bf16_input[0] == '1')) {
-                    quantized_input = quantized_input.to(mfq_tensor_backend::kFloat16);
-                }
-                quantized_input = pad_last(
-                    quantized_input,
-                    layers[0].nint.w.neuron_len);
-                Workspace & shared = layers[0].nint.w.workspace(1);
-                nint4_gs24_quantize_input_ws_cuda(
-                    quantized_input, shared.qx,
-                    shared.xscale, shared.xsum);
-                auto outputs = nint4_gs24_gemv_multi_qx_ws_cuda(
-                    nint_q_packed, nint_sub_scale, nint_sub_min,
-                    nint_neuron_scale, nint_neuron_min,
-                    shared.qx, shared.xscale, shared.xsum,
-                    output_bf16);
-                MFQ_RUNTIME_CHECK(
-                    outputs.size() == layers.size(),
-                    "multi-projection NINT output count mismatch");
-                for (size_t index = 0; index < outputs.size(); ++index) {
-                    auto output_shape = shape;
-                    output_shape.back() = outputs[index].size(-1);
-                    outputs[index] = outputs[index].reshape(output_shape);
-                }
-                return outputs;
-            }
-            std::vector<mfq_tensor_backend::Tensor> result;
-            result.reserve(layers.size());
-
-            auto first = nint_matmul(layers[0].nint.w, flat);
-            auto first_shape = shape;
-            first_shape.back() = first.size(-1);
-            result.push_back(first.reshape(first_shape));
-
-            Workspace & shared = layers[0].nint.w.workspace(1);
-            for (size_t index = 1; index < layers.size(); ++index) {
-                auto output = nint_matmul_qx(layers[index].nint.w, shared);
-                auto output_shape = shape;
-                output_shape.back() = output.size(-1);
-                result.push_back(output.reshape(output_shape));
-            }
-            return result;
-        }
         if (g_kl_mmq_mode == KlMmqMode::Default &&
                 nvq_prefix2 && nvq_fusion_enabled()) {
             auto shape = x.sizes().vec();
@@ -14298,16 +13022,11 @@ struct QuantLinearGroup {
 };
 
 static bool is_nint_linear_dtype(const std::string & dtype) {
-    return dtype != "NINTM" && dtype.rfind("NINT", 0) == 0;
+    return dtype == "NINT";
 }
 
 static bool is_nvq_linear_dtype(const std::string & dtype) {
-    return dtype == "NPQ0-L" || dtype == "NPQ0-S" ||
-           dtype == "NVQ1-L" || dtype == "NVQ1-S" || dtype == "NVQ2" ||
-           dtype == "NVQ2J" || dtype == "NVQ2J-L" || dtype == "NVQ2J-XL" ||
-           dtype == "NVQ3" || dtype == "NVQ3J" ||
-           dtype == "NVQ3J-512" || dtype == "NVQ3J-L" ||
-           dtype == "NIQ2" || dtype == "NIQ2J" || dtype == "NIQ3";
+    return dtype == "NVQ" || dtype == "NPQ";
 }
 
 static TensorParallelAxis infer_tensor_parallel_axis(
@@ -14594,6 +13313,24 @@ static QuantLinear load_quant_linear(
                 result.nvq.w = to_device_nvq(cpu, true);
             }
         }
+    } else if (dtype == "MXFP4-SQ") {
+        result.kind = QuantLinearKind::Mxfp4Sq;
+        if (g_tensor_parallel.enabled() &&
+                axis != TensorParallelAxis::Mirrored) {
+            throw std::runtime_error(
+                "MXFP4-SQ tensor parallelism is not implemented: " + name);
+        }
+        if (g_loading_cpu_layer) {
+            throw std::runtime_error(
+                "MXFP4-SQ does not support dense CPU-layer offload: " + name);
+        }
+        result.mxfp4_sq.weight = to_device_mxfp4_sq(
+            mfq.read_blob(name),
+            true,
+            active_weight_load_device());
+        result.logical_out = result.mxfp4_sq.weight.out;
+        result.logical_neuron_len =
+            result.mxfp4_sq.weight.neuron_len;
     } else if (dtype == "MXFP4") {
         result.kind = QuantLinearKind::Mxfp4;
         const auto cpu = unpack_mxfp4(mfq.read_blob(name));
@@ -14750,7 +13487,7 @@ static QuantLinear load_quant_linear(
         }
     } else {
         throw std::runtime_error(
-            "linear tensor must be NINT/NVQ/MXFP4/MXFP8/TPQ/BF16/F16/F32: " +
+            "linear tensor must be NINT/NVQ/MXFP4-SQ/MXFP4/MXFP8/TPQ/BF16/F16/F32: " +
             name + " dtype=" + dtype);
     }
     return result;
@@ -14758,7 +13495,8 @@ static QuantLinear load_quant_linear(
 
 static bool is_quant_dtype(const std::string & dtype) {
     return is_nint_linear_dtype(dtype) ||
-        is_nvq_linear_dtype(dtype) || dtype == "MXFP4" || dtype == "MXFP8" ||
+        is_nvq_linear_dtype(dtype) || dtype == "MXFP4-SQ" ||
+        dtype == "MXFP4" || dtype == "MXFP8" ||
         dtype == "TPQ-I4G64" || is_tpq_pq_dtype(dtype);
 }
 
@@ -14788,21 +13526,6 @@ static QuantLinearGroup make_quant_group(
         [](const QuantLinear & layer) {
             return layer.tensor_parallel();
         });
-    result.decode_nint_qx_reuse = preserve_projection_boundaries &&
-        all_nint && !g_loading_cpu_layer && !any_tensor_parallel &&
-        layers.size() > 1 &&
-        std::all_of(
-            layers.begin(), layers.end(),
-            [&](const QuantLinear & layer) {
-                const auto & weight = layer.nint.w;
-                const auto & first = layers[0].nint.w;
-                return weight.bits == 4 && weight.gs == 24 &&
-                    !weight.mixed_q &&
-                    !weight.q8_zero &&
-                    !weight.q5_exec && weight.ng == first.ng &&
-                    weight.gs == first.gs &&
-                    weight.neuron_len == first.neuron_len;
-            });
     if (all_nint && !preserve_projection_boundaries &&
         !diagnostic_keep_nint_separate && !g_loading_cpu_layer &&
         !any_tensor_parallel) {
@@ -14810,21 +13533,6 @@ static QuantLinearGroup make_quant_group(
         result.nint = make_linear_group(nint_weights);
     } else {
         result.layers = std::move(layers);
-        if (result.decode_nint_qx_reuse) {
-            result.nint_q_packed.reserve(result.layers.size());
-            result.nint_sub_scale.reserve(result.layers.size());
-            result.nint_sub_min.reserve(result.layers.size());
-            result.nint_neuron_scale.reserve(result.layers.size());
-            result.nint_neuron_min.reserve(result.layers.size());
-            for (const auto & layer : result.layers) {
-                const auto & weight = layer.nint.w;
-                result.nint_q_packed.push_back(weight.q_packed);
-                result.nint_sub_scale.push_back(weight.sub_scale);
-                result.nint_sub_min.push_back(weight.sub_min);
-                result.nint_neuron_scale.push_back(weight.neuron_scale);
-                result.nint_neuron_min.push_back(weight.neuron_min);
-            }
-        }
         result.nvq_prefix2 = !g_loading_cpu_layer && result.layers.size() >= 2 &&
             !any_tensor_parallel &&
             result.layers[0].is_nvq() && result.layers[1].is_nvq() &&
@@ -14849,6 +13557,11 @@ static bool quant_linear_pair_compatible(const QuantLinear & a, const QuantLinea
     if (a.is_mxfp4()) {
         return a.mxfp4.weight.neuron_len == b.mxfp4.weight.neuron_len;
     }
+    if (a.is_mxfp4_sq()) {
+        return a.mxfp4_sq.weight.neuron_len ==
+                b.mxfp4_sq.weight.neuron_len &&
+            a.mxfp4_sq.weight.bits == b.mxfp4_sq.weight.bits;
+    }
     if (a.is_tpq()) {
         return a.tpq.weight.int4 == b.tpq.weight.int4 &&
             a.tpq.weight.neuron_len == b.tpq.weight.neuron_len &&
@@ -14861,8 +13574,8 @@ static bool quant_linear_pair_compatible(const QuantLinear & a, const QuantLinea
     }
     const auto & x = a.nint.w;
     const auto & y = b.nint.w;
-    return x.ng == y.ng && x.gs == y.gs && x.bits == y.bits &&
-        x.qbytes == y.qbytes && x.neuron_len == y.neuron_len && x.q5_exec == y.q5_exec;
+    return x.ng == y.ng && x.gs == y.gs &&
+        x.neuron_len == y.neuron_len && x.q8_zero == y.q8_zero;
 }
 
 static QuantLinearGroup load_quant_group(
@@ -14981,18 +13694,10 @@ static mfq_tensor_backend::Tensor dequant_nint_dense_f32(const NintWeight & w) {
         dense = nint8_zero_dequant_cuda(
             w.q_packed, w.q8_zero_scale, w.neuron_len);
     } else {
-        if (w.q5_exec) {
-            throw std::runtime_error(
-                "FP32 compressor projection does not accept Q5 execution-only weights");
-        }
-        dense = w.bits == 4
-            ? nint_dequant_full_packed_compact_cuda(
-                w.q_packed, w.sub_scale, w.sub_min,
-                w.neuron_scale, w.neuron_min, w.neuron_len, w.gs)
-            : nint_dequant_full_packed_compact_bits_cuda(
-                w.q_packed, w.sub_scale, w.sub_min,
-                w.neuron_scale, w.neuron_min,
-                w.neuron_len, w.gs, w.bits);
+        dense = nint_decode_cuda(
+            w.q_packed, w.row_q_bits, w.row_q_bit_offsets,
+            w.sub_scale, w.sub_min, w.neuron_scale, w.neuron_min,
+            w.neuron_len, w.gs);
     }
     return dense.to(mfq_tensor_backend::kFloat32).contiguous();
 }
@@ -15017,6 +13722,16 @@ static mfq_tensor_backend::Tensor dequant_quant_linear_f32(const QuantLinear & l
                 linear.mxfp4.weight.values,
                 linear.mxfp4.weight.scales)
                 .to(mfq_tensor_backend::kFloat32).contiguous();
+        }
+        if (linear.is_mxfp4_sq()) {
+            const auto & weight = linear.mxfp4_sq.weight;
+            return mxfp4_sq_dequant_cuda(
+                weight.blob,
+                weight.bits,
+                weight.out,
+                weight.neuron_len,
+                weight.matrix_scale_base,
+                true).contiguous();
         }
         if (linear.is_tpq()) {
             const auto & weight = linear.tpq.weight;
@@ -15893,10 +14608,10 @@ struct FFN {
     bool geglu = false;
     bool is_moe = false;
     bool moe_split_gate_up = false;
-    NintMoeWeight moe_gate_up;
-    NintMoeWeight moe_gate;
-    NintMoeWeight moe_up;
-    NintMoeWeight moe_down;
+    MfeWeight moe_gate_up;
+    MfeWeight moe_gate;
+    MfeWeight moe_up;
+    MfeWeight moe_down;
     std::shared_ptr<MixedMoeRuntime> cpu_moe_gate_up;
     std::shared_ptr<MixedMoeRuntime> cpu_moe_gate;
     std::shared_ptr<MixedMoeRuntime> cpu_moe_up;
@@ -16091,10 +14806,9 @@ struct FFN {
             const bool allow_fusion =
                 !g_force_moe_materialized_swiglu &&
                 !disable_swiglu_quant_fusion &&
-                moe_small_hetero_enabled(
+                moe_small_glu_path_enabled(
                     static_cast<int>(gate_up_pair.size(0)));
-            if (swiglu_limit <= 0.0 && allow_fusion &&
-                    down_shard.weight->hetero_supported) {
+            if (swiglu_limit <= 0.0 && allow_fusion) {
                 down_pair = down_shard.weight->forward_swiglu(
                     gate_up_pair, local_route);
             } else if (swiglu_limit > 0.0 && allow_fusion &&
@@ -16376,12 +15090,12 @@ struct FFN {
                     }
                 }
             }
-            std::optional<NintMoeWeight> staged_gate_up;
-            std::optional<NintMoeWeight> staged_gate;
-            std::optional<NintMoeWeight> staged_up;
-            const NintMoeWeight * active_gate_up = &moe_gate_up;
-            const NintMoeWeight * active_gate = &moe_gate;
-            const NintMoeWeight * active_up = &moe_up;
+            std::optional<MfeWeight> staged_gate_up;
+            std::optional<MfeWeight> staged_gate;
+            std::optional<MfeWeight> staged_up;
+            const MfeWeight * active_gate_up = &moe_gate_up;
+            const MfeWeight * active_gate = &moe_gate;
+            const MfeWeight * active_up = &moe_up;
             mfq_tensor_backend::Tensor gate_up_pair;
             if (moe_split_gate_up) {
                 if (cpu_moe_gate) {
@@ -16446,8 +15160,8 @@ struct FFN {
             if (!projection_bundle_prefetched) {
                 moe_down.prefetch(route);
             }
-            std::optional<NintMoeWeight> staged_down;
-            const NintMoeWeight * active_down = &moe_down;
+            std::optional<MfeWeight> staged_down;
+            const MfeWeight * active_down = &moe_down;
             if (cpu_moe_down) {
                 staged_down.emplace(g_profiler.measure(
                     "moe.cpu_offload_down_h2d", [&]() {
@@ -16463,10 +15177,9 @@ struct FFN {
             const bool allow_swiglu_quant_fusion =
                 !g_force_moe_materialized_swiglu &&
                 !disable_swiglu_quant_fusion &&
-                moe_small_hetero_enabled(
+                moe_small_glu_path_enabled(
                     static_cast<int>(gate_up_pair.size(0)));
-            if (swiglu_limit <= 0.0 && allow_swiglu_quant_fusion &&
-                    active_down->hetero_supported) {
+            if (swiglu_limit <= 0.0 && allow_swiglu_quant_fusion) {
                 down_pair = g_profiler.measure("moe.swiglu_down", [&]() {
                     return active_down->forward_swiglu(gate_up_pair, route);
                 });
@@ -16540,40 +15253,6 @@ struct FFN {
             const char * disable_geglu = std::getenv("MFQ_DISABLE_FFN_GEGLU_FUSION");
             const bool geglu_fusion_enabled =
                 disable_geglu == nullptr || disable_geglu[0] != '1';
-            const char * enable_quant = std::getenv("MFQ_ENABLE_FFN_GATEUP_QUANT_FUSION");
-            const bool quant_fusion_enabled = geglu_fusion_enabled &&
-                (enable_quant == nullptr || enable_quant[0] == '1');
-            const bool down_quant_layout_supported =
-                down.is_nint() && !down.tensor_parallel() &&
-                !down.nint.w.q8_zero &&
-                down.nint.w.gs <= 32;
-            if (gate_up.nint_grouped && down.is_nint() &&
-                quant_fusion_enabled && down_quant_layout_supported &&
-                !gate_up.nint.w.q8_zero &&
-                xh.numel() / xh.size(-1) == 1 && gate_up.nint.split_w.empty() &&
-                gate_up.outs.size() == 2 && gate_up.outs[0] == gate_up.outs[1] &&
-                (gate_up.nint.w.bits == 2 || gate_up.nint.w.bits == 3 || gate_up.nint.w.bits == 4 || gate_up.nint.w.bits == 5 ||
-                 gate_up.nint.w.bits == 6 || gate_up.nint.w.bits == 8)) {
-                auto shape = xh.sizes().vec();
-                shape.back() = down.nint.w.out;
-                Workspace & gate_ws = gate_up.nint.w.workspace(1);
-                Workspace & down_ws = down.nint.w.workspace(1);
-                auto xf = pad_last(
-                    xh.reshape({-1, xh.size(-1)}).contiguous(), gate_up.nint.w.neuron_len);
-                g_profiler.measure("ffn.gate_up_geglu_quant", [&]() {
-                    nint_ffn_gate_up_geglu_quant_ws_cuda(
-                        gate_up.nint.w.q_packed, gate_up.nint.w.sub_scale,
-                        gate_up.nint.w.sub_min, gate_up.nint.w.neuron_scale,
-                        gate_up.nint.w.neuron_min, xf, gate_up.nint.w.gs,
-                        gate_up.nint.w.bits, down.nint.w.gs,
-                        gate_ws.qx, gate_ws.xscale, gate_ws.xsum,
-                        down_ws.qx, down_ws.xscale, down_ws.xsum);
-                    return down_ws.qx;
-                });
-                return g_profiler.measure("ffn.down_qx", [&]() {
-                    return nint_matmul_qx(down.nint.w, down_ws).reshape(shape);
-                });
-            }
             if (geglu_fusion_enabled && xh.numel() / xh.size(-1) == 1 && gate_up.nint_grouped &&
                 gate_up.nint.split_w.empty()) {
                 auto act = g_profiler.measure("ffn.gate_up_geglu", [&]() {
@@ -16616,34 +15295,6 @@ struct FFN {
                 gate_up.layers[0].nvq.w, gate_up.layers[1].nvq.w, down.nvq.w,
                 xh.reshape({-1, xh.size(-1)}));
             return y.reshape(shape);
-        }
-        const char* enable_gateup_quant = std::getenv("MFQ_ENABLE_FFN_GATEUP_QUANT_FUSION");
-            if (gate_up.nint_grouped && down.is_nint() &&
-                !gate_up.nint.w.q8_zero && !down.nint.w.q8_zero &&
-                (enable_gateup_quant != nullptr && enable_gateup_quant[0] == '1') &&
-            xh.numel() / xh.size(-1) == 1 &&
-            gate_up.nint.split_w.empty() && gate_up.outs.size() == 2 && gate_up.outs[0] == gate_up.outs[1] &&
-            down.nint.w.gs <= 32 &&
-            (gate_up.nint.w.bits == 2 || gate_up.nint.w.bits == 3 || gate_up.nint.w.bits == 4 || gate_up.nint.w.bits == 5 || gate_up.nint.w.bits == 6 || gate_up.nint.w.bits == 8) &&
-            (down.nint.w.bits == 2 || down.nint.w.bits == 3 || down.nint.w.bits == 4 || down.nint.w.bits == 5 || down.nint.w.bits == 6 || down.nint.w.bits == 8)) {
-            auto shape = xh.sizes().vec();
-            shape.back() = down.nint.w.out;
-            Workspace & gate_ws = gate_up.nint.w.workspace(1);
-            Workspace & down_ws = down.nint.w.workspace(1);
-            auto xf = xh.reshape({-1, xh.size(-1)}).contiguous();
-            xf = pad_last(xf, gate_up.nint.w.neuron_len);
-            g_profiler.measure("ffn.gate_up_quant", [&]() {
-                nint_ffn_gate_up_swiglu_quant_ws_cuda(
-                    gate_up.nint.w.q_packed, gate_up.nint.w.sub_scale, gate_up.nint.w.sub_min,
-                    gate_up.nint.w.neuron_scale, gate_up.nint.w.neuron_min, xf,
-                    gate_up.nint.w.gs, gate_up.nint.w.bits, down.nint.w.gs,
-                    gate_ws.qx, gate_ws.xscale, gate_ws.xsum,
-                    down_ws.qx, down_ws.xscale, down_ws.xsum);
-                return down_ws.qx;
-            });
-            return g_profiler.measure("ffn.down_qx", [&]() {
-                return nint_matmul_qx(down.nint.w, down_ws).reshape(shape);
-            });
         }
         const char* disable_swiglu = std::getenv("MFQ_DISABLE_FFN_SWIGLU_FUSION");
         if ((disable_swiglu == nullptr || disable_swiglu[0] != '1') &&
@@ -17830,8 +16481,8 @@ struct FullBlock : Block {
     QuantLinear v_projection;
     QuantLinear o;
     FFN ffn;
-    NintMoeWeight gemma_moe_gate_up;
-    NintMoeWeight gemma_moe_down;
+    MfeWeight gemma_moe_gate_up;
+    MfeWeight gemma_moe_down;
     mfq_tensor_backend::Tensor gemma_router;
     mfq_tensor_backend::Tensor gemma_router_norm_scale;
     mfq_tensor_backend::Tensor gemma_expert_scale;
@@ -18546,8 +17197,8 @@ struct FullBlock : Block {
             mfq_tensor_backend::Tensor down_pair;
             const bool tracing_layer =
                 g_gemma_stage_trace != nullptr && layer == g_gemma_trace_layer;
-            if (!tracing_layer && moe_input.dim() == 2 && moe_input.size(0) <= 4 &&
-                    gemma_moe_gate_up.hetero_supported) {
+            if (!tracing_layer && moe_input.dim() == 2 &&
+                    moe_input.size(0) <= 4) {
                 auto moe_hidden = g_profiler.measure("gemma.moe_gate_up_geglu", [&]() {
                     return gemma_moe_gate_up.forward_glu_output(moe_input, route, true);
                 });
@@ -18565,8 +17216,7 @@ struct FullBlock : Block {
                     gemma_moe_down.prefetch(route);
                 }
                 trace_gemma_stage(layer, "moe_gate_up", gate_up_pair);
-                if (tracing_layer || gate_up_pair.size(0) > 4 ||
-                    !gemma_moe_down.hetero_supported) {
+                if (tracing_layer || gate_up_pair.size(0) > 4) {
                     auto moe_hidden = g_profiler.measure("gemma.moe_geglu", [&]() {
                         return moe_geglu_split_cuda(gate_up_pair);
                     });
@@ -18743,8 +17393,8 @@ struct GlmDsaBlock : Block {
     mfq_tensor_backend::Tensor index_k_norm, index_k_bias;
     QuantLinearGroup input_proj;
     QuantLinearGroup q_proj;
-    NintMoeWeight embed_q;
-    NintMoeWeight unembed_out;
+    MfeWeight embed_q;
+    MfeWeight unembed_out;
     QuantLinear o_proj;
     FFN ffn;
     mfq_tensor_backend::Tensor kv_cache;
@@ -18758,12 +17408,12 @@ struct GlmDsaBlock : Block {
     }
 
     mfq_tensor_backend::Tensor headwise_project(
-        const NintMoeWeight & weight, mfq_tensor_backend::Tensor x,
+        const MfeWeight & weight, mfq_tensor_backend::Tensor x,
         int64_t B, int64_t T, int64_t heads) const {
         if (x.dim() != 4 || x.size(0) != B || x.size(1) != T ||
             x.size(2) != heads || x.size(3) != weight.neuron_len ||
             weight.n_experts != heads) {
-            throw std::runtime_error("GLM head-wise NINTM projection shape mismatch");
+            throw std::runtime_error("GLM head-wise MFE projection shape mismatch");
         }
         const int64_t rows = B * T * heads;
         const auto & route = shared_state->head_route(rows, static_cast<int>(heads));
@@ -19361,50 +18011,6 @@ struct LinearBlock : Block {
             beta_raw = ab[1];
         } else if (split_in_proj) {
             bool shared_projection_input = false;
-            const char * shared_qx_environment = std::getenv(
-                "MFQ_LINEAR_ATTN_SMALL_M_QX_REUSE");
-            const int64_t projection_rows = B * T;
-            if (!split_dense_zab && ab_is_nint &&
-                    g_kl_mmq_mode == KlMmqMode::Default &&
-                    projection_rows >= 2 && projection_rows <= 6 &&
-                    (shared_qx_environment == nullptr ||
-                     shared_qx_environment[0] != '0')) {
-                const NintWeight * qkv_weight =
-                    qkv_proj.shared_qx_weight();
-                const NintWeight * z_weight =
-                    z_proj.shared_qx_weight();
-                const NintWeight * ab_weight =
-                    ab_nint_proj.shared_qx_weight();
-                if (qkv_weight != nullptr && z_weight != nullptr &&
-                        ab_weight != nullptr &&
-                        nint_small_m_qx_compatible(
-                            *qkv_weight, *z_weight) &&
-                        nint_small_m_qx_compatible(
-                            *qkv_weight, *ab_weight)) {
-                    auto qkv_parts = g_profiler.measure(
-                        "linear.qkv_proj", [&]() {
-                            return qkv_proj.forward(xn);
-                        });
-                    qk_part = qkv_parts[0];
-                    v_part = qkv_parts[1];
-                    Workspace & shared_workspace =
-                        qkv_weight->workspace(
-                            static_cast<int>(projection_rows));
-                    z = g_profiler.measure(
-                        "linear.z_proj", [&]() {
-                            return z_proj.forward_qx(
-                                xn, shared_workspace);
-                        });
-                    auto ab = g_profiler.measure(
-                        "linear.ab_proj", [&]() {
-                            return ab_nint_proj.forward_qx(
-                                xn, shared_workspace);
-                        });
-                    alpha_raw = ab[0];
-                    beta_raw = ab[1];
-                    shared_projection_input = true;
-                }
-            }
             if (!shared_projection_input &&
                     !split_dense_zab && ab_is_nint &&
                     tensor_parallel_grouped_projections_enabled() &&
@@ -19597,40 +18203,22 @@ struct LinearBlock : Block {
         auto y = gd[0];
         gdn_state = gd[1];
         mfq_tensor_backend::Tensor oo;
-        const NintWeight * out_nint =
-            !dense_out_proj && out_proj.is_nint() &&
-            !out_proj.tensor_parallel()
-                ? &out_proj.nint.w : nullptr;
-        if (out_nint != nullptr && B == 1 && T == 1 && out_nint->bits == 5 && out_nint->gs == 28 &&
-            y.scalar_type() == mfq_tensor_backend::kFloat32 && z.scalar_type() == mfq_tensor_backend::kFloat16) {
-            oo = g_profiler.measure("linear.out_norm_gate_proj", [&]() {
-                Workspace & ws = out_nint->workspace(1);
-                out_nint->ensure_rinv_workspace(ws, nv);
-                return nint_gemv_packed_bits_linear_out_norm_gate_ws_cuda(
-                    out_nint->q_packed, out_nint->sub_scale, out_nint->sub_min,
-                    out_nint->neuron_scale, out_nint->neuron_min,
-                    y.contiguous().reshape({vsz}), z.contiguous().reshape({vsz}), linear_norm,
-                    out_nint->gs, out_nint->bits, dv, c.rms_norm_eps,
-                    ws.qx, ws.xscale, ws.xsum, ws.rinv).reshape({B, T, H});
+        z = g_profiler.measure("linear.z_view", [&]() { return z.reshape({B, T, nv, dv}).transpose(1, 2).contiguous(); });
+        auto y_norm = g_profiler.measure("linear.out_norm", [&]() { return rms_norm_cuda(y.reshape({-1, dv}).to(mfq_tensor_backend::kFloat32), linear_norm, c.rms_norm_eps).reshape_as(y); });
+        auto yf = g_profiler.measure("linear.y_view", [&]() { return y_norm.transpose(1, 2).contiguous().reshape({B, T, vsz}); });
+        auto zf = g_profiler.measure("linear.zf_view", [&]() { return z.transpose(1, 2).contiguous().reshape({B, T, vsz}); });
+        if (dense_out_proj) {
+            oo = g_profiler.measure("linear.out_proj_gate_dense", [&]() {
+                auto dtype = out_proj_dense.scalar_type();
+                auto gated = yf.to(dtype) * mfq_tensor_backend::silu(zf.to(dtype));
+                return mfq_tensor_backend::matmul(
+                    gated.reshape({B * T, vsz}),
+                    out_proj_dense.transpose(0, 1)).reshape({B, T, H});
             });
         } else {
-            z = g_profiler.measure("linear.z_view", [&]() { return z.reshape({B, T, nv, dv}).transpose(1, 2).contiguous(); });
-            auto y_norm = g_profiler.measure("linear.out_norm", [&]() { return rms_norm_cuda(y.reshape({-1, dv}).to(mfq_tensor_backend::kFloat32), linear_norm, c.rms_norm_eps).reshape_as(y); });
-            auto yf = g_profiler.measure("linear.y_view", [&]() { return y_norm.transpose(1, 2).contiguous().reshape({B, T, vsz}); });
-            auto zf = g_profiler.measure("linear.zf_view", [&]() { return z.transpose(1, 2).contiguous().reshape({B, T, vsz}); });
-            if (dense_out_proj) {
-                oo = g_profiler.measure("linear.out_proj_gate_dense", [&]() {
-                    auto dtype = out_proj_dense.scalar_type();
-                    auto gated = yf.to(dtype) * mfq_tensor_backend::silu(zf.to(dtype));
-                    return mfq_tensor_backend::matmul(
-                        gated.reshape({B * T, vsz}),
-                        out_proj_dense.transpose(0, 1)).reshape({B, T, H});
-                });
-            } else {
-                oo = g_profiler.measure("linear.out_proj_gate", [&]() {
-                    return out_proj.forward_input_mul(yf, zf, 2);
-                });
-            }
+            oo = g_profiler.measure("linear.out_proj_gate", [&]() {
+                return out_proj.forward_input_mul(yf, zf, 2);
+            });
         }
         auto attn_pair = g_profiler.measure("linear.attn_residual_ffn_norm", [&]() {
             auto rr = residual.reshape({-1, H});
@@ -19769,9 +18357,9 @@ static FFN load_ffn(const MfqFile & mfq, const Config & c, int i) {
             const std::string expert_gate_up = p + "experts.gate_up.weight";
             const std::string expert_down = p + "experts.down.weight";
             f.is_moe = true;
-            f.moe_gate_up = load_nint_moe_gpu(
+            f.moe_gate_up = load_mfe_gpu(
                 mfq, expert_gate_up, true, i, "gate_up");
-            f.moe_down = load_nint_moe_gpu(
+            f.moe_down = load_mfe_gpu(
                 mfq, expert_down, true, i, "down");
             f.moe_router = load_dense_gpu(
                 mfq, p + "router.weight").to(mfq_tensor_backend::kFloat32).contiguous();
@@ -19848,15 +18436,15 @@ static FFN load_ffn(const MfqFile & mfq, const Config & c, int i) {
         f.is_moe = true;
         f.moe_split_gate_up = has_expert_gate;
         if (f.moe_split_gate_up) {
-            f.moe_gate = load_nint_moe_gpu(
+            f.moe_gate = load_mfe_gpu(
                 mfq, expert_gate, true, i, "gate");
-            f.moe_up = load_nint_moe_gpu(
+            f.moe_up = load_mfe_gpu(
                 mfq, expert_up, true, i, "up");
         } else {
-            f.moe_gate_up = load_nint_moe_gpu(
+            f.moe_gate_up = load_mfe_gpu(
                 mfq, expert_gate_up, true, i, "gate_up");
         }
-        f.moe_down = load_nint_moe_gpu(
+        f.moe_down = load_mfe_gpu(
             mfq, expert_down, true, i, "down");
         f.moe_router = load_dense_gpu(
             mfq, p + "router.weight").to(mfq_tensor_backend::kFloat32).contiguous();
@@ -20062,21 +18650,21 @@ static std::unique_ptr<Block> load_block(
             g_dsv4_cpu_offload_layers.count(i) != 0;
         if (cpu_offload) {
             if (b->ffn.moe_split_gate_up) {
-                b->ffn.cpu_moe_gate = load_nint_moe_cpu_offloaded(
+                b->ffn.cpu_moe_gate = load_mfe_cpu_offloaded(
                     mfq, p + "mlp.experts.gate.weight");
-                b->ffn.cpu_moe_up = load_nint_moe_cpu_offloaded(
+                b->ffn.cpu_moe_up = load_mfe_cpu_offloaded(
                     mfq, p + "mlp.experts.up.weight");
                 b->ffn.moe_gate =
                     cpu_mixed_moe_metadata(b->ffn.cpu_moe_gate);
                 b->ffn.moe_up =
                     cpu_mixed_moe_metadata(b->ffn.cpu_moe_up);
             } else {
-                b->ffn.cpu_moe_gate_up = load_nint_moe_cpu_offloaded(
+                b->ffn.cpu_moe_gate_up = load_mfe_cpu_offloaded(
                     mfq, p + "mlp.experts.gate_up.weight");
                 b->ffn.moe_gate_up =
                     cpu_mixed_moe_metadata(b->ffn.cpu_moe_gate_up);
             }
-            b->ffn.cpu_moe_down = load_nint_moe_cpu_offloaded(
+            b->ffn.cpu_moe_down = load_mfe_cpu_offloaded(
                 mfq, p + "mlp.experts.down.weight");
             b->ffn.moe_down =
                 cpu_mixed_moe_metadata(b->ffn.cpu_moe_down);
@@ -20097,18 +18685,18 @@ static std::unique_ptr<Block> load_block(
                 << std::endl;
         } else {
             if (b->ffn.moe_split_gate_up) {
-                b->ffn.moe_gate = load_nint_moe_gpu(
+                b->ffn.moe_gate = load_mfe_gpu(
                     mfq, p + "mlp.experts.gate.weight",
                     true, i, "gate");
-                b->ffn.moe_up = load_nint_moe_gpu(
+                b->ffn.moe_up = load_mfe_gpu(
                     mfq, p + "mlp.experts.up.weight",
                     true, i, "up");
             } else {
-                b->ffn.moe_gate_up = load_nint_moe_gpu(
+                b->ffn.moe_gate_up = load_mfe_gpu(
                     mfq, p + "mlp.experts.gate_up.weight",
                     true, i, "gate_up");
             }
-            b->ffn.moe_down = load_nint_moe_gpu(
+            b->ffn.moe_down = load_mfe_gpu(
                 mfq, p + "mlp.experts.down.weight",
                 true, i, "down");
         }
@@ -20224,9 +18812,9 @@ static std::unique_ptr<Block> load_block(
         }
         b->input_proj = load_quant_group(mfq, first_names);
         b->q_proj = load_quant_group(mfq, second_names);
-        b->embed_q = load_nint_moe_gpu(
+        b->embed_q = load_mfe_gpu(
             mfq, ap + "latent.query_embedding.weight");
-        b->unembed_out = load_nint_moe_gpu(
+        b->unembed_out = load_mfe_gpu(
             mfq, ap + "latent.output_unembedding.weight");
         b->o_proj = load_quant_linear(mfq, ap + "output.weight");
         b->ffn = load_ffn(mfq, c, i);
@@ -20334,10 +18922,10 @@ static std::unique_ptr<Block> load_block(
 
         if (!b->gemma4_moe) return b;
 
-        b->gemma_moe_gate_up = load_nint_moe_gpu(
+        b->gemma_moe_gate_up = load_mfe_gpu(
             mfq, mp + "experts.gate_up.weight",
             true, i, "gate_up");
-        b->gemma_moe_down = load_nint_moe_gpu(
+        b->gemma_moe_down = load_mfe_gpu(
             mfq, mp + "experts.down.weight",
             true, i, "down");
         b->gemma_router = load_dense_gpu(
@@ -21755,41 +20343,6 @@ struct Model {
             return mfq_tensor_backend::argmax(logits, -1).to(mfq_tensor_backend::kInt64);
         }
         last = last.to(mfq_tensor_backend::kFloat16).contiguous();
-        const char* use_argmax = std::getenv("MFQ_LM_HEAD_ARGMAX");
-        const char* disable_argmax = std::getenv("MFQ_DISABLE_LM_HEAD_ARGMAX");
-        bool lm_head_argmax = (disable_argmax == nullptr || disable_argmax[0] != '1') ||
-                              (use_argmax != nullptr && use_argmax[0] == '1');
-        NintWeight * lm_nint =
-            lm_head.is_nint() && !lm_head.tensor_parallel()
-                ? &lm_head.nint.w : nullptr;
-        if (lm_head_argmax && lm_nint != nullptr &&
-            !lm_nint->q5_exec &&
-            last.size(0) == 1 &&
-            ((lm_nint->bits == 5 && lm_nint->gs == 28) ||
-             (lm_nint->bits == 6 && (lm_nint->gs == 24 || lm_nint->gs == 26)))) {
-            return g_profiler.measure("model.lm_head_argmax", [&]() {
-                Workspace & ws = lm_nint->workspace(1);
-                lm_nint->ensure_argmax_workspace(ws);
-                return nint_gemv_packed_bits_argmax_ws_cuda(
-                    lm_nint->q_packed, lm_nint->sub_scale, lm_nint->sub_min,
-                    lm_nint->neuron_scale, lm_nint->neuron_min, pad_last(last, lm_nint->neuron_len),
-                    lm_nint->gs, lm_nint->bits, ws.qx, ws.xscale, ws.xsum,
-                    ws.argmax_vals, ws.argmax_idxs);
-            });
-        }
-        const char* use_outbuf = std::getenv("MFQ_LM_HEAD_OUTBUF");
-        if (use_outbuf != nullptr && use_outbuf[0] == '1' && lm_nint != nullptr &&
-            last.size(0) == 1 && lm_nint->bits == 6 && lm_nint->gs == 26) {
-            auto logits = g_profiler.measure("model.lm_head_outbuf", [&]() {
-                Workspace & ws = lm_nint->workspace(1);
-                lm_nint->ensure_output_workspace(ws);
-                return nint_gemv_packed_bits_m1_out_ws_cuda(
-                    lm_nint->q_packed, lm_nint->sub_scale, lm_nint->sub_min,
-                    lm_nint->neuron_scale, lm_nint->neuron_min, pad_last(last, lm_nint->neuron_len),
-                    lm_nint->gs, lm_nint->bits, ws.qx, ws.xscale, ws.xsum, ws.out_buf);
-            });
-            return sample_greedy_cuda(logits);
-        }
         auto logits = g_profiler.measure("model.lm_head", [&]() { return lm_head.forward(last); });
         return sample_greedy_cuda(logits.contiguous().view({last.size(0), -1}));
     }
@@ -21922,26 +20475,6 @@ static Model load_model(const std::string & mfq_path, const std::string & config
         m.lm_head = load_quant_linear(
             mfq, output_name,
             TensorParallelAxis::Output);
-    }
-    if (g_kl_mmq_mode == KlMmqMode::Default &&
-        nint5_q5_exec_enabled() &&
-        m.lm_head.is_nint() &&
-        ((m.lm_head.tensor_parallel() &&
-          !m.lm_head.tensor_parallel_shards.empty() &&
-          m.lm_head.tensor_parallel_shards.front().nint.bits == 5 &&
-          m.lm_head.tensor_parallel_shards.front().nint.gs == 28) ||
-         (!m.lm_head.tensor_parallel() &&
-          m.lm_head.nint.w.bits == 5 &&
-          m.lm_head.nint.w.gs == 28))) {
-        std::cerr << "repacking lm_head NINT5 gs28 execution layout" << std::endl;
-        if (m.lm_head.tensor_parallel()) {
-            for (auto & shard : m.lm_head.tensor_parallel_shards) {
-                MfqCudaGuard guard(shard.device);
-                enable_nint5_q5_exec(shard.nint);
-            }
-        } else {
-            enable_nint5_q5_exec(m.lm_head.nint.w);
-        }
     }
     if (load_blocks) {
         m.blocks.reserve((size_t)m.c.num_hidden_layers);
@@ -26165,10 +24698,6 @@ static int run_linear_check(
     int reps) {
     MfqFile mfq(mfq_path);
     auto linear = load_quant_linear(mfq, name);
-    if (nint5_q5_exec_enabled() && linear.is_nint() &&
-        linear.nint.w.bits == 5 && linear.nint.w.gs == 28) {
-        enable_nint5_q5_exec(linear.nint.w);
-    }
     MFQ_RUNTIME_CHECK(M >= 1 && M <= 4096, "--check-linear-m must be in [1, 4096]");
     MFQ_RUNTIME_CHECK(reps >= 1, "--check-linear-reps must be positive");
     int64_t neuron_len = linear.neuron_len();
@@ -26233,42 +24762,34 @@ static int run_linear_check(
     const NvqWeight * nvq = linear.is_nvq() ? &linear.nvq.w : nullptr;
     const Mxfp4Weight * mxfp4 = linear.is_mxfp4()
         ? &linear.mxfp4.weight : nullptr;
+    const Mxfp4SqWeight * mxfp4_sq = linear.is_mxfp4_sq()
+        ? &linear.mxfp4_sq.weight : nullptr;
     const Mxfp8Weight * mxfp8 = linear.is_mxfp8()
         ? &linear.mxfp8.weight : nullptr;
     const TpqWeight * tpq = linear.is_tpq()
         ? &linear.tpq.weight : nullptr;
-    const char * dq_env_name = nint == nullptr ? nullptr :
-        (nint->bits == 4 ? "MFQ_NINT4_GS24_DQ_VEC2" :
-         (nint->bits == 6 ? "MFQ_NINT6_GS24_DQ_VEC4" : nullptr));
-    std::string dq_env_saved;
-    bool had_dq_env = false;
-    if (dq_env_name != nullptr) {
-        const char * value = std::getenv(dq_env_name);
-        if (value != nullptr) {
-            had_dq_env = true;
-            dq_env_saved = value;
-        }
-        mfq_set_env(dq_env_name, "0");
-    }
     mfq_tensor_backend::Tensor ww;
     if (nint != nullptr) {
         ww = nint->q8_zero
             ? nint8_zero_dequant_cuda(
                   nint->q_packed, nint->q8_zero_scale, nint->neuron_len)
-            : nint->q5_exec
-            ? nint5_gs28_q5_dequant_cuda(
-                  nint->q_packed, nint->neuron_scale, nint->neuron_min, nint->neuron_len)
-            : nint->bits == 4
-            ? nint_dequant_full_packed_compact_cuda(
-                  nint->q_packed, nint->sub_scale, nint->sub_min,
-                  nint->neuron_scale, nint->neuron_min, nint->neuron_len, nint->gs)
-            : nint_dequant_full_packed_compact_bits_cuda(
-                  nint->q_packed, nint->sub_scale, nint->sub_min,
-                  nint->neuron_scale, nint->neuron_min, nint->neuron_len, nint->gs, nint->bits);
+            : nint_decode_cuda(
+                  nint->q_packed, nint->row_q_bits,
+                  nint->row_q_bit_offsets, nint->sub_scale,
+                  nint->sub_min, nint->neuron_scale,
+                  nint->neuron_min, nint->neuron_len, nint->gs);
     } else if (nvq != nullptr) {
         ww = nvq_dequant(*nvq);
     } else if (mxfp4 != nullptr) {
         ww = mxfp4_dequant_cuda(mxfp4->values, mxfp4->scales);
+    } else if (mxfp4_sq != nullptr) {
+        ww = mxfp4_sq_dequant_cuda(
+            mxfp4_sq->blob,
+            mxfp4_sq->bits,
+            mxfp4_sq->out,
+            mxfp4_sq->neuron_len,
+            mxfp4_sq->matrix_scale_base,
+            false);
     } else if (tpq != nullptr) {
         ww = tpq->int4
             ? tpq_int4_dequant_cuda(
@@ -26284,19 +24805,14 @@ static int run_linear_check(
     else if (gate_mode == 2) ref_input = xh * mfq_tensor_backend::silu(gateh);
     auto y_ref = mfq_tensor_backend::matmul(ref_input, ww.transpose(0, 1)).to(mfq_tensor_backend::kFloat32);
     mfq_cuda_synchronize();
-    if (dq_env_name != nullptr) {
-        mfq_set_env(dq_env_name, had_dq_env ? dq_env_saved.c_str() : "");
-    }
     auto diff = (y_test - y_ref).abs();
     double per_ms = (double)elapsed_ms / (double)reps;
     double weight_bytes = nint != nullptr
         ? (double)nint->q_packed.numel() +
           (nint->q8_zero
               ? (double)nint->q8_zero_scale.numel() * sizeof(mfq_half)
-              : (nint->q5_exec
-                    ? 0.0
-                    : (double)(nint->sub_scale.numel() +
-                               nint->sub_min.numel())) +
+              : (double)(nint->sub_scale.numel() +
+                         nint->sub_min.numel()) +
                 (double)(nint->neuron_scale.numel() +
                          nint->neuron_min.numel()) * sizeof(float))
         : nvq != nullptr
@@ -26305,6 +24821,8 @@ static int run_linear_check(
           (double)nvq->neuron_scale.numel() * sizeof(float) + (double)nvq->codebook.numel()
         : mxfp4 != nullptr
         ? (double)mxfp4->values.numel() + (double)mxfp4->scales.numel()
+        : mxfp4_sq != nullptr
+        ? (double)mxfp4_sq->blob.numel()
         : tpq != nullptr
         ? (double)tpq->packed.numel() +
           (double)tpq->scales.numel() * sizeof(mfq_half) +
@@ -26320,6 +24838,9 @@ static int run_linear_check(
                   << " sub_bits=" << nvq->sub_bits << " m=" << M << "\n";
     } else if (mxfp4 != nullptr) {
         std::cout << "dtype=MXFP4 block=1x32 m=" << M << "\n";
+    } else if (mxfp4_sq != nullptr) {
+        std::cout << "dtype=MXFP4-SQ profile=SQ" << mxfp4_sq->bits
+                  << " block=1x32 m=" << M << "\n";
     } else if (tpq != nullptr) {
         std::cout << "dtype=" << (tpq->int4 ? "TPQ-I4G64" : "TPQ-PQ")
                   << " m=" << M << "\n";
@@ -26631,19 +25152,11 @@ static int run_linear_group_check(
         auto dense = weight.q8_zero
             ? nint8_zero_dequant_cuda(
                   weight.q_packed, weight.q8_zero_scale, weight.neuron_len)
-            : weight.q5_exec
-            ? nint5_gs28_q5_dequant_cuda(
-                  weight.q_packed, weight.neuron_scale, weight.neuron_min,
-                  weight.neuron_len)
-            : weight.bits == 4
-            ? nint_dequant_full_packed_compact_cuda(
-                  weight.q_packed, weight.sub_scale, weight.sub_min,
-                  weight.neuron_scale, weight.neuron_min,
-                  weight.neuron_len, weight.gs)
-            : nint_dequant_full_packed_compact_bits_cuda(
-                  weight.q_packed, weight.sub_scale, weight.sub_min,
-                  weight.neuron_scale, weight.neuron_min,
-                  weight.neuron_len, weight.gs, weight.bits);
+            : nint_decode_cuda(
+                  weight.q_packed, weight.row_q_bits,
+                  weight.row_q_bit_offsets, weight.sub_scale,
+                  weight.sub_min, weight.neuron_scale,
+                  weight.neuron_min, weight.neuron_len, weight.gs);
         auto separate = linear.forward(x);
         if (actual[index].scalar_type() == mfq_tensor_backend::kBFloat16) {
             separate = separate.to(mfq_tensor_backend::kBFloat16);
@@ -27063,22 +25576,9 @@ static int run_gemma_geglu_check(
     auto materialized = [&]() { return down.forward(materialized_activation()); };
     auto fused_activation = [&]() { return gate_up.forward_geglu(x); };
     auto fused = [&]() { return down.forward(fused_activation()); };
-    auto fused_quant = [&]() {
-        Workspace & gate_ws = gate_up.nint.w.workspace(1);
-        Workspace & down_ws = down.nint.w.workspace(1);
-        nint_ffn_gate_up_geglu_quant_ws_cuda(
-            gate_up.nint.w.q_packed, gate_up.nint.w.sub_scale,
-            gate_up.nint.w.sub_min, gate_up.nint.w.neuron_scale,
-            gate_up.nint.w.neuron_min, x, gate_up.nint.w.gs,
-            gate_up.nint.w.bits, down.nint.w.gs,
-            gate_ws.qx, gate_ws.xscale, gate_ws.xsum,
-            down_ws.qx, down_ws.xscale, down_ws.xsum);
-        return nint_matmul_qx(down.nint.w, down_ws);
-    };
 
     auto reference_activation = materialized_activation();
     auto reference_output = down.forward(reference_activation);
-    const bool quant_supported = down.nint.w.gs <= 32;
     std::cout << "gemma_geglu_check layer=" << layer
               << " gate_up_bits=" << gate_up.nint.w.bits
               << " gate_up_gs=" << gate_up.nint.w.gs
@@ -27104,9 +25604,6 @@ static int run_gemma_geglu_check(
     mfq_set_env("MFQ_NINT_GLU_COMBINED", "0");
     report("activation_pair", fused_activation(), reference_activation);
     report("output_pair", fused(), reference_output);
-    if (quant_supported) {
-        report("output_quant", fused_quant(), reference_output);
-    }
     mfq_set_env("MFQ_NINT_GLU_COMBINED", "");
 
     auto time_ms = [&](auto && fn) {
@@ -27131,7 +25628,6 @@ static int run_gemma_geglu_check(
     const float combined_ms = time_ms(fused);
     mfq_set_env("MFQ_NINT_GLU_COMBINED", "0");
     const float pair_ms = time_ms(fused);
-    const float quant_ms = quant_supported ? time_ms(fused_quant) : 0.0f;
     mfq_set_env("MFQ_NINT_GLU_COMBINED", "");
     std::cout << "gemma_geglu_check layer=" << layer
               << " gate_bits=" << gate_up.nint.w.bits
@@ -27140,23 +25636,24 @@ static int run_gemma_geglu_check(
               << " down_gs=" << down.nint.w.gs
               << " materialized_ms=" << materialized_ms
               << " combined_ms=" << combined_ms
-              << " pair_ms=" << pair_ms
-              << " quant_ms=" << quant_ms << "\n";
+              << " pair_ms=" << pair_ms << "\n";
     return 0;
 }
 
 
-static double nint_moe_weight_bytes(const NintMoeWeight & weight) {
+static double mfe_weight_bytes(const MfeWeight & weight) {
     double bytes = static_cast<double>(weight.mixed_weight_bytes);
     for (const auto & shard :
          weight.expert_parallel_shards) {
         if (shard.weight) {
-            bytes += nint_moe_weight_bytes(
+            bytes += mfe_weight_bytes(
                 *shard.weight);
         }
     }
     for (const auto & pool : weight.pools) {
         bytes += static_cast<double>(pool.weight.q_packed.numel()) * pool.weight.q_packed.element_size();
+        bytes += static_cast<double>(pool.weight.row_q_bits.numel()) * pool.weight.row_q_bits.element_size();
+        bytes += static_cast<double>(pool.weight.row_q_bit_offsets.numel()) * pool.weight.row_q_bit_offsets.element_size();
         bytes += static_cast<double>(pool.weight.sub_scale.numel()) * pool.weight.sub_scale.element_size();
         bytes += static_cast<double>(pool.weight.sub_min.numel()) * pool.weight.sub_min.element_size();
         bytes += static_cast<double>(pool.weight.neuron_scale.numel()) * pool.weight.neuron_scale.element_size();
@@ -27189,11 +25686,11 @@ static int run_expert_parallel_moe_check(
     g_tensor_parallel = {};
     g_expert_parallel = {};
     g_expert_parallel.devices = {saved.primary_device()};
-    auto full = load_nint_moe_gpu(
+    auto full = load_mfe_gpu(
         mfq, tensor_name, false, 0, role);
     g_tensor_parallel = saved_tensor;
     g_expert_parallel = saved_expert;
-    auto sharded = load_nint_moe_gpu(
+    auto sharded = load_mfe_gpu(
         mfq, tensor_name, false, 0, role);
     MFQ_RUNTIME_CHECK(
         sharded.expert_parallel(),
@@ -27293,7 +25790,7 @@ static int run_expert_parallel_moe_check(
     return 0;
 }
 
-static int run_nintm_tensor_check(
+static int run_mfe_tensor_check(
         const std::string & mfq_path,
         const std::string & tensor_name,
         int tokens,
@@ -27305,27 +25802,26 @@ static int run_nintm_tensor_check(
     const int max_tokens = benchmark_only ? 131072 : 4096;
     if (tokens < 1 || tokens > max_tokens || routes < 1 || reps < 1 ||
             split_width < 0) {
-        throw std::runtime_error("NINTM tensor check dimensions are invalid");
+        throw std::runtime_error("MFE tensor check dimensions are invalid");
     }
     if (benchmark_only && split_width != 0) {
         throw std::runtime_error(
-            "NINTM benchmark-only mode does not support split checks");
+            "MFE benchmark-only mode does not support split checks");
     }
     MfqFile mfq(mfq_path);
-    auto weight = load_nint_moe_gpu(
+    auto weight = load_mfe_gpu(
         mfq, tensor_name, true, 0, "diagnostic");
     if (g_moe_expert_cache &&
             !g_moe_expert_cache->finalized()) {
         g_moe_expert_cache->finalize();
     }
     if (routes > weight.n_experts) {
-        throw std::runtime_error("NINTM tensor check routes exceed expert count");
+        throw std::runtime_error("MFE tensor check routes exceed expert count");
     }
     if (split_width > 0 &&
-            (split_width >= weight.out_per_expert ||
-             !weight.hetero_supported || weight.mixed_forward)) {
+            (split_width >= weight.out_per_expert || weight.mixed_forward)) {
         throw std::runtime_error(
-            "NINTM merged/split check requires a pure supported NINT tensor "
+            "MFE merged/split check requires a resident NINT tensor "
             "and an interior split width");
     }
     const int64_t count =
@@ -27383,7 +25879,7 @@ static int run_nintm_tensor_check(
     MFQ_CUDA_CHECK(cudaEventDestroy(stop));
     if (benchmark_only) {
         std::cout << std::fixed << std::setprecision(9)
-                  << "nintm_tensor_benchmark"
+                  << "mfe_tensor_benchmark"
                   << " tensor=" << tensor_name
                   << " tokens=" << tokens
                   << " routes=" << routes
@@ -27392,8 +25888,7 @@ static int run_nintm_tensor_check(
                   << " k=" << weight.neuron_len
                   << " routed_input=" << (routed_input ? 1 : 0)
                   << " mixed=" << (weight.mixed_forward ? 1 : 0)
-                  << " hetero=" << (weight.hetero_supported ? 1 : 0)
-                  << " weight_bytes=" << nint_moe_weight_bytes(weight)
+                  << " weight_bytes=" << mfe_weight_bytes(weight)
                   << " cuda_ms=" << elapsed / reps
                   << '\n';
         return 0;
@@ -27402,7 +25897,7 @@ static int run_nintm_tensor_check(
     double dense_reference_mean_abs = -1.0;
     double dense_reference_max_abs = -1.0;
     if (split_width == 0) {
-        auto cpu_reference = unpack_nint_moe(mfq.read_blob(tensor_name));
+        auto cpu_reference = unpack_mfe(mfq.read_blob(tensor_name));
         auto reference = mfq_tensor_backend::empty(
             {tokens * routes, weight.out_per_expert},
             output.options().dtype(mfq_tensor_backend::kFloat16));
@@ -27415,20 +25910,13 @@ static int run_nintm_tensor_check(
                 dense_flat = nint8_zero_dequant_cuda(
                     packed.q_packed, packed.q8_zero_scale,
                     packed.neuron_len);
-            } else if (pool.dtype != "NINTM" &&
-                       pool.dtype.rfind("NINT", 0) == 0) {
+            } else if (pool.dtype == "NINT") {
                 auto packed = to_gpu_nint(pool.weight);
-                dense_flat = packed.bits == 4
-                    ? nint_dequant_full_packed_compact_cuda(
-                          packed.q_packed, packed.sub_scale,
-                          packed.sub_min, packed.neuron_scale,
-                          packed.neuron_min, packed.neuron_len,
-                          packed.gs)
-                    : nint_dequant_full_packed_compact_bits_cuda(
-                          packed.q_packed, packed.sub_scale,
-                          packed.sub_min, packed.neuron_scale,
-                          packed.neuron_min, packed.neuron_len,
-                          packed.gs, packed.bits);
+                dense_flat = nint_decode_cuda(
+                    packed.q_packed, packed.row_q_bits,
+                    packed.row_q_bit_offsets, packed.sub_scale,
+                    packed.sub_min, packed.neuron_scale,
+                    packed.neuron_min, packed.neuron_len, packed.gs);
             } else if (pool.dtype == "MXFP4") {
                 dense_flat = dequant_mxfp4_cpu(pool.mxfp4)
                     .to(mfq_tensor_backend::kCUDA).contiguous();
@@ -27438,7 +25926,7 @@ static int run_nintm_tensor_check(
                     packed.packed, packed.codebook,
                     packed.out, packed.neuron_len,
                     packed.vector_size, packed.index_bits);
-            } else if (pool.dtype.rfind("NEPQ", 0) == 0) {
+            } else if (pool.dtype == "NEPQ") {
                 auto parsed = unpack_nepq(
                     pool.payload, pool.dtype, pool.runtime_payload);
                 auto packed = to_gpu_nepq(parsed);
@@ -27522,13 +26010,13 @@ static int run_nintm_tensor_check(
     }
     auto output_f32 = output.to(mfq_tensor_backend::kFloat32);
     if (!mfq_tensor_backend::isfinite(output_f32).all().item<bool>()) {
-        throw std::runtime_error("NINTM tensor check produced a non-finite value");
+        throw std::runtime_error("MFE tensor check produced a non-finite value");
     }
     const double checksum = output_f32.sum().item<double>();
     const double squared_checksum = output_f32.square().sum().item<double>();
     auto flat = output_f32.cpu().reshape({-1});
     std::cout << std::fixed << std::setprecision(9)
-              << "nintm_tensor_check"
+              << "mfe_tensor_check"
               << " tensor=" << tensor_name
               << " tokens=" << tokens
               << " routes=" << routes
@@ -27537,8 +26025,7 @@ static int run_nintm_tensor_check(
               << " k=" << weight.neuron_len
               << " routed_input=" << (routed_input ? 1 : 0)
               << " mixed=" << (weight.mixed_forward ? 1 : 0)
-              << " hetero=" << (weight.hetero_supported ? 1 : 0)
-              << " weight_bytes=" << nint_moe_weight_bytes(weight)
+              << " weight_bytes=" << mfe_weight_bytes(weight)
               << " cuda_ms=" << elapsed / reps
               << " dense_reference_rel=" << dense_reference_rel
               << " dense_reference_mean_abs=" << dense_reference_mean_abs
@@ -27555,24 +26042,9 @@ static int run_nintm_tensor_check(
     std::cout << "\n";
 
     if (split_width > 0) {
-        if (tokens <= 8 || !route.map_ready ||
-                route.ids_dst.numel() != route.ids.numel()) {
-            throw std::runtime_error(
-                "NINTM merged/split check requires the grouped MMA route map");
-        }
         auto run_segment = [&](int width, int row_offset) {
-            auto segment = mfq_tensor_backend::empty(
-                {tokens, routes, width},
-                x.options().dtype(mfq_tensor_backend::kFloat16));
-            return nint_moe_grouped_matmul_hetero_f16_slice_cuda(
-                weight.weight_ptrs, weight.pool_params,
-                weight.expert_pool, weight.expert_local,
-                x, route.ids, weight.n_experts, width,
-                weight.neuron_len, false, segment,
-                route.ids_dst, route.expert_bounds,
-                route.mma_tile_bounds, route.mma_tile_experts,
-                route.mma_tile_m,
-                weight.out_per_expert, row_offset);
+            return weight.forward(x, route)
+                .narrow(2, row_offset, width).contiguous();
         };
         mfq_tensor_backend::Tensor merged;
         mfq_tensor_backend::Tensor left;
@@ -27595,9 +26067,9 @@ static int run_nintm_tensor_check(
         const int64_t differing = left_differing + right_differing;
         const double merged_norm = merged.to(mfq_tensor_backend::kFloat32).norm().item<double>();
         std::cout << std::scientific << std::setprecision(9)
-                  << "nintm_merged_split_check"
+                  << "mfe_merged_split_check"
                   << " tensor=" << tensor_name
-                  << " path=nint_moe_hetero_mma_kernel"
+                  << " path=nint_matmul_kernel"
                   << " tokens=" << tokens
                   << " routes=" << routes
                   << " experts=" << weight.n_experts
@@ -27680,12 +26152,12 @@ static int run_nintm_tensor_check(
     }
 
     const char * clamped_ab_env =
-        std::getenv("MFQ_CHECK_NINTM_CLAMPED_SWIGLU_AB");
+        std::getenv("MFQ_CHECK_MFE_CLAMPED_SWIGLU_AB");
     if (clamped_ab_env != nullptr && weight.supports_clamped_swiglu()) {
         const double limit = std::atof(clamped_ab_env);
         if (!std::isfinite(limit) || limit <= 0.0) {
             throw std::runtime_error(
-                "MFQ_CHECK_NINTM_CLAMPED_SWIGLU_AB must be positive");
+                "MFQ_CHECK_MFE_CLAMPED_SWIGLU_AB must be positive");
         }
         const int64_t gate_up_count =
             static_cast<int64_t>(tokens) * routes * 2 * weight.neuron_len;
@@ -27748,7 +26220,7 @@ static int run_nintm_tensor_check(
         auto diff = candidate_f32 - baseline_f32;
         const double baseline_norm = baseline_f32.norm().item<double>();
         std::cout << std::scientific << std::setprecision(9)
-                  << "nintm_clamped_swiglu_ab"
+                  << "mfe_clamped_swiglu_ab"
                   << " limit=" << limit
                   << " candidate_ms=" << candidate_timing.first
                   << " baseline_ms=" << baseline_timing.first
@@ -27774,10 +26246,10 @@ static int run_gemma_moe_check(
     int reps) {
     const std::string prefix =
         "model.block." + std::to_string(layer) + ".mlp.experts.";
-    auto gate_up = load_nint_moe_gpu(
+    auto gate_up = load_mfe_gpu(
         mfq, prefix + "gate_up.weight",
         true, layer, "gate_up");
-    auto down = load_nint_moe_gpu(
+    auto down = load_mfe_gpu(
         mfq, prefix + "down.weight",
         true, layer, "down");
     if (g_moe_expert_cache &&
@@ -27793,7 +26265,7 @@ static int run_gemma_moe_check(
     const bool dense_reference_enabled =
         dense_reference_env != nullptr && std::atoi(dense_reference_env) != 0;
     auto materialize_dense_moe = [&](const std::string & name) {
-        auto cpu = unpack_nint_moe(mfq.read_blob(name));
+        auto cpu = unpack_mfe(mfq.read_blob(name));
         auto dense = mfq_tensor_backend::empty(
             {cpu.n_experts, cpu.out_per_expert, cpu.neuron_len},
             mfq_tensor_backend::TensorOptions().device(mfq_tensor_backend::kCUDA).dtype(mfq_tensor_backend::kFloat16));
@@ -27804,19 +26276,13 @@ static int run_gemma_moe_check(
                 local_flat = nint8_zero_dequant_cuda(
                     packed.q_packed, packed.q8_zero_scale,
                     packed.neuron_len);
-            } else if (pool.dtype.rfind("NINT", 0) == 0) {
+            } else if (pool.dtype == "NINT") {
                 auto packed = to_gpu_nint(pool.weight);
-                local_flat = packed.bits == 4
-                    ? nint_dequant_full_packed_compact_cuda(
-                          packed.q_packed, packed.sub_scale,
-                          packed.sub_min, packed.neuron_scale,
-                          packed.neuron_min, packed.neuron_len,
-                          packed.gs)
-                    : nint_dequant_full_packed_compact_bits_cuda(
-                          packed.q_packed, packed.sub_scale,
-                          packed.sub_min, packed.neuron_scale,
-                          packed.neuron_min, packed.neuron_len,
-                          packed.gs, packed.bits);
+                local_flat = nint_decode_cuda(
+                    packed.q_packed, packed.row_q_bits,
+                    packed.row_q_bit_offsets, packed.sub_scale,
+                    packed.sub_min, packed.neuron_scale,
+                    packed.neuron_min, packed.neuron_len, packed.gs);
             } else if (pool.dtype == "MXFP4") {
                 local_flat = dequant_mxfp4_cpu(pool.mxfp4)
                     .to(mfq_tensor_backend::kCUDA).contiguous();
@@ -27851,7 +26317,7 @@ static int run_gemma_moe_check(
               << " gate_up_pools=" << gate_up.pools.size()
               << " down_pools=" << down.pools.size()
               << " routed_weight_bytes=" << std::fixed << std::setprecision(0)
-              << nint_moe_weight_bytes(gate_up) + nint_moe_weight_bytes(down)
+              << mfe_weight_bytes(gate_up) + mfe_weight_bytes(down)
               << "\n";
 
     auto stream = mfq_get_current_cuda_stream().stream();
@@ -27932,8 +26398,7 @@ static int run_gemma_moe_check(
             auto down_pair = down.forward(hidden, route);
             return moe_weighted_reduce_cuda(down_pair, weights);
         };
-        const bool gate_glu_supported =
-            tokens <= 4 && gate_up.hetero_supported;
+        const bool gate_glu_supported = tokens <= 4;
         auto forward = [&]() {
             return gate_glu_supported
                 ? forward_gate_glu()
@@ -27984,17 +26449,17 @@ static int run_gemma_moe_check(
 
         if (tokens != 1) {
             g_force_moe_prefill_mma_off = false;
-            nint_moe_set_small_mmq_cuda(1);
+            mfe_set_small_mmq_cuda(1);
             auto mma = time_ms(forward, reps);
             auto mma_first = mma.second.clone();
             auto mma_repeat = forward().clone();
             mfq_cuda_synchronize();
             g_force_moe_prefill_mma_off = true;
-            nint_moe_set_small_mmq_cuda(0);
+            mfe_set_small_mmq_cuda(0);
             auto baseline = time_ms(forward, reps);
             mfq_cuda_synchronize();
             g_force_moe_prefill_mma_off = false;
-            nint_moe_set_small_mmq_cuda(-1);
+            mfe_set_small_mmq_cuda(-1);
             auto repeat_diff = (mma_repeat - mma_first).abs().to(mfq_tensor_backend::kFloat32);
             auto baseline_diff = (mma_first - baseline.second).abs().to(mfq_tensor_backend::kFloat32);
             std::cout << std::setprecision(6)
@@ -28078,13 +26543,13 @@ static int run_moe_check(
         return run_gemma_moe_check(mfq, config, layer, token_sizes, reps);
     }
     FFN ffn = load_ffn(mfq, config, layer);
-    if (!ffn.is_moe) throw std::runtime_error("selected layer does not contain NINTM MoE weights");
+    if (!ffn.is_moe) throw std::runtime_error("selected layer does not contain MFE MoE weights");
     if (g_moe_expert_cache &&
             !g_moe_expert_cache->finalized()) {
         g_moe_expert_cache->finalize();
     }
     const double routed_weight_bytes =
-        nint_moe_weight_bytes(ffn.moe_gate_up) + nint_moe_weight_bytes(ffn.moe_down);
+        mfe_weight_bytes(ffn.moe_gate_up) + mfe_weight_bytes(ffn.moe_down);
     std::cout << "moe_bench_config"
               << " layer=" << layer
               << " experts=" << ffn.moe_gate_up.n_experts
@@ -28156,12 +26621,12 @@ static int run_moe_check(
         const char * small_mmq_ab_env = std::getenv("MFQ_CHECK_MOE_SMALL_MMQ_AB");
         if (small_mmq_ab_env != nullptr && std::atoi(small_mmq_ab_env) != 0 &&
                 tokens >= 16 && tokens <= 128) {
-            nint_moe_set_small_mmq_cuda(1);
+            mfe_set_small_mmq_cuda(1);
             auto candidate = ffn.forward(x);
-            nint_moe_set_small_mmq_cuda(0);
+            mfe_set_small_mmq_cuda(0);
             auto baseline = ffn.forward(x);
             mfq_cuda_synchronize();
-            nint_moe_set_small_mmq_cuda(-1);
+            mfe_set_small_mmq_cuda(-1);
             auto candidate_f32 = candidate.to(mfq_tensor_backend::kFloat32);
             auto baseline_f32 = baseline.to(mfq_tensor_backend::kFloat32);
             auto diff = candidate_f32 - baseline_f32;
@@ -29831,7 +28296,7 @@ int main(int argc, char ** argv) {
         std::string check_linear_group, check_q8_embedding;
         std::string check_gdn_input, check_gdn_output, check_gdn_state;
         std::string check_linear_conv_input, check_linear_conv_output;
-        std::string check_nintm_tensor, check_dsv4_output_a;
+        std::string check_mfe_tensor, check_dsv4_output_a;
         std::string kl_chunks_sequence_arg, kl_mmq_sequence_arg;
         std::string kl_evaluator_arg = "optimized";
         std::string kl_mmq_arg = "default";
@@ -29893,10 +28358,10 @@ int main(int argc, char ** argv) {
         int check_gemma_geglu_reps = 100;
         int check_moe_layer = -1;
         int check_moe_reps = 100;
-        int check_nintm_tokens = 1;
-        int check_nintm_routes = 2;
-        int check_nintm_reps = 100;
-        int check_nintm_split_width = 0;
+        int check_mfe_tokens = 1;
+        int check_mfe_routes = 2;
+        int check_mfe_reps = 100;
+        int check_mfe_split_width = 0;
         int check_dsv4_output_a_batch = 1;
         int check_dsv4_output_a_reps = 200;
         int check_attention_decode = 0;
@@ -29925,8 +28390,8 @@ int main(int argc, char ** argv) {
         bool compare_dsv4_hc_ops = false;
         bool compare_dsv4_hc_model = false;
         bool check_attention_swa_decode = false;
-        bool check_nintm_routed_input = false;
-        bool check_nintm_benchmark_only = false;
+        bool check_mfe_routed_input = false;
+        bool check_mfe_benchmark_only = false;
         bool parallel_test_duplicates = false;
         bool server_mode = false;
         bool check_runtime_assets = false;
@@ -30033,13 +28498,13 @@ int main(int argc, char ** argv) {
             else if (a == "--check-moe-layer" && i + 1 < argc) check_moe_layer = std::stoi(argv[++i]);
             else if (a == "--check-moe-tokens" && i + 1 < argc) check_moe_tokens = argv[++i];
             else if (a == "--check-moe-reps" && i + 1 < argc) check_moe_reps = std::stoi(argv[++i]);
-            else if (a == "--check-nintm-tensor" && i + 1 < argc) check_nintm_tensor = argv[++i];
-            else if (a == "--check-nintm-tokens" && i + 1 < argc) check_nintm_tokens = std::stoi(argv[++i]);
-            else if (a == "--check-nintm-routes" && i + 1 < argc) check_nintm_routes = std::stoi(argv[++i]);
-            else if (a == "--check-nintm-reps" && i + 1 < argc) check_nintm_reps = std::stoi(argv[++i]);
-            else if (a == "--check-nintm-split-width" && i + 1 < argc) check_nintm_split_width = std::stoi(argv[++i]);
-            else if (a == "--check-nintm-routed-input") check_nintm_routed_input = true;
-            else if (a == "--check-nintm-benchmark-only") check_nintm_benchmark_only = true;
+            else if (a == "--check-mfe-tensor" && i + 1 < argc) check_mfe_tensor = argv[++i];
+            else if (a == "--check-mfe-tokens" && i + 1 < argc) check_mfe_tokens = std::stoi(argv[++i]);
+            else if (a == "--check-mfe-routes" && i + 1 < argc) check_mfe_routes = std::stoi(argv[++i]);
+            else if (a == "--check-mfe-reps" && i + 1 < argc) check_mfe_reps = std::stoi(argv[++i]);
+            else if (a == "--check-mfe-split-width" && i + 1 < argc) check_mfe_split_width = std::stoi(argv[++i]);
+            else if (a == "--check-mfe-routed-input") check_mfe_routed_input = true;
+            else if (a == "--check-mfe-benchmark-only") check_mfe_benchmark_only = true;
             else if (a == "--check-dsv4-output-a" && i + 1 < argc) check_dsv4_output_a = argv[++i];
             else if (a == "--check-dsv4-output-a-batch" && i + 1 < argc) check_dsv4_output_a_batch = std::stoi(argv[++i]);
             else if (a == "--check-dsv4-output-a-reps" && i + 1 < argc) check_dsv4_output_a_reps = std::stoi(argv[++i]);
@@ -30456,26 +28921,26 @@ int main(int argc, char ** argv) {
             return run_moe_check(
                 mfq_path, config_path, check_moe_layer, parse_ids(check_moe_tokens), check_moe_reps);
         }
-        if (!check_nintm_tensor.empty()) {
+        if (!check_mfe_tensor.empty()) {
             if (mfq_path.empty()) {
-                throw std::runtime_error("--check-nintm-tensor requires --mfq");
+                throw std::runtime_error("--check-mfe-tensor requires --mfq");
             }
             KlMmqScope check_kl_mmq_scope(
                 parse_kl_mmq_mode(kl_mmq_arg));
             const auto tensor_names =
-                parse_tensor_names(check_nintm_tensor);
+                parse_tensor_names(check_mfe_tensor);
             if (g_moe_expert_cache &&
                     tensor_names.size() != 1) {
                 throw std::runtime_error(
-                    "cached --check-nintm-tensor accepts one tensor "
+                    "cached --check-mfe-tensor accepts one tensor "
                     "per invocation");
             }
             for (const auto & tensor_name : tensor_names) {
-                const int result = run_nintm_tensor_check(
-                    mfq_path, tensor_name, check_nintm_tokens,
-                    check_nintm_routes, check_nintm_reps,
-                    check_nintm_split_width, check_nintm_routed_input,
-                    check_nintm_benchmark_only);
+                const int result = run_mfe_tensor_check(
+                    mfq_path, tensor_name, check_mfe_tokens,
+                    check_mfe_routes, check_mfe_reps,
+                    check_mfe_split_width, check_mfe_routed_input,
+                    check_mfe_benchmark_only);
                 if (result != 0) return result;
             }
             return 0;

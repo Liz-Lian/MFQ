@@ -1277,11 +1277,11 @@ int main() {
             grouped.packed_nbytes() > 0,
             "grouped linear did not retain packed streams");
         require(
-            !grouped.uses_zero_copy_storage(),
-            "generalized group unexpectedly bypassed pooled fallback");
+            grouped.uses_zero_copy_storage(),
+            "generalized NINT group did not retain source storage");
         require(
-            grouped.copied_packed_nbytes() > 0,
-            "pooled fallback did not report copied packed bytes");
+            grouped.copied_packed_nbytes() == 0,
+            "common-kernel NINT group copied packed bytes");
         for (std::size_t index = 0; index < fixtures.size(); ++index) {
             require(
                 grouped.output_sizes()[index]
@@ -1427,9 +1427,6 @@ int main() {
             direct_qkv.uses_zero_copy_storage()
                 && direct_qkv.copied_packed_nbytes() == 0,
             "ordinary NINT QKV group copied packed streams");
-        require(
-            direct_qkv.has_single_row_nint_fast_path(),
-            "NINT4/5/6 QKV did not enable the single-row fast path");
         const auto half_input =
             mlx::core::astype(input, mlx::core::float16);
         require_one_row_matches(
@@ -1442,7 +1439,7 @@ int main() {
                 &fixtures[5],
             },
             8e-4f,
-            "NINT4/5/6 M=1 fast");
+            "NINT4/5/6 M=1 common kernel");
         // Float32 deliberately retains the established direct kernel. This
         // also guards the fast-path dtype gate.
         require_one_row_matches(
@@ -1459,8 +1456,8 @@ int main() {
 
         // MiniCPM uses K=4096 with GS24, so the final packed group has eight
         // padded weights. Keep non-zero values immediately after the logical
-        // input view and verify that the partitioned QKV kernel never reads
-        // them as activations.
+        // input view and verify that the common NINT kernel never reads them
+        // as activations.
         {
             constexpr int tail_input_width = 65;
             constexpr int backing_width = 73;
@@ -1481,9 +1478,6 @@ int main() {
                 &k_weight,
                 &v_weight,
             });
-            require(
-                tail_qkv.has_single_row_nint_fast_path(),
-                "GS24 tail QKV did not enable the partitioned path");
 
             std::vector<float> backing_values(backing_width);
             for (int column = 0; column < tail_input_width; ++column) {
@@ -1524,7 +1518,7 @@ int main() {
                 if (!std::isfinite(difference.item<float>()) ||
                     difference.item<float>() > 0.0f) {
                     throw std::runtime_error(
-                        "GS24 interleaved QKV changed FP16 values: " +
+                        "GS24 common-kernel QKV changed FP16 values: " +
                         std::to_string(difference.item<float>()));
                 }
             }
@@ -1587,15 +1581,15 @@ int main() {
                 if (!std::isfinite(difference.item<float>()) ||
                     difference.item<float>() > 0.0f) {
                     throw std::runtime_error(
-                        "production interleaved QKV changed FP16 values: " +
+                        "production common-kernel QKV changed FP16 values: " +
                         std::to_string(difference.item<float>()));
                 }
             }
         }
 
-        // The DeepSeek-V4 shared expert uses an independent dense router and
-        // an equal-width NINT gate/up pair.  Decode can therefore keep the
-        // pair's limited SwiGLU inside the single-row grouped dispatch.
+        // NINT gate/up uses the same metadata-driven matmul kernel as every
+        // other NINT projection. It must not instantiate a format/profile
+        // specific fused SwiGLU kernel.
         const auto swiglu_gate_fixture =
             make_nint_fixture(5, 9);
         const auto swiglu_up_fixture =
@@ -1611,8 +1605,8 @@ int main() {
             &swiglu_up_weight,
         });
         require(
-            swiglu_pair.supports_single_row_swiglu(half_input),
-            "equal-width NINT5/6 gate/up rejected fused SwiGLU");
+            !swiglu_pair.supports_single_row_swiglu(half_input),
+            "NINT5/6 gate/up unexpectedly enabled fused SwiGLU");
         require(
             !swiglu_pair.supports_single_row_swiglu(input),
             "float32 gate/up unexpectedly accepted fused SwiGLU");
@@ -1623,45 +1617,13 @@ int main() {
                     0)),
             "multi-row gate/up unexpectedly accepted fused SwiGLU");
 
-        constexpr float swiglu_limit = 0.75f;
-        auto unfused_swiglu = swiglu_pair(half_input);
-        auto fused_swiglu = mlx::core::contiguous(
-            mlx::core::astype(
-                swiglu_pair.single_row_swiglu(
-                    half_input,
-                    swiglu_limit),
-                mlx::core::float32));
-        auto unfused_gate = mlx::core::contiguous(
-            mlx::core::astype(
-                unfused_swiglu[0],
-                mlx::core::float32));
-        auto unfused_up = mlx::core::contiguous(
-            mlx::core::astype(
-                unfused_swiglu[1],
-                mlx::core::float32));
-        mlx::core::eval(
-            {fused_swiglu, unfused_gate, unfused_up});
-        require(
-            fused_swiglu.shape() == mlx::core::Shape{1, 9},
-            "fused grouped SwiGLU output shape mismatch");
-        const auto* fused_values = fused_swiglu.data<float>();
-        const auto* gate_values = unfused_gate.data<float>();
-        const auto* up_values = unfused_up.data<float>();
-        for (int output = 0; output < 9; ++output) {
-            const float gate = std::min(
-                gate_values[output],
-                swiglu_limit);
-            const float up = std::clamp(
-                up_values[output],
-                -swiglu_limit,
-                swiglu_limit);
-            const float expected =
-                gate / (1.0f + std::exp(-gate)) * up;
-            require_close(
-                fused_values[output],
-                expected,
-                1.5e-3f);
-        }
+        require_one_row_matches(
+            swiglu_pair,
+            half_input,
+            source,
+            {&swiglu_gate_fixture, &swiglu_up_fixture},
+            8e-4f,
+            "NINT5/6 gate/up common kernel");
 
         // Cover tiles where only a subset of heterogeneous projections is
         // still active (Q only, Q+V, and Q+K+V).
@@ -1685,9 +1647,6 @@ int main() {
             &uneven_k_weight,
             &uneven_v_weight,
         });
-        require(
-            uneven_qkv.has_single_row_nint_fast_path(),
-            "uneven NINT4/5/6 QKV did not enable M=1 fast path");
         require_one_row_matches(
             uneven_qkv,
             half_input,
@@ -1698,10 +1657,10 @@ int main() {
                 &uneven_v_fixture,
             },
             8e-4f,
-            "uneven NINT4/5/6 M=1 fast");
+            "uneven NINT4/5/6 M=1 common kernel");
 
-        // Exercise the QKV-sized route, including the special NINT5 execution
-        // layout and a heterogeneous NINT8-0 middle projection.
+        // Exercise QKV-sized graph-level composition with an NINT8-0 middle
+        // projection. Both NINT projections reuse the ordinary NINT kernel.
         const mfq::metal::MlxGroupedLinear direct_triple({
             &nint_weights[4],
             &q8_weight,
@@ -1710,9 +1669,6 @@ int main() {
         require(
             direct_triple.uses_zero_copy_storage(),
             "three-projection group did not use zero-copy storage");
-        require(
-            !direct_triple.has_single_row_nint_fast_path(),
-            "mixed NINT/Q8 group incorrectly enabled NINT fast path");
         require(
             direct_triple.copied_packed_nbytes() == 0,
             "three-projection group copied packed streams");
@@ -1726,9 +1682,9 @@ int main() {
                 &fixtures[5],
             });
 
-        // Every ordinary public NVQ/NPQ dtype participates directly in a
-        // heterogeneous gate/up-style pair with NINT. No packed model pool
-        // is copied; the grouped object retains the original MLX arrays.
+        // Every ordinary public NVQ/NPQ dtype participates in a gate/up-style
+        // pair with NINT. No packed model pool is copied; the grouped object
+        // retains the original MLX arrays and composes their format kernels.
         for (std::size_t index = 0;
              index < vq_weights.size();
              ++index) {
@@ -2406,8 +2362,8 @@ int main() {
         require_unsupported(grouped, integer_input);
 
         std::cout
-            << "MFQ C++ heterogeneous NINT1-NINT8/NINT8-0/NVQ/NPQ "
-               "single-dispatch grouped Metal tests passed\n";
+            << "MFQ C++ unified NINT plus NINT8-0/NVQ/NPQ grouped "
+               "Metal tests passed\n";
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << "\n";

@@ -237,7 +237,7 @@ def test_nepq_file_and_mmap_roundtrip(tmp_path):
     np.testing.assert_array_equal(restored.bank_ids, tensor.bank_ids)
     _, store = io.load_mmap(path)
     try:
-        assert store.records["blk.0.ffn_gate_exps.weight"].dtype == "NEPQ0-S"
+        assert store.records["blk.0.ffn_gate_exps.weight"].dtype == "NEPQ"
         lazy = store["blk.0.ffn_gate_exps.weight"]
         np.testing.assert_allclose(
             dequantize_nepq(lazy), dequantize_nepq(canonical), rtol=0, atol=0

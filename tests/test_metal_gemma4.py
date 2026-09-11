@@ -15,7 +15,7 @@ from mfq.architectures.tensor_schema import map_source_tensor_name  # noqa: E402
 from mfq.formats import io  # noqa: E402
 from mfq.formats.assets import MODEL_CONFIG_ASSET, model_config_asset  # noqa: E402
 from mfq.formats.header import FileHeader  # noqa: E402
-from mfq.formats.moe import NintMoePool, NintMoeTensor  # noqa: E402
+from mfq.formats.mfe import MfePool, MfeTensor  # noqa: E402
 from mfq.formats.nint import NintSpec  # noqa: E402
 from mfq.kernels.metal.gemma4 import (  # noqa: E402
     gemma4_attn_residual_pre_norms,
@@ -164,7 +164,7 @@ def _gemma4_model() -> MlxGemma4:
         value = rng.normal(0.0, 0.04, (out, width)).astype(np.float32)
         return quantize(value, spec)
 
-    def experts(out: int, width: int) -> NintMoeTensor:
+    def experts(out: int, width: int) -> MfeTensor:
         dense = rng.normal(
             0.0,
             0.035,
@@ -174,10 +174,10 @@ def _gemma4_model() -> MlxGemma4:
             dense.reshape((config.num_experts * out, width)),
             spec,
         )
-        return NintMoeTensor(
+        return MfeTensor(
             dense.shape,
             (
-                NintMoePool(
+                MfePool(
                     np.arange(config.num_experts, dtype=np.int32),
                     packed,
                 ),

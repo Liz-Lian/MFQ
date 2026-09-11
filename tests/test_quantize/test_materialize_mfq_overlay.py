@@ -8,14 +8,14 @@ import pytest
 
 from mfq.formats.header import FileHeader
 from mfq.formats.io import (
-    _NINT_MOE_HDR,
-    _NINT_MOE_POOL_V2_HDR,
+    _MFE_HDR,
+    _MFE_POOL_HDR,
     _pack_tensor,
     _unpack_tensor,
     open_mmap,
     save,
 )
-from mfq.formats.moe import NintMoePool, NintMoeTensor
+from mfq.formats.mfe import MfePool, MfeTensor
 from mfq.formats.mx import MxTensor
 from mfq.formats.nepq import NEPQ0_S, NepqTensor
 from mfq.formats.nint import NintSpec, NintTensor
@@ -28,7 +28,12 @@ from mfq.tools.materialize_mfq_overlay import (
     read_mfq_index,
     validate_materialized_mfq,
 )
+from mfq.tools.v4f_sensitivity_overlay import DELTA_MAGIC
 from tests.mixed_family_fixtures import make_flat_family
+
+
+def test_new_mfe_delta_writers_use_the_canonical_magic() -> None:
+    assert DELTA_MAGIC == b"MFD1"
 
 
 def _pack_delta(
@@ -37,10 +42,11 @@ def _pack_delta(
     out_per_expert: int,
     neuron_len: int,
     pools: list[tuple[list[int], object]],
+    magic: bytes = b"MFD1",
 ) -> bytes:
     parts = [
-        _NINT_MOE_HDR.pack(
-            b"NID2",
+        _MFE_HDR.pack(
+            magic,
             n_experts,
             out_per_expert,
             neuron_len,
@@ -52,7 +58,7 @@ def _pack_delta(
         dtype_bytes = dtype.encode("ascii")
         parts.extend(
             [
-                _NINT_MOE_POOL_V2_HDR.pack(len(expert_ids), len(dtype_bytes), len(payload), 0),
+                _MFE_POOL_HDR.pack(len(expert_ids), len(dtype_bytes), len(payload), 0),
                 struct.pack(f"<{len(expert_ids)}i", *expert_ids),
                 dtype_bytes,
                 payload,
@@ -96,7 +102,7 @@ def _write_raw_mfq(
             handle.write(payload)
 
 
-def _expert_values(tensor: NintMoeTensor, expert: int) -> np.ndarray:
+def _expert_values(tensor: MfeTensor, expert: int) -> np.ndarray:
     rows = tensor.out_per_expert
     for pool in tensor.pools:
         matches = np.flatnonzero(np.asarray(pool.expert_ids) == expert)
@@ -113,12 +119,19 @@ def _expert_values(tensor: NintMoeTensor, expert: int) -> np.ndarray:
 
 
 @pytest.mark.parametrize(
-    "family",
-    ("NVQ2J", "NVQ2J-L", "NVQ2J-XL", "NVQ3J-L"),
+    "family,delta_magic",
+    (
+        ("NVQ2J", b"MFD1"),
+        ("NVQ2J-L", b"MFD1"),
+        ("NVQ2J-XL", b"MFD1"),
+        ("NVQ3J-L", b"MFD1"),
+        ("NVQ2J", b"NID2"),
+    ),
 )
 def test_materialize_overlay_slices_nint_and_jsc_without_requantizing(
     tmp_path: Path,
     family: str,
+    delta_magic: bytes,
 ) -> None:
     rng = np.random.default_rng(20260725)
     n_experts = 4
@@ -129,11 +142,11 @@ def test_materialize_overlay_slices_nint_and_jsc_without_requantizing(
         NintSpec(4, 24, 6),
     )
     nvq = make_flat_family(family, rows=2 * rows, neuron_len=width)
-    base_tensor = NintMoeTensor(
+    base_tensor = MfeTensor(
         (n_experts, rows, width),
         (
-            NintMoePool(np.array([0, 1], dtype=np.int32), nint),
-            NintMoePool(np.array([2, 3], dtype=np.int32), nvq),
+            MfePool(np.array([0, 1], dtype=np.int32), nint),
+            MfePool(np.array([2, 3], dtype=np.int32), nvq),
         ),
     )
     base_path = tmp_path / "base.mfq"
@@ -169,12 +182,13 @@ def test_materialize_overlay_slices_nint_and_jsc_without_requantizing(
         out_per_expert=rows,
         neuron_len=width,
         pools=[([1], replacement_nvq), ([2], replacement_nint)],
+        magic=delta_magic,
     )
     overlay_path = tmp_path / "overlay.mfq"
     _write_raw_mfq(
         overlay_path,
         arch="overlay",
-        records=[("experts", "NINTMD", delta)],
+        records=[("experts", "MFED", delta)],
         extra={
             "base_allocation_sha256": "base-allocation",
             "source_index_sha256": "source",
@@ -205,7 +219,7 @@ def test_materialize_overlay_slices_nint_and_jsc_without_requantizing(
             handle.close()
 
     assert output_path.stat().st_size == plan.total_bytes
-    assert read_mfq_index(output_path).records[1].dtype == "NINTM"
+    assert read_mfq_index(output_path).records[1].dtype == "MFE"
     resumed_path = tmp_path / "resumed.mfq"
     split = 137
     with (
@@ -240,19 +254,19 @@ def test_materialize_overlay_slices_nint_and_jsc_without_requantizing(
     validation = validate_materialized_mfq(
         output_path,
         expected_bytes=plan.total_bytes,
-        expected_family_expert_counts={"NINT4": 2, family: 2},
+        expected_family_expert_counts={"NINT": 2, "NVQ": 2},
     )
     assert validation["status"] == "passed"
     assert validation["moe_records"] == 1
     with open_mmap(base_path) as base_store, open_mmap(output_path) as merged_store:
         original = base_store["experts"]
         merged = merged_store["experts"]
-        assert isinstance(original, NintMoeTensor)
-        assert isinstance(merged, NintMoeTensor)
+        assert isinstance(original, MfeTensor)
+        assert isinstance(merged, MfeTensor)
         assert merged.expert_profiles == (
-            "NINT4-24",
+            "NINT",
             family,
-            "NINT4-24",
+            "NINT",
             family,
         )
         np.testing.assert_array_equal(_expert_values(merged, 0), _expert_values(original, 0))
@@ -296,11 +310,11 @@ def test_materialize_overlay_slices_mixed_sub_bit_nint_without_requantizing(
         rng.normal(size=(rows, width)).astype(np.float32),
         spec,
     )
-    base = NintMoeTensor(
+    base = MfeTensor(
         (n_experts, rows, width),
         (
-            NintMoePool(np.array([0, 1], dtype=np.int32), mixed),
-            NintMoePool(np.array([2], dtype=np.int32), ordinary),
+            MfePool(np.array([0, 1], dtype=np.int32), mixed),
+            MfePool(np.array([2], dtype=np.int32), ordinary),
         ),
     )
     base_path = tmp_path / "base-mixed-sub-bits.mfq"
@@ -321,7 +335,7 @@ def test_materialize_overlay_slices_mixed_sub_bit_nint_without_requantizing(
         records=[
             (
                 "experts",
-                "NINTMD",
+                "MFED",
                 _pack_delta(
                     n_experts=n_experts,
                     out_per_expert=rows,
@@ -393,13 +407,13 @@ def test_materialize_overlay_slices_mixed_sub_bit_nint_without_requantizing(
     validate_materialized_mfq(
         output_path,
         expected_bytes=plan.total_bytes,
-            expected_family_expert_counts={"NINT4": 2, "NINTv2": 1},
+        expected_family_expert_counts={"NINT": 3},
     )
     with open_mmap(base_path) as base_store, open_mmap(output_path) as merged_store:
         original = base_store["experts"]
         merged = merged_store["experts"]
-        assert isinstance(original, NintMoeTensor)
-        assert isinstance(merged, NintMoeTensor)
+        assert isinstance(original, MfeTensor)
+        assert isinstance(merged, MfeTensor)
         kept_pool = next(
             pool for pool in merged.pools if np.array_equal(pool.expert_ids, [0])
         )
@@ -442,11 +456,11 @@ def test_materialize_overlay_slices_nepq_without_requantizing(tmp_path: Path) ->
         rng.normal(size=(rows, width)).astype(np.float32),
         NintSpec(4, 24, 6),
     )
-    base_tensor = NintMoeTensor(
+    base_tensor = MfeTensor(
         (n_experts, rows, width),
         (
-            NintMoePool(np.array([0, 1], dtype=np.int32), nepq),
-            NintMoePool(np.array([2], dtype=np.int32), nint),
+            MfePool(np.array([0, 1], dtype=np.int32), nepq),
+            MfePool(np.array([2], dtype=np.int32), nint),
         ),
     )
     base_path = tmp_path / "base-nepq.mfq"
@@ -467,7 +481,7 @@ def test_materialize_overlay_slices_nepq_without_requantizing(tmp_path: Path) ->
         records=[
             (
                 "experts",
-                "NINTMD",
+                "MFED",
                 _pack_delta(
                     n_experts=n_experts,
                     out_per_expert=rows,
@@ -499,14 +513,14 @@ def test_materialize_overlay_slices_nepq_without_requantizing(tmp_path: Path) ->
     validate_materialized_mfq(
         output_path,
         expected_bytes=plan.total_bytes,
-        expected_family_expert_counts={"NEPQ0-S": 1, "NINT4": 2},
+        expected_family_expert_counts={"NEPQ": 1, "NINT": 2},
     )
     with open_mmap(base_path) as base_store, open_mmap(output_path) as merged_store:
         original = base_store["experts"]
         merged = merged_store["experts"]
-        assert isinstance(original, NintMoeTensor)
-        assert isinstance(merged, NintMoeTensor)
-        assert merged.expert_profiles == ("NEPQ0-S", "NINT4-24", "NINT4-24")
+        assert isinstance(original, MfeTensor)
+        assert isinstance(merged, MfeTensor)
+        assert merged.expert_profiles == ("NEPQ0-S", "NINT", "NINT")
         original_nepq = original.pools[0].tensor
         merged_nepq = merged.pools[0].tensor
         assert isinstance(original_nepq, NepqTensor)
@@ -538,11 +552,11 @@ def test_materialize_overlay_slices_mxfp4_without_reencoding(tmp_path: Path) -> 
         rng.normal(size=(rows, width)).astype(np.float32),
         NintSpec(4, 24, 6),
     )
-    base = NintMoeTensor(
+    base = MfeTensor(
         (3, rows, width),
         (
-            NintMoePool(np.array([0, 1], dtype=np.int32), native),
-            NintMoePool(np.array([2], dtype=np.int32), third),
+            MfePool(np.array([0, 1], dtype=np.int32), native),
+            MfePool(np.array([2], dtype=np.int32), third),
         ),
     )
     base_path = tmp_path / "base-mxfp4.mfq"
@@ -562,7 +576,7 @@ def test_materialize_overlay_slices_mxfp4_without_reencoding(tmp_path: Path) -> 
         records=[
             (
                 "experts",
-                "NINTMD",
+                "MFED",
                 _pack_delta(
                     n_experts=3,
                     out_per_expert=rows,
@@ -593,12 +607,12 @@ def test_materialize_overlay_slices_mxfp4_without_reencoding(tmp_path: Path) -> 
     validate_materialized_mfq(
         output_path,
         expected_bytes=plan.total_bytes,
-        expected_family_expert_counts={"MXFP4": 1, "NINT4": 2},
+        expected_family_expert_counts={"MXFP4": 1, "NINT": 2},
     )
     with open_mmap(output_path) as store:
         merged = store["experts"]
-        assert isinstance(merged, NintMoeTensor)
-        assert merged.expert_profiles == ("MXFP4", "NINT4-24", "NINT4-24")
+        assert isinstance(merged, MfeTensor)
+        assert merged.expert_profiles == ("MXFP4", "NINT", "NINT")
         mx = merged.pools[0].tensor
         assert isinstance(mx, MxTensor)
         np.testing.assert_array_equal(mx.values, native_values[:rows])

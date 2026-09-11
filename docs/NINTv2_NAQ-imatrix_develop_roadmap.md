@@ -36,24 +36,24 @@ precision-specific Sub-FFNs.
 The result is one tensor, one dispatch contract and one physical format even
 when every neuron receives a different `(q, k)` choice. The surrounding graph
 does not need to understand that internal allocation. Current Metal
-measurements on a 4096 x 5120 matrix put the heterogeneous path within roughly
-5% of fixed NINT4 at M=1, and at parity in the sampled M=2--16 range, without a
-configuration-specific fast path. More importantly, the representation avoids
+measurements on a 4096 x 5120 matrix put the adaptive metadata-driven path
+within roughly 5% of fixed NINT4 at M=1, and at parity in the sampled M=2--16
+range, without a configuration-specific fast path. More importantly, the representation avoids
 the combinatorial growth in logical tensors and kernel dispatches that made
 fine-grained precision allocation awkward in NINTv1.
 
-NINTv2 also fits naturally inside heterogeneous containers such as NINTM.
-NINTM registers it simply as `NINTv2`; the per-neuron precision map remains
-inside the tensor payload. Experts do not need to be split or regrouped by
-their internal assignments, and two NINTv2 tensors may use entirely different
-precision distributions while presenting the same format identity to the
-container and runtime.
+NINTv2 also fits naturally inside the mixed-format expert container MFE. MFE
+registers it simply as `NINT`; the per-neuron precision map remains inside the
+tensor payload. Experts do not need to be split or regrouped by their internal
+assignments, and two NINTv2 tensors may use entirely different precision
+distributions while presenting the same format identity to the container and
+runtime.
 
 Conceptually, the fixed NINTv1 profiles become a small set of presets inside
 the NINTv2 search space. A conventional NINT4 profile is the point obtained by
 assigning the same `q` and `k` to every neuron; other familiar NINTv1 profiles
 are analogous uniform points. They remain useful as simple, robust presets and
-fixed-kernel baselines, but they no longer define the boundary of the
+uniform-allocation baselines, but they no longer define the boundary of the
 representable precision space. NINTv2 is better described by an aggregate
 `xbpw` budget and the allocation of that budget across neurons than by a
 single nominal bit width.

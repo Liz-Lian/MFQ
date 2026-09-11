@@ -574,19 +574,53 @@ def _packed_candidate_index(root: Path | None) -> dict[tuple[str, int, int, int]
     return result
 
 
-def _unpack_packed_q(q_packed: np.ndarray, bits: int, groupsize: int) -> np.ndarray:
+def _unpack_packed_q(
+    q_packed: np.ndarray,
+    bits: int,
+    groupsize: int,
+    *,
+    row_q_bits: np.ndarray | None = None,
+    row_q_bit_offsets: np.ndarray | None = None,
+    groups: int | None = None,
+) -> np.ndarray:
     values = np.asarray(q_packed, dtype=np.uint8)
-    if values.ndim != 3:
-        raise ValueError("packed NINT values must have [out, groups, bytes] shape")
-    expected_bytes = (groupsize * bits + 7) // 8
-    if values.shape[-1] != expected_bytes:
-        raise ValueError(
-            f"packed NINT group has {values.shape[-1]} bytes; expected {expected_bytes}"
+    if values.ndim == 3:
+        expected_bytes = (groupsize * bits + 7) // 8
+        if values.shape[-1] != expected_bytes:
+            raise ValueError(
+                f"packed NINT group has {values.shape[-1]} bytes; expected {expected_bytes}"
+            )
+        unpacked = np.unpackbits(
+            values, axis=-1, count=groupsize * bits, bitorder="little"
         )
-    unpacked = np.unpackbits(values, axis=-1, count=groupsize * bits, bitorder="little")
-    unpacked = unpacked.reshape(*values.shape[:-1], groupsize, bits)
-    powers = np.asarray(1 << np.arange(bits), dtype=np.uint16)
-    return np.ascontiguousarray((unpacked * powers).sum(axis=-1), dtype=np.uint8)
+        unpacked = unpacked.reshape(*values.shape[:-1], groupsize, bits)
+        powers = np.asarray(1 << np.arange(bits), dtype=np.uint16)
+        return np.ascontiguousarray(
+            (unpacked * powers).sum(axis=-1), dtype=np.uint8
+        )
+    if values.ndim != 1:
+        raise ValueError("packed NINT values must be a stream or grouped rows")
+    if row_q_bits is None or row_q_bit_offsets is None or groups is None:
+        raise ValueError("streamed NINT values require row metadata and group count")
+    widths = np.asarray(row_q_bits, dtype=np.uint8).reshape(-1)
+    offsets = np.asarray(row_q_bit_offsets, dtype=np.int64).reshape(-1)
+    if widths.shape != offsets.shape or np.any((widths < 1) | (widths > 8)):
+        raise ValueError("invalid streamed NINT row metadata")
+    values_per_row = int(groups) * int(groupsize)
+    stream = np.unpackbits(values, bitorder="little")
+    result = np.empty((widths.size, values_per_row), dtype=np.uint8)
+    for row, (row_bits, row_offset) in enumerate(zip(widths, offsets, strict=True)):
+        width = int(row_bits)
+        start = int(row_offset)
+        stop = start + values_per_row * width
+        if start < 0 or stop > stream.size:
+            raise ValueError("streamed NINT row exceeds its packed value buffer")
+        row_stream = stream[start:stop].reshape(values_per_row, width)
+        powers = np.asarray(1 << np.arange(width), dtype=np.uint16)
+        result[row] = (row_stream * powers).sum(axis=-1).astype(np.uint8)
+    return np.ascontiguousarray(
+        result.reshape(widths.size, int(groups), int(groupsize))
+    )
 
 
 def _load_packed_candidate(
@@ -609,8 +643,25 @@ def _load_packed_candidate(
         }
         if document != expected:
             raise ValueError(f"packed NINT candidate metadata does not match {profile}: {path}")
-        q = _unpack_packed_q(archive["q_packed"], spec.bits, spec.groupsize)
         sub_scale = np.ascontiguousarray(archive["sub_scale"])
+        row_q_bits = (
+            np.ascontiguousarray(archive["row_q_bits"], dtype=np.uint8)
+            if "row_q_bits" in archive
+            else None
+        )
+        row_q_bit_offsets = (
+            np.ascontiguousarray(archive["row_q_bit_offsets"], dtype=np.int64)
+            if "row_q_bit_offsets" in archive
+            else None
+        )
+        q = _unpack_packed_q(
+            archive["q_packed"],
+            spec.bits,
+            spec.groupsize,
+            row_q_bits=row_q_bits,
+            row_q_bit_offsets=row_q_bit_offsets,
+            groups=int(sub_scale.shape[1]),
+        )
         sub_min = np.ascontiguousarray(archive["sub_min"])
         neuron_scale = np.ascontiguousarray(archive["neuron_scale"], dtype=np.float32)
         neuron_min = np.ascontiguousarray(archive["neuron_min"], dtype=np.float32)
@@ -624,6 +675,7 @@ def _load_packed_candidate(
         sub_scale=sub_scale,
         sub_min=sub_min,
         neuron_len=target.columns,
+        row_q_bits=row_q_bits,
     )
 
 

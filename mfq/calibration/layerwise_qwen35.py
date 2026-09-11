@@ -261,15 +261,18 @@ class Qwen35LayerwiseBackend:
             }
             if document != expected:
                 raise ValueError(f"invalid packed calibration candidate: {path}")
+            names = [
+                "q_packed",
+                "sub_scale",
+                "sub_min",
+                "neuron_scale",
+                "neuron_min",
+            ]
+            for name in ("row_q_bits", "row_q_bit_offsets"):
+                if name in archive:
+                    names.append(name)
             arrays = {
-                name: np.ascontiguousarray(archive[name])
-                for name in (
-                    "q_packed",
-                    "sub_scale",
-                    "sub_min",
-                    "neuron_scale",
-                    "neuron_min",
-                )
+                name: np.ascontiguousarray(archive[name]) for name in names
             }
         return TorchNintLinear.from_deploy_arrays(
             arrays,

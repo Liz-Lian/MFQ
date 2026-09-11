@@ -86,7 +86,7 @@ set_target_properties(mfq-avfoundation-video PROPERTIES
 )
 
 # MLX's runtime Metal compiler does not expose filesystem include paths.  Fold
-# the Steel MMA implementation into the NINTM prefill source at configure time
+# the Steel MMA implementation into the MFE prefill source at configure time
 # so the native primitive can use the same tiled MMA machinery as MLX/oMLX
 # without requiring a full Xcode Metal command-line toolchain at build time.
 set(_MFQ_STEEL_STUB_DIR
@@ -160,15 +160,15 @@ if(NOT _MFQ_STEEL_ATTN_EXPAND_RESULT EQUAL 0)
         "Failed to embed MLX Steel attention headers: "
         "${_MFQ_STEEL_ATTN_EXPAND_ERROR}")
 endif()
-set(_MFQ_NINTM_PREFILL_METAL
-    "${MFQ_METAL_ROOT}/kernels/mfq_nintm_prefill.metal")
-file(READ "${_MFQ_NINTM_PREFILL_METAL}"
-    MFQ_NINTM_PREFILL_SOURCE)
+set(_MFQ_MFE_PREFILL_METAL
+    "${MFQ_METAL_ROOT}/kernels/mfq_mfe_prefill.metal")
+file(READ "${_MFQ_MFE_PREFILL_METAL}"
+    MFQ_MFE_PREFILL_SOURCE)
 string(REPLACE
     "#include \"mlx/backend/metal/kernels/steel/gemm/gemm.h\""
     ""
-    MFQ_NINTM_PREFILL_SOURCE
-    "${MFQ_NINTM_PREFILL_SOURCE}")
+    MFQ_MFE_PREFILL_SOURCE
+    "${MFQ_MFE_PREFILL_SOURCE}")
 set(_MFQ_DSV4_SPARSE_PREFILL_METAL
     "${MFQ_METAL_ROOT}/kernels/mfq_dsv4_sparse_prefill.metal")
 file(READ "${_MFQ_DSV4_SPARSE_PREFILL_METAL}"
@@ -188,22 +188,22 @@ string(REPLACE
     MFQ_SPARSE_BLOCK_GQA_SOURCE
     "${MFQ_SPARSE_BLOCK_GQA_SOURCE}")
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
-    "${_MFQ_NINTM_PREFILL_METAL}"
+    "${_MFQ_MFE_PREFILL_METAL}"
     "${_MFQ_DSV4_SPARSE_PREFILL_METAL}"
     "${_MFQ_SPARSE_BLOCK_GQA_METAL}"
     "${MFQ_MLX_ROOT}/include/mlx/backend/metal/kernels/steel/attn/attn.h"
     "${MFQ_MLX_ROOT}/include/mlx/backend/metal/kernels/steel/gemm/mma.h"
     "${MFQ_MLX_ROOT}/include/mlx/backend/metal/kernels/steel/gemm/nax.h")
 configure_file(
-    "${MFQ_METAL_ROOT}/kernels/mfq_nintm_prefill_embedded.h.in"
-    "${CMAKE_CURRENT_BINARY_DIR}/mfq_nintm_prefill_embedded.h"
+    "${MFQ_METAL_ROOT}/kernels/mfq_mfe_prefill_embedded.h.in"
+    "${CMAKE_CURRENT_BINARY_DIR}/mfq_mfe_prefill_embedded.h"
     @ONLY)
 
 add_library(mfq-metal-runtime STATIC
     storage/deepseek_v41_engram_store.cpp
     storage/hf_safetensors_store.cpp
     storage/mfq_container.cpp
-    storage/nintm_expert_store.cpp
+    storage/mfe_expert_store.cpp
     storage/mlx_tensor_schema.cpp
     storage/compat/mlx_legacy_tensor_compat.cpp
     runtime/mlx_axial_patch_vision.cpp
@@ -223,8 +223,7 @@ add_library(mfq-metal-runtime STATIC
     ops/mlx_moe.cpp
     ops/mlx_moe_ops.cpp
     ops/mlx_mx.cpp
-    ops/mlx_mxfp4_sq2.cpp
-    ops/mlx_mxfp4_sq3.cpp
+    ops/mlx_mxfp4_sq.cpp
     ops/mlx_nint.cpp
     ops/mlx_nint8_zero.cpp
     ops/mlx_sparse_attention.cpp

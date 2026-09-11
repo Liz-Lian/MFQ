@@ -1,7 +1,8 @@
 """NintLinear: a linear layer whose weights are :class:`~mfq.formats.nint.NintTensor`.
 
-Lazy dequantization (computed and cached on first access) plus matmul. This is the NumPy reference implementation;
-real kernels will fuse dequantization and matmul in backends registered with :mod:`mfq.runtime.dequantize`.
+Lazy dequantization (computed and cached on first access) plus matmul. This is
+the NumPy reference implementation; hardware runtimes use the shared packed
+NINT execution contract directly.
 """
 
 from __future__ import annotations

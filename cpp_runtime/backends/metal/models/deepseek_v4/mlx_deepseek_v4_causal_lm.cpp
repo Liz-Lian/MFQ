@@ -573,7 +573,7 @@ MlxDeepseekV4Layer MlxDeepseekV4Layer::load(
     const array& available,
     std::pair<array, array> rope_base,
     std::pair<array, array> rope_compressed,
-    std::shared_ptr<MlxNintMoeOffloadCache> offload) {
+    std::shared_ptr<MlxMfeOffloadCache> offload) {
     config.validate();
     if (index >=
         static_cast<std::size_t>(
@@ -1159,11 +1159,11 @@ MlxDeepseekV4CausalLm::load(
             config.rope_scaling);
     auto availability =
         expert_availability(model, config);
-    std::shared_ptr<MlxNintMoeOffloadCache>
+    std::shared_ptr<MlxMfeOffloadCache>
         expert_offload;
     if (expert_cache_bytes.has_value()) {
         expert_offload =
-            std::make_shared<MlxNintMoeOffloadCache>(
+            std::make_shared<MlxMfeOffloadCache>(
                 model,
                 *expert_cache_bytes,
                 checked_int(
@@ -1412,7 +1412,7 @@ MlxDeepseekV4CausalLm::MlxDeepseekV4CausalLm(
     std::optional<array> hc_head_scale,
     int max_context,
     Dtype activation_dtype,
-    std::shared_ptr<MlxNintMoeOffloadCache>
+    std::shared_ptr<MlxMfeOffloadCache>
         expert_offload,
     std::shared_ptr<MlxDeepseekV4SsdExpertCache>
         ssd_expert_cache,

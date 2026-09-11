@@ -201,6 +201,8 @@ def slice_dense_tensor_rows(
             neuron_min=rows(tensor.neuron_min),
             sub_scale=rows(tensor.sub_scale),
             sub_min=rows(tensor.sub_min),
+            row_sub_bits=rows(tensor.row_sub_bits),
+            row_q_bits=rows(tensor.row_q_bits),
         )
     if isinstance(tensor, Nint8ZeroTensor):
         return replace(

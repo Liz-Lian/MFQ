@@ -44,11 +44,12 @@ def _nint8_zero_matmul_forward(
     flat = x.reshape(-1, width).contiguous()
     rows = int(flat.shape[0])
     ng = int(weight["ng"])
-    if rows <= 64:
+    if rows <= 8:
         qx = torch.empty((rows, ng * 32), device=q.device, dtype=torch.int8)
         xscale = torch.empty((rows, ng), device=q.device, dtype=torch.float32)
-        function = ext().nint8_zero_gemv_ws_cuda if rows <= 8 else ext().nint8_zero_mmq_ws_cuda
-        output = function(weight["q"], weight["scale"], flat, qx, xscale)
+        output = ext().nint8_zero_gemv_ws_cuda(
+            weight["q"], weight["scale"], flat, qx, xscale
+        )
     else:
         output = ext().nint8_zero_mmq_f16_packed_cuda(
             weight["q"], weight["scale"], flat, width

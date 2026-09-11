@@ -24,7 +24,12 @@ class LayoutRecord:
 
 
 def _nvq2j_xl_layout(record: MMapTensorRecord, blob: memoryview) -> tuple[str, int]:
-    if record.dtype != "NVQ2J-XL" or len(blob) < 40:
+    if record.dtype != "NVQ" or len(blob) < 40:
+        return "unchanged", record.nbytes
+    if bytes(blob[:4]) not in {b"NVQ1", b"NIQ1"}:
+        return "unchanged", record.nbytes
+    profile = int(blob[4])
+    if not profile & 0x20 or profile & ~0xE0 != 5:
         return "unchanged", record.nbytes
     ndim = struct.unpack_from("<I", blob, 16)[0]
     if ndim == 0 or ndim > 8:

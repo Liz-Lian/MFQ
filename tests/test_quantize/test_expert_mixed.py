@@ -14,7 +14,7 @@ from mfq.calibration.artifact import (
     save_scheme,
 )
 from mfq.formats import io
-from mfq.formats.moe import expert_tensor_family
+from mfq.formats.mfe import expert_tensor_family
 from mfq.formats.mx import MxTensor, pack_mx
 from mfq.formats.nepq import NEPQ0_L, NEPQ0_S, NEPQ1_L, NEPQ1_S
 from mfq.formats.nint import NintSpec
@@ -181,7 +181,7 @@ def test_quantize_expertwise_mixes_flat_and_cross_expert_families():
     )
     restored = dequantize_expertwise(tensor)
     assert tensor.expert_profiles == (
-        "NINT4-24",
+        "NINT",
         "NPQ0-S",
         "NVQ2J",
         "NEPQ0-S",
@@ -233,14 +233,14 @@ def test_mixed_moe_writer_size_and_roundtrip(tmp_path):
         artifact_root=tmp_path,
     )
     assert nbytes == _mixed_moe_blob_nbytes(shape, precisions, tmp_path)
-    tensor = io.unpack_nint_moe(path.read_bytes())
+    tensor = io.unpack_mfe(path.read_bytes())
     assert tensor.expert_profiles == (
-        "NINT4-24",
+        "NINT",
         "NPQ0-S",
         "NVQ2J",
         "NEPQ0-S",
     )
-    assert io.pack_nint_moe(tensor) == path.read_bytes()
+    assert io.pack_mfe(tensor) == path.read_bytes()
 
 
 def test_mixed_moe_preserves_native_mxfp4_bytes(tmp_path):
@@ -275,7 +275,7 @@ def test_mixed_moe_preserves_native_mxfp4_bytes(tmp_path):
         artifact_root=tmp_path,
     )
     assert nbytes == _mixed_moe_blob_nbytes(shape, precisions, tmp_path)
-    restored = io.unpack_nint_moe(path.read_bytes())
+    restored = io.unpack_mfe(path.read_bytes())
     assert restored.expert_profiles == ("MXFP4", "MXFP4")
     pool = restored.pools[0].tensor
     assert isinstance(pool, MxTensor)
@@ -308,14 +308,14 @@ def test_synthetic_mixed_moe_writer_covers_all_runtime_families(tmp_path):
     )
 
     assert nbytes == _mixed_moe_blob_nbytes(shape, precisions, None)
-    restored = io.unpack_nint_moe(path.read_bytes())
+    restored = io.unpack_mfe(path.read_bytes())
     assert restored.expert_profiles == (
-        "NINT2-16",
-        "NINT3-24",
-        "NINT4-24",
-        "NINT5-28",
-        "NINT6-24",
-        "NINT8-48",
+        "NINT",
+        "NINT",
+        "NINT",
+        "NINT",
+        "NINT",
+        "NINT",
         "NVQ2J",
         "NVQ3J",
         "MXFP4",
@@ -379,21 +379,21 @@ def test_streaming_writer_builds_all_precision_families(
             device=device,
             artifact_root=tmp_path,
         )
-    restored = io.unpack_nint_moe(path.read_bytes())
+    restored = io.unpack_mfe(path.read_bytes())
     assert nbytes == path.stat().st_size
     assert restored.expert_profiles == (
-        "NINT2-16",
-        "NINT4-24",
-        "NINT5-28",
-        "NINT6-24",
-        "NINT8-48",
+        "NINT",
+        "NINT",
+        "NINT",
+        "NINT",
+        "NINT",
         *FLAT_FAMILIES,
         "NEPQ0-S",
         "NEPQ0-L",
         "NEPQ1-S",
         "NEPQ1-L",
     )
-    assert io.pack_nint_moe(restored) == path.read_bytes()
+    assert io.pack_mfe(restored) == path.read_bytes()
 
 
 def test_mixed_nint_imatrix_changes_nint4_and_leaves_nint8_unchanged(tmp_path):
@@ -438,8 +438,8 @@ def test_mixed_nint_imatrix_changes_nint4_and_leaves_nint8_unchanged(tmp_path):
         artifact_root=tmp_path,
         importance=importance,
     )
-    plain = io.unpack_nint_moe(plain_path.read_bytes())
-    weighted = io.unpack_nint_moe(weighted_path.read_bytes())
+    plain = io.unpack_mfe(plain_path.read_bytes())
+    weighted = io.unpack_mfe(weighted_path.read_bytes())
 
     assert io.pack_nint(plain.pools[0].tensor) != io.pack_nint(
         weighted.pools[0].tensor
@@ -449,7 +449,7 @@ def test_mixed_nint_imatrix_changes_nint4_and_leaves_nint8_unchanged(tmp_path):
     )
 
 
-def test_nintm_stream_writer_keeps_per_neuron_qk_inside_one_pool(tmp_path):
+def test_mfe_stream_writer_keeps_per_neuron_qk_inside_one_pool(tmp_path):
     rng = np.random.default_rng(20260911)
     shape = (2, 6, 73)
     weight = rng.normal(0, 0.05, size=shape).astype(np.float32)
@@ -458,7 +458,7 @@ def test_nintm_stream_writer_keeps_per_neuron_qk_inside_one_pool(tmp_path):
         [1.0, 2.0, 3.0, 10.0, 50.0, 100.0] * 2,
         dtype=np.float32,
     )
-    path = tmp_path / "nintm-v2.blob"
+    path = tmp_path / "mfe.blob"
 
     _write_mixed_moe_axis0_blob(
         weight,
@@ -473,7 +473,7 @@ def test_nintm_stream_writer_keeps_per_neuron_qk_inside_one_pool(tmp_path):
         neuron_importance=neuron_importance,
     )
 
-    restored = io.unpack_nint_moe(path.read_bytes())
+    restored = io.unpack_mfe(path.read_bytes())
     pool = restored.pools[0].tensor
     assert pool.has_mixed_sub_bits
     assert pool.has_mixed_q_bits
@@ -485,7 +485,7 @@ def test_nintm_stream_writer_keeps_per_neuron_qk_inside_one_pool(tmp_path):
     assert actual_variable_bits <= uniform_variable_bits
     assert int(pool.row_q_bits[5]) > int(pool.row_q_bits[0])
     assert np.isfinite(dequantize_expertwise(restored)).all()
-    assert io.pack_nint_moe(restored) == path.read_bytes()
+    assert io.pack_mfe(restored) == path.read_bytes()
 
 
 def test_flat_nint_cohort_forwards_imatrix_to_nint_solver():

@@ -19,7 +19,7 @@ except ModuleNotFoundError as exc:  # pragma: no cover - optional dependency
 
 from mfq.formats.assets import MODEL_CONFIG_ASSET
 from mfq.formats.io import MfqTensor
-from mfq.formats.moe import NintMoeTensor
+from mfq.formats.mfe import MfeTensor
 from mfq.kernels.metal.glm_dsa import (
     attention_glm_mla_dense,
     attention_glm_mla_sparse,
@@ -217,12 +217,12 @@ def _dense_vector(model: MlxNintModel, name: str) -> mx.array:
     return mx.contiguous(value.astype(mx.float32))
 
 
-def _nint_moe(model: MlxNintModel, name: str) -> NintMoeTensor:
+def _nint_moe(model: MlxNintModel, name: str) -> MfeTensor:
     if name not in model.tensors:
         raise KeyError(f"tensor {name!r} is not present in the GLM DSA model")
     value = model.tensors[name]
-    if not isinstance(value, NintMoeTensor):
-        raise TypeError(f"GLM DSA tensor {name!r} must use NINTM")
+    if not isinstance(value, MfeTensor):
+        raise TypeError(f"GLM DSA tensor {name!r} must use MFE")
     return value
 
 

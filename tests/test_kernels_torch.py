@@ -9,7 +9,7 @@ torch = pytest.importorskip("torch")
 if not torch.cuda.is_available():
     pytest.skip("CUDA 不可用", allow_module_level=True)
 
-from mfq.formats.nint import RUNTIME_PROFILE_CATALOG, NintSpec  # noqa: E402
+from mfq.formats.nint import RUNTIME_UNIFORM_TEMPLATE_CATALOG, NintSpec  # noqa: E402
 from mfq.kernels import torch_backend  # noqa: E402
 from mfq.kernels.cuda.activation import silu_mul  # noqa: E402
 from mfq.kernels.cuda.moe import MoeRoutePlan  # noqa: E402
@@ -28,7 +28,7 @@ def _W(seed: int, shape: tuple[int, ...], scale: float = 0.05) -> np.ndarray:
     return np.random.default_rng(seed).normal(0, scale, size=shape).astype(np.float32)
 
 
-@pytest.mark.parametrize("bits,gs", RUNTIME_PROFILE_CATALOG)
+@pytest.mark.parametrize("bits,gs", RUNTIME_UNIFORM_TEMPLATE_CATALOG)
 def test_dequant_matches_numpy_all_profiles(bits, gs):
     W = _W(hash((bits, gs)) & 0xFFFF, (32, 96))
     t = nint_quant.quantize(W, NintSpec(bits, gs, 6), axis=0)

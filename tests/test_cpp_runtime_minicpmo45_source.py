@@ -123,7 +123,7 @@ def test_minicpmo45_qwen_runtime_follows_official_bfloat16_boundaries():
     assert "MFQ_DISABLE_NATIVE_PARALLEL_F32_MEAN" in (
         ROOT / "cpp_runtime" / "backends" / "cuda" / "src" / "mfq_native_tensor_ops.cu"
     ).read_text(encoding="utf-8")
-    assert 'rec.dtype.rfind("NINT", 0) == 0' in DECODE
+    assert 'rec.dtype == "NINT"' in DECODE
     assert "dequant_nint_dense_f32(load_nint_gpu(mfq, name))" in DECODE
     assert "attention_cache_decode_split_gqa4_d128_part_kernel" in ATTENTION
     assert "mfq_dispatch_bfloat16" in ATTENTION

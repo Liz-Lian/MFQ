@@ -24,7 +24,7 @@ def test_best_spec_under_budget_and_decent_snr():
 def test_best_spec_in_gs_sweet_region():
     W = _gauss(64, 5120, seed=1)
     res = search_mat.search(W, target_bpw=4.51)
-    assert res.spec.groupsize in (16, 24, 32, 48, 64)  # PROFILE_CATALOG
+    assert res.spec.groupsize in (16, 24, 32, 48, 64)  # UNIFORM_TEMPLATE_CATALOG
 
 
 def test_snr_matches_full_recompute():
@@ -45,7 +45,7 @@ def test_higher_budget_no_worse():
 def test_rejects_too_low_budget():
     W = _gauss(32, 96)
     with pytest.raises(ValueError):
-        # NINT2 is now part of PROFILE_CATALOG and reaches ~2.96 bpw here.
+        # NINT2 is now part of UNIFORM_TEMPLATE_CATALOG and reaches ~2.96 bpw here.
         search_mat.search(W, target_bpw=2.0)
 
 

@@ -17,10 +17,6 @@ if shutil.which("cl") is None and shutil.which("cl.exe") is None:
 from mfq.kernels.cuda.gated_delta_net import gated_delta_net as gdn_cuda  # noqa: E402
 from mfq.kernels.gated_delta_net import gated_delta_net as gdn_ref  # noqa: E402
 from mfq.kernels.cuda.nint_matmul import (  # noqa: E402
-    nint5_q5_exec_argmax,
-    nint5_q5_exec_dequant,
-    nint5_q5_exec_matmul,
-    nint5_q5_exec_repack,
     nint_argmax,
     nint_backward_input,
     nint_matmul as fused_matmul,
@@ -75,48 +71,6 @@ def test_nint8_one_cuda_matches_cpu_q8_1_oracle_with_tail():
     np.testing.assert_array_equal(s.cpu().numpy(), oracle.s)
     np.testing.assert_array_equal(
         reconstructed.cpu().numpy(), oracle.reconstructed
-    )
-
-
-@pytest.mark.parametrize(
-    "spec",
-    [
-        NintSpec(2, 16, 5),
-        NintSpec(3, 24, 5),
-        NintSpec(4, 24, 6),
-        NintSpec(5, 28, 7),
-        NintSpec(6, 24, 7),
-        NintSpec(8, 48, 7),
-    ],
-)
-def test_common_f16_packed_mmq_matches_dequantized_weight(spec):
-    torch.manual_seed(901 + spec.bits)
-    np.random.seed(901 + spec.bits)
-    out, width, rows = 71, 280, 512
-    tensor, gpu = _gpu_g(
-        np.random.randn(out, width).astype(np.float32) * 0.05,
-        spec,
-    )
-    x = (
-        torch.randn(rows, width, device=DEV, dtype=torch.float16)
-        * 0.1
-    ).contiguous()
-
-    actual = ext().nint_mmq_f16_packed_cuda(
-        gpu["q_packed"],
-        gpu["sub_scale"],
-        gpu["sub_min"],
-        gpu["neuron_scale"],
-        gpu["neuron_min"],
-        x,
-        spec.groupsize,
-        spec.bits,
-    )
-    expected = _ref_out(tensor, x)
-
-    relative = ((actual - expected).norm() / expected.norm()).item()
-    assert relative < 3e-3, (
-        f"NINT{spec.bits} gs{spec.groupsize} fp16 relative={relative}"
     )
 
 
@@ -208,808 +162,185 @@ def test_gdn_cuda_state_carryover():
 
 
 # ---------------------------------------------------------------------------
-# NINT INT-fused-GEMM
+# Canonical NINT runtime
 # ---------------------------------------------------------------------------
-def _gpu_g(W_np, spec):
-    nt = nint_quantize(W_np, spec, axis=0)
-    return nt, to_gpu(nt, layout="experimental")
+def _gpu_g(weight, spec, **quantize_kwargs):
+    tensor = nint_quantize(weight, spec, axis=0, **quantize_kwargs)
+    return tensor, to_gpu(tensor)
 
 
-def _ref_out(nt, x):
-    """FP32 dequantized-weight reference: y = x * Wq^T."""
-    Wq = torch.as_tensor(np.ascontiguousarray(nint_dequant(nt)), device=DEV)  # [out, K]
-    return (x.to(torch.float32) @ Wq.T).to(torch.float16)
-
-
-def test_nint_fused_matches_reference_gs24():
-    torch.manual_seed(0); np.random.seed(0)
-    out, K, M = 128, 256, 16
-    W = (np.random.randn(out, K).astype(np.float32)) * 0.05
-    nt, g = _gpu_g(W, NintSpec(4, 24, 6))
-    x = torch.randn(M, K, device=DEV) * 0.1
-    y_fused = fused_matmul(g, x)
-    y_ref = _ref_out(nt, x)
-    rel = ((y_fused - y_ref).norm() / y_ref.norm()).item()
-    assert rel < 2e-2, f"fused vs fp32-ref rel={rel}"
-    y_tb = tb_matmul(g, x)
-    rel2 = ((y_fused - y_tb).norm() / y_tb.norm()).item()
-    assert rel2 < 2e-2, f"fused vs torch_backend rel={rel2}"
-
-
-@pytest.mark.parametrize("gs", [16, 32, 48])
-def test_nint_fused_other_profiles(gs):
-    torch.manual_seed(1); np.random.seed(1)
-    out, K, M = 64, 200, 8
-    W = (np.random.randn(out, K).astype(np.float32)) * 0.05
-    nt, g = _gpu_g(W, NintSpec(4, gs, 6))
-    x = torch.randn(M, K, device=DEV) * 0.1
-    y_fused = fused_matmul(g, x)
-    y_ref = _ref_out(nt, x)
-    rel = ((y_fused - y_ref).norm() / y_ref.norm()).item()
-    assert rel < 3e-2, f"gs={gs} rel={rel}"
-
-
-def test_nint_fused_tail_group():
-    """K is not divisible by gs, requiring trailing-group zero padding."""
-    torch.manual_seed(2); np.random.seed(2)
-    out, K, M = 48, 250, 12          # 250 % 24 != 0
-    W = (np.random.randn(out, K).astype(np.float32)) * 0.05
-    nt, g = _gpu_g(W, NintSpec(4, 24, 6))
-    x = torch.randn(M, K, device=DEV) * 0.1
-    y_fused = fused_matmul(g, x)
-    y_ref = _ref_out(nt, x)
-    rel = ((y_fused - y_ref).norm() / y_ref.norm()).item()
-    assert rel < 2e-2, f"tail rel={rel}"
-
-
-def test_nint_fused_x_pad():
-    """The final dimension of x is smaller than neuron_len, requiring adapter padding."""
-    torch.manual_seed(3); np.random.seed(3)
-    out, K, M = 32, 256, 4
-    W = (np.random.randn(out, K).astype(np.float32)) * 0.05
-    nt, g = _gpu_g(W, NintSpec(4, 24, 6))
-    Kshort = 200
-    x = torch.randn(M, Kshort, device=DEV) * 0.1
-    y_fused = fused_matmul(g, x)
-    # Reference: zero-pad x to K as well
-    x_full = torch.nn.functional.pad(x, (0, K - Kshort))
-    y_ref = _ref_out(nt, x_full)
-    rel = ((y_fused - y_ref).norm() / y_ref.norm()).item()
-    assert rel < 2e-2, f"x-pad rel={rel}"
-
-
-def test_nint_fused_workspace_reuse_changes_input():
-    """Workspace reuse across different x values with the same GPU dictionary must not retain old activations."""
-    torch.manual_seed(33); np.random.seed(33)
-    out, K, M = 64, 256, 8
-    W = (np.random.randn(out, K).astype(np.float32)) * 0.05
-    nt, g = _gpu_g(W, NintSpec(4, 24, 6))
-    x1 = torch.randn(M, K, device=DEV) * 0.1
-    x2 = torch.randn(M, K, device=DEV) * 0.1
-    _ = fused_matmul(g, x1)
-    y2 = fused_matmul(g, x2)
-    y_ref = _ref_out(nt, x2)
-    rel = ((y2 - y_ref).norm() / y_ref.norm()).item()
-    assert rel < 2e-2, f"workspace reuse rel={rel}"
-
-
-def test_nint_fused_small_batch_default_matches_ref():
-    """M2-M6 use batched GEMV by default, while M7 enters MMQ."""
-    torch.manual_seed(37); np.random.seed(37)
-    out, K = 96, 280
-    W = (np.random.randn(out, K).astype(np.float32)) * 0.05
-    nt, g = _gpu_g(W, NintSpec(4, 24, 6))
-    for M in range(2, 8):
-        x = torch.randn(M, K, device=DEV) * 0.1
-        y_fused = fused_matmul(g, x)
-        y_ref = _ref_out(nt, x)
-        rel = ((y_fused - y_ref).norm() / y_ref.norm()).item()
-        assert rel < 2e-2, f"M{M} small-batch rel={rel}"
-
-
-def test_nint_prefill_default_matches_ref():
-    """The default prefill path for M>64 should agree within fp16 error."""
-    torch.manual_seed(41); np.random.seed(41)
-    out, K, M = 96, 280, 128
-    W = (np.random.randn(out, K).astype(np.float32)) * 0.05
-    nt, g = _gpu_g(W, NintSpec(4, 24, 6))
-    x = torch.randn(M, K, device=DEV) * 0.1
-    y_fused = fused_matmul(g, x)
-    y_ref = _ref_out(nt, x)
-    rel = ((y_fused - y_ref).norm() / y_ref.norm()).item()
-    assert rel < 2e-2, f"prefill rel={rel}"
-
-
-def test_nint_dequant_wq_packed_matches_torch():
-    """CUDA packed Wq materialization should match Wq from torch_backend."""
-    torch.manual_seed(42); np.random.seed(42)
-    out, K = 48, 250
-    W = (np.random.randn(out, K).astype(np.float32)) * 0.05
-    _, g = _gpu_g(W, NintSpec(4, 24, 6))
-    wq_cuda = ext().nint_dequant_wq_packed_cuda(g["q_packed"], g["d_eff"], int(g["neuron_len"]), int(g["gs"]))
-    wq_ref = (
-        g["d_eff"][:, :, None] * g["q"].to(torch.float32)
-    ).reshape(g["out"], int(g["ng"]) * int(g["gs"]))[:, : int(g["neuron_len"])].to(torch.float16)
-    torch.testing.assert_close(wq_cuda, wq_ref, atol=0, rtol=0)
-
-
-def test_nint_dequant_full_packed_matches_torch():
-    """CUDA packed full-W materialization should match dequantized weights from torch_backend."""
-    torch.manual_seed(43); np.random.seed(43)
-    out, K = 48, 250
-    W = (np.random.randn(out, K).astype(np.float32)) * 0.05
-    _, g = _gpu_g(W, NintSpec(4, 24, 6))
-    w_cuda = ext().nint_dequant_full_packed_cuda(
-        g["q_packed"], g["d_eff"], g["m_eff"], int(g["neuron_len"]), int(g["gs"])
+def _ref_out(tensor, value):
+    dense = torch.as_tensor(
+        np.ascontiguousarray(nint_dequant(tensor)),
+        device=DEV,
+        dtype=torch.float32,
     )
-    w_ref = (
-        g["d_eff"][:, :, None] * g["q"].to(torch.float32)
-        - g["m_eff"][:, :, None]
-    ).reshape(g["out"], int(g["ng"]) * int(g["gs"]))[:, : int(g["neuron_len"])].to(torch.float16)
-    torch.testing.assert_close(w_cuda, w_ref, atol=0, rtol=0)
-
-
-def test_nint_dequant_full_packed_compact_matches_torch():
-    """Full dequantization with compact deployment metadata should match expanded metadata."""
-    torch.manual_seed(59); np.random.seed(59)
-    out, K = 48, 250
-    W = (np.random.randn(out, K).astype(np.float32)) * 0.05
-    _, g = _gpu_g(W, NintSpec(4, 24, 6))
-    w_cuda = ext().nint_dequant_full_packed_compact_cuda(
-        g["q_packed"],
-        g["sub_scale"],
-        g["sub_min"],
-        g["neuron_scale"],
-        g["neuron_min"],
-        int(g["neuron_len"]),
-        int(g["gs"]),
-    )
-    w_ref = (
-        g["d_eff"][:, :, None] * g["q"].to(torch.float32)
-        - g["m_eff"][:, :, None]
-    ).reshape(g["out"], int(g["ng"]) * int(g["gs"]))[:, : int(g["neuron_len"])].to(torch.float16)
-    torch.testing.assert_close(w_cuda, w_ref, atol=0, rtol=0)
-
-
-def test_nint_dequant_full_packed_h2_matches_torch():
-    """CUDA half2 full-W materialization should match half-precision execution metadata."""
-    torch.manual_seed(44); np.random.seed(44)
-    out, K = 48, 250
-    W = (np.random.randn(out, K).astype(np.float32)) * 0.05
-    _, g = _gpu_g(W, NintSpec(4, 24, 6))
-    w_cuda = ext().nint_dequant_full_packed_h2_cuda(
-        g["q_packed"], g["eff_pair_h"], int(g["neuron_len"]), int(g["gs"])
-    )
-    w_ref = (
-        g["d_eff_h"][:, :, None] * g["q"].to(torch.float16)
-        - g["m_eff_h"][:, :, None]
-    ).reshape(g["out"], int(g["ng"]) * int(g["gs"]))[:, : int(g["neuron_len"])]
-    torch.testing.assert_close(w_cuda, w_ref, atol=1.3e-4, rtol=0)
-
-
-def test_nint_dequant_full_packed_gs24_x2_matches_default():
-    """gs24 x2 full dequantization should exactly match the default f32 metadata kernel."""
-    torch.manual_seed(55); np.random.seed(55)
-    out, K = 48, 250
-    W = (np.random.randn(out, K).astype(np.float32)) * 0.05
-    _, g = _gpu_g(W, NintSpec(4, 24, 6))
-    w_ref = ext().nint_dequant_full_packed_cuda(
-        g["q_packed"], g["d_eff"], g["m_eff"], int(g["neuron_len"]), int(g["gs"])
-    )
-    w_x2 = ext().nint_dequant_full_packed_gs24_x2_cuda(
-        g["q_packed"], g["d_eff"], g["m_eff"], int(g["neuron_len"])
-    )
-    torch.testing.assert_close(w_x2, w_ref, atol=0, rtol=0)
-
-
-def test_nint_dequant_full_packed_gs24_x2h2_matches_half2_reference():
-    """The gs24 x2 half2 metadata candidate should match the error of half2 full dequantization."""
-    torch.manual_seed(56); np.random.seed(56)
-    out, K = 48, 250
-    W = (np.random.randn(out, K).astype(np.float32)) * 0.05
-    _, g = _gpu_g(W, NintSpec(4, 24, 6))
-    w_ref = ext().nint_dequant_full_packed_h2_cuda(
-        g["q_packed"], g["eff_pair_h"], int(g["neuron_len"]), int(g["gs"])
-    )
-    w_x2h2 = ext().nint_dequant_full_packed_gs24_x2h2_cuda(
-        g["q_packed"], g["eff_pair_h"], int(g["neuron_len"])
-    )
-    torch.testing.assert_close(w_x2h2, w_ref, atol=0, rtol=0)
-
-
-def test_nint_batched_gemv_matches_gemv():
-    """MMVQ-style batched GEMV should exactly match per-row GEMV."""
-    torch.manual_seed(38); np.random.seed(38)
-    out, K, M = 96, 280, 6
-    W = (np.random.randn(out, K).astype(np.float32)) * 0.05
-    _, g = _gpu_g(W, NintSpec(4, 24, 6))
-    x = torch.randn(M, K, device=DEV) * 0.1
-    qx, xscale, xsum = _workspace(g, x)
-    args = (g["q_packed"], g["sub_scale"], g["sub_min"], g["neuron_scale"], g["neuron_min"])
-    xh = x.contiguous().to(torch.float16)
-    y_gemv = ext().nint_gemv_packed_ws_cuda(*args, xh, int(g["gs"]), qx, xscale, xsum)
-    y_batch = ext().nint_gemv_packed_batch_ws_cuda(*args, xh, int(g["gs"]), qx, xscale, xsum)
-    torch.testing.assert_close(y_batch, y_gemv, atol=1e-4, rtol=1e-3)
+    return (value.to(torch.float32) @ dense.T).to(torch.float16)
 
 
 @pytest.mark.parametrize(
     "spec",
     [
-        NintSpec(2, 16, 5),
-        NintSpec(3, 24, 5),
-        NintSpec(5, 24, 6),
-        NintSpec(6, 22, 6),
-        NintSpec(8, 32, 6),
-    ],
-)
-@pytest.mark.parametrize("M", [1, 3, 9])
-def test_nint_packed_bits_matmul_matches_dequant(spec, M):
-    torch.manual_seed(70 + spec.bits + M); np.random.seed(70 + spec.bits + M)
-    out, K = 48, 88
-    W = (np.random.randn(out, K).astype(np.float32)) * 0.05
-    nt = nint_quantize(W, spec, axis=0)
-    g = to_gpu(nt, layout="deploy")
-    x = (torch.randn(M, K, device=DEV) * 0.1).to(torch.float16)
-    y = fused_matmul(g, x)
-    w_ref = torch.as_tensor(np.ascontiguousarray(nint_dequant(nt)), device=DEV, dtype=torch.float16)
-    ref = x @ w_ref.T
-    torch.testing.assert_close(y, ref, atol=2e-3, rtol=3e-3)
-
-
-@pytest.mark.parametrize(
-    "spec",
-    [
-        NintSpec(1, 24, 7),
+        NintSpec(1, 4, 4),
         NintSpec(2, 16, 5),
         NintSpec(3, 24, 5),
         NintSpec(4, 24, 6),
         NintSpec(5, 28, 7),
-        NintSpec(6, 24, 7),
-        NintSpec(6, 22, 6),
-        NintSpec(7, 24, 7),
-        NintSpec(8, 48, 7),
+        NintSpec(6, 26, 7),
+        NintSpec(7, 63, 7),
+        NintSpec(8, 64, 7),
     ],
 )
-@pytest.mark.parametrize("rows", [1, 2, 4, 8, 13, 16, 23, 32])
-def test_nint_packed_backward_and_autograd_match_dequant(spec, rows):
-    torch.manual_seed(1700 + spec.bits + spec.groupsize + rows)
-    np.random.seed(1700 + spec.bits + spec.groupsize + rows)
-    out, width = 19, 72
-    tensor = nint_quantize(
-        np.random.randn(out, width).astype(np.float32) * 0.05,
-        spec,
-        axis=0,
+@pytest.mark.parametrize("rows", [1, 2, 6, 8, 9, 65])
+def test_nint_common_kernel_all_q_and_m_boundaries(spec, rows):
+    seed = 1100 + spec.bits * 100 + spec.groupsize + rows
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    outputs = 37
+    width = spec.groupsize * 2 + 7
+    weight = np.random.randn(outputs, width).astype(np.float32) * 0.04
+    tensor, packed = _gpu_g(weight, spec)
+    value = torch.randn(
+        rows, width, device=DEV, dtype=torch.float16
+    ).mul_(0.1)
+    actual = fused_matmul(packed, value)
+    expected = _ref_out(tensor, value)
+    relative = ((actual - expected).norm() / expected.norm()).item()
+    assert relative < 3e-2, (
+        f"q={spec.bits}, gs={spec.groupsize}, M={rows}, relative={relative}"
     )
-    weight = to_gpu(tensor, layout="deploy")
+
+
+@pytest.mark.parametrize("rows", [1, 6, 8, 9, 33])
+def test_nint_adaptive_qk_uses_the_same_runtime_path(rows):
+    torch.manual_seed(2400 + rows)
+    np.random.seed(2400 + rows)
+    outputs, width = 32, 103
+    spec = NintSpec(4, 24, 6)
+    q_bits = np.tile(np.arange(1, 9, dtype=np.uint8), 4)
+    sub_bits = np.tile(np.asarray([5, 6, 7, 8], dtype=np.uint8), 8)
+    weight = np.random.randn(outputs, width).astype(np.float32) * 0.04
+    tensor, packed = _gpu_g(
+        weight,
+        spec,
+        row_q_bits=q_bits,
+        row_sub_bits=sub_bits,
+    )
+    assert np.array_equal(tensor.row_q_bits, q_bits)
+    assert np.array_equal(tensor.row_sub_bits, sub_bits)
+    value = torch.randn(
+        rows, width, device=DEV, dtype=torch.float16
+    ).mul_(0.1)
+    actual = fused_matmul(packed, value)
+    expected = _ref_out(tensor, value)
+    relative = ((actual - expected).norm() / expected.norm()).item()
+    assert relative < 3e-2, f"M={rows}, relative={relative}"
+
+
+def test_nint_common_kernel_reuses_workspace_without_stale_activation():
+    torch.manual_seed(2501)
+    np.random.seed(2501)
+    outputs, width, rows = 64, 257, 6
+    tensor, packed = _gpu_g(
+        np.random.randn(outputs, width).astype(np.float32) * 0.04,
+        NintSpec(4, 24, 6),
+    )
+    first = torch.randn(rows, width, device=DEV, dtype=torch.float16)
+    second = torch.randn(rows, width, device=DEV, dtype=torch.float16)
+    fused_matmul(packed, first)
+    actual = fused_matmul(packed, second)
+    expected = _ref_out(tensor, second)
+    torch.testing.assert_close(actual, expected, atol=3e-2, rtol=3e-2)
+    assert len(packed["_workspace"]) == 1
+
+
+@pytest.mark.parametrize("rows", [1, 6, 9, 32])
+def test_nint_backward_and_autograd_match_canonical_decode(rows):
+    torch.manual_seed(2600 + rows)
+    np.random.seed(2600 + rows)
+    outputs, width = 31, 113
+    q_bits = np.resize(np.arange(1, 9, dtype=np.uint8), outputs)
+    sub_bits = np.resize(np.asarray([5, 6, 7, 8], dtype=np.uint8), outputs)
+    tensor, packed = _gpu_g(
+        np.random.randn(outputs, width).astype(np.float32) * 0.04,
+        NintSpec(4, 24, 6),
+        row_q_bits=q_bits,
+        row_sub_bits=sub_bits,
+    )
     dense = torch.as_tensor(
         np.ascontiguousarray(nint_dequant(tensor)),
         device=DEV,
         dtype=torch.float16,
     )
     output_gradient = torch.randn(
-        rows, out, device=DEV, dtype=torch.float16
+        rows, outputs, device=DEV, dtype=torch.float16
     )
     expected = output_gradient @ dense
     torch.testing.assert_close(
-        nint_backward_input(weight, output_gradient),
+        nint_backward_input(packed, output_gradient),
         expected,
-        rtol=3e-3,
         atol=2e-3,
+        rtol=3e-3,
     )
     source = torch.randn(
-        rows, width, device=DEV, dtype=torch.float16, requires_grad=True
+        rows,
+        width,
+        device=DEV,
+        dtype=torch.float16,
+        requires_grad=True,
     )
-    (fused_matmul(weight, source) * output_gradient).sum().backward()
-    torch.testing.assert_close(source.grad, expected, rtol=3e-3, atol=2e-3)
-
-
-@pytest.mark.parametrize("M", [2, 4, 8])
-def test_nint6_gs26_special_gemv_matches_generic(monkeypatch, M):
-    torch.manual_seed(92 + M); np.random.seed(92 + M)
-    out, K = 64, 104
-    W = (np.random.randn(out, K).astype(np.float32)) * 0.05
-    nt = nint_quantize(W, NintSpec(6, 26, 7), axis=0)
-    g = to_gpu(nt, layout="deploy")
-    x = (torch.randn(M, K, device=DEV) * 0.1).to(torch.float16)
-    y_special = fused_matmul(g, x)
-    monkeypatch.setenv("MFQ_NINT_BITS_GEMV_GENERIC", "1")
-    y_generic = fused_matmul(g, x)
-    torch.testing.assert_close(y_special, y_generic, atol=2e-3, rtol=3e-3)
-
-
-@pytest.mark.parametrize("M", [2, 5, 8])
-def test_nint5_gs28_special_gemv_matches_generic(monkeypatch, M):
-    torch.manual_seed(104 + M); np.random.seed(104 + M)
-    out, K = 64, 112
-    W = (np.random.randn(out, K).astype(np.float32)) * 0.05
-    nt = nint_quantize(W, NintSpec(5, 28, 7), axis=0)
-    g = to_gpu(nt, layout="deploy")
-    x = (torch.randn(M, K, device=DEV) * 0.1).to(torch.float16)
-    y_special = fused_matmul(g, x)
-    monkeypatch.setenv("MFQ_NINT_BITS_GEMV_GENERIC", "1")
-    y_generic = fused_matmul(g, x)
-    torch.testing.assert_close(y_special, y_generic, atol=2e-3, rtol=3e-3)
-
-
-@pytest.mark.parametrize("seed", [201, 202, 203])
-def test_nint5_gs28_argmax_matches_materialized_logits(seed):
-    torch.manual_seed(seed); np.random.seed(seed)
-    out, K = 257, 224
-    W = (np.random.randn(out, K).astype(np.float32)) * 0.05
-    nt = nint_quantize(W, NintSpec(5, 28, 7), axis=0)
-    g = to_gpu(nt, layout="deploy")
-    x = (torch.randn(1, K, device=DEV) * 0.1).to(torch.float16)
-    expected = fused_matmul(g, x).argmax(-1).to(torch.int64)
-    actual = nint_argmax(g, x)
-    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
-
-
-def test_nint5_q5_exec_dequant_is_bit_exact():
-    torch.manual_seed(211); np.random.seed(211)
-    out, K = 64, 224
-    W = (np.random.randn(out, K).astype(np.float32)) * 0.05
-    nt = nint_quantize(W, NintSpec(5, 28, 7), axis=0)
-    g = to_gpu(nt, layout="deploy")
-    q5 = nint5_q5_exec_repack(g)
-    expected = ext().nint_dequant_full_packed_compact_bits_cuda(
-        g["q_packed"], g["sub_scale"], g["sub_min"],
-        g["neuron_scale"], g["neuron_min"], int(g["neuron_len"]), 28, 5,
+    (fused_matmul(packed, source) * output_gradient).sum().backward()
+    torch.testing.assert_close(
+        source.grad, expected, atol=2e-3, rtol=3e-3
     )
-    actual = nint5_q5_exec_dequant(q5)
-    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
-
-
-@pytest.mark.parametrize("M", [1, 2, 5, 8])
-def test_nint5_q5_exec_gemv_matches_original(M):
-    torch.manual_seed(220 + M); np.random.seed(220 + M)
-    out, K = 128, 224
-    W = (np.random.randn(out, K).astype(np.float32)) * 0.05
-    nt = nint_quantize(W, NintSpec(5, 28, 7), axis=0)
-    g = to_gpu(nt, layout="deploy")
-    q5 = nint5_q5_exec_repack(g)
-    x = (torch.randn(M, K, device=DEV) * 0.1).to(torch.float16)
-    actual = nint5_q5_exec_matmul(q5, x)
-    expected = fused_matmul(g, x)
-    torch.testing.assert_close(actual, expected, atol=2e-3, rtol=3e-3)
-
-
-@pytest.mark.parametrize("seed", [231, 232, 233])
-def test_nint5_q5_exec_argmax_matches_original(seed):
-    torch.manual_seed(seed); np.random.seed(seed)
-    out, K = 257, 224
-    W = (np.random.randn(out, K).astype(np.float32)) * 0.05
-    nt = nint_quantize(W, NintSpec(5, 28, 7), axis=0)
-    g = to_gpu(nt, layout="deploy")
-    q5 = nint5_q5_exec_repack(g)
-    x = (torch.randn(1, K, device=DEV) * 0.1).to(torch.float16)
-    actual = nint5_q5_exec_argmax(q5, x)
-    expected = nint_argmax(g, x)
-    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
-
-
-def test_nint5_q5_exec_handles_partial_group_batch():
-    torch.manual_seed(241); np.random.seed(241)
-    out, K = 64, 252  # nine groups exercises the final partial 8-group warp batch.
-    W = (np.random.randn(out, K).astype(np.float32)) * 0.05
-    nt = nint_quantize(W, NintSpec(5, 28, 7), axis=0)
-    g = to_gpu(nt, layout="deploy")
-    q5 = nint5_q5_exec_repack(g)
-    x = (torch.randn(1, K, device=DEV) * 0.1).to(torch.float16)
-    actual = nint5_q5_exec_matmul(q5, x)
-    expected = fused_matmul(g, x)
-    torch.testing.assert_close(actual, expected, atol=2e-3, rtol=3e-3)
-
-
-def test_nint8_mmq_env_matches_dequant(monkeypatch):
-    torch.manual_seed(83); np.random.seed(83)
-    out, K, M = 48, 88, 9
-    W = (np.random.randn(out, K).astype(np.float32)) * 0.05
-    nt = nint_quantize(W, NintSpec(8, 32, 6), axis=0)
-    g = to_gpu(nt, layout="deploy")
-    x = (torch.randn(M, K, device=DEV) * 0.1).to(torch.float16)
-    monkeypatch.setenv("MFQ_NINT8_MMQ", "1")
-    y = fused_matmul(g, x)
-    w_ref = torch.as_tensor(np.ascontiguousarray(nint_dequant(nt)), device=DEV, dtype=torch.float16)
-    ref = x @ w_ref.T
-    torch.testing.assert_close(y, ref, atol=2e-3, rtol=3e-3)
-
-
-@pytest.mark.parametrize("M", [2, 3])
-def test_nint_batched_gemv_eff_metadata_matches_gemv(M):
-    """MMVQ with prefused fp16 execution metadata should remain within fp16 error."""
-    torch.manual_seed(39); np.random.seed(39)
-    out, K = 96, 280
-    W = (np.random.randn(out, K).astype(np.float32)) * 0.05
-    _, g = _gpu_g(W, NintSpec(4, 24, 6))
-    x = torch.randn(M, K, device=DEV) * 0.1
-    qx, xscale, xsum = _workspace(g, x)
-    xh = x.contiguous().to(torch.float16)
-    y_gemv = ext().nint_gemv_packed_batch_ws_cuda(
-        g["q_packed"], g["sub_scale"], g["sub_min"], g["neuron_scale"], g["neuron_min"],
-        xh, int(g["gs"]), qx, xscale, xsum,
-    )
-    y_eff = ext().nint_gemv_packed_batch_eff_ws_cuda(
-        g["q_packed"], g["d_eff_h"], g["m_eff_h"], xh, int(g["gs"]), qx, xscale, xsum,
-    )
-    torch.testing.assert_close(y_eff, y_gemv, atol=1e-3, rtol=2e-3)
-
-
-@pytest.mark.parametrize("M", [2, 4, 6, 7])
-def test_nint_batched_gemv_eff2_metadata_matches_gemv(M):
-    """MMVQ with half2 execution metadata should remain within fp16 error."""
-    torch.manual_seed(40); np.random.seed(40)
-    out, K = 96, 280
-    W = (np.random.randn(out, K).astype(np.float32)) * 0.05
-    _, g = _gpu_g(W, NintSpec(4, 24, 6))
-    x = torch.randn(M, K, device=DEV) * 0.1
-    qx, xscale, xsum = _workspace(g, x)
-    xh = x.contiguous().to(torch.float16)
-    y_gemv = ext().nint_gemv_packed_batch_ws_cuda(
-        g["q_packed"], g["sub_scale"], g["sub_min"], g["neuron_scale"], g["neuron_min"],
-        xh, int(g["gs"]), qx, xscale, xsum,
-    )
-    y_eff2 = ext().nint_gemv_packed_batch_eff2_ws_cuda(
-        g["q_packed"], g["eff_pair_h"], xh, int(g["gs"]), qx, xscale, xsum,
-    )
-    torch.testing.assert_close(y_eff2, y_gemv, atol=1e-3, rtol=2e-3)
 
 
 @pytest.mark.parametrize("activation", ["sigmoid", "silu"])
-def test_nint_input_mul_compact_decode_matches_materialized(activation):
-    """The actual compact decode path should equal materializing gated activations before GEMV."""
-    torch.manual_seed(60); np.random.seed(60)
-    out, K, M = 96, 280, 1
-    W = (np.random.randn(out, K).astype(np.float32)) * 0.05
-    nt = nint_quantize(W, NintSpec(4, 24, 6), axis=0)
-    g = to_gpu(nt, layout="deploy")
-    x = (torch.randn(M, K, device=DEV) * 0.1).to(torch.float16)
-    gate = (torch.randn(M, K, device=DEV) * 0.5).to(torch.float16)
-    if activation == "sigmoid":
-        materialized = x * torch.sigmoid(gate)
-    else:
-        materialized = x * F.silu(gate)
-    y_ref = fused_matmul(g, materialized)
-    y_fused = nint_matmul_input_mul(g, x, gate, activation)
-    torch.testing.assert_close(y_fused, y_ref, atol=2e-3, rtol=3e-3)
-
-
-@pytest.mark.parametrize(
-    "spec",
-    [
-        NintSpec(2, 16, 5),
-        NintSpec(3, 24, 5),
-        NintSpec(5, 28, 7),
-        NintSpec(6, 24, 7),
-        NintSpec(8, 48, 7),
-    ],
-)
-@pytest.mark.parametrize("activation,mode", [("sigmoid", 1), ("silu", 2)])
-@pytest.mark.parametrize("M", [1, 2, 7, 8])
-def test_nint_packed_bits_input_mul_decode_matches_materialized(spec, activation, mode, M):
-    """C++ decode uses this packed-bits gate path directly for NINT5/6/8."""
-    torch.manual_seed(62 + spec.bits + M); np.random.seed(62 + spec.bits + M)
-    out, K = 96, 280
-    W = (np.random.randn(out, K).astype(np.float32)) * 0.05
-    nt = nint_quantize(W, spec, axis=0)
-    g = to_gpu(nt, layout="deploy")
-    x = (torch.randn(M, K, device=DEV) * 0.35).to(torch.float16)
-    gate = (torch.randn(M, K, device=DEV) * 1.2).to(torch.float16)
-    multiplier = torch.sigmoid(gate) if activation == "sigmoid" else F.silu(gate)
-    y_ref = fused_matmul(g, x * multiplier)
-    qx, xscale, xsum = _workspace(g, x)
-    y_fused = ext().nint_gemv_packed_bits_gate_ws_cuda(
-        g["q_packed"], g["sub_scale"], g["sub_min"],
-        g["neuron_scale"], g["neuron_min"], x, gate,
-        int(g["gs"]), int(g["bits"]), mode, qx, xscale, xsum,
+def test_nint_input_gate_composes_with_common_kernel(activation):
+    torch.manual_seed(2701)
+    np.random.seed(2701)
+    outputs, width, rows = 29, 91, 6
+    tensor, packed = _gpu_g(
+        np.random.randn(outputs, width).astype(np.float32) * 0.04,
+        NintSpec(5, 24, 6),
     )
-    diff = y_fused.float() - y_ref.float()
-    assert (diff.norm() / y_ref.float().norm()).item() < 5e-3
-    assert diff.abs().max().item() < 5e-3
-
-
-def test_nint5_linear_out_norm_gate_decode_matches_materialized():
-    """Validate the decode-only linear-attention output fusion used by the baseline recipe."""
-    torch.manual_seed(70); np.random.seed(70)
-    heads, head_dim, out = 8, 32, 96
-    K = heads * head_dim
-    W = (np.random.randn(out, K).astype(np.float32)) * 0.05
-    nt = nint_quantize(W, NintSpec(5, 28, 7), axis=0)
-    g = to_gpu(nt, layout="deploy")
-    y = (torch.randn(K, device=DEV) * 0.4).to(torch.float32)
-    gate = (torch.randn(K, device=DEV) * 1.2).to(torch.float16)
-    norm_weight = (torch.randn(head_dim, device=DEV) * 0.08 + 1.0).to(torch.float32)
-    eps = 1e-6
-    rows = y.reshape(heads, head_dim)
-    normalized = rows * torch.rsqrt(rows.square().mean(-1, keepdim=True) + eps)
-    materialized = (normalized * norm_weight).reshape(1, K) * F.silu(gate).reshape(1, K)
-    y_ref = fused_matmul(g, materialized.to(torch.float16))
-    qx, xscale, xsum = _workspace(g, materialized)
-    rinv = torch.empty(heads, device=DEV, dtype=torch.float32)
-    y_fused = ext().nint_gemv_packed_bits_linear_out_norm_gate_ws_cuda(
-        g["q_packed"], g["sub_scale"], g["sub_min"],
-        g["neuron_scale"], g["neuron_min"], y, gate, norm_weight,
-        int(g["gs"]), int(g["bits"]), head_dim, eps,
-        qx, xscale, xsum, rinv,
+    value = torch.randn(rows, width, device=DEV, dtype=torch.float16)
+    gate = torch.randn_like(value)
+    transformed = value * (
+        torch.sigmoid(gate)
+        if activation == "sigmoid"
+        else torch.nn.functional.silu(gate)
     )
-    diff = y_fused.float() - y_ref.float()
-    assert (diff.norm() / y_ref.float().norm()).item() < 3e-3
-    assert diff.abs().max().item() < 5e-3
+    actual = nint_matmul_input_mul(packed, value, gate, activation)
+    expected = _ref_out(tensor, transformed)
+    torch.testing.assert_close(actual, expected, atol=3e-2, rtol=3e-2)
 
 
-@pytest.mark.parametrize("activation", ["sigmoid", "silu"])
-@pytest.mark.parametrize("M", [1, 2, 7])
-def test_nint_input_mul_eff2_decode_matches_materialized(M, activation):
-    """The half2-metadata decode path should equal materializing gated activations before GEMV."""
-    torch.manual_seed(61); np.random.seed(61)
-    out, K = 96, 280
-    W = (np.random.randn(out, K).astype(np.float32)) * 0.05
-    nt = nint_quantize(W, NintSpec(4, 24, 6), axis=0)
-    g_exp = to_gpu(nt, layout="experimental")
-    g_eff = {
-        "q_packed": g_exp["q_packed"],
-        "eff_pair_h": g_exp["eff_pair_h"],
-        "out": g_exp["out"],
-        "ng": g_exp["ng"],
-        "gs": g_exp["gs"],
-        "neuron_len": g_exp["neuron_len"],
-    }
-    x = (torch.randn(M, K, device=DEV) * 0.1).to(torch.float16)
-    gate = (torch.randn(M, K, device=DEV) * 0.5).to(torch.float16)
-    if activation == "sigmoid":
-        materialized = x * torch.sigmoid(gate)
-    else:
-        materialized = x * F.silu(gate)
-    y_ref = fused_matmul(g_exp, materialized)
-    y_fused = nint_matmul_input_mul(g_eff, x, gate, activation)
-    torch.testing.assert_close(y_fused, y_ref, atol=2e-3, rtol=3e-3)
-
-
-@pytest.mark.parametrize("M", [16, 32, 64])
-def test_nint_mmq_exec_weight_layout_matches_workspace(M):
-    """The MMQ weight execution format should match row-major packed MMQ."""
-    torch.manual_seed(36); np.random.seed(36)
-    out, K = 96, 280
-    W = (np.random.randn(out, K).astype(np.float32)) * 0.05
-    _, g = _gpu_g(W, NintSpec(4, 24, 6))
-    x = torch.randn(M, K, device=DEV) * 0.1
-    qx, xscale, xsum = _workspace(g, x)
-    row_args = (g["q_packed"], g["sub_scale"], g["sub_min"], g["neuron_scale"], g["neuron_min"])
-    exec_args = (
-        g["q_mmq_packed"],
-        g["sub_scale_mmq"],
-        g["sub_min_mmq"],
-        g["neuron_scale"],
-        g["neuron_min"],
+def test_nint_large_mixed_q_projection():
+    torch.manual_seed(2801)
+    np.random.seed(2801)
+    outputs, width, rows = 4096, 4096, 6
+    spec = NintSpec(4, 24, 6)
+    q_bits = np.resize(np.arange(1, 9, dtype=np.uint8), outputs)
+    sub_bits = np.resize(np.asarray([5, 6, 7, 8], dtype=np.uint8), outputs)
+    tensor, packed = _gpu_g(
+        np.random.randn(outputs, width).astype(np.float32) * 0.02,
+        spec,
+        row_q_bits=q_bits,
+        row_sub_bits=sub_bits,
     )
-    xh = x.contiguous().to(torch.float16)
-    y_row = ext().nint_mmq_packed_ws_cuda(*row_args, xh, int(g["gs"]), qx, xscale, xsum)
-    y_exec = ext().nint_mmq_packed_exec_ws_cuda(*exec_args, xh, int(g["ng"]), int(g["gs"]), qx, xscale, xsum)
-    torch.testing.assert_close(y_exec, y_row, atol=0, rtol=0)
-
-
-@pytest.mark.parametrize("M", [16, 32])
-def test_nint4_gs24_group32_matches_dequant(M):
-    torch.manual_seed(130 + M); np.random.seed(130 + M)
-    out, K = 128, 280
-    nt, g = _gpu_g((np.random.randn(out, K).astype(np.float32)) * 0.05, NintSpec(4, 24, 6))
-    x = (torch.randn(M, K, device=DEV) * 0.1).to(torch.float16)
-    ng = int(g["ng"])
-    nchunks = (ng + 7) // 8
-    qx_mmq = torch.empty(nchunks * M * 68, device=DEV, dtype=torch.int32)
-    xscale = torch.empty((M, ng), device=DEV, dtype=torch.float32)
-    xsum = torch.empty((M, ng), device=DEV, dtype=torch.int32)
-    partial = torch.empty((2, M, out), device=DEV, dtype=torch.float32)
-    y = ext().nint_mmq_gs24_group32_ws_cuda(
-        g["q_packed"], g["sub_scale"], g["sub_min"], g["neuron_scale"],
-        g["neuron_min"], x, qx_mmq, xscale, xsum, 2, partial,
-    )
-    ref = _ref_out(nt, x)
-    rel = ((y - ref).norm() / ref.norm()).item()
-    assert rel < 1e-2, f"M{M} group32 rel={rel}"
-
-
-@pytest.mark.parametrize("M", [9, 17, 65, 512])
-def test_nint2_gs16_pair32_matches_dequant(M):
-    torch.manual_seed(2160 + M); np.random.seed(2160 + M)
-    out, K = 73, 1537
-    nt, g = _gpu_g(
-        (np.random.randn(out, K).astype(np.float32)) * 0.05,
-        NintSpec(2, 16, 5),
-    )
-    x = (torch.randn(M, K, device=DEV) * 0.1).to(torch.float16)
-    ng = int(g["ng"])
-    m_pad = ((M + 15) // 16) * 16
-    nchunks = (ng + 7) // 8
-    qx_mmq = torch.empty(nchunks * m_pad * 36, device=DEV, dtype=torch.int32)
-    xscale = torch.empty((M, ng), device=DEV, dtype=torch.float32)
-    xsum = torch.empty((M, ng), device=DEV, dtype=torch.int32)
-    partial = torch.empty((2, M, out), device=DEV, dtype=torch.float32)
-    y = ext().nint_mmq_gs24_group32_ws_cuda(
-        g["q_packed"], g["sub_scale"], g["sub_min"], g["neuron_scale"],
-        g["neuron_min"], x, qx_mmq, xscale, xsum, 2, partial,
-    )
-    ref = _ref_out(nt, x)
-    rel = ((y - ref).norm() / ref.norm()).item()
-    assert rel < 1e-2, f"NINT2 M{M} pair32 rel={rel}"
-
-
-@pytest.mark.parametrize("M", [9, 32, 128])
-def test_nint2_gs16_f16_mmq_matches_dequant(M):
-    torch.manual_seed(2180 + M); np.random.seed(2180 + M)
-    out, K = 128, 280
-    nt, g = _gpu_g(
-        (np.random.randn(out, K).astype(np.float32)) * 0.05,
-        NintSpec(2, 16, 5),
-    )
-    x = (torch.randn(M, K, device=DEV) * 0.1).to(torch.float16)
-    y = ext().nint_mmq_gs24_f16_nint3_cuda(
-        g["q_packed"], g["sub_scale"], g["sub_min"],
-        g["neuron_scale"], g["neuron_min"], x,
-    )
-    ref = _ref_out(nt, x)
-    rel = ((y - ref).norm() / ref.norm()).item()
-    assert rel < 3e-3, f"NINT2 M{M} fp16 MMQ rel={rel}"
-
-
-def test_nint2_ffn_gate_up_swiglu_quant_matches_materialized():
-    torch.manual_seed(2192); np.random.seed(2192)
-    out, K = 64, 256
-    nt, g = _gpu_g(
-        (np.random.randn(out * 2, K).astype(np.float32)) * 0.05,
-        NintSpec(2, 16, 5),
-    )
-    x = (torch.randn(1, K, device=DEV) * 0.1).to(torch.float16)
-    gu_qx = torch.empty((1, int(g["ng"]) * 16), device=DEV, dtype=torch.int8)
-    gu_xscale = torch.empty((1, int(g["ng"])), device=DEV, dtype=torch.float32)
-    gu_xsum = torch.empty((1, int(g["ng"])), device=DEV, dtype=torch.int32)
-    down_ng = (out + 15) // 16
-    down_qx = torch.empty((1, down_ng * 16), device=DEV, dtype=torch.int8)
-    down_xscale = torch.empty((1, down_ng), device=DEV, dtype=torch.float32)
-    down_xsum = torch.empty((1, down_ng), device=DEV, dtype=torch.int32)
-    ext().nint_ffn_gate_up_swiglu_quant_ws_cuda(
-        g["q_packed"], g["sub_scale"], g["sub_min"],
-        g["neuron_scale"], g["neuron_min"], x,
-        16, 2, 16,
-        gu_qx, gu_xscale, gu_xsum,
-        down_qx, down_xscale, down_xsum,
-    )
-    gate_up = fused_matmul(g, x).float()
-    expected = F.silu(gate_up[:, :out]) * gate_up[:, out:]
-    actual = (
-        down_qx[:, :out].float().reshape(1, down_ng, 16)
-        * down_xscale[:, :, None]
-    ).reshape(1, out)
+    value = torch.randn(
+        rows, width, device=DEV, dtype=torch.float16
+    ).mul_(0.05)
+    actual = fused_matmul(packed, value)
+    expected = _ref_out(tensor, value)
     relative = ((actual - expected).norm() / expected.norm()).item()
-    assert relative < 0.02, f"NINT2 fused FFN quantization relative={relative}"
-
-
-@pytest.mark.parametrize("bits", [3, 4, 6])
-@pytest.mark.parametrize("M", [16, 23, 32])
-def test_nint_gs24_f16_mmq_matches_dequant(bits, M):
-    torch.manual_seed(170 + bits + M); np.random.seed(170 + bits + M)
-    out, K = 128, 280
-    nt, g = _gpu_g((np.random.randn(out, K).astype(np.float32)) * 0.05, NintSpec(bits, 24, 6))
-    x = (torch.randn(M, K, device=DEV) * 0.1).to(torch.float16)
-    if bits == 3:
-        y = ext().nint_mmq_gs24_f16_nint3_cuda(
-            g["q_packed"], g["sub_scale"], g["sub_min"],
-            g["neuron_scale"], g["neuron_min"], x,
-        )
-    elif bits == 4:
-        y = ext().nint_mmq_gs24_f16_nint4_cuda(
-            g["q_packed"], g["sub_scale"], g["sub_min"],
-            g["neuron_scale"], g["neuron_min"], x,
-        )
-    else:
-        partial = torch.empty((4, M, out), device=DEV, dtype=torch.float32)
-        y = ext().nint_mmq_gs24_f16_nint6_split4_ws_cuda(
-            g["q_packed"], g["sub_scale"], g["sub_min"],
-            g["neuron_scale"], g["neuron_min"], x, partial,
-        )
-    ref = _ref_out(nt, x)
-    rel = ((y - ref).norm() / ref.norm()).item()
-    assert rel < 3e-3, f"NINT{bits} M{M} fp16 MMQ rel={rel}"
-
-
-@pytest.mark.parametrize("bits", [3, 6])
-@pytest.mark.parametrize("M", [9, 16, 32, 64, 257, 512])
-def test_nint_gs24_group32_matches_dequant(bits, M):
-    torch.manual_seed(260 + bits + M); np.random.seed(260 + bits + M)
-    out, K = 128, 280
-    nt, g = _gpu_g(
-        (np.random.randn(out, K).astype(np.float32)) * 0.05,
-        NintSpec(bits, 24, 7 if bits == 6 else 5),
-    )
-    x = (torch.randn(M, K, device=DEV) * 0.1).to(torch.float16)
-    ng = int(g["ng"])
-    m_pad = ((M + 15) // 16) * 16
-    nchunks = (ng + 7) // 8
-    qx_mmq = torch.empty(nchunks * m_pad * 68, device=DEV, dtype=torch.int32)
-    xscale = torch.empty((M, ng), device=DEV, dtype=torch.float32)
-    xsum = torch.empty((M, ng), device=DEV, dtype=torch.int32)
-    partial = torch.empty((2, M, out), device=DEV, dtype=torch.float32)
-    y = ext().nint_mmq_gs24_group32_ws_cuda(
-        g["q_packed"], g["sub_scale"], g["sub_min"], g["neuron_scale"],
-        g["neuron_min"], x, qx_mmq, xscale, xsum, 2, partial,
-    )
-    ref = _ref_out(nt, x)
-    rel = ((y - ref).norm() / ref.norm()).item()
-    assert rel < 1e-2, f"NINT{bits} M{M} group32 rel={rel}"
-
-
-@pytest.mark.parametrize("M", [9, 64, 257])
-def test_nint3_production_dispatch_matches_dequant(M):
-    torch.manual_seed(310 + M)
-    np.random.seed(310 + M)
-    out, K = 1024, 280
-    nt, g = _gpu_g(
-        (np.random.randn(out, K).astype(np.float32)) * 0.05,
-        NintSpec(3, 24, 5),
-    )
-    x = (torch.randn(M, K, device=DEV) * 0.1).to(torch.float16)
-    y = fused_matmul(g, x)
-    ref = _ref_out(nt, x)
-    rel = ((y - ref).norm() / ref.norm()).item()
-    assert rel < 1e-2, f"NINT3 M{M} production rel={rel}"
-
-
-@pytest.mark.parametrize("M", [16, 23, 32, 64, 257, 512])
-def test_nint6_production_dispatch_matches_dequant(M):
-    torch.manual_seed(360 + M)
-    np.random.seed(360 + M)
-    out, K = 128, 280
-    nt, g = _gpu_g(
-        (np.random.randn(out, K).astype(np.float32)) * 0.05,
-        NintSpec(6, 24, 7),
-    )
-    x = (torch.randn(M, K, device=DEV) * 0.1).to(torch.float16)
-    y = fused_matmul(g, x)
-    ref = _ref_out(nt, x)
-    rel = ((y - ref).norm() / ref.norm()).item()
-    assert rel < 3e-3, f"NINT6 M{M} production rel={rel}"
-
-
-def test_nint6_int8_mmq_requires_explicit_opt_in(monkeypatch):
-    torch.manual_seed(366)
-    np.random.seed(366)
-    out, K, M = 1024, 280, 16
-    nt, g = _gpu_g(
-        (np.random.randn(out, K).astype(np.float32)) * 0.05,
-        NintSpec(6, 24, 7),
-    )
-    x = (torch.randn(M, K, device=DEV) * 0.1).to(torch.float16)
-
-    monkeypatch.delenv("MFQ_NINT6_MMQ", raising=False)
-    default = fused_matmul(g, x)
-    assert "_group32_workspace" not in g
-
-    monkeypatch.setenv("MFQ_NINT6_MMQ", "int8")
-    explicit = fused_matmul(g, x)
-    assert "_group32_workspace" in g
-
-    ref = _ref_out(nt, x)
-    default_rel = ((default - ref).norm() / ref.norm()).item()
-    explicit_rel = ((explicit - ref).norm() / ref.norm()).item()
-    assert default_rel < 3e-3
-    assert explicit_rel < 1e-2
-
-
-def test_nint_fused_large_shape():
-    """Use a larger FFN-scale slice to check multiple blocks and the absence of NaNs."""
-    torch.manual_seed(4); np.random.seed(4)
-    out, K, M = 512, 768, 64
-    W = (np.random.randn(out, K).astype(np.float32)) * 0.05
-    nt, g = _gpu_g(W, NintSpec(4, 24, 6))
-    x = torch.randn(M, K, device=DEV) * 0.1
-    y_fused = fused_matmul(g, x)
-    y_ref = _ref_out(nt, x)
-    assert torch.isfinite(y_fused).all()
-    rel = ((y_fused - y_ref).norm() / y_ref.norm()).item()
-    assert rel < 2e-2, f"large rel={rel}"
+    assert relative < 3e-2
+    assert torch.isfinite(actual).all()
 
 
 # ---------------------------------------------------------------------------
-# Standard-operator CUDA kernels (compared against built-in torch implementations)
+# Standard-operator CUDA kernels
 # ---------------------------------------------------------------------------
 def test_rms_norm_cuda():
     torch.manual_seed(0)
@@ -1617,120 +948,3 @@ def test_gelu_mul_saturates_f16_overflow_without_nonfinite_values():
     )
     assert torch.isfinite(actual).all()
     torch.testing.assert_close(actual, expected, atol=0.0, rtol=0.0)
-
-
-@pytest.mark.parametrize(
-    "spec",
-    [NintSpec(3, 24, 5), NintSpec(4, 24, 6), NintSpec(6, 24, 6)],
-)
-def test_nint_fused_geglu_matches_materialized_quantized_projections(spec):
-    torch.manual_seed(75 + spec.bits)
-    np.random.seed(75 + spec.bits)
-    width, kdim = 96, 193
-    weights = np.random.randn(2 * width, kdim).astype(np.float32) * 0.04
-    nt = nint_quantize(weights, spec, axis=0)
-    g = to_gpu(nt)
-    x = torch.randn(1, kdim, device=DEV, dtype=torch.float16)
-    qx, xscale, xsum = _workspace(g, x)
-    args = (
-        g["q_packed"], g["sub_scale"], g["sub_min"],
-        g["neuron_scale"], g["neuron_min"], x, int(g["gs"]),
-    )
-    if spec.bits == 4:
-        pair = ext().nint_gemv_packed_ws_cuda(*args, qx, xscale, xsum)
-        actual = ext().nint_gemv_packed_geglu_ws_cuda(*args, qx, xscale, xsum)
-    else:
-        pair = ext().nint_gemv_packed_bits_ws_cuda(
-            *args, spec.bits, qx, xscale, xsum
-        )
-        actual = ext().nint_gemv_packed_bits_geglu_ws_cuda(
-            *args, spec.bits, qx, xscale, xsum
-        )
-    gate, up = pair.chunk(2, dim=-1)
-    expected = (F.gelu(gate.float(), approximate="tanh") * up.float()).half()
-    torch.testing.assert_close(actual, expected, atol=1e-3, rtol=1e-3)
-
-
-_PACKED_BITS_GLU_SPECS = [
-    NintSpec(3, 24, 5),
-    *[
-    NintSpec(bits, gs, 6 if bits < 8 else 7)
-    for bits in (5, 6, 8)
-    for gs in (16, 20, 22, 24, 26, 28, 30, 32, 34, 36, 40, 48, 64)
-    ],
-]
-
-
-@pytest.mark.parametrize("spec", _PACKED_BITS_GLU_SPECS)
-def test_packed_bits_combined_glu_matches_two_warp_path(spec):
-    seed = 91 + spec.bits * 100 + spec.groupsize
-    torch.manual_seed(seed)
-    np.random.seed(seed)
-    hidden, width = spec.groupsize * 2 + 7, 64
-    gate_up_np = np.random.randn(2 * width, hidden).astype(np.float32) * 0.04
-    _, gate_up = _gpu_g(gate_up_np, spec)
-    x = torch.randn(1, hidden, device=DEV, dtype=torch.float16)
-    gu_qx, gu_xscale, gu_xsum = _workspace(gate_up, x)
-
-    combined_key = "MFQ_NINT_GLU_COMBINED"
-    previous_combined = os.environ.get(combined_key)
-    try:
-        os.environ[combined_key] = "0"
-        refs = [
-            fn(
-                gate_up["q_packed"], gate_up["sub_scale"], gate_up["sub_min"],
-                gate_up["neuron_scale"], gate_up["neuron_min"], x,
-                int(gate_up["gs"]), int(gate_up["bits"]),
-                gu_qx, gu_xscale, gu_xsum,
-            )
-            for fn in (
-                ext().nint_gemv_packed_bits_swiglu_ws_cuda,
-                ext().nint_gemv_packed_bits_geglu_ws_cuda,
-            )
-        ]
-        os.environ[combined_key] = "1"
-        actuals = [
-            fn(
-                gate_up["q_packed"], gate_up["sub_scale"], gate_up["sub_min"],
-                gate_up["neuron_scale"], gate_up["neuron_min"], x,
-                int(gate_up["gs"]), int(gate_up["bits"]),
-                gu_qx, gu_xscale, gu_xsum,
-            )
-            for fn in (
-                ext().nint_gemv_packed_bits_swiglu_ws_cuda,
-                ext().nint_gemv_packed_bits_geglu_ws_cuda,
-            )
-        ]
-    finally:
-        if previous_combined is None:
-            os.environ.pop(combined_key, None)
-        else:
-            os.environ[combined_key] = previous_combined
-    for actual, expected in zip(actuals, refs):
-        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
-
-
-@pytest.mark.parametrize("gs", [16, 24, 32, 48])
-def test_nint4_glu_supports_silu_and_gelu_for_all_runtime_groupsizes(gs):
-    seed = 700 + gs
-    torch.manual_seed(seed)
-    np.random.seed(seed)
-    spec = NintSpec(4, gs, 6)
-    hidden, width = gs * 2 + 7, 64
-    weights = np.random.randn(2 * width, hidden).astype(np.float32) * 0.04
-    nt = nint_quantize(weights, spec, axis=0)
-    g = to_gpu(nt)
-    x = torch.randn(1, hidden, device=DEV, dtype=torch.float16)
-    qx, xscale, xsum = _workspace(g, x)
-    args = (
-        g["q_packed"], g["sub_scale"], g["sub_min"],
-        g["neuron_scale"], g["neuron_min"], x, int(g["gs"]),
-    )
-    pair = ext().nint_gemv_packed_ws_cuda(*args, qx, xscale, xsum)
-    gate, up = pair.chunk(2, dim=-1)
-    expected_silu = (F.silu(gate.float()) * up.float()).half()
-    expected_gelu = (F.gelu(gate.float(), approximate="tanh") * up.float()).half()
-    actual_silu = ext().nint_gemv_packed_swiglu_ws_cuda(*args, qx, xscale, xsum)
-    actual_gelu = ext().nint_gemv_packed_geglu_ws_cuda(*args, qx, xscale, xsum)
-    torch.testing.assert_close(actual_silu, expected_silu, atol=1e-3, rtol=1e-3)
-    torch.testing.assert_close(actual_gelu, expected_gelu, atol=1e-3, rtol=1e-3)

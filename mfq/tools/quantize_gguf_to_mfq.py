@@ -289,7 +289,14 @@ _JSC_DTYPES = {
 _SPLIT_EXPERT_RE = re.compile(r"^(blk\.\d+)\.ffn_(gate|up)_exps\.weight$")
 _BLOCK_TENSOR_RE = re.compile(r"^blk\.(\d+)\.")
 _IMATRIX_OPTIONAL_TENSORS = {"token_embd.weight", "output.weight"}
-_IMATRIX_NINT_DTYPES = {"NINT2", "NINT3", "NINT4", "NINT5", "NINT6"}
+_IMATRIX_NINT_DTYPES = {
+    "NINT",
+    "NINT2",
+    "NINT3",
+    "NINT4",
+    "NINT5",
+    "NINT6",
+}
 _TENSOR_OVERRIDE_DTYPES = {
     "F16",
     "F32",
@@ -368,7 +375,7 @@ def _bind_imatrix(
             item.target_dtype.startswith("NVQ")
             or item.target_dtype in _IMATRIX_NINT_DTYPES
             or (
-                item.target_dtype == "NINTM"
+                item.target_dtype == "MFE"
                 and item.expert_precisions is not None
                 and any(
                     precision.family in _IMATRIX_NINT_DTYPES
@@ -723,7 +730,7 @@ def _apply_expert_scheme(
         result.append(
             replace(
                 item,
-                target_dtype="NINTM",
+                target_dtype="MFE",
                 expert_shape=expected,
                 expert_precisions=selection.precisions,
             )
@@ -1682,9 +1689,9 @@ def _estimate_blob_bytes(
     expert_artifact_root: str | Path | None = None,
 ) -> int:
     n = math.prod(item.storage_shape)
-    if item.target_dtype == "NINTM":
+    if item.target_dtype == "MFE":
         if item.expert_shape is None or item.expert_precisions is None:
-            raise ValueError(f"NINTM plan lacks expert metadata: {item.name}")
+            raise ValueError(f"MFE plan lacks expert metadata: {item.name}")
         return _mixed_moe_blob_nbytes(
             item.expert_shape,
             item.expert_precisions,
@@ -2541,9 +2548,9 @@ def convert(args: argparse.Namespace) -> None:
                 )
                 continue
             source_tensor = source_by_name[item.source_name]
-            if item.target_dtype == "NINTM":
+            if item.target_dtype == "MFE":
                 if item.expert_shape is None or item.expert_precisions is None:
-                    raise ValueError(f"NINTM plan lacks expert metadata: {item.name}")
+                    raise ValueError(f"MFE plan lacks expert metadata: {item.name}")
                 row_source = GgufRowSource(source_tensor, item, dequantize)
                 imatrix_binding = imatrix_bindings.get(item.name)
                 expert_importance = None
@@ -2782,7 +2789,7 @@ def convert(args: argparse.Namespace) -> None:
                 ),
                 flush=True,
             )
-            if item.target_dtype == "NINTM":
+            if item.target_dtype == "MFE":
                 _trim_windows_working_set()
 
         architecture, architecture_metadata = _architecture_metadata(source_reader)

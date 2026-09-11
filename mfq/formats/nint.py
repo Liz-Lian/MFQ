@@ -24,9 +24,10 @@ from dataclasses import dataclass
 
 import numpy as np
 
-NINT_V2_FLAG = 0x80
-NINT_V2_K_SELECTOR_BITS = 2
-NINT_V2_Q_SELECTOR_BITS = 3
+NINT_FORMAT_VERSION = 2
+NINT_ADAPTIVE_FLAG = 0x80
+NINT_K_SELECTOR_BITS = 2
+NINT_Q_SELECTOR_BITS = 3
 
 
 @dataclass(frozen=True)
@@ -54,9 +55,9 @@ class NintSpec:
         return self.bits + 32.0 / neuron_len + 2.0 * self.sub_bits / self.groupsize
 
     @property
-    def profile_label(self) -> str:
-        """Profile label for kernel dispatch, such as ``NINT4-24``; includes bits/gs but not k."""
-        return profile_label(self.bits, self.groupsize)
+    def uniform_template_label(self) -> str:
+        """Human-readable uniform preset label; never a runtime dtype."""
+        return uniform_template_label(self.bits, self.groupsize)
 
 
 @dataclass
@@ -72,46 +73,50 @@ class NintTensor:
     sub_scale: np.ndarray       # (out, ng) uint
     sub_min: np.ndarray         # (out, ng) uint
     neuron_len: int             # Valid length of each neuron, excluding padding
-    row_sub_bits: np.ndarray | None = None  # (out,) uint8; None means spec.sub_bits for every row
-    row_q_bits: np.ndarray | None = None    # (out,) uint8; None means spec.bits for every row
+    row_sub_bits: np.ndarray | None = None
+    row_q_bits: np.ndarray | None = None
+
+    def __post_init__(self) -> None:
+        """Canonicalize every tensor to the NINT format-v2 in-memory contract.
+
+        Legacy payloads omit the two selector vectors.  Their compatibility
+        reader supplies ``None`` and this boundary expands them to the uniform
+        preset represented by ``spec``.  Quantizers and runtimes therefore do
+        not carry a second NINTv1 object model.
+        """
+
+        rows = int(np.asarray(self.q).shape[0])
+        self.row_q_bits = normalize_row_q_bits(self.spec, self.row_q_bits, rows)
+        self.row_sub_bits = normalize_row_sub_bits(
+            self.spec, self.row_sub_bits, rows
+        )
+
+    @property
+    def format_version(self) -> int:
+        return NINT_FORMAT_VERSION
 
     @property
     def has_mixed_sub_bits(self) -> bool:
-        if self.row_sub_bits is None:
-            return False
         values = np.asarray(self.row_sub_bits).reshape(-1)
         return bool(np.any(values != int(self.spec.sub_bits)))
 
     @property
     def mean_sub_bits(self) -> float:
-        if self.row_sub_bits is None:
-            return float(self.spec.sub_bits)
         return float(np.asarray(self.row_sub_bits, dtype=np.float64).mean())
 
     @property
     def has_mixed_q_bits(self) -> bool:
-        if self.row_q_bits is None:
-            return False
         values = np.asarray(self.row_q_bits).reshape(-1)
         return bool(np.any(values != int(self.spec.bits)))
 
     @property
     def mean_q_bits(self) -> float:
-        if self.row_q_bits is None:
-            return float(self.spec.bits)
         return float(np.asarray(self.row_q_bits, dtype=np.float64).mean())
-
-    @property
-    def is_nint_v2(self) -> bool:
-        return self.row_q_bits is not None or self.row_sub_bits is not None
 
     def bpw(self) -> float:
         selector_bits = (
-            (NINT_V2_K_SELECTOR_BITS + NINT_V2_Q_SELECTOR_BITS)
-            / float(self.neuron_len)
-            if self.is_nint_v2
-            else 0.0
-        )
+            NINT_K_SELECTOR_BITS + NINT_Q_SELECTOR_BITS
+        ) / float(self.neuron_len)
         return (
             self.mean_q_bits
             + 32.0 / float(self.neuron_len)
@@ -148,7 +153,7 @@ def normalize_row_sub_bits(
     row_sub_bits: np.ndarray | None,
     rows: int,
 ) -> np.ndarray:
-    """Return validated per-neuron metadata widths for the NINTv2 selector range."""
+    """Return validated per-neuron metadata widths for the NINT selector range."""
 
     nominal = int(spec.sub_bits)
     if not 1 <= nominal <= 8:
@@ -164,9 +169,9 @@ def normalize_row_sub_bits(
     if np.any(values < 1) or np.any(values > 8):
         raise ValueError("NINT row_sub_bits values must be in [1, 8]")
     selector = values - (nominal - 1)
-    if np.any(selector < 0) or np.any(selector >= (1 << NINT_V2_K_SELECTOR_BITS)):
+    if np.any(selector < 0) or np.any(selector >= (1 << NINT_K_SELECTOR_BITS)):
         raise ValueError(
-            "NINTv2 row_sub_bits must lie in "
+            "NINT row_sub_bits must lie in "
             f"[{nominal - 1}, {nominal + 2}] for nominal sub_bits={nominal}"
         )
     return values.astype(np.uint8)
@@ -178,9 +183,9 @@ def normalize_row_sub_bits(
 NINT2_SPEC = NintSpec(bits=2, groupsize=16, sub_bits=5)
 
 
-# Fixed profile catalog: (bits, groupsize). k is free (baked into neuron_scale and invisible to the kernel).
-# Runtime kernels dispatch by profile, with one kernel variant per (bits, gs).
-PROFILE_CATALOG: tuple[tuple[int, int], ...] = (
+# Uniform template catalog.  These are search seeds and presets only: all
+# entries use the same row-metadata runtime kernel.
+UNIFORM_TEMPLATE_CATALOG: tuple[tuple[int, int], ...] = (
     (2, 16),
     *((4, gs) for gs in (16, 24, 32, 48, 64)),
     *((5, gs) for gs in (16, 24, 32, 48, 64)),
@@ -189,7 +194,7 @@ PROFILE_CATALOG: tuple[tuple[int, int], ...] = (
     (3, 24),
 )
 
-RUNTIME_PROFILE_CATALOG: tuple[tuple[int, int], ...] = (
+RUNTIME_UNIFORM_TEMPLATE_CATALOG: tuple[tuple[int, int], ...] = (
     (2, 16),
     (4, 16),
     (4, 24),
@@ -202,8 +207,8 @@ RUNTIME_PROFILE_CATALOG: tuple[tuple[int, int], ...] = (
 )
 
 
-def profile_label(bits: int, groupsize: int) -> str:
-    """Return a profile label such as ``NINT4-24``."""
+def uniform_template_label(bits: int, groupsize: int) -> str:
+    """Return a uniform-template label such as ``NINT4-24``."""
     return f"NINT{bits}-{groupsize}"
 
 

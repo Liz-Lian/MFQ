@@ -45,7 +45,7 @@ for trial in 1 2 3; do
         -u MFQ_METAL_PROFILE_COMPONENTS \
         NO_PROXY='*' \
         no_proxy='*' \
-        MFQ_METAL_NINTM_PREFILL_NAX="$nax" \
+        MFQ_METAL_MFE_PREFILL_NAX="$nax" \
         "$runner" \
         "$model_dir" \
         73728 \

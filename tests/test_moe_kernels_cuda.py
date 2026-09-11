@@ -149,7 +149,7 @@ def test_moe_route_plan_builds_fine_coarse_and_wide_maps():
         )
 
 
-def _legacy_grouped(weight, x: torch.Tensor, route: MoeRoutePlan) -> torch.Tensor:
+def _canonical_grouped(weight, x: torch.Tensor, route: MoeRoutePlan) -> torch.Tensor:
     out = torch.empty(
         (route.tokens, route.routes, weight.out_per_expert),
         device=x.device,
@@ -165,8 +165,10 @@ def _legacy_grouped(weight, x: torch.Tensor, route: MoeRoutePlan) -> torch.Tenso
         qx, xscale = weight.activation_workspace(
             x, gs=gs, groups=groups, input_rows=input_rows
         )
-        ext().nint_moe_grouped_matmul_pool_ws_cuda(
+        ext().mfe_nint_matmul_ws_cuda(
             packed["q_packed"],
+            packed["row_q_bits"],
+            packed["row_q_bit_offsets"],
             packed["sub_scale"],
             packed["sub_min"],
             packed["neuron_scale"],
@@ -178,18 +180,10 @@ def _legacy_grouped(weight, x: torch.Tensor, route: MoeRoutePlan) -> torch.Tenso
             len(pool.expert_ids),
             weight.out_per_expert,
             gs,
-            int(packed.get("bits", 4)),
-            route.map_ready,
             key in quantized,
             out,
             qx,
             xscale,
-            route.counts,
-            route.cursors,
-            route.ids_dst,
-            route.expert_bounds,
-            route.tile_bounds,
-            route.tile_experts,
         )
         quantized.add(key)
     return out
@@ -221,16 +215,40 @@ def test_expertwise_nint_grouped_down_input_matches_reference():
     assert relative < 0.025, f"relative={relative}"
 
 
+def test_expertwise_nint_large_routed_tensor_matches_reference():
+    torch.manual_seed(145)
+    tensor, weight = _mixed_weight(
+        145,
+        experts=11,
+        out=257,
+        k=1025,
+    )
+    tokens, routes = 33, 4
+    x = torch.randn(
+        tokens,
+        routes,
+        tensor.neuron_len,
+        device="cuda",
+        dtype=torch.float16,
+    ) * 0.1
+    ids = _ids(tokens, tensor.n_experts, routes)
+    route = MoeRoutePlan.build(ids, tensor.n_experts)
+    actual = grouped_matmul(weight, x, route)
+    expected = _reference(tensor, x, ids)
+    relative = ((actual - expected).float().norm() / expected.float().norm()).item()
+    assert relative < 0.025, f"relative={relative}"
+
+
 @pytest.mark.parametrize("tokens", [1, 2])
-def test_expertwise_nint_heterogeneous_launch_matches_legacy(tokens):
+def test_expertwise_nint_uses_the_canonical_launch(tokens):
     torch.manual_seed(140 + tokens)
     tensor, weight = _mixed_weight(tokens, experts=8, out=17, k=97)
     ids = _ids(tokens, tensor.n_experts, 3)
     route = MoeRoutePlan.build(ids, tensor.n_experts)
     x = torch.randn(tokens, tensor.neuron_len, device="cuda", dtype=torch.float16) * 0.1
     actual = grouped_matmul(weight, x, route)
-    legacy = _legacy_grouped(weight, x, route)
-    torch.testing.assert_close(actual, legacy, rtol=0, atol=0)
+    canonical = _canonical_grouped(weight, x, route)
+    torch.testing.assert_close(actual, canonical, rtol=0, atol=0)
 
 
 def test_moe_topk_softmax_matches_torch():
@@ -365,152 +383,3 @@ def test_moe_reduce_shared_gate_is_bit_exact_to_two_kernels():
     actual = weighted_reduce_shared_gate(pair, weights, shared, gate)
     expected = add_shared_gate(weighted_reduce(pair, weights), shared, gate)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-
-
-def test_moe_dual_group_quantization_is_bit_exact():
-    torch.manual_seed(770)
-    rows, width = 8, 2048
-    x = torch.randn(rows, width, device="cuda", dtype=torch.float16)
-    groups24 = (width + 23) // 24
-    groups28 = (width + 27) // 28
-    expected_qx24 = torch.empty((rows, groups24 * 24), device="cuda", dtype=torch.int8)
-    expected_scale24 = torch.empty((rows, groups24), device="cuda", dtype=torch.float32)
-    expected_qx28 = torch.empty((rows, groups28 * 28), device="cuda", dtype=torch.int8)
-    expected_scale28 = torch.empty((rows, groups28), device="cuda", dtype=torch.float32)
-    ext().nint_moe_quantize_input_ws_cuda(x, 24, expected_qx24, expected_scale24)
-    ext().nint_moe_quantize_input_ws_cuda(x, 28, expected_qx28, expected_scale28)
-
-    actual_qx24 = torch.empty_like(expected_qx24)
-    actual_scale24 = torch.empty_like(expected_scale24)
-    actual_qx28 = torch.empty_like(expected_qx28)
-    actual_scale28 = torch.empty_like(expected_scale28)
-    ext().nint_moe_quantize_24_28_ws_cuda(
-        x, actual_qx24, actual_scale24, actual_qx28, actual_scale28
-    )
-
-    torch.testing.assert_close(actual_qx24, expected_qx24, rtol=0, atol=0)
-    torch.testing.assert_close(actual_scale24, expected_scale24, rtol=0, atol=0)
-    torch.testing.assert_close(actual_qx28, expected_qx28, rtol=0, atol=0)
-    torch.testing.assert_close(actual_scale28, expected_scale28, rtol=0, atol=0)
-
-
-def _multi_quant_metadata(outputs, geometries):
-    pointers = torch.tensor(
-        [[qx.data_ptr(), xscale.data_ptr()] for qx, xscale in outputs],
-        device="cuda",
-        dtype=torch.int64,
-    )
-    params = torch.tensor(
-        [[groups, gs] for groups, gs in geometries],
-        device="cuda",
-        dtype=torch.int32,
-    )
-    plan = torch.tensor(
-        [
-            [geometry, group]
-            for geometry, (groups, _) in enumerate(geometries)
-            for group in range(groups)
-        ],
-        device="cuda",
-        dtype=torch.int32,
-    )
-    return pointers, params, plan
-
-
-def test_moe_multi_group_quantization_is_bit_exact():
-    torch.manual_seed(771)
-    rows, width = 7, 2051
-    x = torch.randn(rows, width, device="cuda", dtype=torch.float16)
-    geometries = tuple(((width + gs - 1) // gs, gs) for gs in (16, 24, 28, 48))
-    expected = []
-    actual = []
-    for groups, gs in geometries:
-        expected_qx = torch.empty((rows, groups * gs), device="cuda", dtype=torch.int8)
-        expected_scale = torch.empty((rows, groups), device="cuda", dtype=torch.float32)
-        ext().nint_moe_quantize_input_ws_cuda(
-            x, gs, expected_qx, expected_scale
-        )
-        expected.append((expected_qx, expected_scale))
-        actual.append((torch.empty_like(expected_qx), torch.empty_like(expected_scale)))
-    pointers, params, plan = _multi_quant_metadata(actual, geometries)
-    ext().nint_moe_quantize_multi_ws_cuda(x, pointers, params, plan)
-    for actual_pair, expected_pair in zip(actual, expected, strict=True):
-        torch.testing.assert_close(actual_pair[0], expected_pair[0], rtol=0, atol=0)
-        torch.testing.assert_close(actual_pair[1], expected_pair[1], rtol=0, atol=0)
-
-
-@pytest.mark.parametrize("activation", ["swiglu", "geglu"])
-def test_moe_gs16_glu_quantization_is_bit_exact(activation):
-    torch.manual_seed(2161 if activation == "swiglu" else 2162)
-    rows, width = 7, 257
-    gate_up = torch.randn(1, rows, 2 * width, device="cuda", dtype=torch.float16)
-    hidden = swiglu_split(gate_up) if activation == "swiglu" else geglu_split(gate_up)
-    groups = (width + 15) // 16
-    expected_qx = torch.empty((rows, groups * 16), device="cuda", dtype=torch.int8)
-    expected_scale = torch.empty((rows, groups), device="cuda", dtype=torch.float32)
-    actual_qx = torch.empty_like(expected_qx)
-    actual_scale = torch.empty_like(expected_scale)
-    ext().nint_moe_quantize_input_ws_cuda(hidden, 16, expected_qx, expected_scale)
-    fn = (
-        ext().nint_moe_quantize_swiglu_input_ws_cuda
-        if activation == "swiglu"
-        else ext().nint_moe_quantize_geglu_input_ws_cuda
-    )
-    fn(gate_up, 16, actual_qx, actual_scale)
-    torch.testing.assert_close(actual_qx, expected_qx, rtol=0, atol=0)
-    torch.testing.assert_close(actual_scale, expected_scale, rtol=0, atol=0)
-
-
-@pytest.mark.parametrize("activation", ["swiglu", "geglu"])
-def test_moe_multi_group_glu_quantization_is_bit_exact(activation):
-    torch.manual_seed(772 if activation == "swiglu" else 773)
-    rows, width = 7, 513
-    gate_up = torch.randn(1, rows, 2 * width, device="cuda", dtype=torch.float16)
-    hidden = swiglu_split(gate_up) if activation == "swiglu" else geglu_split(gate_up)
-    geometries = tuple(((width + gs - 1) // gs, gs) for gs in (16, 24, 28, 48))
-    expected = []
-    actual = []
-    for groups, gs in geometries:
-        expected_qx = torch.empty((rows, groups * gs), device="cuda", dtype=torch.int8)
-        expected_scale = torch.empty((rows, groups), device="cuda", dtype=torch.float32)
-        ext().nint_moe_quantize_input_ws_cuda(
-            hidden, gs, expected_qx, expected_scale
-        )
-        expected.append((expected_qx, expected_scale))
-        actual.append((torch.empty_like(expected_qx), torch.empty_like(expected_scale)))
-    pointers, params, plan = _multi_quant_metadata(actual, geometries)
-    ext().nint_moe_quantize_glu_multi_ws_cuda(
-        gate_up, pointers, params, plan, activation == "geglu"
-    )
-    for actual_pair, expected_pair in zip(actual, expected, strict=True):
-        torch.testing.assert_close(actual_pair[0], expected_pair[0], rtol=0, atol=0)
-        torch.testing.assert_close(actual_pair[1], expected_pair[1], rtol=0, atol=0)
-
-
-def test_moe_swiglu_dual_group_quantization_is_bit_exact():
-    torch.manual_seed(77)
-    rows, width = 8, 512
-    gate_up = torch.randn(1, rows, 2 * width, device="cuda", dtype=torch.float16)
-    hidden = swiglu_split(gate_up)
-
-    groups24 = (width + 23) // 24
-    groups28 = (width + 27) // 28
-    expected_qx24 = torch.empty((rows, groups24 * 24), device="cuda", dtype=torch.int8)
-    expected_scale24 = torch.empty((rows, groups24), device="cuda", dtype=torch.float32)
-    expected_qx28 = torch.empty((rows, groups28 * 28), device="cuda", dtype=torch.int8)
-    expected_scale28 = torch.empty((rows, groups28), device="cuda", dtype=torch.float32)
-    ext().nint_moe_quantize_input_ws_cuda(hidden, 24, expected_qx24, expected_scale24)
-    ext().nint_moe_quantize_input_ws_cuda(hidden, 28, expected_qx28, expected_scale28)
-
-    actual_qx24 = torch.empty_like(expected_qx24)
-    actual_scale24 = torch.empty_like(expected_scale24)
-    actual_qx28 = torch.empty_like(expected_qx28)
-    actual_scale28 = torch.empty_like(expected_scale28)
-    ext().nint_moe_quantize_swiglu_24_28_ws_cuda(
-        gate_up, actual_qx24, actual_scale24, actual_qx28, actual_scale28
-    )
-
-    torch.testing.assert_close(actual_qx24, expected_qx24, rtol=0, atol=0)
-    torch.testing.assert_close(actual_scale24, expected_scale24, rtol=0, atol=0)
-    torch.testing.assert_close(actual_qx28, expected_qx28, rtol=0, atol=0)
-    torch.testing.assert_close(actual_scale28, expected_scale28, rtol=0, atol=0)

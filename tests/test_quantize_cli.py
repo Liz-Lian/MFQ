@@ -83,6 +83,28 @@ def test_quantize_routes_metal_backend(tmp_path: Path, monkeypatch) -> None:
     assert captured[0].staged_blobs is False
 
 
+def test_quantize_routes_data_free_nint_v2(tmp_path: Path, monkeypatch) -> None:
+    source = _hf_source(tmp_path)
+    captured: list[argparse.Namespace] = []
+    monkeypatch.setattr(
+        "mfq.tools.quantize_hf_to_mfq.convert", captured.append
+    )
+
+    assert (
+        cli.main(
+            [
+                "quantize",
+                str(source),
+                str(tmp_path / "model.mfq"),
+                "--nint-data-free",
+                "--dry-run",
+            ]
+        )
+        == 0
+    )
+    assert captured[0].nint_data_free is True
+
+
 def test_quantize_routes_incremental_mtp_base(tmp_path: Path, monkeypatch) -> None:
     source = _hf_source(tmp_path)
     base = tmp_path / "base.mfq"

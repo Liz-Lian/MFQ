@@ -12,7 +12,7 @@ except RuntimeError:
     pytest.skip("Metal device unavailable", allow_module_level=True)
 
 from mfq.formats.tpq import TPQ_X, TpqPqTensor  # noqa: E402
-from mfq.formats.moe import NintMoePool, NintMoeTensor  # noqa: E402
+from mfq.formats.mfe import MfePool, MfeTensor  # noqa: E402
 from mfq.runtime.mlx_kimi_k3 import (  # noqa: E402
     MlxKimiK3,
     MlxKimiK3Config,
@@ -269,7 +269,7 @@ def _pq_pool(
     expert_ids: np.ndarray,
     rows_per_expert: int,
     columns: int,
-) -> tuple[NintMoePool, np.ndarray]:
+) -> tuple[MfePool, np.ndarray]:
     rows = int(expert_ids.size) * rows_per_expert
     codebook = rng.normal(
         0.0,
@@ -291,7 +291,7 @@ def _pq_pool(
         codebook=codebook,
     )
     return (
-        NintMoePool(expert_ids=expert_ids, tensor=tensor),
+        MfePool(expert_ids=expert_ids, tensor=tensor),
         codebook[indices].reshape(rows, columns),
     )
 
@@ -325,11 +325,11 @@ def test_kimi_routed_situ_executes_tpq_experts_directly():
         routed,
         intermediate,
     )
-    gate_up = NintMoeTensor(
+    gate_up = MfeTensor(
         shape=(experts, 2 * intermediate, routed),
         pools=(gu_a, gu_b),
     )
-    down = NintMoeTensor(
+    down = MfeTensor(
         shape=(experts, routed, intermediate),
         pools=(down_a, down_b),
     )

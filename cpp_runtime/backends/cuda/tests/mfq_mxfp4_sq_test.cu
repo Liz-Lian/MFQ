@@ -153,6 +153,59 @@ void check_fixture(const std::filesystem::path& path, int& matmuls,
             }
         }
     }
+    if (q.outputs == 33 && q.width == 96) {
+        constexpr int tokens = 2;
+        constexpr int routes = 4;
+        constexpr int n_experts = 5;
+        constexpr int local_experts = 3;
+        constexpr int out_per_expert = 11;
+        const std::vector<std::int32_t> ids{0, 1, 2, 3, 4, -1, 3, 0};
+        const std::vector<std::int32_t> local{2, -1, 0, 1, -1};
+        std::vector<float> values(std::size_t(tokens) * q.width);
+        for (std::size_t i = 0; i < values.size(); ++i)
+            values[i] = float(int((i * 19 + 5) % 41) - 20) / 64;
+        auto x = from_blob(
+            values.data(), {tokens, q.width},
+            TensorOptions{}.dtype(kFloat32)).to(gpu).to(kFloat16);
+        auto route_ids = from_blob(
+            const_cast<std::int32_t*>(ids.data()), {tokens, routes},
+            TensorOptions{}.dtype(kInt32)).to(gpu);
+        auto expert_local = from_blob(
+            const_cast<std::int32_t*>(local.data()), {n_experts},
+            TensorOptions{}.dtype(kInt32)).to(gpu);
+        auto output = zeros(
+            {tokens, routes, out_per_expert},
+            TensorOptions{}.device(gpu).dtype(kFloat16));
+        mxfp4_sq_moe_matmul_cuda(
+            blob, x, route_ids, expert_local, q.bits,
+            n_experts, local_experts, out_per_expert,
+            q.width, q.base, output);
+        const auto host = output.to(kCPU, kFloat32).contiguous();
+        for (int token = 0; token < tokens; ++token) {
+            for (int route = 0; route < routes; ++route) {
+                const int expert = ids[token * routes + route];
+                const int local_expert = expert >= 0 && expert < n_experts
+                    ? local[static_cast<std::size_t>(expert)] : -1;
+                for (int row = 0; row < out_per_expert; ++row) {
+                    double sum = 0.0;
+                    if (local_expert >= 0) {
+                        for (int k = 0; k < q.width; ++k) {
+                            sum += double(values[token * q.width + k]) *
+                                expected[(local_expert * out_per_expert + row)
+                                    * q.width + k];
+                        }
+                    }
+                    const float actual = host.data_ptr<float>()[
+                        (token * routes + route) * out_per_expert + row];
+                    if (!std::isfinite(actual) ||
+                            std::abs(actual - sum) > .02 + .006 * std::abs(sum)) {
+                        throw std::runtime_error(
+                            "SQ routed shared-kernel mismatch");
+                    }
+                }
+            }
+        }
+    }
 }
 } // namespace
 

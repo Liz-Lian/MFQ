@@ -21,6 +21,15 @@ public:
     mlx::core::array matmul_add(
         const mlx::core::array& input,
         const mlx::core::array& residual) const;
+    // Routed MFE projection over this packed expert cohort.  This is another
+    // invocation mode of the ordinary NINT matmul kernel, not a separate MoE
+    // decoder. expert_map maps global expert IDs to cohort-local rows and -1
+    // for experts owned by another MFE cohort.
+    mlx::core::array routed_matmul(
+        const mlx::core::array& input,
+        const mlx::core::array& expert_ids,
+        const mlx::core::array& expert_map,
+        int out_per_expert) const;
     // Decode-only fast path for a single FP16 row. Supported layouts compute
     // the LM-head projection and greedy argmax without materializing logits.
     std::optional<mlx::core::array> greedy_argmax(
@@ -37,8 +46,8 @@ public:
         mlx::core::Dtype dtype = mlx::core::float16) const;
     // O-LoRA-style grouped projection:
     // [..., M, G, K] x [G * O, K] -> [..., M, G, O].
-    // Returns nullopt when the packed layout or geometry should use the
-    // established exact fallback in MlxLinear.
+    // Reuses the routed mode of the same metadata-driven NINT matmul kernel;
+    // the optional return type is retained for the packed-linear interface.
     std::optional<mlx::core::array> grouped_row_matmul(
         const mlx::core::array& input,
         int group_count) const;
@@ -77,17 +86,14 @@ public:
     const mlx::core::array& neuron_mins() const noexcept {
         return neuron_min_;
     }
-    bool q5_execution_layout() const noexcept {
-        return q5_execution_layout_;
+    const mlx::core::array& row_q_layout() const noexcept {
+        return row_q_layout_;
     }
-    bool is_nint_v2() const noexcept {
-        return row_q_bits_.has_value();
+    const mlx::core::array& row_q_byte_offsets() const noexcept {
+        return row_q_byte_offsets_;
     }
-    const mlx::core::array& row_q_bits() const {
-        return row_q_bits_.value();
-    }
-    const mlx::core::array& row_q_bit_offsets() const {
-        return row_q_bit_offsets_.value();
+    bool has_uniform_q_bits() const noexcept {
+        return uniform_q_bits_;
     }
 
 private:
@@ -101,28 +107,28 @@ private:
         mlx::core::array sub_min,
         mlx::core::array neuron_scale,
         mlx::core::array neuron_min,
-        std::optional<mlx::core::array> row_q_bits,
-        std::optional<mlx::core::array> row_q_bit_offsets,
+        mlx::core::array row_q_layout,
+        mlx::core::array row_q_byte_offsets,
         int bits,
         int group_size,
         int groups,
         int input_size,
         int output_size,
-        bool q5_execution_layout);
+        bool uniform_q_bits);
 
     mlx::core::array q_packed_;
     mlx::core::array sub_scale_;
     mlx::core::array sub_min_;
     mlx::core::array neuron_scale_;
     mlx::core::array neuron_min_;
-    std::optional<mlx::core::array> row_q_bits_;
-    std::optional<mlx::core::array> row_q_bit_offsets_;
+    mlx::core::array row_q_layout_;
+    mlx::core::array row_q_byte_offsets_;
     int bits_ = 0;
     int group_size_ = 0;
     int groups_ = 0;
     int input_size_ = 0;
     int output_size_ = 0;
-    bool q5_execution_layout_ = false;
+    bool uniform_q_bits_ = false;
 };
 
 } // namespace mfq::metal

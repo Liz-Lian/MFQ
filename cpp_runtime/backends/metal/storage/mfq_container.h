@@ -2,6 +2,7 @@
 
 #include "hf_safetensors_store.h"
 #include "mfq_legacy_tensor_names.h"
+#include "mfq_format_compat.h"
 #include "mfq_model_graph.h"
 
 #include <cstdint>
@@ -49,6 +50,7 @@ private:
 struct MfqRecord {
     std::string name;
     std::string dtype;
+    std::string stored_dtype;
     // Stable absolute path: streamed reads remain valid if the process changes
     // its working directory after the container table has been loaded.
     std::filesystem::path source_path;
@@ -109,11 +111,11 @@ public:
     void install_legacy_aliases(
         std::unordered_map<std::string, std::string> canonical_to_stored,
         mfq::MfqLegacyTensorLayout layout = {});
-    // Turn per-expert native HF tensors into canonical, virtual NINTM
+    // Turn per-expert native HF tensors into canonical, virtual MFE
     // projections. The logical container is assembled from exact tensor
     // ranges, so callers can stream one expert without materializing its
     // siblings or rewriting the source checkpoint.
-    void install_hf_nintm_views(
+    void install_hf_mfe_views(
         const std::unordered_map<std::string, std::string>&
             canonical_to_stored);
     bool has_legacy_aliases() const noexcept {

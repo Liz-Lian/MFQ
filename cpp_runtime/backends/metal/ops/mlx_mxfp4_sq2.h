@@ -1,5 +1,7 @@
 #pragma once
 
+#include "mlx_mxfp4_sq.h"
+
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -23,42 +25,8 @@ inline constexpr std::array<std::uint8_t, 128> kMxfp4Sq2PaletteNibbles{
     0,  4,  13, 1,  5,  7,  15, 14, 13, 12, 15, 14, 13, 11,
 };
 
-class MlxMxfp4Sq2Weight {
-public:
-  static MlxMxfp4Sq2Weight from_blob(const std::vector<std::uint8_t> &blob);
-  static MlxMxfp4Sq2Weight from_blob(std::span<const std::uint8_t> blob);
-
-  // The dedicated decode kernel expands directly to FP16/FP32. The
-  // single-row matmul path is a fused packed GEMV and does not materialize
-  // the complete weight matrix.
-  mlx::core::array
-  dequantize(mlx::core::Dtype dtype = mlx::core::float16) const;
-  mlx::core::array matmul(const mlx::core::array &input) const;
-  mlx::core::array
-  backward_input(const mlx::core::array &output_gradient) const;
-
-  int input_size() const noexcept { return input_size_; }
-  int output_size() const noexcept { return output_size_; }
-  std::uint8_t matrix_scale_base() const noexcept {
-    return matrix_scale_base_value_;
-  }
-  std::size_t packed_nbytes() const noexcept;
-
-private:
-  MlxMxfp4Sq2Weight(mlx::core::array symbols, mlx::core::array block_selectors,
-                    mlx::core::array state_scale_stream,
-                    mlx::core::array state_palettes,
-                    std::uint8_t matrix_scale_base_value, int input_size,
-                    int output_size);
-
-  mlx::core::array symbols_;
-  mlx::core::array block_selectors_;
-  // Byte zero is the matrix E8M0 base; packed two-bit state offsets follow.
-  mlx::core::array state_scale_stream_;
-  mlx::core::array state_palettes_;
-  std::uint8_t matrix_scale_base_value_ = 0;
-  int input_size_ = 0;
-  int output_size_ = 0;
-};
+// Source-compatible reader name for experimental callers.  It is an alias,
+// not a second format class or execution implementation.
+using MlxMxfp4Sq2Weight = MlxMxfp4SqWeight;
 
 } // namespace mfq::metal

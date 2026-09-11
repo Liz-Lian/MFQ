@@ -155,7 +155,7 @@ Fixture make_fixture(int rows, int columns) {
       rows,
       columns,
       matrix_scale_base,
-      blob.size() - header_nbytes + 1,
+      blob.size(),
       std::move(blob),
       std::move(dense),
   };

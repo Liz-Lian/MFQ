@@ -1,4 +1,4 @@
-"""Gumbel-Softmax Quantization (GSQ) over a format-preserving scalar grid."""
+"""Legacy-style Gumbel-Softmax Quantization functions."""
 
 from __future__ import annotations
 
@@ -6,17 +6,18 @@ from dataclasses import dataclass
 
 import torch
 
-from mfq.quantize.gptq import GptqConfig, GptqSolver
-from mfq.quantize.weight_solver import (
-    ImportanceMap,
-    QuadraticReconstructionObjective,
-    ReconstructionObjective,
-    ScalarGridCodec,
-    ScalarGridTensor,
-    WeightSolver,
-    WeightSolverProblem,
-    WeightSolverResult,
+from mfq.quantize._scalar_grid import (
+    QuantizationResult,
+    _build_importance_view,
+    _ImportanceView,
+    _QuadraticReconstructionError,
+    _QuantizationInput,
+    _ReconstructionError,
+    _ScalarGrid,
+    _ScalarGridCodec,
+    _UniformAffineCodec,
 )
+from mfq.quantize.gptq import GptqConfig, _GptqImplementation
 
 
 @dataclass(frozen=True)
@@ -145,7 +146,7 @@ def _reconstruct(
     codes: torch.Tensor,
     scale_parameters: torch.Tensor,
     offset_parameters: torch.Tensor,
-    grid: ScalarGridTensor,
+    grid: _ScalarGrid,
     row_start: int,
 ) -> torch.Tensor:
     row_stop = row_start + int(codes.shape[0])
@@ -168,7 +169,7 @@ def _reconstruct(
     )
 
 
-class GsqSolver(WeightSolver):
+class _GsqImplementation:
     """Jointly learn integer-grid assignments and representable scale parameters.
 
     Two-bit rows search their full grid.  Wider rows search the five-point
@@ -180,35 +181,35 @@ class GsqSolver(WeightSolver):
     def __init__(
         self,
         config: GsqConfig | None = None,
-        objective: ReconstructionObjective | None = None,
+        error: _ReconstructionError | None = None,
         gptq_config: GptqConfig | None = None,
     ) -> None:
         self.config = GsqConfig() if config is None else config
-        self.objective = (
-            QuadraticReconstructionObjective() if objective is None else objective
+        self.error = (
+            _QuadraticReconstructionError() if error is None else error
         )
         self.gptq_config = GptqConfig() if gptq_config is None else gptq_config
 
     def solve(
         self,
-        problem: WeightSolverProblem,
-        codec: ScalarGridCodec,
-        imap: ImportanceMap | None = None,
+        problem: _QuantizationInput,
+        codec: _ScalarGridCodec,
+        imap: _ImportanceView | None = None,
         *,
-        initial: ScalarGridTensor | None = None,
-    ) -> WeightSolverResult:
+        initial: _ScalarGrid | None = None,
+    ) -> QuantizationResult:
         if initial is None:
             initial = codec.initialize(problem, imap)
             if self.config.use_gptq_init:
-                initial = GptqSolver(
-                    self.gptq_config, objective=self.objective
+                initial = _GptqImplementation(
+                    self.gptq_config, error=self.error
                 ).solve(problem, codec, imap, initial=initial).grid
         baseline_grid = codec.canonicalize(initial)
         baseline_reconstruction = baseline_grid.dequantize()
-        baseline_value = self.objective.evaluate(
+        baseline_value = self.error.evaluate(
             problem, baseline_reconstruction, imap
         )
-        baseline_rows = self.objective.row_losses(
+        baseline_rows = self.error.row_losses(
             problem, baseline_reconstruction, imap
         ).detach()
 
@@ -308,7 +309,7 @@ class GsqSolver(WeightSolver):
                     baseline_grid,
                     row_start,
                 )
-                loss = self.objective.loss(
+                loss = self.error.loss(
                     problem, reconstruction, imap, row_start=row_start
                 ) / float(reconstruction.numel())
                 if not bool(torch.isfinite(loss)):
@@ -338,7 +339,7 @@ class GsqSolver(WeightSolver):
                             baseline_grid,
                             row_start,
                         )
-                        hard_loss = self.objective.row_losses(
+                        hard_loss = self.error.row_losses(
                             problem,
                             hard_reconstruction,
                             imap,
@@ -366,7 +367,7 @@ class GsqSolver(WeightSolver):
             )
         )
         candidate_reconstruction = candidate_grid.dequantize()
-        candidate_value = self.objective.evaluate(
+        candidate_value = self.error.evaluate(
             problem, candidate_reconstruction, imap
         )
         accepted = candidate_value.total <= baseline_value.total * (
@@ -377,7 +378,7 @@ class GsqSolver(WeightSolver):
             candidate_reconstruction if accepted else baseline_reconstruction
         )
         objective_value = candidate_value if accepted else baseline_value
-        row_losses = self.objective.row_losses(
+        row_losses = self.error.row_losses(
             problem, reconstruction, imap
         ).detach()
         encoded = codec.finalize(selected_grid)
@@ -386,12 +387,12 @@ class GsqSolver(WeightSolver):
             if baseline_value.total == 0
             else (baseline_value.total - objective_value.total) / baseline_value.total
         )
-        return WeightSolverResult(
+        return QuantizationResult(
             encoded=encoded,
             grid=selected_grid,
             reconstruction=reconstruction.detach(),
-            objective=objective_value,
-            baseline=baseline_value,
+            loss=objective_value,
+            baseline_loss=baseline_value,
             row_losses=row_losses,
             metrics={
                 "accepted": float(accepted),
@@ -408,4 +409,42 @@ class GsqSolver(WeightSolver):
         )
 
 
-__all__ = ["GsqConfig", "GsqSolver"]
+def quantize_gsq(
+    weight,
+    *,
+    q_bits: int,
+    group_size: int,
+    calibration_inputs=None,
+    hessian=None,
+    importance=None,
+    neuron_importance=None,
+    symmetric: bool = False,
+    fit_iterations: int = 4,
+    config: GsqConfig | None = None,
+    gptq_config: GptqConfig | None = None,
+) -> QuantizationResult:
+    """Quantize one matrix with GSQ using ordinary tensor arguments."""
+
+    problem = _QuantizationInput(
+        weight,
+        calibration_inputs=calibration_inputs,
+        hessian=hessian,
+    )
+    imap = _build_importance_view(
+        importance,
+        neuron_importance,
+        tuple(map(int, problem.weight.shape)),
+    )
+    codec = _UniformAffineCodec(
+        q_bits,
+        group_size,
+        symmetric=symmetric,
+        fit_iterations=fit_iterations,
+    )
+    return _GsqImplementation(
+        config=config,
+        gptq_config=gptq_config,
+    ).solve(problem, codec, imap)
+
+
+__all__ = ["GsqConfig", "QuantizationResult", "quantize_gsq"]

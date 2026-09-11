@@ -18,8 +18,9 @@ import numpy as np
 from mfq.calibration.artifact import ExpertPrecision
 from mfq.formats.header import FileHeader
 from mfq.formats.io import (
-    _NINT_MOE_HDR,
-    _NINT_MOE_POOL_V2_HDR,
+    _MFE_DELTA_MAGIC,
+    _MFE_HDR,
+    _MFE_POOL_HDR,
 )
 from mfq.formats.nint import NintSpec
 from mfq.quantize.expert_sensitivity import load_expert_sensitivity_map
@@ -50,7 +51,7 @@ SPECS = {
     "NINT8": NintSpec(8, 48, 7),
 }
 PROJECTIONS = ("gate_up", "down")
-DELTA_MAGIC = b"NID2"
+DELTA_MAGIC = _MFE_DELTA_MAGIC
 ROBUST_FAMILIES = ("NVQ2J", "NINT4", "NINT5", "NINT6", "NINT8")
 V4F_PROJECTION_WEIGHTS_PER_EXPERT = {
     "gate_up": 2 * 2048 * 4096,
@@ -650,10 +651,10 @@ def _solve_robust_profiles(
             0.0,
         )
 
-    fixed_headers = len(base) * _NINT_MOE_HDR.size
+    fixed_headers = len(base) * _MFE_HDR.size
     variable_budget = int(routed_limit) - fixed_headers
     if variable_budget <= 0:
-        raise ValueError("routed byte limit cannot hold NINTM headers")
+        raise ValueError("routed byte limit cannot hold MFE headers")
     pool_costs = {
         (projection, family): _pool_affine_bytes(projection, family)
         for projection in PROJECTIONS
@@ -690,7 +691,7 @@ def _solve_robust_profiles(
             if family == base[(projection, layer)][expert]:
                 continue
             conservative = (
-                _NINT_MOE_HDR.size
+                _MFE_HDR.size
                 + routed_family_pool_bytes(projection, family, 1)
             )
             overlay_entries.append(
@@ -929,7 +930,7 @@ def _solve_robust_profiles(
     ]
     changed = _changes(base, final)
     exact_overlay_payload = sum(
-        _NINT_MOE_HDR.size
+        _MFE_HDR.size
         + sum(
             routed_family_pool_bytes(
                 projection,
@@ -941,7 +942,7 @@ def _solve_robust_profiles(
         for (projection, _layer), entries in changed.items()
     )
     conservative_overlay = sum(
-        _NINT_MOE_HDR.size
+        _MFE_HDR.size
         + routed_family_pool_bytes(projection, family, 1)
         for (projection, layer), entries in changed.items()
         for expert, family in entries.items()
@@ -1096,7 +1097,7 @@ def build_robust_plan(
             else "mfq.v4f-sensitivity-robust.v1"
         ),
         "method": {
-            "solver": "global multiple-choice MILP with exact NINTM bytes",
+            "solver": "global multiple-choice MILP with exact MFE bytes",
             "objective": (
                 "minimize worst final/base REAP-energy-weighted NMSE "
                 "over sensitivity-strength scenarios, subject to exact "
@@ -1258,7 +1259,7 @@ def _write_delta_blob(
     try:
         with output.open("wb") as handle:
             handle.write(
-                _NINT_MOE_HDR.pack(
+                _MFE_HDR.pack(
                     DELTA_MAGIC,
                     256,
                     4096,
@@ -1306,7 +1307,7 @@ def _write_delta_blob(
                     )
                 dtype = family.encode("ascii")
                 handle.write(
-                    _NINT_MOE_POOL_V2_HDR.pack(
+                    _MFE_POOL_HDR.pack(
                         len(experts),
                         len(dtype),
                         nbytes,
@@ -1358,7 +1359,7 @@ def materialize_overlay(args) -> None:
         records.append(
             (
                 name,
-                "NINTMD",
+                "MFED",
                 _delta_expected_bytes(projection, entries, artifact),
                 projection,
                 layer,

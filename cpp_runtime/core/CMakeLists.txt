@@ -9,6 +9,7 @@ add_library(mfq-model-graph STATIC
     compat/mfq_legacy_model_graph.h
     compat/mfq_legacy_tensor_names.cpp
     compat/mfq_legacy_tensor_names.h
+    compat/mfq_format_compat.h
 )
 add_library(mfq::model-graph ALIAS mfq-model-graph)
 target_include_directories(mfq-model-graph PUBLIC

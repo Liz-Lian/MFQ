@@ -1,4 +1,4 @@
-#include "nintm_expert_store.h"
+#include "mfe_expert_store.h"
 
 #include <algorithm>
 #include <array>
@@ -15,7 +15,7 @@ namespace {
 template <typename T>
 T little(std::span<const std::uint8_t> bytes, std::size_t offset) {
     if (offset > bytes.size() || sizeof(T) > bytes.size() - offset) {
-        throw std::runtime_error("truncated NINTM expert metadata");
+        throw std::runtime_error("truncated MFE expert metadata");
     }
     using Unsigned = std::make_unsigned_t<T>;
     Unsigned result{};
@@ -61,7 +61,7 @@ std::array<std::span<std::byte>, 6> destinations(
 
 } // namespace
 
-MlxNintMxfp4ExpertStore::MlxNintMxfp4ExpertStore(
+MlxMfeMxfp4ExpertStore::MlxMfeMxfp4ExpertStore(
     const MfqContainer& model,
     std::vector<std::string> layer_prefixes,
     std::vector<std::size_t> experts_per_layer,
@@ -74,10 +74,10 @@ MlxNintMxfp4ExpertStore::MlxNintMxfp4ExpertStore(
         std::find(experts_per_layer_.begin(), experts_per_layer_.end(), 0) !=
             experts_per_layer_.end() || hidden_size == 0 ||
         intermediate_size == 0) {
-        throw std::invalid_argument("NINTM MXFP4 expert geometry is invalid");
+        throw std::invalid_argument("MFE MXFP4 expert geometry is invalid");
     }
     if (hidden_size % 32 != 0 || intermediate_size % 32 != 0) {
-        throw MlxNintMxfp4Unsupported(
+        throw MlxMfeMxfp4Unsupported(
             "SSD MXFP4 experts require block-aligned geometry");
     }
     max_num_experts_ = *std::max_element(
@@ -106,32 +106,33 @@ MlxNintMxfp4ExpertStore::MlxNintMxfp4ExpertStore(
             std::size_t input,
             std::span<const ProjectionSlice> slices) {
             const auto& outer = model_.record(name);
-            if (outer.dtype != "NINTM" || outer.nbytes < 20) {
-                throw MlxNintMxfp4Unsupported(
-                    "SSD expert projection is not NINTM: " + name);
+            if (outer.dtype != "MFE" || outer.nbytes < 20) {
+                throw MlxMfeMxfp4Unsupported(
+                    "SSD expert projection is not MFE: " + name);
             }
             const auto header = model_.read_range(name, 0, 20);
-            if (std::memcmp(header.data(), "NIM2", 4) != 0) {
-                throw MlxNintMxfp4Unsupported(
-                    "SSD expert projection is not NIM2: " + name);
+            if (std::memcmp(header.data(), "MFE1", 4) != 0 &&
+                std::memcmp(header.data(), "NIM2", 4) != 0) {
+                throw MlxMfeMxfp4Unsupported(
+                    "SSD expert projection is not MFE1 or legacy NIM2: " + name);
             }
             if (little<std::uint32_t>(header, 4) != layer_experts ||
                 little<std::uint32_t>(header, 8) != output ||
                 little<std::uint32_t>(header, 12) != input) {
                 throw std::runtime_error(
-                    "SSD expert NINTM geometry mismatch: " + name);
+                    "SSD expert MFE geometry mismatch: " + name);
             }
             const auto pools = little<std::uint32_t>(header, 16);
             if (pools == 0 || pools > layer_experts) {
                 throw std::runtime_error(
-                    "SSD expert NINTM pool count is invalid: " + name);
+                    "SSD expert MFE pool count is invalid: " + name);
             }
             std::vector<std::uint8_t> present(layer_experts, 0);
             std::uint64_t cursor = 20;
             for (std::uint32_t pool = 0; pool < pools; ++pool) {
                 if (cursor > outer.nbytes || 24 > outer.nbytes - cursor) {
                     throw std::runtime_error(
-                        "truncated SSD expert NINTM pool: " + name);
+                        "truncated SSD expert MFE pool: " + name);
                 }
                 const auto pool_header = model_.read_range(name, cursor, 24);
                 const auto count = little<std::uint32_t>(pool_header, 0);
@@ -141,16 +142,16 @@ MlxNintMxfp4ExpertStore::MlxNintMxfp4ExpertStore(
                 if (count == 0 || count > layer_experts || dtype_bytes == 0 ||
                     dtype_bytes > 32 || runtime_bytes != 0) {
                     throw std::runtime_error(
-                        "unsupported SSD expert NINTM pool metadata: " + name);
+                        "unsupported SSD expert MFE pool metadata: " + name);
                 }
-                cursor = checked_add(cursor, 24, "NINTM pool offset");
+                cursor = checked_add(cursor, 24, "MFE pool offset");
                 const auto ids_bytes = checked_product(
-                    count, sizeof(std::int32_t), "NINTM expert IDs");
+                    count, sizeof(std::int32_t), "MFE expert IDs");
                 const auto metadata_bytes = checked_add(
-                    ids_bytes, dtype_bytes, "NINTM pool metadata");
+                    ids_bytes, dtype_bytes, "MFE pool metadata");
                 if (cursor > outer.nbytes || metadata_bytes > outer.nbytes - cursor) {
                     throw std::runtime_error(
-                        "truncated SSD expert NINTM metadata: " + name);
+                        "truncated SSD expert MFE metadata: " + name);
                 }
                 const auto metadata = model_.read_range(
                     name, cursor, metadata_bytes);
@@ -158,13 +159,13 @@ MlxNintMxfp4ExpertStore::MlxNintMxfp4ExpertStore(
                     reinterpret_cast<const char*>(metadata.data() + ids_bytes),
                     dtype_bytes);
                 if (dtype != "MXFP4") {
-                    throw MlxNintMxfp4Unsupported(
-                        "SSD arena requires MXFP4 NINTM experts: " + name);
+                    throw MlxMfeMxfp4Unsupported(
+                        "SSD arena requires MXFP4 MFE experts: " + name);
                 }
                 const auto payload_offset = checked_add(
-                    cursor, metadata_bytes, "NINTM payload offset");
+                    cursor, metadata_bytes, "MFE payload offset");
                 const auto payload_end = checked_add(
-                    payload_offset, payload_bytes, "NINTM payload end");
+                    payload_offset, payload_bytes, "MFE payload end");
                 if (payload_end > outer.nbytes || payload_bytes < 56) {
                     throw std::runtime_error(
                         "truncated SSD expert MXFP4 payload: " + name);
@@ -257,7 +258,7 @@ MlxNintMxfp4ExpertStore::MlxNintMxfp4ExpertStore(
             if (cursor != outer.nbytes ||
                 std::find(present.begin(), present.end(), 0) != present.end()) {
                 throw std::runtime_error(
-                    "SSD expert NINTM does not cover every expert: " + name);
+                    "SSD expert MFE does not cover every expert: " + name);
             }
         };
 
@@ -275,7 +276,7 @@ MlxNintMxfp4ExpertStore::MlxNintMxfp4ExpertStore(
         const bool has_up = model_.contains(experts + "up.weight");
         if (has_gate != has_up) {
             throw std::runtime_error(
-                "incomplete canonical Gate/Up NINTM pair: " + experts);
+                "incomplete canonical Gate/Up MFE pair: " + experts);
         }
         if (has_gate) {
             const std::array<ProjectionSlice, 1> gate{{
@@ -305,7 +306,7 @@ MlxNintMxfp4ExpertStore::MlxNintMxfp4ExpertStore(
                 hidden_size,
                 gate_up);
         } else {
-            throw MlxNintMxfp4Unsupported(
+            throw MlxMfeMxfp4Unsupported(
                 "SSD expert layer has no canonical Gate/Up projection: " +
                 experts);
         }
@@ -325,43 +326,43 @@ MlxNintMxfp4ExpertStore::MlxNintMxfp4ExpertStore(
         for (std::size_t part = 0; part < kParts; ++part) {
             if (expert.parts[part].nbytes != first.parts[part].nbytes) {
                 throw std::runtime_error(
-                    "SSD NINTM expert tensors have inconsistent sizes");
+                    "SSD MFE expert tensors have inconsistent sizes");
             }
         }
     }
 }
 
-std::size_t MlxNintMxfp4ExpertStore::num_layers() const noexcept {
+std::size_t MlxMfeMxfp4ExpertStore::num_layers() const noexcept {
     return num_layers_;
 }
 
-std::size_t MlxNintMxfp4ExpertStore::num_experts(
+std::size_t MlxMfeMxfp4ExpertStore::num_experts(
     std::size_t layer) const {
     if (layer >= num_layers_) {
-        throw std::out_of_range("SSD NINTM expert layer out of range");
+        throw std::out_of_range("SSD MFE expert layer out of range");
     }
     return experts_per_layer_[layer];
 }
 
-std::size_t MlxNintMxfp4ExpertStore::max_num_experts() const noexcept {
+std::size_t MlxMfeMxfp4ExpertStore::max_num_experts() const noexcept {
     return max_num_experts_;
 }
 
-std::size_t MlxNintMxfp4ExpertStore::slot_bytes() const noexcept {
+std::size_t MlxMfeMxfp4ExpertStore::slot_bytes() const noexcept {
     return slot_bytes_;
 }
 
-const MlxNintMxfp4ExpertStore::ExpertRecord&
-MlxNintMxfp4ExpertStore::expert_record(
+const MlxMfeMxfp4ExpertStore::ExpertRecord&
+MlxMfeMxfp4ExpertStore::expert_record(
     std::size_t layer,
     std::size_t expert) const {
     if (layer >= num_layers_ || expert >= experts_per_layer_[layer]) {
-        throw std::out_of_range("SSD NINTM expert index out of range");
+        throw std::out_of_range("SSD MFE expert index out of range");
     }
     return experts_[expert_offsets_[layer] + expert];
 }
 
-MlxNativeMxfp4ExpertLoadStats MlxNintMxfp4ExpertStore::load_parts(
+MlxNativeMxfp4ExpertLoadStats MlxMfeMxfp4ExpertStore::load_parts(
     const ExpertRecord& record,
     std::span<const std::size_t> parts,
     const MlxNativeMxfp4ExpertDestination& destination) const {
@@ -370,7 +371,7 @@ MlxNativeMxfp4ExpertLoadStats MlxNintMxfp4ExpertStore::load_parts(
     for (const auto part : parts) {
         if (part >= kParts || targets[part].size() != record.parts[part].nbytes) {
             throw std::runtime_error(
-                "SSD NINTM expert destination size mismatch");
+                "SSD MFE expert destination size mismatch");
         }
         model_.read_range_into(
             record.parts[part].record,
@@ -382,12 +383,12 @@ MlxNativeMxfp4ExpertLoadStats MlxNintMxfp4ExpertStore::load_parts(
     return result;
 }
 
-MlxNativeMxfp4ExpertLoadStats MlxNintMxfp4ExpertStore::load(
+MlxNativeMxfp4ExpertLoadStats MlxMfeMxfp4ExpertStore::load(
     std::size_t layer,
     std::size_t expert,
     std::span<std::byte> slot) const {
     if (slot.size() < slot_bytes_) {
-        throw std::runtime_error("SSD NINTM expert slot is too small");
+        throw std::runtime_error("SSD MFE expert slot is too small");
     }
     return load_scatter(layer, expert, {
         .w1_scale = slot.subspan(slot_offsets_[0], slot_offsets_[1] - slot_offsets_[0]),
@@ -399,7 +400,7 @@ MlxNativeMxfp4ExpertLoadStats MlxNintMxfp4ExpertStore::load(
     });
 }
 
-MlxNativeMxfp4ExpertLoadStats MlxNintMxfp4ExpertStore::load_scatter(
+MlxNativeMxfp4ExpertLoadStats MlxMfeMxfp4ExpertStore::load_scatter(
     std::size_t layer,
     std::size_t expert,
     const MlxNativeMxfp4ExpertDestination& destination) const {
@@ -408,7 +409,7 @@ MlxNativeMxfp4ExpertLoadStats MlxNintMxfp4ExpertStore::load_scatter(
 }
 
 MlxNativeMxfp4ExpertLoadStats
-MlxNintMxfp4ExpertStore::load_gate_up_scatter(
+MlxMfeMxfp4ExpertStore::load_gate_up_scatter(
     std::size_t layer,
     std::size_t expert,
     const MlxNativeMxfp4ExpertDestination& destination) const {
@@ -421,7 +422,7 @@ MlxNintMxfp4ExpertStore::load_gate_up_scatter(
     };
 }
 
-MlxNativeMxfp4ExpertLoadStats MlxNintMxfp4ExpertStore::load_scales_scatter(
+MlxNativeMxfp4ExpertLoadStats MlxMfeMxfp4ExpertStore::load_scales_scatter(
     std::size_t layer,
     std::size_t expert,
     const MlxNativeMxfp4ExpertDestination& destination) const {
@@ -429,7 +430,7 @@ MlxNativeMxfp4ExpertLoadStats MlxNintMxfp4ExpertStore::load_scales_scatter(
     return load_parts(expert_record(layer, expert), parts, destination);
 }
 
-MlxNativeMxfp4ExpertLoadStats MlxNintMxfp4ExpertStore::load_gate_scatter(
+MlxNativeMxfp4ExpertLoadStats MlxMfeMxfp4ExpertStore::load_gate_scatter(
     std::size_t layer,
     std::size_t expert,
     const MlxNativeMxfp4ExpertDestination& destination) const {
@@ -437,7 +438,7 @@ MlxNativeMxfp4ExpertLoadStats MlxNintMxfp4ExpertStore::load_gate_scatter(
     return load_parts(expert_record(layer, expert), parts, destination);
 }
 
-MlxNativeMxfp4ExpertLoadStats MlxNintMxfp4ExpertStore::load_up_scatter(
+MlxNativeMxfp4ExpertLoadStats MlxMfeMxfp4ExpertStore::load_up_scatter(
     std::size_t layer,
     std::size_t expert,
     const MlxNativeMxfp4ExpertDestination& destination) const {
@@ -445,7 +446,7 @@ MlxNativeMxfp4ExpertLoadStats MlxNintMxfp4ExpertStore::load_up_scatter(
     return load_parts(expert_record(layer, expert), parts, destination);
 }
 
-MlxNativeMxfp4ExpertLoadStats MlxNintMxfp4ExpertStore::load_down_scatter(
+MlxNativeMxfp4ExpertLoadStats MlxMfeMxfp4ExpertStore::load_down_scatter(
     std::size_t layer,
     std::size_t expert,
     const MlxNativeMxfp4ExpertDestination& destination) const {
@@ -453,10 +454,10 @@ MlxNativeMxfp4ExpertLoadStats MlxNintMxfp4ExpertStore::load_down_scatter(
     return load_parts(expert_record(layer, expert), parts, destination);
 }
 
-MlxNativeMxfp4ExpertView MlxNintMxfp4ExpertStore::view(
+MlxNativeMxfp4ExpertView MlxMfeMxfp4ExpertStore::view(
     std::span<const std::byte> slot) const {
     if (slot.size() < slot_bytes_) {
-        throw std::runtime_error("SSD NINTM expert slot is too small");
+        throw std::runtime_error("SSD MFE expert slot is too small");
     }
     return {
         .w1_scale = slot.subspan(slot_offsets_[0], slot_offsets_[1] - slot_offsets_[0]),

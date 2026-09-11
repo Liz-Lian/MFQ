@@ -14,7 +14,7 @@ from safetensors.torch import load_file, save_file
 
 from mfq.formats.tpq import TpqInt4Tensor, pack_tpq_indices
 from mfq.formats.io import BFloat16Array, load_mmap
-from mfq.formats.moe import NintMoeTensor
+from mfq.formats.mfe import MfeTensor
 from mfq.quantize.expert_nint import dequantize_expertwise
 from mfq.runtime.tpq import load_tpq_package, open_tpq_artifact
 from mfq.runtime.tpq_mfq import MfqTpqStore, install_mfq_tpq_store
@@ -221,7 +221,7 @@ def test_import_projection_tpq_preserves_three_packed_projections(
                 }
             )
             gate = mapped["layers.0.ffn.experts.gate.weight"]
-            assert isinstance(gate, NintMoeTensor)
+            assert isinstance(gate, MfeTensor)
             assert {pool.tensor.spec.tier for pool in gate.pools} == {"p"}
             assert {pool.tensor.spec.index_bits for pool in gate.pools} == {9}
             del gate
@@ -245,8 +245,8 @@ def test_import_tpq_directory_to_native_mfq(tmp_path: Path) -> None:
 
         gate = store["layers.0.ffn.experts.gate_up.weight"]
         down = store["layers.0.ffn.experts.down.weight"]
-        assert isinstance(gate, NintMoeTensor)
-        assert isinstance(down, NintMoeTensor)
+        assert isinstance(gate, MfeTensor)
+        assert isinstance(down, MfeTensor)
         assert gate.expert_profiles == (
             "TPQ-X",
             "TPQ-W",
@@ -324,8 +324,8 @@ def test_import_kimi_tpq2_sharded_dense_and_compact_experts(
         assert store.records["extra.weight"].dtype == "F16"
         gate = store["layers.1.ffn.experts.gate_up.weight"]
         down = store["layers.1.ffn.experts.down.weight"]
-        assert isinstance(gate, NintMoeTensor)
-        assert isinstance(down, NintMoeTensor)
+        assert isinstance(gate, MfeTensor)
+        assert isinstance(down, MfeTensor)
         assert gate.shape == (4, 16, 8)
         assert down.shape == (4, 8, 8)
         assert gate.expert_profiles[-1] == "TPQ-X"

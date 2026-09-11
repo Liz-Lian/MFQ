@@ -299,19 +299,19 @@ public:
 
     array operation(Path path, Stage stage) const {
         setenv(
-            "MFQ_METAL_NINTM_SORT_ROUTES",
+            "MFQ_METAL_MFE_SORT_ROUTES",
             path == Path::sorted || path == Path::adaptive ? "1" : "0",
             1);
         setenv(
-            "MFQ_METAL_NINTM_PREFILL_NAX",
+            "MFQ_METAL_MFE_PREFILL_NAX",
             "0",
             1);
         setenv(
-            "MFQ_METAL_NINTM_SMALLM_NAX",
+            "MFQ_METAL_MFE_SMALLM_NAX",
             path == Path::adaptive ? "auto" : "0",
             1);
         setenv(
-            "MFQ_METAL_NINTM_DECODE_DOWN_REDUCE",
+            "MFQ_METAL_MFE_DECODE_DOWN_REDUCE",
             path == Path::fused ? "1" : "0",
             1);
         if (path == Path::omlx) {

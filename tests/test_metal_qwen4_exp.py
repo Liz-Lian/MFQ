@@ -14,7 +14,7 @@ except RuntimeError:
 from mfq.architectures.tensor_schema import map_source_tensor_name  # noqa: E402
 from mfq.formats import io  # noqa: E402
 from mfq.formats.header import FileHeader  # noqa: E402
-from mfq.formats.moe import NintMoePool, NintMoeTensor  # noqa: E402
+from mfq.formats.mfe import MfePool, MfeTensor  # noqa: E402
 from mfq.formats.nint import NintSpec  # noqa: E402
 from mfq.quantize.nint_quant import dequantize, quantize  # noqa: E402
 from mfq.runtime.mlx_linear import MlxMMapEmbedding, MlxNintModel  # noqa: E402
@@ -35,16 +35,16 @@ def _random(
     return rng.normal(scale=scale, size=shape).astype(np.float32)
 
 
-def _expert(weight: np.ndarray) -> NintMoeTensor:
+def _expert(weight: np.ndarray) -> MfeTensor:
     experts, output, width = (int(item) for item in weight.shape)
     packed = quantize(
         weight.reshape(experts * output, width),
         NintSpec(4, 8, 6),
     )
-    return NintMoeTensor(
+    return MfeTensor(
         shape=(experts, output, width),
         pools=(
-            NintMoePool(
+            MfePool(
                 expert_ids=np.arange(experts, dtype=np.int32),
                 tensor=packed,
             ),
@@ -569,7 +569,7 @@ def test_qwen4_mtp_cached_chunks_match_full_multistream_sequence() -> None:
     streams, heads, kv_heads, experts, intermediate = 2, 2, 1, 2, 64
     width = streams * hidden
     prefix = "mtp.layers.0"
-    tensors: dict[str, np.ndarray | NintMoeTensor] = {
+    tensors: dict[str, np.ndarray | MfeTensor] = {
         "model.language_model.embed_tokens.weight": _random(rng, (32, hidden)),
         "mtp.pre_fc_norm_embedding.weight": np.zeros((hidden,), dtype=np.float32),
         "mtp.pre_fc_norm_hidden.weight": np.zeros((width,), dtype=np.float32),

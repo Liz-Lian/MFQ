@@ -11,17 +11,6 @@ from mfq.kernels.cuda._ext import ext
 from mfq.kernels.cuda.activation import silu_mul
 
 
-def _hetero_profile_code(bits: int, gs: int) -> int:
-    return {
-        (2, 16): 6,
-        (4, 24): 0,
-        (5, 28): 1,
-        (6, 24): 2,
-        (8, 48): 3,
-        (8, 24): 4,
-    }.get((int(bits), int(gs)), -1)
-
-
 @dataclass
 class NintExpertPool:
     """One homogeneous execution cohort inside an expert-wise weight tensor.
@@ -82,12 +71,6 @@ class ExpertWiseNintWeight:
     _activation_workspaces: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = field(
         default_factory=dict, init=False, repr=False
     )
-    _hetero_metadata: dict[str, tuple[torch.Tensor, ...]] = field(
-        default_factory=dict, init=False, repr=False
-    )
-    _hetero_workspaces: dict[
-        tuple, tuple[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...], torch.Tensor]
-    ] = field(default_factory=dict, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if self.n_experts <= 0 or self.out_per_expert <= 0 or self.neuron_len <= 0:
@@ -105,8 +88,10 @@ class ExpertWiseNintWeight:
             if int(g["neuron_len"]) != self.neuron_len:
                 raise ValueError(f"pool {pool_index} input width mismatch")
             bits = int(g.get("bits", 4))
-            if bits not in (2, 3, 4, 5, 6, 8):
+            if bits not in range(1, 9):
                 raise ValueError(f"pool {pool_index} uses unsupported NINT{bits}")
+            if g.get("row_q_bits") is None or g.get("row_q_bit_offsets") is None:
+                raise ValueError(f"pool {pool_index} lacks canonical NINT row metadata")
             for expert in pool.expert_ids:
                 if not 0 <= expert < self.n_experts:
                     raise ValueError(f"expert id {expert} is outside [0, {self.n_experts})")
@@ -155,78 +140,6 @@ class ExpertWiseNintWeight:
         self._activation_workspaces[key] = cached
         return cached
 
-    @property
-    def hetero_supported(self) -> bool:
-        return all(
-            not bool(pool.weight.get("mixed_q", False))
-            and
-            _hetero_profile_code(int(pool.weight.get("bits", 4)), int(pool.weight["gs"])) >= 0
-            for pool in self.pools
-        )
-
-    def hetero_metadata(self, device: torch.device) -> tuple[torch.Tensor, ...]:
-        key = str(device)
-        cached = self._hetero_metadata.get(key)
-        if cached is not None:
-            return cached
-        weight_ptrs: list[list[int]] = []
-        pool_params: list[list[int]] = []
-        expert_pool = [-1] * self.n_experts
-        expert_local = [-1] * self.n_experts
-        for pool_index, pool in enumerate(self.pools):
-            weight = pool.weight
-            tensors = (
-                weight["q_packed"],
-                weight["sub_scale"],
-                weight["sub_min"],
-                weight["neuron_scale"],
-                weight["neuron_min"],
-            )
-            if any(tensor.device != device for tensor in tensors):
-                raise ValueError("heterogeneous expert metadata and input must share a device")
-            weight_ptrs.append([int(tensor.data_ptr()) for tensor in tensors])
-            profile = _hetero_profile_code(int(weight.get("bits", 4)), int(weight["gs"]))
-            if profile < 0:
-                raise ValueError("unsupported heterogeneous expert profile")
-            pool_params.append([profile, int(weight["ng"])])
-            for local, expert in enumerate(pool.expert_ids):
-                expert_pool[expert] = pool_index
-                expert_local[expert] = local
-        cached = (
-            torch.tensor(weight_ptrs, device=device, dtype=torch.int64),
-            torch.tensor(pool_params, device=device, dtype=torch.int32),
-            torch.tensor(expert_pool, device=device, dtype=torch.int32),
-            torch.tensor(expert_local, device=device, dtype=torch.int32),
-        )
-        self._hetero_metadata[key] = cached
-        return cached
-
-    def hetero_workspace(
-        self, x: torch.Tensor, input_rows: int
-    ) -> tuple[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...], torch.Tensor]:
-        profile_shapes = tuple(
-            (int(pool.weight["gs"]), int(pool.weight["ng"])) for pool in self.pools
-        )
-        key = (str(x.device), int(input_rows), profile_shapes)
-        cached = self._hetero_workspaces.get(key)
-        if cached is not None:
-            return cached
-        qx_list: list[torch.Tensor] = []
-        xscale_list: list[torch.Tensor] = []
-        pointers: list[list[int]] = []
-        for _pool, (gs, groups) in zip(self.pools, profile_shapes, strict=True):
-            qx, xscale = self.activation_workspace(x, gs=gs, groups=groups, input_rows=input_rows)
-            qx_list.append(qx)
-            xscale_list.append(xscale)
-            pointers.append([int(qx.data_ptr()), int(xscale.data_ptr())])
-        cached = (
-            tuple(qx_list),
-            tuple(xscale_list),
-            torch.tensor(pointers, device=x.device, dtype=torch.int64),
-        )
-        self._hetero_workspaces[key] = cached
-        return cached
-
 
 @dataclass
 class ExpertWiseMixedWeight:
@@ -254,6 +167,11 @@ class ExpertWiseMixedWeight:
             g = pool.weight
             if int(g["neuron_len"]) != self.neuron_len:
                 raise ValueError(f"pool {pool_index} input width mismatch")
+            if pool.family == "nint" and (
+                g.get("row_q_bits") is None
+                or g.get("row_q_bit_offsets") is None
+            ):
+                raise ValueError(f"NINT pool {pool_index} lacks canonical row metadata")
             if pool.family == "nepq":
                 if (
                     int(g["n_experts"]) != len(pool.expert_ids)
@@ -553,54 +471,26 @@ def _grouped_matmul_mixed(
         )
         input_quantized = activation_key in quantized
         if pool.family == "nint":
-            if g.get("mixed_q", False):
-                ext().nint_moe_grouped_matmul_pool_mixed_q_ws_cuda(
-                    g["q_packed"],
-                    g["row_q_bits"],
-                    g["row_q_bit_offsets"],
-                    g["sub_scale"],
-                    g["sub_min"],
-                    g["neuron_scale"],
-                    g["neuron_min"],
-                    value,
-                    route.ids,
-                    expert_local,
-                    weight.n_experts,
-                    len(pool.expert_ids),
-                    weight.out_per_expert,
-                    gs,
-                    input_quantized,
-                    out,
-                    qx,
-                    xscale,
-                )
-            else:
-                ext().nint_moe_grouped_matmul_pool_ws_cuda(
-                    g["q_packed"],
-                    g["sub_scale"],
-                    g["sub_min"],
-                    g["neuron_scale"],
-                    g["neuron_min"],
-                    value,
-                    route.ids,
-                    expert_local,
-                    weight.n_experts,
-                    len(pool.expert_ids),
-                    weight.out_per_expert,
-                    gs,
-                    int(g.get("bits", 4)),
-                    route.map_ready,
-                    input_quantized,
-                    out,
-                    qx,
-                    xscale,
-                    route.counts,
-                    route.cursors,
-                    route.ids_dst,
-                    route.expert_bounds,
-                    route.tile_bounds,
-                    route.tile_experts,
-                )
+            ext().mfe_nint_matmul_ws_cuda(
+                g["q_packed"],
+                g["row_q_bits"],
+                g["row_q_bit_offsets"],
+                g["sub_scale"],
+                g["sub_min"],
+                g["neuron_scale"],
+                g["neuron_min"],
+                value,
+                route.ids,
+                expert_local,
+                weight.n_experts,
+                len(pool.expert_ids),
+                weight.out_per_expert,
+                gs,
+                input_quantized,
+                out,
+                qx,
+                xscale,
+            )
         elif pool.family == "nint8_zero":
             ext().nint8_zero_moe_grouped_matmul_pool_ws_cuda(
                 g["q"],
@@ -687,41 +577,6 @@ def grouped_matmul(
             raise ValueError("out must be contiguous")
 
     input_rows = route.tokens * route.routes if x.ndim == 3 else route.tokens
-    if weight.hetero_supported and route.tokens <= 2:
-        weight_ptrs, pool_params, expert_pool, expert_local = weight.hetero_metadata(x.device)
-        qx_list, xscale_list, activation_ptrs = weight.hetero_workspace(x, input_rows)
-        quantized_groups: set[tuple[int, int]] = set()
-        for pool, qx, xscale in zip(weight.pools, qx_list, xscale_list, strict=True):
-            gs = int(pool.weight["gs"])
-            groups = int(pool.weight["ng"])
-            key = (gs, groups)
-            if key in quantized_groups:
-                continue
-            ext().nint_moe_quantize_input_ws_cuda(x, gs, qx, xscale)
-            quantized_groups.add(key)
-        profile_mask = 0
-        for pool in weight.pools:
-            profile_mask |= 1 << _hetero_profile_code(
-                int(pool.weight.get("bits", 4)), int(pool.weight["gs"])
-            )
-        return ext().nint_moe_grouped_matmul_hetero_qx_cuda(
-            weight_ptrs,
-            pool_params,
-            activation_ptrs,
-            expert_pool,
-            expert_local,
-            route.ids,
-            profile_mask,
-            weight.n_experts,
-            weight.out_per_expert,
-            weight.neuron_len,
-            x.ndim == 3,
-            out,
-            route.ids_dst,
-            route.expert_bounds,
-            route.tile_bounds,
-            route.tile_experts,
-        )
     quantized_groups: set[tuple[int, int]] = set()
     for pool in weight.pools:
         g = pool.weight
@@ -729,54 +584,26 @@ def grouped_matmul(
         groups = int(g["ng"])
         key = (gs, groups)
         qx, xscale = weight.activation_workspace(x, gs=gs, groups=groups, input_rows=input_rows)
-        if g.get("mixed_q", False):
-            ext().nint_moe_grouped_matmul_pool_mixed_q_ws_cuda(
-                g["q_packed"],
-                g["row_q_bits"],
-                g["row_q_bit_offsets"],
-                g["sub_scale"],
-                g["sub_min"],
-                g["neuron_scale"],
-                g["neuron_min"],
-                x,
-                route.ids,
-                pool.local_map(weight.n_experts, x.device),
-                weight.n_experts,
-                len(pool.expert_ids),
-                weight.out_per_expert,
-                gs,
-                key in quantized_groups,
-                out,
-                qx,
-                xscale,
-            )
-        else:
-            ext().nint_moe_grouped_matmul_pool_ws_cuda(
-                g["q_packed"],
-                g["sub_scale"],
-                g["sub_min"],
-                g["neuron_scale"],
-                g["neuron_min"],
-                x,
-                route.ids,
-                pool.local_map(weight.n_experts, x.device),
-                weight.n_experts,
-                len(pool.expert_ids),
-                weight.out_per_expert,
-                gs,
-                int(g.get("bits", 4)),
-                route.map_ready,
-                key in quantized_groups,
-                out,
-                qx,
-                xscale,
-                route.counts,
-                route.cursors,
-                route.ids_dst,
-                route.expert_bounds,
-                route.tile_bounds,
-                route.tile_experts,
-            )
+        ext().mfe_nint_matmul_ws_cuda(
+            g["q_packed"],
+            g["row_q_bits"],
+            g["row_q_bit_offsets"],
+            g["sub_scale"],
+            g["sub_min"],
+            g["neuron_scale"],
+            g["neuron_min"],
+            x,
+            route.ids,
+            pool.local_map(weight.n_experts, x.device),
+            weight.n_experts,
+            len(pool.expert_ids),
+            weight.out_per_expert,
+            gs,
+            key in quantized_groups,
+            out,
+            qx,
+            xscale,
+        )
         quantized_groups.add(key)
     return out
 
@@ -882,9 +709,9 @@ def pools_from_groups(groups: Iterable[tuple[dict, Iterable[int]]]) -> tuple[Nin
 def to_gpu(
     tensor, device: str | torch.device = "cuda"
 ) -> ExpertWiseNintWeight | ExpertWiseMixedWeight:
-    """Upload an :class:`NintMoeTensor` as native execution cohorts."""
+    """Upload an :class:`MfeTensor` as native execution cohorts."""
 
-    from mfq.formats.moe import NintMoeTensor
+    from mfq.formats.mfe import MfeTensor
     from mfq.formats.mx import MxTensor
     from mfq.formats.nepq import NepqTensor
     from mfq.formats.nint import NintTensor
@@ -897,8 +724,8 @@ def to_gpu(
     from mfq.kernels.cuda.tpq_matmul import to_gpu_tpq
     from mfq.kernels.torch_backend import to_gpu as nint_to_gpu
 
-    if not isinstance(tensor, NintMoeTensor):
-        raise TypeError("to_gpu expects NintMoeTensor")
+    if not isinstance(tensor, MfeTensor):
+        raise TypeError("to_gpu expects MfeTensor")
     if all(isinstance(pool.tensor, NintTensor) for pool in tensor.pools):
         pools = tuple(
             NintExpertPool(
@@ -928,7 +755,7 @@ def to_gpu(
             packed = to_gpu_nepq(pool.tensor, device=device)
         elif isinstance(pool.tensor, MxTensor):
             if pool.tensor.dtype != "MXFP4":
-                raise ValueError("NINTM CUDA execution supports MXFP4 expert pools")
+                raise ValueError("MFE CUDA execution supports MXFP4 expert pools")
             family = "mxfp4"
             packed = to_gpu_mx(pool.tensor, device=device)
         elif isinstance(pool.tensor, TpqPqTensor):

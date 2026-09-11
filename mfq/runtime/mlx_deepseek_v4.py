@@ -25,7 +25,7 @@ except ModuleNotFoundError as exc:  # pragma: no cover - optional dependency
 
 from mfq.formats import io
 from mfq.formats.tpq import TpqPqSpec
-from mfq.formats.moe import NintMoeTensor
+from mfq.formats.mfe import MfeTensor
 from mfq.kernels.metal.tpq import (
     MetalTpqMoeWeight,
     MetalTpqPqWeight,
@@ -726,32 +726,32 @@ class _MlxTpqExpertResidency:
         if cached is not None:
             return cached
         record = self.store.records[name]
-        if record.dtype != "NINTM":
-            raise _UnsupportedStreamedExpertsError(f"expert record {name!r} is not NINTM")
+        if record.dtype != "MFE":
+            raise _UnsupportedStreamedExpertsError(f"expert record {name!r} is not MFE")
         source = self.store.mmap_for(record)
         start = int(record.offset)
         end = start + int(record.nbytes)
-        if start + io._NINT_MOE_HDR.size > end:
+        if start + io._MFE_HDR.size > end:
             raise ValueError(f"truncated native TPQ expert header: {name}")
-        magic, experts, rows_per_expert, columns, pool_count = io._NINT_MOE_HDR.unpack_from(
+        magic, experts, rows_per_expert, columns, pool_count = io._MFE_HDR.unpack_from(
             source, start
         )
-        if magic != b"NIM2" or int(experts) != self.experts:
+        if magic not in (b"MFE1", b"NIM2") or int(experts) != self.experts:
             raise _UnsupportedStreamedExpertsError(
-                f"expert record {name!r} is not a native TPQ NIM2 container"
+                f"expert record {name!r} is not a native MFE container"
             )
-        offset = start + io._NINT_MOE_HDR.size
+        offset = start + io._MFE_HDR.size
         result: dict[int, tuple[_MlxTpqStreamPool, int]] = {}
         for _ in range(int(pool_count)):
-            if offset + io._NINT_MOE_POOL_V2_HDR.size > end:
+            if offset + io._MFE_POOL_HDR.size > end:
                 raise ValueError(f"truncated native TPQ pool header: {name}")
             (
                 expert_count,
                 dtype_nbytes,
                 payload_nbytes,
                 runtime_nbytes,
-            ) = io._NINT_MOE_POOL_V2_HDR.unpack_from(source, offset)
-            offset += io._NINT_MOE_POOL_V2_HDR.size
+            ) = io._MFE_POOL_HDR.unpack_from(source, offset)
+            offset += io._MFE_POOL_HDR.size
             ids_nbytes = int(expert_count) * np.dtype("<i4").itemsize
             ids_end = offset + ids_nbytes
             dtype_end = ids_end + int(dtype_nbytes)
@@ -968,11 +968,11 @@ class MlxDeepseekV4MoE:
         if self.residency is None:
             gate_up = model.tensors[self.gate_up_name]
             down = model.tensors[self.down_name]
-            if not isinstance(gate_up, NintMoeTensor) or not isinstance(
+            if not isinstance(gate_up, MfeTensor) or not isinstance(
                 down,
-                NintMoeTensor,
+                MfeTensor,
             ):
-                raise TypeError(f"DeepSeek-V4 layer {layer} expert records must be NINTM")
+                raise TypeError(f"DeepSeek-V4 layer {layer} expert records must be MFE")
             self.gate_up: MlxRoutedLinear | None = MlxRoutedLinear(gate_up)
             self.down: MlxRoutedLinear | None = MlxRoutedLinear(down)
         else:

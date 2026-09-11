@@ -12,7 +12,7 @@ except RuntimeError:
     pytest.skip("Metal device unavailable", allow_module_level=True)
 
 from mfq.formats.io import BFloat16Array  # noqa: E402
-from mfq.formats.moe import NintMoePool, NintMoeTensor  # noqa: E402
+from mfq.formats.mfe import MfePool, MfeTensor  # noqa: E402
 from mfq.formats.nint import NintSpec  # noqa: E402
 from mfq.quantize.nint_quant import quantize  # noqa: E402
 from mfq.runtime.mlx_glm5_next import (  # noqa: E402
@@ -38,16 +38,16 @@ def _bfloat16(values: np.ndarray) -> BFloat16Array:
     return (bits >> 16).astype(np.uint16).view(BFloat16Array)
 
 
-def _expert(weight: np.ndarray) -> NintMoeTensor:
+def _expert(weight: np.ndarray) -> MfeTensor:
     experts, output, width = (int(item) for item in weight.shape)
     packed = quantize(
         weight.reshape(experts * output, width),
         NintSpec(4, 8, 6),
     )
-    return NintMoeTensor(
+    return MfeTensor(
         shape=(experts, output, width),
         pools=(
-            NintMoePool(
+            MfePool(
                 expert_ids=np.arange(experts, dtype=np.int32),
                 tensor=packed,
             ),
@@ -143,7 +143,7 @@ def test_glm5_absorbed_sparse_mla_cached_chunks_match_full_sequence() -> None:
     hidden = rank = nope = value_dim = index_dim = 128
     heads = index_heads = 2
     prefix = "model.block.0.attention"
-    tensors: dict[str, np.ndarray | NintMoeTensor] = {
+    tensors: dict[str, np.ndarray | MfeTensor] = {
         prefix + ".query_a.weight": _random(rng, (rank, hidden)),
         prefix + ".key_value_a.weight": _random(rng, (rank, hidden)),
         prefix + ".query_a_norm.weight": np.ones((rank,), dtype=np.float32),
@@ -210,7 +210,7 @@ def test_glm5_mtp_cached_chunks_match_full_appended_layer() -> None:
     heads = index_heads = experts = 2
     intermediate = 64
     prefix = "predictor.block.0"
-    tensors: dict[str, np.ndarray | NintMoeTensor] = {
+    tensors: dict[str, np.ndarray | MfeTensor] = {
         "model.token_embedding.weight": _bfloat16(_random(rng, (32, hidden))),
         "predictor.embedding_norm.weight": np.ones((hidden,), dtype=np.float32),
         "predictor.hidden_norm.weight": np.ones((hidden,), dtype=np.float32),

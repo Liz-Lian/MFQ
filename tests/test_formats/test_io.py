@@ -126,7 +126,7 @@ def test_pack_roundtrip_mixed_sub_bits_keeps_one_logical_nint_tensor():
     blob = io.pack_nint(tensor)
     restored = io.unpack_nint(blob)
 
-    assert dtype == "NINTv2"
+    assert dtype == "NINT"
     assert payload == blob
     assert blob[0] & 0x80
     assert not blob[1] & 0x80
@@ -257,7 +257,7 @@ def test_pack_roundtrip_high_bit_nint(spec):
     np.testing.assert_allclose(nint_quant.dequantize(t2), nint_quant.dequantize(t))
 
 
-def test_nintm_roundtrip_preserves_expert_profiles():
+def test_mfe_roundtrip_preserves_expert_profiles():
     rng = np.random.default_rng(20260719)
     weight = rng.normal(0, 0.05, size=(6, 5, 73)).astype(np.float32)
     specs = (
@@ -269,7 +269,7 @@ def test_nintm_roundtrip_preserves_expert_profiles():
         NintSpec(6, 24, 6),
     )
     tensor = quantize_expertwise(weight, specs)
-    restored = io.unpack_nint_moe(io.pack_nint_moe(tensor))
+    restored = io.unpack_mfe(io.pack_mfe(tensor))
     assert restored.shape == tensor.shape
     assert restored.expert_profiles == tensor.expert_profiles
     assert len(restored.pools) == 4
@@ -279,7 +279,7 @@ def test_nintm_roundtrip_preserves_expert_profiles():
     )
 
 
-def test_nintm_file_and_mmap_roundtrip(tmp_path: Path):
+def test_mfe_file_and_mmap_roundtrip(tmp_path: Path):
     rng = np.random.default_rng(77)
     weight = rng.normal(0, 0.05, size=(4, 3, 48)).astype(np.float32)
     tensor = quantize_expertwise(
@@ -296,7 +296,7 @@ def test_nintm_file_and_mmap_roundtrip(tmp_path: Path):
     assert loaded["blk.0.ffn_gate_exps.weight"].expert_profiles == tensor.expert_profiles
     _header, store = io.load_mmap(path)
     try:
-        assert store.records["blk.0.ffn_gate_exps.weight"].dtype == "NINTM"
+        assert store.records["blk.0.ffn_gate_exps.weight"].dtype == "MFE"
         lazy = store["blk.0.ffn_gate_exps.weight"]
         np.testing.assert_allclose(
             dequantize_expertwise(lazy),
@@ -306,20 +306,20 @@ def test_nintm_file_and_mmap_roundtrip(tmp_path: Path):
         store.close()
 
 
-def test_nintm_blob_view_exposes_packed_cohorts_without_decoding():
+def test_mfe_blob_view_exposes_packed_cohorts_without_decoding():
     rng = np.random.default_rng(770)
     weight = rng.normal(0, 0.05, size=(4, 3, 48)).astype(np.float32)
     tensor = quantize_expertwise(
         weight,
         [NintSpec(4, 24, 6), NintSpec(6, 24, 6)] * 2,
     )
-    blob = io.pack_nint_moe(tensor)
+    blob = io.pack_mfe(tensor)
 
-    shape, pools = io.view_nint_moe_blob(blob)
+    shape, pools = io.view_mfe_blob(blob)
 
     assert shape == tensor.shape
     assert tuple(tuple(pool.expert_ids) for pool in pools) == ((0, 2), (1, 3))
-    assert tuple(pool.dtype for pool in pools) == ("NINT4", "NINT6")
+    assert tuple(pool.dtype for pool in pools) == ("NINT", "NINT")
     assert all(not pool.runtime_payload for pool in pools)
     assert all(pool.tensor_payload.obj is not None for pool in pools)
 
@@ -483,12 +483,8 @@ def test_file_and_mmap_roundtrip_nvq_tensors(tmp_path: Path):
 
     _header, store = io.load_mmap(path)
     try:
-        assert store.records["w1"].dtype == "NVQ1-L"
-        assert store.records["w2"].dtype == "NVQ2"
-        assert store.records["w2j"].dtype == "NVQ2J"
-        assert store.records["w3"].dtype == "NVQ3"
-        assert store.records["w3j"].dtype == "NVQ3J"
-        assert store.records["w3j512"].dtype == "NVQ3J-512"
+        assert {store.records[name].dtype for name in store.records} == {"NVQ"}
+        assert {store.records[name].stored_dtype for name in store.records} == {"NVQ"}
         np.testing.assert_array_equal(store["w1"].delta_sign, nvq1_l.delta_sign)
         np.testing.assert_array_equal(store["w2"].indices, nvq2.indices)
         np.testing.assert_array_equal(store["w2j"].codebooks, nvq2j.codebooks)
@@ -497,23 +493,17 @@ def test_file_and_mmap_roundtrip_nvq_tensors(tmp_path: Path):
     finally:
         store.close()
 
-    legacy_path = tmp_path / "niq-legacy.mfq"
-    io.save(
-        legacy_path,
-        FileHeader(model_arch="nvq", num_tensors=3),
-        {"w2": nvq2, "w2j": nvq2j, "w3": nvq3},
+    legacy_payloads = {
+        "NIQ2": io.pack_nvq(nvq2).replace(b"NVQ1", b"NIQ1", 1),
+        "NIQ2J": io.pack_nvq(nvq2j).replace(b"NVQ1", b"NIQ1", 1),
+        "NIQ3": io.pack_nvq(nvq3).replace(b"NVQ1", b"NIQ1", 1),
+    }
+    assert isinstance(io.unpack_tensor_payload("NIQ2", legacy_payloads["NIQ2"]), NvqTensor)
+    assert isinstance(
+        io.unpack_tensor_payload("NIQ2J", legacy_payloads["NIQ2J"]),
+        NvqJscTensor,
     )
-    legacy_path.write_bytes(legacy_path.read_bytes().replace(b"NVQ", b"NIQ"))
-    _header, legacy_store = io.load_mmap(legacy_path)
-    try:
-        assert legacy_store.records["w2"].dtype == "NIQ2"
-        assert legacy_store.records["w2j"].dtype == "NIQ2J"
-        assert legacy_store.records["w3"].dtype == "NIQ3"
-        np.testing.assert_array_equal(legacy_store["w2"].signs, nvq2.signs)
-        np.testing.assert_array_equal(legacy_store["w2j"].state, nvq2j.state)
-        np.testing.assert_array_equal(legacy_store["w3"].sub_scale, nvq3.sub_scale)
-    finally:
-        legacy_store.close()
+    assert isinstance(io.unpack_tensor_payload("NIQ3", legacy_payloads["NIQ3"]), NvqTensor)
 
 
 def test_file_and_mmap_roundtrip_extended_nvq_jsc(tmp_path: Path) -> None:
@@ -530,9 +520,7 @@ def test_file_and_mmap_roundtrip_extended_nvq_jsc(tmp_path: Path) -> None:
     )
     _header, store = io.load_mmap(path)
     try:
-        assert store.records["v2l"].dtype == "NVQ2J-L"
-        assert store.records["v2xl"].dtype == "NVQ2J-XL"
-        assert store.records["v3l"].dtype == "NVQ3J-L"
+        assert {store.records[name].dtype for name in store.records} == {"NVQ"}
         for name, tensor in tensors.items():
             np.testing.assert_array_equal(store[name].indices, tensor.indices)
             np.testing.assert_array_equal(store[name].codebooks, tensor.codebooks)
@@ -590,7 +578,7 @@ def test_file_and_mmap_roundtrip_npq0_l(tmp_path: Path) -> None:
 
     _header, store = io.load_mmap(path)
     try:
-        assert store.records["weight"].dtype == "NPQ0-L"
+        assert store.records["weight"].dtype == "NPQ"
         np.testing.assert_array_equal(store["weight"].state, tensor.state)
         np.testing.assert_array_equal(store["weight"].second_codebooks, tensor.second_codebooks)
     finally:
@@ -652,8 +640,8 @@ def test_file_and_mmap_roundtrip_nvq1_s_and_npq0_s(tmp_path: Path) -> None:
 
     _header, store = io.load_mmap(path)
     try:
-        assert store.records["nvq1_s"].dtype == "NVQ1-S"
-        assert store.records["npq0_s"].dtype == "NPQ0-S"
+        assert store.records["nvq1_s"].dtype == "NVQ"
+        assert store.records["npq0_s"].dtype == "NPQ"
         np.testing.assert_array_equal(store["nvq1_s"].indices, nvq1_s.indices)
         np.testing.assert_array_equal(store["npq0_s"].state, npq0_s.state)
     finally:

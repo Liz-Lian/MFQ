@@ -386,7 +386,7 @@ def _load_minicpmo45(
 
 
 def _record_is_quantized(dtype: str) -> bool:
-    return dtype.startswith(("NINT", "NVQ", "NPQ"))
+    return dtype in {"NINT", "NINT8-0", "NVQ", "NPQ", "NEPQ"}
 
 
 def _replace_module(root: nn.Module, name: str, replacement: nn.Module) -> None:

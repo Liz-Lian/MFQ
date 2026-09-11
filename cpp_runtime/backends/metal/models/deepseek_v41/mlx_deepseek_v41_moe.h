@@ -15,7 +15,7 @@
 namespace mfq::metal {
 
 // DeepSeek-V4.1 routed + shared expert block.  The architecture owns router
-// semantics; only the heterogeneous NINTM projection primitive is shared.
+// semantics; only the heterogeneous MFE projection primitive is shared.
 class MlxDeepseekV41Moe {
 public:
     static MlxDeepseekV41Moe load(

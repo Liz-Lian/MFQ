@@ -27,7 +27,7 @@ from mfq.formats.tpq import (
     unpack_tpq_int4,
     unpack_tpq_pq,
 )
-from mfq.formats.io import pack_nint_moe, unpack_nint_moe
+from mfq.formats.io import pack_mfe, unpack_mfe
 from mfq.quantize.tpq import (
     TpqKmeansConfig,
     assign_tpq_codebook,
@@ -250,7 +250,7 @@ def test_tpq_audit_sums_match_materialized_reconstruction() -> None:
     assert signal == pytest.approx(float(np.square(weight).sum()))
 
 
-def test_tpq_tiers_and_nintm_roundtrip() -> None:
+def test_tpq_tiers_and_mfe_roundtrip() -> None:
     allocation = allocate_tpq_tiers(
         [70.0, 26.6, 3.2, 0.2],
         vv_share=0.5,
@@ -309,7 +309,7 @@ def test_tpq_tiers_and_nintm_roundtrip() -> None:
             plain_pool.tensor.indices,
             calibrated_pool.tensor.indices,
         )
-    restored = unpack_nint_moe(pack_nint_moe(tensor))
+    restored = unpack_mfe(pack_mfe(tensor))
     assert restored.expert_profiles == tensor.expert_profiles
     np.testing.assert_array_equal(
         dequantize_expertwise(restored),

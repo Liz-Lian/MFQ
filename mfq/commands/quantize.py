@@ -101,6 +101,14 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
     precision.add_argument("--groupsize", type=int, default=24, help="HF uniform NINT group size")
     precision.add_argument("--sub-bits", type=int, default=6, help="HF NINT scale precision")
     precision.add_argument(
+        "--nint-data-free",
+        action="store_true",
+        help=(
+            "allocate per-neuron NINT q+k profiles from reconstruction SSE "
+            "without calibration data, at the matched uniform-NINT packed-bit budget"
+        ),
+    )
+    precision.add_argument(
         "--q8-mode",
         choices=("nint8", "nint8-0"),
         default="nint8",
@@ -438,6 +446,11 @@ def _hf_arguments(
     _append_flag(argv, "--text-only", args.text_only)
     _append_flag(argv, "--quantize-vision", args.quantize_vision)
     _append_flag(argv, "--quantize-mtp", args.quantize_mtp)
+    _append_flag(
+        argv,
+        "--nint-data-free",
+        bool(getattr(args, "nint_data_free", False)),
+    )
     _append_flag(argv, "--bf16", args.bf16)
     _append_flag(argv, "--q8-to-nint8-zero", args.q8_mode == "nint8-0")
     _append_vq_arguments(argv, args)
@@ -527,11 +540,12 @@ def _validate(args: argparse.Namespace, source_format: str) -> None:
             or args.scheme
             or args.imatrix
             or args.tensor_overrides
+            or args.nint_data_free
         ):
             raise ValueError(
                 "--base-mfq derives MTP precision from the base and cannot use "
                 "full-precision, recipe, standard preset, scheme, imatrix, "
-                "or tensor overrides"
+                "tensor overrides, or data-free NINTv2"
             )
     if args.bf16 and source_format != "hf":
         raise ValueError("--full-precision requires an HF safetensors source")
@@ -544,6 +558,12 @@ def _validate(args: argparse.Namespace, source_format: str) -> None:
         raise ValueError("--tensor-overrides do not apply to --full-precision")
     if args.bf16 and (args.quantize_vision or args.quantize_mtp):
         raise ValueError("--quantize-vision and --quantize-mtp do not apply to --full-precision")
+    if args.bf16 and args.nint_data_free:
+        raise ValueError("--nint-data-free does not apply to --full-precision")
+    if args.nint_data_free and (args.imatrix or args.scheme):
+        raise ValueError(
+            "--nint-data-free cannot be combined with --imatrix or --scheme"
+        )
     if args.bf16 and args.important_neurons:
         raise ValueError("--full-precision cannot be combined with important-neuron quantization")
     if args.bf16 and (args.bits, args.groupsize, args.sub_bits) != (4, 24, 6):
@@ -566,6 +586,8 @@ def _validate(args: argparse.Namespace, source_format: str) -> None:
         raise ValueError(
             "--quantize-vision and --quantize-mtp require an HF or full-precision MFQ source"
         )
+    if source_format == "gguf" and args.nint_data_free:
+        raise ValueError("--nint-data-free requires an HF or full-precision MFQ source")
     if args.text_only and args.quantize_vision:
         raise ValueError("--quantize-vision cannot be combined with --text-only")
     if source_format == "gguf" and (args.bits != 4 or args.groupsize != 24 or args.sub_bits != 6):
@@ -614,6 +636,7 @@ def run(args: argparse.Namespace) -> int:
                 "full_precision": args.bf16,
                 "quantize_vision": args.quantize_vision,
                 "quantize_mtp": args.quantize_mtp,
+                "nint_data_free": args.nint_data_free,
                 "important_neurons": args.important_neurons or None,
                 "staged_blobs": args.staged_blobs,
             },

@@ -65,6 +65,12 @@ _BASED_ADDRESS_PATTERN = re.compile(
     r"uint shift = residual_bits & 7u;"
 )
 
+_ROW_ADDRESS_PATTERN = re.compile(
+    r"uint row_relative_bits = row_bit_shift \+ value_index \* bits;\s*"
+    r"uint byte_index = row_byte_offset \+ \(row_relative_bits >> 3u\);\s*"
+    r"uint shift = row_relative_bits & 7u;"
+)
+
 
 def _function_body(source: str, name: str) -> str:
     """Return one non-nested Metal helper body from an embedded source string."""
@@ -91,8 +97,6 @@ def _wrapped_old_address(value_index: int, bits: int) -> tuple[int, int]:
 @pytest.mark.parametrize(
     ("path", "helper"),
     [
-        (_PYTHON_NINT, "mfq_nint_read_bits"),
-        (_CPP_NINT, "mfq_nint_read_bits"),
         (_CPP_GROUPED, "mfq_grouped_nint_read_bits"),
     ],
 )
@@ -110,9 +114,19 @@ def test_all_nint_metal_helpers_use_overflow_safe_address(
     )
 
 
+@pytest.mark.parametrize("path", [_PYTHON_NINT, _CPP_NINT])
+def test_unified_nint_row_helpers_use_byte_base_and_safe_relative_address(
+    path: Path,
+):
+    body = _function_body(path.read_text(), "mfq_nint_read_row_value")
+    assert _ROW_ADDRESS_PATTERN.search(body)
+    assert "uint row_byte_offset" in path.read_text()
+    assert "uint row_bit_shift" in path.read_text()
+
+
 @pytest.mark.parametrize(
     "path",
-    [_PYTHON_NINT, _CPP_NINT, _PYTHON_MOE, _CPP_MOE],
+    [_PYTHON_MOE],
 )
 def test_specialized_nint3_nint6_addresses_do_not_multiply_before_shift(
     path: Path,
@@ -146,11 +160,9 @@ def test_no_metal_packed_index_multiplies_bits_before_reducing(path: Path):
 @pytest.mark.parametrize(
     ("path", "minimum_safe_addresses"),
     [
-        (_PYTHON_NINT, 1),
-        (_CPP_NINT, 1),
         (_CPP_GROUPED, 2),
         (_PYTHON_MOE, 1),
-        (_CPP_MOE, 2),
+        (_CPP_MOE, 1),
         (_PYTHON_VQ, 2),
         (_CPP_VQ, 2),
     ],
@@ -219,8 +231,8 @@ def test_large_nint_address_exact_metal_probe():
         pytest.skip("Metal device unavailable")
 
     source_text = _PYTHON_NINT.read_text()
-    helper = _function_body(source_text, "mfq_nint_read_bits")
-    match = _ADDRESS_PATTERN.search(helper)
+    helper = _function_body(source_text, "mfq_nint_read_row_value")
+    match = _ROW_ADDRESS_PATTERN.search(helper)
     assert match is not None
 
     # This is the exact address block extracted from the production helper.
@@ -228,13 +240,20 @@ def test_large_nint_address_exact_metal_probe():
     address_source = match.group(0)
     probe = mx.fast.metal_kernel(
         name="mfq_test_nint_large_bit_address",
-        input_names=["value_indices", "bit_widths"],
+        input_names=[
+            "row_byte_offsets",
+            "row_bit_shifts",
+            "value_indices",
+            "bit_widths",
+        ],
         output_names=["byte_offsets", "shifts"],
         source=f"""
             uint linear = thread_position_in_grid.x;
             if (linear >= uint(COUNT)) {{
                 return;
             }}
+            uint row_byte_offset = uint(row_byte_offsets[linear]);
+            uint row_bit_shift = uint(row_bit_shifts[linear]);
             uint value_index = uint(value_indices[linear]);
             uint bits = uint(bit_widths[linear]);
             {address_source}
@@ -243,20 +262,21 @@ def test_large_nint_address_exact_metal_probe():
         """,
     )
 
-    qwen_last = 248_320 * 5_120 - 1
+    qwen_row = 248_320 - 1
     widths = np.asarray([4, 5, 6, 7, 8], dtype=np.uint32)
-    indices = np.asarray(
-        [
-            qwen_last,
-            qwen_last,
-            qwen_last,
-            (1 << 32) // 7 + 19,
-            qwen_last,
-        ],
-        dtype=np.uint32,
+    row_bit_offsets = np.asarray(
+        [qwen_row * 5_120 * int(bits) for bits in widths], dtype=np.uint64
     )
+    row_byte_offsets = (row_bit_offsets >> 3).astype(np.uint32)
+    row_bit_shifts = (row_bit_offsets & 7).astype(np.uint32)
+    indices = np.full(widths.shape, 5_119, dtype=np.uint32)
     byte_offsets, shifts = probe(
-        inputs=[mx.array(indices), mx.array(widths)],
+        inputs=[
+            mx.array(row_byte_offsets),
+            mx.array(row_bit_shifts),
+            mx.array(indices),
+            mx.array(widths),
+        ],
         template=[("COUNT", len(indices))],
         grid=(len(indices), 1, 1),
         threadgroup=(len(indices), 1, 1),
@@ -266,7 +286,12 @@ def test_large_nint_address_exact_metal_probe():
     mx.eval(byte_offsets, shifts)
 
     expected = np.asarray(
-        [_host_address(int(index), int(bits)) for index, bits in zip(indices, widths)],
+        [
+            divmod(int(row_offset) + int(index) * int(bits), 8)
+            for row_offset, index, bits in zip(
+                row_bit_offsets, indices, widths, strict=True
+            )
+        ],
         dtype=np.uint32,
     )
     np.testing.assert_array_equal(np.asarray(byte_offsets), expected[:, 0])

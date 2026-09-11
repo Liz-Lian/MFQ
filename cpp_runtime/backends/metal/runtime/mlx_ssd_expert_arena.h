@@ -22,7 +22,7 @@ struct MlxSsdExpertWeights {
 // Four-bank unified-memory arena shared by SSD prefill buffers and the decode
 // expert cache. Geometry is supplied by the model graph; the arena itself is
 // independent of model family. Gate and Up stay adjacent so one heterogeneous
-// NINTM dispatch can project and apply SwiGLU.
+// MFE dispatch can project and apply SwiGLU.
 class MlxMxfp4SsdExpertArena {
 public:
     MlxMxfp4SsdExpertArena(

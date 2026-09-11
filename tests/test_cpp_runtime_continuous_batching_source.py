@@ -88,9 +88,9 @@ def test_real_weight_gate_exercises_join_and_compaction():
     assert '" prompt_lengths=193,17 split_k=1"' in BATCHING
 
 
-def test_linear_attention_small_m_can_share_nint_activation_quantization():
-    assert "MFQ_LINEAR_ATTN_SMALL_M_QX_REUSE" in DECODE
-    assert "nint_small_m_qx_compatible" in DECODE
-    assert "qkv_proj.shared_qx_weight()" in DECODE
-    assert "z_proj.forward_qx(" in DECODE
-    assert "ab_nint_proj.forward_qx(" in DECODE
+def test_linear_attention_uses_the_canonical_nint_operator():
+    assert "nint_matmul_ws_cuda" in DECODE
+    assert "MFQ_LINEAR_ATTN_SMALL_M_QX_REUSE" not in DECODE
+    assert "nint_small_m_qx_compatible" not in DECODE
+    assert "shared_qx_weight" not in DECODE
+    assert "forward_qx(" not in DECODE

@@ -1,4 +1,4 @@
-"""Expert-wise mixed-family compact tensor containers."""
+"""MFE -- Mixed Format Experts container definitions."""
 
 from __future__ import annotations
 
@@ -8,7 +8,9 @@ from typing import TypeAlias
 import numpy as np
 
 from mfq.formats.mx import MxTensor
+from mfq.formats.compat import MXFP4_SQ_DTYPE, NINT_DTYPE
 from mfq.formats.nepq import NepqTensor
+from mfq.formats.mxfp4_sq import Mxfp4SqTensor
 from mfq.formats.nint import NintTensor
 from mfq.formats.nint8_zero import Nint8ZeroTensor
 from mfq.formats.npq0_l import Npq0LTensor
@@ -30,6 +32,7 @@ ExpertPoolTensor: TypeAlias = (
     | NepqTensor
     | TpqPqTensor
     | MxTensor
+    | Mxfp4SqTensor
     | np.ndarray
 )
 
@@ -41,19 +44,21 @@ def expert_tensor_family(tensor: ExpertPoolTensor) -> str:
         return "NINT8-0"
     if isinstance(tensor, MxTensor):
         if tensor.dtype not in {"MXFP4", "MXFP8"}:
-            raise ValueError(f"NINTM supports native MXFP4/MXFP8 expert pools, got {tensor.dtype}")
+            raise ValueError(f"MFE supports native MXFP4/MXFP8 expert pools, got {tensor.dtype}")
         return tensor.dtype
+    if isinstance(tensor, Mxfp4SqTensor):
+        return f"{MXFP4_SQ_DTYPE}{tensor.bits}"
     if isinstance(tensor, np.ndarray):
         if tensor.dtype == np.dtype(np.float16):
             return "F16"
         # BF16 is represented by io.BFloat16Array, a tagged uint16 ndarray.
-        # Avoid importing io here because io owns the NINTM codec and imports
+        # Avoid importing io here because io owns the MFE codec and imports
         # this module.
         if tensor.dtype == np.dtype("<u2") and type(tensor).__name__ == "BFloat16Array":
             return "BF16"
-        raise ValueError(f"NINTM dense expert pools support BF16/F16, got {tensor.dtype}")
+        raise ValueError(f"MFE dense expert pools support BF16/F16, got {tensor.dtype}")
     if isinstance(tensor, NintTensor):
-        return tensor.spec.profile_label
+        return NINT_DTYPE
     if isinstance(tensor, NepqTensor):
         return tensor.spec.label
     if isinstance(tensor, TpqPqTensor):
@@ -83,11 +88,11 @@ def expert_tensor_family(tensor: ExpertPoolTensor) -> str:
         if family is None:
             raise ValueError(f"{tensor.spec.codebook} requires an NvqJscTensor expert profile")
         return family
-    raise TypeError(f"unsupported NINTM cohort tensor: {type(tensor)!r}")
+    raise TypeError(f"unsupported MFE cohort tensor: {type(tensor)!r}")
 
 
 @dataclass(frozen=True)
-class NintMoePool:
+class MfePool:
     """One homogeneous precision cohort and its global expert IDs."""
 
     expert_ids: np.ndarray
@@ -95,29 +100,29 @@ class NintMoePool:
 
 
 @dataclass(frozen=True)
-class NintMoeTensor:
+class MfeTensor:
     """One logical ``[experts, out, in]`` tensor with per-expert precision."""
 
     shape: tuple[int, int, int]
-    pools: tuple[NintMoePool, ...]
+    pools: tuple[MfePool, ...]
 
     def __post_init__(self) -> None:
         if len(self.shape) != 3 or any(int(value) <= 0 for value in self.shape):
-            raise ValueError("NINTM shape must be [experts, out, in]")
+            raise ValueError("MFE shape must be [experts, out, in]")
         n_experts, out_per_expert, neuron_len = (int(value) for value in self.shape)
         if not self.pools:
-            raise ValueError("NINTM must contain at least one precision pool")
+            raise ValueError("MFE must contain at least one precision pool")
         owners = np.full(n_experts, -1, dtype=np.int32)
         for pool_index, pool in enumerate(self.pools):
             expert_ids = np.ascontiguousarray(pool.expert_ids, dtype=np.int32).reshape(-1)
             if expert_ids.size == 0:
-                raise ValueError("NINTM precision pools cannot be empty")
+                raise ValueError("MFE precision pools cannot be empty")
             if np.any(expert_ids < 0) or np.any(expert_ids >= n_experts):
-                raise ValueError(f"NINTM pool {pool_index} contains an invalid expert id")
+                raise ValueError(f"MFE pool {pool_index} contains an invalid expert id")
             if np.unique(expert_ids).size != expert_ids.size:
-                raise ValueError(f"NINTM pool {pool_index} repeats an expert id")
+                raise ValueError(f"MFE pool {pool_index} repeats an expert id")
             if np.any(owners[expert_ids] >= 0):
-                raise ValueError("an expert belongs to multiple NINTM pools")
+                raise ValueError("an expert belongs to multiple MFE pools")
             owners[expert_ids] = pool_index
 
             tensor = pool.tensor
@@ -125,7 +130,7 @@ class NintMoeTensor:
             if isinstance(tensor, NepqTensor):
                 expected_shape = (expert_ids.size, out_per_expert, neuron_len)
                 valid = tuple(tensor.shape) == expected_shape
-            elif isinstance(tensor, (MxTensor, np.ndarray)):
+            elif isinstance(tensor, (MxTensor, Mxfp4SqTensor, np.ndarray)):
                 expected_shape = (expert_ids.size * out_per_expert, neuron_len)
                 valid = tuple(tensor.shape) == expected_shape
             else:
@@ -133,11 +138,11 @@ class NintMoeTensor:
                 valid = tuple(tensor.shape) == expected_shape and tensor.axis == 0
             if not valid:
                 raise ValueError(
-                    f"NINTM pool {pool_index} tensor shape {tensor.shape} must be {expected_shape}"
+                    f"MFE pool {pool_index} tensor shape {tensor.shape} must be {expected_shape}"
                 )
         missing = np.flatnonzero(owners < 0)
         if missing.size:
-            raise ValueError(f"NINTM pools do not cover experts {missing[:16].tolist()}")
+            raise ValueError(f"MFE pools do not cover experts {missing[:16].tolist()}")
 
     @property
     def n_experts(self) -> int:

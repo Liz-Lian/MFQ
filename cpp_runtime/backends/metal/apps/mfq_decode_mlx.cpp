@@ -57,7 +57,7 @@ constexpr std::size_t kDeepseekV41AutomaticExpertCacheLimitBytes =
     std::size_t{128} << 30;
 
 void release_model_load_staging_memory() {
-    // Model conversion and NINTM repacking leave large, now-unused buffers in
+    // Model conversion and MFE repacking leave large, now-unused buffers in
     // both the MLX cache and macOS malloc's large-object depot. Keeping those
     // pages makes a single fully resident model look tens of GiB larger and
     // can force useful weights into swap before the first request.
@@ -255,10 +255,10 @@ void print_help() {
         << "  --tensor NAME          load and execute one supported linear weight\n"
         << "  --benchmark-reps N     timed executions for --tensor (default 1)\n"
         << "  --benchmark-tokens N   routed input rows for --tensor (default 1)\n"
-        << "  --benchmark-experts L  comma-separated NINTM expert IDs\n"
+        << "  --benchmark-experts L  comma-separated MFE expert IDs\n"
         << "  --benchmark-distributed-experts N\n"
         << "                          vary N routed experts across benchmark tokens\n"
-        << "  --benchmark-swiglu     fuse an even-width NINTM gate/up record\n"
+        << "  --benchmark-swiglu     fuse an even-width MFE gate/up record\n"
         << "  --self-test-metal      execute an MLX C++ graph on Metal\n"
         << "  --server               run the native C++ OpenAI-compatible server\n"
         << "  --metal-predequantize-f16\n"
@@ -1993,7 +1993,7 @@ int run_native_server(
             << load_seconds << " s; runtime=native-cpp"
             << " expert_backing="
             << (expert_cache_bytes.has_value()
-                    ? "nintm-ssd"
+                    ? "mfe-ssd"
                     : "full-resident")
             << std::endl;
         const auto load_runtime =
@@ -2055,11 +2055,11 @@ int run_native_server(
             << load_seconds << " s";
         if (expert_cache_bytes.has_value()) {
             std::cout
-                << " nintm_load=disk-cache cache_gb="
+                << " mfe_load=disk-cache cache_gb="
                 << static_cast<double>(*expert_cache_bytes) /
                     static_cast<double>(std::uint64_t{1} << 30);
         } else {
-            std::cout << " nintm_load=full-resident";
+            std::cout << " mfe_load=full-resident";
         }
         std::cout << std::endl;
         const auto load_runtime =
@@ -2285,9 +2285,9 @@ int main(int argc, char** argv) {
         if (!arguments.tensor.empty()) {
             configure_mlx_metal();
             const auto& record = model.record(arguments.tensor);
-            if (record.dtype == "NINTM") {
+            if (record.dtype == "MFE") {
                 const auto weight =
-                    mfq::metal::MlxNintMoeWeight::from_blob(
+                    mfq::metal::MlxMfeWeight::from_blob(
                         model.read(arguments.tensor));
                 if (arguments.benchmark_distributed_routes > 0
                     && !arguments.benchmark_experts.empty()) {
@@ -2303,7 +2303,7 @@ int main(int argc, char** argv) {
                           arguments.benchmark_experts.size());
                 if (routes > weight.experts()) {
                     usage_error(
-                        "NINTM benchmark routes exceed expert count");
+                        "MFE benchmark routes exceed expert count");
                 }
                 std::vector<float> input_values(
                     static_cast<std::size_t>(arguments.benchmark_tokens)
@@ -2392,7 +2392,7 @@ int main(int argc, char** argv) {
                      ++index) {
                     if (!std::isfinite(values[index])) {
                         throw std::runtime_error(
-                            "Metal NINTM smoke test returned non-finite data");
+                            "Metal MFE smoke test returned non-finite data");
                     }
                     maximum = std::max(
                         maximum, std::fabs(values[index]));
@@ -2404,10 +2404,10 @@ int main(int argc, char** argv) {
                 }
                 if (maximum <= 1e-12f) {
                     throw std::runtime_error(
-                        "Metal NINTM smoke test unexpectedly returned all zero");
+                        "Metal MFE smoke test unexpectedly returned all zero");
                 }
                 std::cout
-                    << "Metal NINTM smoke test passed"
+                    << "Metal MFE smoke test passed"
                     << " experts=" << weight.experts()
                     << " tokens=" << arguments.benchmark_tokens
                     << " routes=" << routes

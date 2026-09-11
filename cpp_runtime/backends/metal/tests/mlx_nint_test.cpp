@@ -434,14 +434,102 @@ void test_mixed_q_bits_gs24_small_m() {
     }
 }
 
+void test_mixed_q_bits_routed_reuses_matmul_kernel() {
+    constexpr int experts = 3;
+    constexpr int global_experts = 5;
+    constexpr int out_per_expert = 7;
+    constexpr int input_size = 47;
+    constexpr int packed_row_size = 48;
+    constexpr int tokens = 3;
+    constexpr int routes = 3;
+    const auto fixture = make_mixed_q_bits_blob(
+        experts * out_per_expert,
+        24,
+        2,
+        input_size,
+        1,
+        8);
+    const auto weight = mfq::metal::MlxNintWeight::from_blob(fixture.blob);
+    const std::vector<std::int32_t> expert_ids{
+        2, 4, 1,
+        0, 2, 3,
+        1, 0, 2,
+    };
+    const std::vector<std::int32_t> expert_map{2, -1, 0, 1, 9};
+    std::vector<float> shared_input(tokens * input_size);
+    for (std::size_t index = 0; index < shared_input.size(); ++index) {
+        shared_input[index] = static_cast<float>(
+            static_cast<int>((index * 7 + 3) % 29) - 14) / 64.0f;
+    }
+    std::vector<float> routed_input(tokens * routes * input_size);
+    for (int token = 0; token < tokens; ++token) {
+        for (int route = 0; route < routes; ++route) {
+            for (int column = 0; column < input_size; ++column) {
+                routed_input[(token * routes + route) * input_size + column] =
+                    shared_input[token * input_size + column]
+                    + static_cast<float>(route) / 128.0f;
+            }
+        }
+    }
+    const auto ids = mlx::core::array(
+        expert_ids.begin(),
+        mlx::core::Shape{tokens, routes});
+    const auto map = mlx::core::array(
+        expert_map.begin(),
+        mlx::core::Shape{global_experts});
+    const auto check = [&](const mlx::core::array& input, bool shared) {
+        auto result = mlx::core::astype(
+            weight.routed_matmul(input, ids, map, out_per_expert),
+            mlx::core::float32);
+        result.eval();
+        const auto* actual = result.data<float>();
+        for (int token = 0; token < tokens; ++token) {
+            for (int route = 0; route < routes; ++route) {
+                const int local = expert_map[expert_ids[token * routes + route]];
+                for (int output = 0; output < out_per_expert; ++output) {
+                    float expected = 0.0f;
+                    if (local >= 0 && local < experts) {
+                        for (int column = 0; column < input_size; ++column) {
+                            const float activation = shared
+                                ? shared_input[token * input_size + column]
+                                : routed_input[
+                                    (token * routes + route) * input_size
+                                    + column];
+                            expected += activation * fixture.quantized[
+                                (local * out_per_expert + output)
+                                    * packed_row_size
+                                + column];
+                        }
+                    }
+                    require_close(
+                        actual[(token * routes + route) * out_per_expert
+                            + output],
+                        expected,
+                        0.08f);
+                }
+            }
+        }
+    };
+    check(mlx::core::astype(
+        mlx::core::array(
+            shared_input.begin(),
+            mlx::core::Shape{tokens, input_size}),
+        mlx::core::float16), true);
+    check(mlx::core::astype(
+        mlx::core::array(
+            routed_input.begin(),
+            mlx::core::Shape{tokens, routes, input_size}),
+        mlx::core::float16), false);
+}
+
 void test_mixed_q_bits_inference() {
     constexpr int output_size = 16;
     constexpr int input_size = 9;
     constexpr int packed_row_size = 10;
     const auto fixture = make_mixed_q_bits_blob();
     const auto weight = mfq::metal::MlxNintWeight::from_blob(fixture.blob);
-    if (!weight.is_nint_v2()) {
-        throw std::runtime_error("NINTv2 layout was not retained");
+    if (weight.has_uniform_q_bits()) {
+        throw std::runtime_error("adaptive NINT q widths were not retained");
     }
 
     auto dense = mlx::core::astype(weight.dequantize(), mlx::core::float32);
@@ -736,22 +824,9 @@ void verify_nint_gs24_decode(
 
         if (bits == 6 && rows == 1 && dtype == float16) {
             auto fused = weight.greedy_argmax(input);
-            if (!fused) {
+            if (fused) {
                 throw std::runtime_error(
-                    "NINT6/GS24 fused greedy path was unavailable");
-            }
-            fused->eval();
-            int expected_index = 0;
-            for (int output_row = 1;
-                 output_row < output_size;
-                 ++output_row) {
-                if (values[output_row] > values[expected_index]) {
-                    expected_index = output_row;
-                }
-            }
-            if (fused->data<std::int32_t>()[0] != expected_index) {
-                throw std::runtime_error(
-                    "NINT6/GS24 fused greedy token mismatch");
+                    "NINT unexpectedly exposed a precision-specific greedy kernel");
             }
         }
 
@@ -794,8 +869,8 @@ void verify_nint_gs24_decode(
 
 void test_nint4_gs24_decode() {
     // Both dimensions have tails: K is not a multiple of GS24 and OUT is not
-    // a multiple of the kernel's 16-row threadgroup tile. M=2..6 exercise
-    // the verify kernel; FP32 retains the generic fallback.
+    // a multiple of the shared kernel's 16-output threadgroup tile. M=2..6
+    // exercise that same metadata-driven kernel.
     verify_nint_gs24_decode(4, 37, 111, true);
 
     // Exercise direct byte addressing and a large non-aligned output grid.
@@ -834,7 +909,7 @@ void test_nint4_gs24_grouped_small_m() {
         if (!grouped || grouped->shape() !=
                 Shape{1, rows, projection_groups, output_per_group}) {
             throw std::runtime_error(
-                "NINT4 grouped small-M kernel was unavailable");
+                "NINT4 shared-kernel grouped-row path was unavailable");
         }
         auto output = astype(*grouped, float32);
         eval(output);
@@ -885,8 +960,8 @@ void test_nint4_gs24_grouped_small_m() {
 }
 
 void test_nint3_gs24_decode() {
-    // Exercise the standard S3 profile across the specialized M=2..6 route,
-    // plus the retained single-row and FP32 paths.
+    // Exercise the standard S3 profile across M=2..6 through the same
+    // metadata-driven kernel, plus the retained single-row and FP32 paths.
     verify_nint_gs24_decode(3, 37, 111, true);
 }
 
@@ -1059,21 +1134,10 @@ int main() {
     try {
         using namespace mlx::core;
         if (!mfq::metal::is_nint_dtype("NINT")) {
-            throw std::runtime_error("legacy NINT dtype was rejected");
-        }
-        if (!mfq::metal::is_nint_dtype("NINTv2")) {
-            throw std::runtime_error("NINTv2 dtype was rejected");
-        }
-        for (int bits = 1; bits <= 8; ++bits) {
-            if (!mfq::metal::is_nint_dtype(
-                    "NINT" + std::to_string(bits))) {
-                throw std::runtime_error(
-                    "NINT dtype was rejected for bit width " +
-                    std::to_string(bits));
-            }
+            throw std::runtime_error("canonical NINT dtype was rejected");
         }
         for (const char* invalid : {
-                 "", "NIN", "NINT0", "NINT9", "NINTM",
+                 "", "NIN", "NINT0", "NINT4", "NINT9", "NINTv2", "MFE",
                  "NINT10", "NINT4-24", "nint4",
              }) {
             if (mfq::metal::is_nint_dtype(invalid)) {
@@ -1219,15 +1283,13 @@ int main() {
         test_nint4_gs24_decode();
         test_nint4_gs24_grouped_small_m();
         test_nint6_gs24_decode();
-        test_nint4_swiglu();
         test_mixed_sub_bits_loads_into_existing_kernel();
         test_mixed_q_bits_inference();
         test_mixed_q_bits_gs24_small_m();
+        test_mixed_q_bits_routed_reuses_matmul_kernel();
         std::cout
-            << "MFQ C++ NINT1-NINT8 matmul/embedding and "
-               "NINT3/NINT4/NINT6 GS24 and NINT5 GS28 decode and "
-               "NINT4 SwiGLU "
-               "Metal tests passed\n";
+            << "MFQ C++ unified NINT matmul, embedding, dequantization, "
+               "and adaptive q/k Metal tests passed\n";
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << "\n";

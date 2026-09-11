@@ -154,7 +154,7 @@ Fixture make_fixture(int rows, int columns) {
       rows,
       columns,
       matrix_scale_base,
-      blob.size() - header_nbytes + 1,
+      blob.size(),
       std::move(blob),
       std::move(dense),
   };
@@ -343,6 +343,68 @@ void test_backward_input() {
   }
 }
 
+void test_routed_cohort_uses_shared_kernel() {
+  using namespace mlx::core;
+  constexpr int experts = 3;
+  constexpr int output = 5;
+  constexpr int tokens = 2;
+  constexpr int routes = 3;
+  const auto fixture = make_fixture(experts * output, 96);
+  const auto weight =
+      mfq::metal::MlxMxfp4Sq2Weight::from_blob(fixture.blob);
+  std::vector<float> input_values(
+      static_cast<std::size_t>(tokens) * fixture.columns);
+  for (std::size_t index = 0; index < input_values.size(); ++index) {
+    input_values[index] =
+        static_cast<float>(static_cast<int>((index * 7 + 3) % 31) - 15) /
+        128.0f;
+  }
+  // Global 0/1/2 map to cohort-local 2/0/1.  Global 3 is not in this
+  // cohort and must produce zeros without another dispatch implementation.
+  const std::vector<std::int32_t> ids{0, 1, 3, 2, 0, -1};
+  const std::vector<std::int32_t> map{2, 0, 1, -1};
+  auto input = astype(
+      array(input_values.begin(), Shape{tokens, fixture.columns}), float16);
+  auto id_array = array(ids.begin(), Shape{tokens, routes});
+  auto map_array = array(map.begin(), Shape{static_cast<int>(map.size())});
+  auto actual = contiguous(astype(
+      weight.routed_matmul(input, id_array, map_array, output), float32));
+  eval(actual);
+  require(actual.shape() == Shape{tokens, routes, output},
+          "MXFP4-SQ2 routed output shape mismatch");
+  float maximum_difference = 0.0f;
+  for (int token = 0; token < tokens; ++token) {
+    for (int route = 0; route < routes; ++route) {
+      const int global = ids[token * routes + route];
+      const int local = global >= 0 && global < static_cast<int>(map.size())
+                            ? map[static_cast<std::size_t>(global)]
+                            : -1;
+      for (int row = 0; row < output; ++row) {
+        float expected = 0.0f;
+        if (local >= 0) {
+          for (int column = 0; column < fixture.columns; ++column) {
+            expected += input_values[
+                            static_cast<std::size_t>(token) * fixture.columns +
+                            column] *
+                        fixture.dense[
+                            (static_cast<std::size_t>(local) * output + row) *
+                                fixture.columns +
+                            column];
+          }
+        }
+        const auto index =
+            (static_cast<std::size_t>(token) * routes + route) * output + row;
+        maximum_difference = std::max(
+            maximum_difference,
+            std::fabs(actual.data<float>()[index] - expected));
+      }
+    }
+  }
+  require(maximum_difference < 8e-3f,
+          "MXFP4-SQ2 routed shared-kernel mismatch: max_abs=" +
+              std::to_string(maximum_difference));
+}
+
 void test_blob_validation() {
   auto fixture = make_fixture(3, 64);
   const auto require_rejected = [](const std::vector<std::uint8_t> &blob,
@@ -364,6 +426,26 @@ void test_blob_validation() {
   invalid_magic[0] = 'X';
   require_rejected(invalid_magic, "MXFP4-SQ2 invalid magic was accepted");
 
+  auto invalid_version = fixture.blob;
+  invalid_version[4] = 2;
+  require_rejected(invalid_version,
+                   "MXFP4-SQ2 invalid version was accepted");
+
+  auto invalid_reserved = fixture.blob;
+  invalid_reserved[6] = 1;
+  require_rejected(invalid_reserved,
+                   "MXFP4-SQ2 nonzero reserved field was accepted");
+
+  auto zero_rows = fixture.blob;
+  std::fill(zero_rows.begin() + 8, zero_rows.begin() + 16, 0);
+  require_rejected(zero_rows, "MXFP4-SQ2 zero row count was accepted");
+
+  auto invalid_width = fixture.blob;
+  std::fill(invalid_width.begin() + 16, invalid_width.begin() + 24, 0);
+  invalid_width[16] = 33;
+  require_rejected(invalid_width,
+                   "MXFP4-SQ2 non-block-aligned width was accepted");
+
   auto trailing = fixture.blob;
   trailing.push_back(0);
   require_rejected(trailing, "MXFP4-SQ2 trailing payload was accepted");
@@ -383,6 +465,7 @@ int main() {
     test_multirow_buckets();
     test_fp32_multirow_contract();
     test_backward_input();
+    test_routed_cohort_uses_shared_kernel();
     test_blob_validation();
     std::cout << "MFQ native-MXFP4 SQ2 Metal dequant/GEMV/MMQ passed\n";
     return 0;

@@ -512,14 +512,7 @@ bool is_mx_dtype(std::string_view dtype) {
 }
 
 bool is_nint_dtype(std::string_view dtype) {
-    if (dtype == "NINT" || dtype == "NINTv2") {
-        return true;
-    }
-    if (dtype.size() != 5 ||
-        dtype.substr(0, 4) != "NINT") {
-        return false;
-    }
-    return dtype[4] >= '1' && dtype[4] <= '8';
+    return dtype == "NINT";
 }
 
 bool is_tpq_pq_dtype(std::string_view dtype) {
@@ -1954,26 +1947,26 @@ inspect_deepseek_v4_tensor_metadata(
         return result;
     }
 
-    if (record.dtype == "NINTM") {
+    if (record.dtype == "MFE") {
         result.packed = true;
         const auto magic =
-            cursor.bytes(4, "NINTM magic");
+            cursor.bytes(4, "MFE magic");
         const auto experts =
-            cursor.scalar<std::uint32_t>("NINTM experts");
+            cursor.scalar<std::uint32_t>("MFE experts");
         const auto output =
             cursor.scalar<std::uint32_t>(
-                "NINTM output per expert");
+                "MFE output per expert");
         const auto input =
             cursor.scalar<std::uint32_t>(
-                "NINTM input width");
+                "MFE input width");
         const auto pools =
-            cursor.scalar<std::uint32_t>("NINTM pool count");
-        if ((magic != "NIM1" && magic != "NIM2") ||
+            cursor.scalar<std::uint32_t>("MFE pool count");
+        if ((magic != "MFE1" && magic != "NIM1" && magic != "NIM2") ||
             experts == 0 || output == 0 || input == 0 ||
             pools == 0 || pools > experts ||
             record.nbytes <= cursor.offset()) {
             throw std::runtime_error(
-                "invalid DeepSeek-V4 NINTM header: " +
+                "invalid DeepSeek-V4 MFE header: " +
                 name);
         }
         result.shape = {
@@ -2025,7 +2018,7 @@ void validate_deepseek_v4_model_bindings(
             supported = is_dense_integer_dtype(metadata.dtype);
             break;
         case DeepseekV4TensorKind::routed_experts:
-            supported = metadata.dtype == "NINTM";
+            supported = metadata.dtype == "MFE";
             break;
         }
         if (!supported) {

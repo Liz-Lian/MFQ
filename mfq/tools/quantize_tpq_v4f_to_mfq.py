@@ -530,11 +530,11 @@ def convert(
                     )
                 os.replace(temporary, blob)
                 status = "written"
-            records.append(BlobRecord(target_name, "NINTM", expected, blob))
+            records.append(BlobRecord(target_name, "MFE", expected, blob))
             event = {
                 "completed": index,
                 "name": target_name,
-                "dtype": "NINTM",
+                "dtype": "MFE",
                 "blob_bytes": expected,
                 "status": status,
                 "seconds": time.perf_counter() - item_started,
@@ -651,12 +651,12 @@ def convert(
                     )
                 os.replace(temporary, blob)
                 status = "written"
-            records.append(BlobRecord(target_name, "NINTM", expected, blob))
+            records.append(BlobRecord(target_name, "MFE", expected, blob))
             dspark_tensor_count += 1
             event = {
                 "completed": index,
                 "name": target_name,
-                "dtype": "NINTM",
+                "dtype": "MFE",
                 "blob_bytes": expected,
                 "status": status,
                 "seconds": time.perf_counter() - item_started,

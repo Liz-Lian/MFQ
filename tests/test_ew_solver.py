@@ -483,9 +483,5 @@ def test_solve_ew_cli_writes_quantizer_scheme_and_report(tmp_path: Path) -> None
     assert report["scheme_sha256"]
     assert report["shape_constraints"]["down-peaks"]["peak_retention"] == 1.0
     precisions = _glm_expert_precisions("blk.0.ffn_down_exps.weight", (4, 1, 100), scheme)
-    assert [precision.family for precision in precisions] == [
-        "NINT4",
-        "NINT4",
-        "NINT2",
-        "NINT2",
-    ]
+    assert [precision.family for precision in precisions] == ["NINT"] * 4
+    assert [precision.nint_spec.bits for precision in precisions] == [4, 4, 2, 2]

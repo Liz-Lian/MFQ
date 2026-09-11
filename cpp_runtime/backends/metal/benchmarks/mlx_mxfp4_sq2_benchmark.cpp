@@ -286,7 +286,7 @@ int main(int argc, char **argv) {
     const auto sq2 = Sq2Weight::from_blob(encoded.sq2_blob);
     const auto native = MlxMxWeight::from_blob("MXFP4", encoded.mxfp4_blob);
     const auto input = make_input(columns);
-    require(sq2.packed_nbytes() == 4'288'513u,
+    require(sq2.packed_nbytes() == 4'288'536u,
             "unexpected SQ2 benchmark payload size");
     require(native.packed_nbytes() == 8'912'896,
             "unexpected MXFP4 benchmark payload size");

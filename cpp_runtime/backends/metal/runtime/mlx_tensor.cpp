@@ -315,6 +315,7 @@ array materialize_weight_fp16(
             } else if constexpr (
                 std::is_same_v<Weight, MlxTpqPqWeight>
                 || std::is_same_v<Weight, MlxMxWeight>
+                || std::is_same_v<Weight, MlxMxfp4SqWeight>
             ) {
                 return value.dequantize(mlx::core::float16);
             } else {
@@ -353,6 +354,7 @@ std::optional<array> unpack_quantized_weight(
                     mlx::core::float16);
             } else if constexpr (
                 std::is_same_v<Weight, MlxTpqPqWeight>
+                || std::is_same_v<Weight, MlxMxfp4SqWeight>
             ) {
                 return mlx::core::astype(
                     value.dequantize(
@@ -522,6 +524,11 @@ MlxLinear MlxLinear::load(
         return finish(MlxLinear(
             MlxVqWeight::from_blob(record.dtype, mapped.view())));
     }
+    if (is_mxfp4_sq_dtype(record.dtype)) {
+        const auto mapped = model.map_record(name);
+        return finish(MlxLinear(
+            MlxMxfp4SqWeight::from_blob(mapped.view())));
+    }
     if (record.dtype == "TPQ-I4G64" ||
         record.dtype == "TPQ-I4G64") {
         return finish(MlxLinear(
@@ -566,6 +573,11 @@ MlxLinear::MlxLinear(MlxTpqPqWeight weight)
       weight_(std::move(weight)) {}
 
 MlxLinear::MlxLinear(MlxMxWeight weight)
+    : input_size_(weight.input_size()),
+      output_size_(weight.output_size()),
+      weight_(std::move(weight)) {}
+
+MlxLinear::MlxLinear(MlxMxfp4SqWeight weight)
     : input_size_(weight.input_size()),
       output_size_(weight.output_size()),
       weight_(std::move(weight)) {}
@@ -623,6 +635,10 @@ array MlxLinear::operator()(const array& input) const {
         return preserve_input_dtype(packed->matmul(input));
     }
     if (const auto* packed = std::get_if<MlxMxWeight>(&weight_)) {
+        return preserve_input_dtype(packed->matmul(input));
+    }
+    if (const auto* packed =
+            std::get_if<MlxMxfp4SqWeight>(&weight_)) {
         return preserve_input_dtype(packed->matmul(input));
     }
     const auto& dense = std::get<array>(weight_);
@@ -865,6 +881,10 @@ MlxEmbedding MlxEmbedding::load(
         const auto mapped = model.map_record(name);
         return finish(MlxEmbedding(
             MlxVqWeight::from_blob(record.dtype, mapped.view())));
+    }
+    if (is_mxfp4_sq_dtype(record.dtype)) {
+        throw std::runtime_error(
+            "MXFP4-SQ tensors do not support embedding lookup: " + name);
     }
     if (record.dtype == "TPQ-I4G64" ||
         record.dtype == "TPQ-I4G64") {

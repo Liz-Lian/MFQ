@@ -69,7 +69,7 @@ std::vector<std::uint8_t> zero_nint_blob(int output, int input) {
     return blob;
 }
 
-std::vector<std::uint8_t> zero_nintm_blob(
+std::vector<std::uint8_t> zero_mfe_blob(
     int output_per_expert,
     int input) {
     auto payload = zero_nint_blob(
@@ -139,9 +139,9 @@ MlxDeepseekV4Moe make_moe(const DeepseekV4Config& cfg) {
         MlxLinear(zeros(kIntermediate, kHidden)),
         MlxLinear(zeros(kHidden, kIntermediate)),
         MlxRoutedLinear::from_blob(
-            zero_nintm_blob(2 * kIntermediate, kHidden)),
+            zero_mfe_blob(2 * kIntermediate, kHidden)),
         MlxRoutedLinear::from_blob(
-            zero_nintm_blob(kHidden, kIntermediate)),
+            zero_mfe_blob(kHidden, kIntermediate)),
         mlx::core::zeros(Shape{kExperts}, mlx::core::float32));
 }
 

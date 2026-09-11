@@ -4,6 +4,7 @@
 #include "mlx_tpq.h"
 #include "mlx_grouped_linear.h"
 #include "mlx_mx.h"
+#include "mlx_mxfp4_sq.h"
 #include "mlx_nint.h"
 #include "mlx_nint8_zero.h"
 #include "mlx_vq.h"
@@ -20,7 +21,7 @@ namespace mfq::metal {
 
 // Experimental memory-for-bandwidth mode. When enabled before model loading,
 // ordinary packed linear and embedding tensors are materialized once as FP16
-// and their packed runtime objects are released. NINTM expert containers keep
+// and their packed runtime objects are released. MFE expert containers keep
 // their dedicated representation.
 void set_mlx_predequantize_fp16(bool enabled) noexcept;
 bool mlx_predequantize_fp16_enabled() noexcept;
@@ -41,6 +42,7 @@ public:
     explicit MlxLinear(MlxTpqInt4Weight weight);
     explicit MlxLinear(MlxTpqPqWeight weight);
     explicit MlxLinear(MlxMxWeight weight);
+    explicit MlxLinear(MlxMxfp4SqWeight weight);
     explicit MlxLinear(mlx::core::array weight);
 
     mlx::core::array operator()(const mlx::core::array& input) const;
@@ -85,6 +87,7 @@ private:
         MlxTpqInt4Weight,
         MlxTpqPqWeight,
         MlxMxWeight,
+        MlxMxfp4SqWeight,
         mlx::core::array> weight_;
     int input_size_ = 0;
     int output_size_ = 0;

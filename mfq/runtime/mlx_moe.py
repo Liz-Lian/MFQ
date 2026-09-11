@@ -1,4 +1,4 @@
-"""Routed NINTM and NEPQ execution primitives for MLX."""
+"""Routed MFE and NEPQ execution primitives for MLX."""
 
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ except ModuleNotFoundError as exc:  # pragma: no cover - optional dependency
         "MFQ's MLX runtime requires MLX; install with `pip install -e '.[metal]'`"
     ) from exc
 
-from mfq.formats.moe import NintMoeTensor
+from mfq.formats.mfe import MfeTensor
 from mfq.formats.mx import MXFP4_DTYPE, MxTensor
 from mfq.formats.nepq import NepqTensor
 from mfq.formats.nint import NintTensor
@@ -146,11 +146,11 @@ class MlxDenseRoutedLinear:
 
 
 class MlxRoutedLinear:
-    """Execute one NINTM tensor for explicit ``[token,route]`` expert IDs."""
+    """Execute one MFE tensor for explicit ``[token,route]`` expert IDs."""
 
     def __init__(
         self,
-        tensor: NintMoeTensor,
+        tensor: MfeTensor,
         *,
         use_grouped: bool = True,
     ) -> None:
@@ -189,7 +189,7 @@ class MlxRoutedLinear:
                 weight = MetalMxWeight.from_tensor(source)
             else:
                 raise TypeError(
-                    "Metal NINTM supports NINT/NVQ/NPQ/NEPQ/TPQ/MXFP4 cohorts; "
+                    "Metal MFE supports NINT/NVQ/NPQ/NEPQ/TPQ/MXFP4 cohorts; "
                     f"received {type(source).__name__}"
                 )
             expert_ids = np.ascontiguousarray(pool.expert_ids, dtype=np.int32)
@@ -205,7 +205,7 @@ class MlxRoutedLinear:
 
     @classmethod
     def from_blob(cls, blob: bytes | memoryview) -> MlxRoutedLinear:
-        """Construct a grouped routed layer from a still-packed NIM2 blob."""
+        """Construct a grouped routed layer from a still-packed MFE blob."""
 
         weight = MetalMoeWeight.from_blob(blob)
         return cls._from_grouped_projection(weight, 0)
@@ -229,7 +229,7 @@ class MlxRoutedLinear:
 
     @property
     def uses_grouped_kernel(self) -> bool:
-        """Whether routed matmul uses one heterogeneous Metal dispatch."""
+        """Whether routed matmul uses the packed MFE runtime."""
 
         return self.grouped_weight is not None
 
@@ -387,13 +387,13 @@ def load_routed_gate_up(model, prefix: str):
 
 
 class MlxRoutedSwiGLUFFN:
-    """Routed gate/up/down NINTM FFN with route-weighted reduction."""
+    """Routed gate/up/down MFE FFN with route-weighted reduction."""
 
     def __init__(
         self,
-        gate: NintMoeTensor,
-        up: NintMoeTensor,
-        down: NintMoeTensor,
+        gate: MfeTensor,
+        up: MfeTensor,
+        down: MfeTensor,
     ) -> None:
         gate_up_weight = MetalMoeWeight.concatenate_projections(
             (
@@ -471,8 +471,8 @@ class MlxRoutedSiTUFFN:
 
     def __init__(
         self,
-        gate_up: NintMoeTensor,
-        down: NintMoeTensor,
+        gate_up: MfeTensor,
+        down: MfeTensor,
         *,
         beta: float,
         linear_beta: float | None,

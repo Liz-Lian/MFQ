@@ -260,7 +260,7 @@ MlxDeepseekV4DSparkStageComponents load_stage(
     const MfqContainer& model,
     const DeepseekV4Config& config,
     std::size_t stage,
-    std::shared_ptr<MlxNintMoeOffloadCache> expert_offload,
+    std::shared_ptr<MlxMfeOffloadCache> expert_offload,
     std::size_t cache_layer) {
     const auto prefix = "predictor.stage." + std::to_string(stage);
     const auto name = [&prefix](std::string_view suffix) {
@@ -812,7 +812,7 @@ MlxDeepseekV4DSpark::load_if_present(
     const MlxEmbedding& embedding,
     const MlxLinear& output,
     int max_context,
-    std::shared_ptr<MlxNintMoeOffloadCache> expert_offload,
+    std::shared_ptr<MlxMfeOffloadCache> expert_offload,
     std::size_t expert_layer_base) {
     const bool root = model.contains(
         "predictor.stage.0.main_projection.weight");

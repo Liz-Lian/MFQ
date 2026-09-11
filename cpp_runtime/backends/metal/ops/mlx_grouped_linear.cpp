@@ -75,6 +75,31 @@ struct DirectProjectionLayout {
     int output_offset = 0;
 };
 
+using RetainedProjection = std::variant<
+    MlxNintWeight,
+    MlxNint8ZeroWeight,
+    MlxVqWeight,
+    MlxTpqInt4Weight,
+    MlxTpqPqWeight,
+    MlxMxWeight>;
+
+RetainedProjection retain_projection(
+    const MlxGroupedLinearWeightRef& value) {
+    return std::visit(
+        [](const auto* weight) -> RetainedProjection {
+            if (weight == nullptr) {
+                throw std::invalid_argument(
+                    "grouped linear weight cannot be null");
+            }
+            using Weight = std::remove_cv_t<
+                std::remove_pointer_t<decltype(weight)>>;
+            return RetainedProjection(
+                std::in_place_type<Weight>,
+                *weight);
+        },
+        value);
+}
+
 constexpr const char* kGroupedHeader = R"METAL(
 template <typename Stream>
 inline uint mfq_grouped_nint_read_bits(
@@ -659,65 +684,6 @@ std::string direct_kernel_key(
     return key;
 }
 
-bool supports_single_row_nint_fast_path(
-    const std::vector<DirectProjectionLayout>& layouts) noexcept {
-    if (layouts.size() < 2 || layouts.size() > 3) {
-        return false;
-    }
-    const int group_size = layouts.front().group_size;
-    const int groups = layouts.front().groups;
-    if (group_size <= 0 || groups <= 0) {
-        return false;
-    }
-    // The fast kernel loads four FP16 activations at a time. Keeping every
-    // group boundary half4-aligned avoids undefined vector loads.
-    if ((group_size % 4) != 0) {
-        return false;
-    }
-    for (const auto& layout : layouts) {
-        if (layout.family != kFamilyNint ||
-            layout.group_size != group_size ||
-            layout.groups != groups) {
-            return false;
-        }
-        if (layout.bits == 4) {
-            if (layout.q5_execution ||
-                (group_size % 2) != 0) {
-                return false;
-            }
-        } else if (layout.bits == 5) {
-            if (!layout.q5_execution) {
-                return false;
-            }
-        } else if (layout.bits == 6) {
-            if (layout.q5_execution ||
-                (group_size % 4) != 0) {
-                return false;
-            }
-        } else {
-            return false;
-        }
-    }
-    return true;
-}
-
-bool supports_partitioned_nint4_qkv(
-    const std::vector<DirectProjectionLayout>& layouts) noexcept {
-    if (layouts.size() != 3) return false;
-    for (const auto& layout : layouts) {
-        if (layout.family != kFamilyNint ||
-            layout.bits != 4 ||
-            layout.group_size != 24 ||
-            layout.q5_execution) {
-            return false;
-        }
-    }
-    return layouts[0].groups == layouts[1].groups &&
-        layouts[0].groups == layouts[2].groups &&
-        layouts[1].output_size == layouts[2].output_size &&
-        layouts[0].output_size >= layouts[1].output_size;
-}
-
 bool supports_single_row_mxfp8_fast_path(
     const std::vector<DirectProjectionLayout>& layouts) noexcept {
     if (layouts.size() < 2 || layouts.size() > 14) {
@@ -781,17 +747,6 @@ bool supports_small_m_qkv_output_tile(
         !value.q5_execution &&
         value.group_size > 0 &&
         (value.group_size % 4) == 0;
-}
-
-std::string single_row_nint_kernel_key(
-    const std::vector<DirectProjectionLayout>& layouts) {
-    std::string key = "m1";
-    for (const auto& layout : layouts) {
-        key += "_b" + std::to_string(layout.bits)
-            + "g" + std::to_string(layout.group_size)
-            + (layout.q5_execution ? "x" : "p");
-    }
-    return key;
 }
 
 std::vector<std::string> direct_input_names(
@@ -2916,736 +2871,6 @@ mlx::core::fast::CustomKernelFunction direct_kernel(
     return kernel;
 }
 
-std::string make_single_row_nint_source(
-    const std::vector<DirectProjectionLayout>& layouts,
-    bool fused_swiglu) {
-    std::string source = R"METAL(
-    constexpr uint ROWS_PER_SIMD = 4u;
-    constexpr uint ROWS_PER_TG = 8u;
-
-    uint lane = thread_index_in_simdgroup;
-    uint simd_group = simdgroup_index_in_threadgroup;
-    uint output_base =
-        threadgroup_position_in_grid.x * ROWS_PER_TG
-        + simd_group * ROWS_PER_SIMD;
-)METAL";
-
-    for (
-        std::size_t projection = 0;
-        projection < layouts.size();
-        ++projection
-    ) {
-        const auto suffix = std::to_string(projection);
-        source +=
-            "    bool active_" + suffix
-            + " = output_base < uint(P" + suffix + "_OUT);\n"
-            "    uint outputs_" + suffix
-            + "[ROWS_PER_SIMD];\n"
-            "    uint metadata_bases_" + suffix
-            + "[ROWS_PER_SIMD];\n"
-            "    float neuron_scales_" + suffix
-            + "[ROWS_PER_SIMD];\n"
-            "    float neuron_minimums_" + suffix
-            + "[ROWS_PER_SIMD];\n"
-            "    float accumulators_" + suffix
-            + "[ROWS_PER_SIMD] = {0.0f};\n"
-            "    if (active_" + suffix + ") {\n"
-            "        for (uint row = 0u;"
-            " row < ROWS_PER_SIMD; ++row) {\n"
-            "            uint output = min(\n"
-            "                output_base + row,"
-            " uint(P" + suffix + "_OUT) - 1u);\n"
-            "            outputs_" + suffix
-            + "[row] = output;\n"
-            "            metadata_bases_" + suffix
-            + "[row] = output * uint(NG);\n"
-            "            neuron_scales_" + suffix
-            + "[row] = neuron_scale_" + suffix
-            + "[output];\n"
-            "            neuron_minimums_" + suffix
-            + "[row] = neuron_min_" + suffix
-            + "[output];\n"
-            "        }\n"
-            "    }\n";
-    }
-
-    source += R"METAL(
-    // A lane owns complete quantization groups. Activations and their sum are
-    // loaded once and reused by every active projection in this output tile.
-    for (uint group = lane; group < uint(NG); group += 32u) {
-        float activation_sum = 0.0f;
-)METAL";
-    for (
-        std::size_t projection = 0;
-        projection < layouts.size();
-        ++projection
-    ) {
-        const auto suffix = std::to_string(projection);
-        source +=
-            "        float quantized_dots_" + suffix
-            + "[ROWS_PER_SIMD] = {0.0f};\n";
-    }
-
-    source += R"METAL(
-        for (uint element = 0u; element < uint(GS); element += 4u) {
-            uint column = group * uint(GS) + element;
-            float4 activation = float4(0.0f);
-            if (column + 3u < uint(K)) {
-                activation =
-                    float4(*(device const half4*)(x + column));
-            } else {
-                activation.x =
-                    column < uint(K) ? float(x[column]) : 0.0f;
-                activation.y =
-                    column + 1u < uint(K)
-                    ? float(x[column + 1u]) : 0.0f;
-                activation.z =
-                    column + 2u < uint(K)
-                    ? float(x[column + 2u]) : 0.0f;
-                activation.w =
-                    column + 3u < uint(K)
-                    ? float(x[column + 3u]) : 0.0f;
-            }
-            activation_sum +=
-                activation.x + activation.y
-                + activation.z + activation.w;
-)METAL";
-
-    for (
-        std::size_t projection = 0;
-        projection < layouts.size();
-        ++projection
-    ) {
-        const auto suffix = std::to_string(projection);
-        source +=
-            "            if (active_" + suffix + ") {\n"
-            "                for (uint row = 0u;"
-            " row < ROWS_PER_SIMD; ++row) {\n"
-            "                    uint metadata_index =\n"
-            "                        metadata_bases_" + suffix
-            + "[row] + group;\n";
-        if (layouts[projection].bits == 4) {
-            source +=
-                "                    constexpr uint GROUP_BYTES ="
-                " uint(GS) / 2u;\n"
-                "                    uint byte_index ="
-                " metadata_index * GROUP_BYTES"
-                " + (element >> 1u);\n"
-                "                    uint packed0 ="
-                " uint(q_packed_" + suffix
-                + "[byte_index]);\n"
-                "                    uint packed1 ="
-                " uint(q_packed_" + suffix
-                + "[byte_index + 1u]);\n"
-                "                    float4 quantized = float4(\n"
-                "                        float(packed0 & 15u),\n"
-                "                        float(packed0 >> 4u),\n"
-                "                        float(packed1 & 15u),\n"
-                "                        float(packed1 >> 4u));\n";
-        } else if (layouts[projection].bits == 5) {
-            source +=
-                "                    constexpr uint LOW_BYTES ="
-                " (uint(GS) + 1u) / 2u;\n"
-                "                    constexpr uint EXEC_BYTES ="
-                " LOW_BYTES + (uint(GS) + 7u) / 8u;\n"
-                "                    uint group_offset ="
-                " metadata_index * EXEC_BYTES;\n"
-                "                    uint low0 = uint(q_packed_"
-                + suffix
-                + "[group_offset + (element >> 1u)]);\n"
-                "                    uint low1 = uint(q_packed_"
-                + suffix
-                + "[group_offset + (element >> 1u) + 1u]);\n"
-                "                    uint high ="
-                " uint(q_packed_" + suffix
-                + "[group_offset + LOW_BYTES"
-                " + (element >> 3u)])"
-                " >> (element & 7u);\n"
-                "                    float4 quantized = float4(\n"
-                "                        float((low0 & 15u)"
-                " | ((high & 1u) << 4u)),\n"
-                "                        float((low0 >> 4u)"
-                " | (((high >> 1u) & 1u) << 4u)),\n"
-                "                        float((low1 & 15u)"
-                " | (((high >> 2u) & 1u) << 4u)),\n"
-                "                        float((low1 >> 4u)"
-                " | (((high >> 3u) & 1u) << 4u)));\n";
-        } else {
-            source +=
-                "                    constexpr uint GROUP_BYTES ="
-                " (uint(GS) / 4u) * 3u;\n"
-                "                    uint byte_index ="
-                " metadata_index * GROUP_BYTES"
-                " + (element >> 2u) * 3u;\n"
-                "                    uint packed =\n"
-                "                        uint(q_packed_" + suffix
-                + "[byte_index])\n"
-                "                        | (uint(q_packed_" + suffix
-                + "[byte_index + 1u]) << 8u)\n"
-                "                        | (uint(q_packed_" + suffix
-                + "[byte_index + 2u]) << 16u);\n"
-                "                    float4 quantized = float4(\n"
-                "                        float(packed & 63u),\n"
-                "                        float((packed >> 6u) & 63u),\n"
-                "                        float((packed >> 12u) & 63u),\n"
-                "                        float((packed >> 18u) & 63u));\n";
-        }
-        source +=
-            "                    quantized_dots_" + suffix
-            + "[row] += dot(activation, quantized);\n"
-            "                }\n"
-            "            }\n";
-    }
-
-    source += "        }\n";
-    for (
-        std::size_t projection = 0;
-        projection < layouts.size();
-        ++projection
-    ) {
-        const auto suffix = std::to_string(projection);
-        source +=
-            "        if (active_" + suffix + ") {\n"
-            "            for (uint row = 0u;"
-            " row < ROWS_PER_SIMD; ++row) {\n"
-            "                uint metadata_index ="
-            " metadata_bases_" + suffix + "[row] + group;\n"
-            "                float scale ="
-            " neuron_scales_" + suffix + "[row]"
-            " * float(sub_scale_" + suffix
-            + "[metadata_index]);\n"
-            "                float minimum ="
-            " neuron_minimums_" + suffix + "[row]"
-            " * float(sub_min_" + suffix
-            + "[metadata_index]);\n"
-            "                accumulators_" + suffix + "[row] = fma(\n"
-            "                    scale,"
-            " quantized_dots_" + suffix + "[row],\n"
-            "                    fma(-minimum, activation_sum,"
-            " accumulators_" + suffix + "[row]));\n"
-            "            }\n"
-            "        }\n";
-    }
-    source += "    }\n";
-
-    if (fused_swiglu) {
-        source += R"METAL(
-    if (active_0 && active_1) {
-        for (uint row = 0u; row < ROWS_PER_SIMD; ++row) {
-            float gate = simd_sum(accumulators_0[row]);
-            float up = simd_sum(accumulators_1[row]);
-            uint output = output_base + row;
-            if (lane == 0u && output < uint(P0_OUT)) {
-                gate = float(T(gate));
-                up = float(T(up));
-                if (params[0] > 0.0f) {
-                    gate = min(gate, params[0]);
-                    up = clamp(up, -params[0], params[0]);
-                }
-                float activated = gate / (1.0f + exp(-gate));
-                y[output] = T(activated * up);
-            }
-        }
-    }
-)METAL";
-    } else {
-        for (
-            std::size_t projection = 0;
-            projection < layouts.size();
-            ++projection
-        ) {
-            const auto suffix = std::to_string(projection);
-            source +=
-                "    if (active_" + suffix + ") {\n"
-                "        for (uint row = 0u;"
-                " row < ROWS_PER_SIMD; ++row) {\n"
-                "            float total ="
-                " simd_sum(accumulators_" + suffix + "[row]);\n"
-                "            uint output = output_base + row;\n"
-                "            if (lane == 0u"
-                " && output < uint(P" + suffix + "_OUT)) {\n"
-                "                y[uint(P" + suffix
-                + "_OUT_OFFSET) + output] = T(total);\n"
-                "            }\n"
-                "        }\n"
-                "    }\n";
-        }
-    }
-    return source;
-}
-
-mlx::core::fast::CustomKernelFunction make_single_row_nint_kernel(
-    const std::vector<DirectProjectionLayout>& layouts,
-    bool fused_swiglu) {
-    CompileOptions options;
-    options.math_mode = MathMode::Fast;
-    const auto key = single_row_nint_kernel_key(layouts);
-    auto inputs = direct_input_names(layouts);
-    if (fused_swiglu) {
-        inputs.emplace_back("params");
-    }
-    return mlx::core::fast::metal_kernel(
-        "mfq_cpp_single_row_grouped_nint_" + key
-            + (fused_swiglu ? "_swiglu" : ""),
-        std::move(inputs),
-        {"y"},
-        make_single_row_nint_source(layouts, fused_swiglu),
-        "",
-        true,
-        false,
-        options);
-}
-
-mlx::core::fast::CustomKernelFunction single_row_nint_kernel(
-    const std::vector<DirectProjectionLayout>& layouts,
-    bool fused_swiglu = false) {
-    static std::mutex mutex;
-    static std::unordered_map<
-        std::string,
-        mlx::core::fast::CustomKernelFunction> kernels;
-
-    const auto key = single_row_nint_kernel_key(layouts)
-        + (fused_swiglu ? "_swiglu" : "");
-    std::lock_guard<std::mutex> lock(mutex);
-    const auto found = kernels.find(key);
-    if (found != kernels.end()) {
-        return found->second;
-    }
-    auto kernel = make_single_row_nint_kernel(
-        layouts,
-        fused_swiglu);
-    kernels.emplace(key, kernel);
-    return kernel;
-}
-
-std::string make_partitioned_nint4_qkv_source(
-    const std::vector<DirectProjectionLayout>& layouts) {
-    std::string source = R"METAL(
-    constexpr uint SIMD_GROUPS = 8u;
-    constexpr uint ROWS_PER_SIMD = 2u;
-    constexpr uint ROWS_PER_TG = SIMD_GROUPS * ROWS_PER_SIMD;
-    constexpr uint GROUP_BYTES = 12u;
-
-    uint lane = thread_index_in_simdgroup;
-    uint simd_group = simdgroup_index_in_threadgroup;
-    uint global_tile = threadgroup_position_in_grid.x;
-)METAL";
-
-    for (std::size_t projection = 0;
-         projection < layouts.size();
-         ++projection) {
-        const auto suffix = std::to_string(projection);
-        source += projection == 0 ? "    if (" : "    else if (";
-        source +=
-            "global_tile < uint(P" + suffix + "_TILE_END)) {\n"
-            "        uint local_tile = global_tile"
-            " - uint(P" + suffix + "_TILE_BEGIN);\n"
-            "        uint output_base = local_tile * ROWS_PER_TG"
-            " + simd_group * ROWS_PER_SIMD;\n"
-            "        uint metadata_bases[ROWS_PER_SIMD];\n"
-            "        float neuron_scales[ROWS_PER_SIMD];\n"
-            "        float neuron_minimums[ROWS_PER_SIMD];\n"
-            "        float accumulators[ROWS_PER_SIMD] = {0.0f};\n"
-            "        for (uint row = 0u; row < ROWS_PER_SIMD; ++row) {\n"
-            "            uint output = min(output_base + row,"
-            " uint(P" + suffix + "_OUT) - 1u);\n"
-            "            metadata_bases[row] = output * uint(NG);\n"
-            "            neuron_scales[row] = neuron_scale_" + suffix
-            + "[output];\n"
-            "            neuron_minimums[row] = neuron_min_" + suffix
-            + "[output];\n"
-            "        }\n"
-            "        for (uint group = lane; group < uint(NG);"
-            " group += 32u) {\n"
-            "            float activation_sum = 0.0f;\n"
-            "            float quantized_dots[ROWS_PER_SIMD] = {0.0f};\n"
-            "            for (uint chunk = 0u; chunk < 6u; ++chunk) {\n"
-            "                uint column = group * 24u + chunk * 4u;\n"
-            "                float4 activation = float4(0.0f);\n"
-            "                if (column + 3u < uint(K)) {\n"
-            "                    activation = float4(\n"
-            "                        *(device const half4*)(x + column));\n"
-            "                } else {\n"
-            "                    activation.x = column < uint(K)"
-            " ? float(x[column]) : 0.0f;\n"
-            "                    activation.y = column + 1u < uint(K)"
-            " ? float(x[column + 1u]) : 0.0f;\n"
-            "                    activation.z = column + 2u < uint(K)"
-            " ? float(x[column + 2u]) : 0.0f;\n"
-            "                    activation.w = column + 3u < uint(K)"
-            " ? float(x[column + 3u]) : 0.0f;\n"
-            "                }\n"
-            "                activation_sum += activation.x + activation.y"
-            " + activation.z + activation.w;\n"
-            "                for (uint row = 0u; row < ROWS_PER_SIMD;"
-            " ++row) {\n"
-            "                    uint metadata_index ="
-            " metadata_bases[row] + group;\n"
-            "                    uint byte_index = metadata_index"
-            " * GROUP_BYTES + chunk * 2u;\n"
-            "                    uint packed ="
-            " uint(q_packed_" + suffix + "[byte_index]) |"
-            " (uint(q_packed_" + suffix
-            + "[byte_index + 1u]) << 8u);\n"
-            "                    float4 quantized = float4(\n"
-            "                        float(packed & 15u),\n"
-            "                        float((packed >> 4u) & 15u),\n"
-            "                        float((packed >> 8u) & 15u),\n"
-            "                        float((packed >> 12u) & 15u));\n"
-            "                    quantized_dots[row] +="
-            " dot(activation, quantized);\n"
-            "                }\n"
-            "            }\n"
-            "            for (uint row = 0u; row < ROWS_PER_SIMD;"
-            " ++row) {\n"
-            "                uint metadata_index ="
-            " metadata_bases[row] + group;\n"
-            "                float scale = neuron_scales[row]"
-            " * float(sub_scale_" + suffix + "[metadata_index]);\n"
-            "                float minimum = neuron_minimums[row]"
-            " * float(sub_min_" + suffix + "[metadata_index]);\n"
-            "                accumulators[row] = fma(scale,"
-            " quantized_dots[row], fma(-minimum, activation_sum,"
-            " accumulators[row]));\n"
-            "            }\n"
-            "        }\n"
-            "        for (uint row = 0u; row < ROWS_PER_SIMD; ++row) {\n"
-            "            float total = simd_sum(accumulators[row]);\n"
-            "            uint output = output_base + row;\n"
-            "            if (lane == 0u && output < uint(P" + suffix
-            + "_OUT)) {\n"
-            "                y[uint(P" + suffix + "_OUT_OFFSET) + output]"
-            " = T(total);\n"
-            "            }\n"
-            "        }\n"
-            "    }\n";
-    }
-    return source;
-}
-
-std::string make_interleaved_nint4_qkv_source() {
-    return R"METAL(
-    constexpr uint SIMD_GROUPS = 8u;
-    constexpr uint ROWS_PER_SIMD = 2u;
-    constexpr uint ROWS_PER_TG = SIMD_GROUPS * ROWS_PER_SIMD;
-    constexpr uint GROUP_BYTES = 12u;
-
-    uint lane = thread_index_in_simdgroup;
-    uint simd_group = simdgroup_index_in_threadgroup;
-    uint global_tile = threadgroup_position_in_grid.x;
-    uint output_base =
-        global_tile * ROWS_PER_TG
-        + simd_group * ROWS_PER_SIMD;
-    bool fused_qkv =
-        global_tile < (uint(P1_OUT) + ROWS_PER_TG - 1u) / ROWS_PER_TG;
-
-    if (!fused_qkv) {
-        constexpr uint Q_ROWS_PER_SIMD = 4u;
-        constexpr uint Q_ROWS_PER_TG = SIMD_GROUPS * Q_ROWS_PER_SIMD;
-        uint common_tiles =
-            (uint(P1_OUT) + ROWS_PER_TG - 1u) / ROWS_PER_TG;
-        uint q_output_base = common_tiles * ROWS_PER_TG
-            + (global_tile - common_tiles) * Q_ROWS_PER_TG
-            + simd_group * Q_ROWS_PER_SIMD;
-        uint q_metadata_bases[Q_ROWS_PER_SIMD];
-        float q_neuron_scales[Q_ROWS_PER_SIMD];
-        float q_neuron_minimums[Q_ROWS_PER_SIMD];
-        float q_accumulators[Q_ROWS_PER_SIMD] = {0.0f};
-        for (uint row = 0u; row < Q_ROWS_PER_SIMD; ++row) {
-            uint output = min(q_output_base + row, uint(P0_OUT) - 1u);
-            q_metadata_bases[row] = output * uint(NG);
-            q_neuron_scales[row] = neuron_scale_0[output];
-            q_neuron_minimums[row] = neuron_min_0[output];
-        }
-        for (uint group = lane; group < uint(NG); group += 32u) {
-            float activation_sum = 0.0f;
-            float q_quantized_dots[Q_ROWS_PER_SIMD] = {0.0f};
-            for (uint chunk = 0u; chunk < 6u; ++chunk) {
-                uint column = group * 24u + chunk * 4u;
-                float4 activation = float4(0.0f);
-                if (column + 3u < uint(K)) {
-                    activation = float4(
-                        *(device const half4*)(x + column));
-                } else {
-                    activation.x = column < uint(K)
-                        ? float(x[column]) : 0.0f;
-                    activation.y = column + 1u < uint(K)
-                        ? float(x[column + 1u]) : 0.0f;
-                    activation.z = column + 2u < uint(K)
-                        ? float(x[column + 2u]) : 0.0f;
-                    activation.w = column + 3u < uint(K)
-                        ? float(x[column + 3u]) : 0.0f;
-                }
-                activation_sum += activation.x + activation.y
-                    + activation.z + activation.w;
-                for (uint row = 0u; row < Q_ROWS_PER_SIMD; ++row) {
-                    uint byte_index = (q_metadata_bases[row] + group)
-                        * GROUP_BYTES + chunk * 2u;
-                    uint packed = uint(q_packed_0[byte_index])
-                        | (uint(q_packed_0[byte_index + 1u]) << 8u);
-                    float4 quantized = float4(
-                        float(packed & 15u),
-                        float((packed >> 4u) & 15u),
-                        float((packed >> 8u) & 15u),
-                        float((packed >> 12u) & 15u));
-                    q_quantized_dots[row] += dot(activation, quantized);
-                }
-            }
-            for (uint row = 0u; row < Q_ROWS_PER_SIMD; ++row) {
-                uint metadata = q_metadata_bases[row] + group;
-                float scale = q_neuron_scales[row]
-                    * float(sub_scale_0[metadata]);
-                float minimum = q_neuron_minimums[row]
-                    * float(sub_min_0[metadata]);
-                q_accumulators[row] = fma(
-                    scale,
-                    q_quantized_dots[row],
-                    fma(-minimum, activation_sum, q_accumulators[row]));
-            }
-        }
-        for (uint row = 0u; row < Q_ROWS_PER_SIMD; ++row) {
-            float total = simd_sum(q_accumulators[row]);
-            uint output = q_output_base + row;
-            if (lane == 0u && output < uint(P0_OUT)) {
-                y[uint(P0_OUT_OFFSET) + output] = T(total);
-            }
-        }
-        return;
-    }
-
-    uint q_outputs[ROWS_PER_SIMD];
-    uint q_metadata_bases[ROWS_PER_SIMD];
-    float q_neuron_scales[ROWS_PER_SIMD];
-    float q_neuron_minimums[ROWS_PER_SIMD];
-    uint k_metadata_bases[ROWS_PER_SIMD];
-    float k_neuron_scales[ROWS_PER_SIMD];
-    float k_neuron_minimums[ROWS_PER_SIMD];
-    uint v_metadata_bases[ROWS_PER_SIMD];
-    float v_neuron_scales[ROWS_PER_SIMD];
-    float v_neuron_minimums[ROWS_PER_SIMD];
-    float q_accumulators[ROWS_PER_SIMD] = {0.0f};
-    float k_accumulators[ROWS_PER_SIMD] = {0.0f};
-    float v_accumulators[ROWS_PER_SIMD] = {0.0f};
-
-    for (uint row = 0u; row < ROWS_PER_SIMD; ++row) {
-        uint output = min(output_base + row, uint(P0_OUT) - 1u);
-        q_outputs[row] = output;
-        q_metadata_bases[row] = output * uint(NG);
-        q_neuron_scales[row] = neuron_scale_0[output];
-        q_neuron_minimums[row] = neuron_min_0[output];
-        uint kv_output = min(output_base + row, uint(P1_OUT) - 1u);
-        k_metadata_bases[row] = kv_output * uint(NG);
-        k_neuron_scales[row] = neuron_scale_1[kv_output];
-        k_neuron_minimums[row] = neuron_min_1[kv_output];
-        v_metadata_bases[row] = kv_output * uint(NG);
-        v_neuron_scales[row] = neuron_scale_2[kv_output];
-        v_neuron_minimums[row] = neuron_min_2[kv_output];
-    }
-
-    for (uint group = lane; group < uint(NG); group += 32u) {
-        float activation_sum = 0.0f;
-        float q_quantized_dots[ROWS_PER_SIMD] = {0.0f};
-        float k_quantized_dots[ROWS_PER_SIMD] = {0.0f};
-        float v_quantized_dots[ROWS_PER_SIMD] = {0.0f};
-        for (uint chunk = 0u; chunk < 6u; ++chunk) {
-            uint column = group * 24u + chunk * 4u;
-            float4 activation = float4(0.0f);
-            if (column + 3u < uint(K)) {
-                activation = float4(*(device const half4*)(x + column));
-            } else {
-                activation.x = column < uint(K) ? float(x[column]) : 0.0f;
-                activation.y = column + 1u < uint(K)
-                    ? float(x[column + 1u]) : 0.0f;
-                activation.z = column + 2u < uint(K)
-                    ? float(x[column + 2u]) : 0.0f;
-                activation.w = column + 3u < uint(K)
-                    ? float(x[column + 3u]) : 0.0f;
-            }
-            activation_sum += activation.x + activation.y
-                + activation.z + activation.w;
-
-            for (uint row = 0u; row < ROWS_PER_SIMD; ++row) {
-                uint q_byte = (q_metadata_bases[row] + group)
-                    * GROUP_BYTES + chunk * 2u;
-                uint q_packed = uint(q_packed_0[q_byte])
-                    | (uint(q_packed_0[q_byte + 1u]) << 8u);
-                float4 q_quantized = float4(
-                    float(q_packed & 15u),
-                    float((q_packed >> 4u) & 15u),
-                    float((q_packed >> 8u) & 15u),
-                    float((q_packed >> 12u) & 15u));
-                q_quantized_dots[row] += dot(activation, q_quantized);
-                uint k_byte = (k_metadata_bases[row] + group)
-                    * GROUP_BYTES + chunk * 2u;
-                uint k_packed = uint(q_packed_1[k_byte])
-                    | (uint(q_packed_1[k_byte + 1u]) << 8u);
-                float4 k_quantized = float4(
-                    float(k_packed & 15u),
-                    float((k_packed >> 4u) & 15u),
-                    float((k_packed >> 8u) & 15u),
-                    float((k_packed >> 12u) & 15u));
-                k_quantized_dots[row] += dot(activation, k_quantized);
-
-                uint v_byte = (v_metadata_bases[row] + group)
-                    * GROUP_BYTES + chunk * 2u;
-                uint v_packed = uint(q_packed_2[v_byte])
-                    | (uint(q_packed_2[v_byte + 1u]) << 8u);
-                float4 v_quantized = float4(
-                    float(v_packed & 15u),
-                    float((v_packed >> 4u) & 15u),
-                    float((v_packed >> 8u) & 15u),
-                    float((v_packed >> 12u) & 15u));
-                v_quantized_dots[row] += dot(activation, v_quantized);
-            }
-        }
-
-        for (uint row = 0u; row < ROWS_PER_SIMD; ++row) {
-            uint q_metadata = q_metadata_bases[row] + group;
-            float q_scale = q_neuron_scales[row]
-                * float(sub_scale_0[q_metadata]);
-            float q_minimum = q_neuron_minimums[row]
-                * float(sub_min_0[q_metadata]);
-            q_accumulators[row] = fma(
-                q_scale,
-                q_quantized_dots[row],
-                fma(-q_minimum, activation_sum, q_accumulators[row]));
-            uint k_metadata = k_metadata_bases[row] + group;
-            float k_scale = k_neuron_scales[row]
-                * float(sub_scale_1[k_metadata]);
-            float k_minimum = k_neuron_minimums[row]
-                * float(sub_min_1[k_metadata]);
-            k_accumulators[row] = fma(
-                k_scale,
-                k_quantized_dots[row],
-                fma(-k_minimum, activation_sum, k_accumulators[row]));
-
-            uint v_metadata = v_metadata_bases[row] + group;
-            float v_scale = v_neuron_scales[row]
-                * float(sub_scale_2[v_metadata]);
-            float v_minimum = v_neuron_minimums[row]
-                * float(sub_min_2[v_metadata]);
-            v_accumulators[row] = fma(
-                v_scale,
-                v_quantized_dots[row],
-                fma(-v_minimum, activation_sum, v_accumulators[row]));
-        }
-    }
-
-    for (uint row = 0u; row < ROWS_PER_SIMD; ++row) {
-        uint output = output_base + row;
-        float q_total = simd_sum(q_accumulators[row]);
-        if (lane == 0u && output < uint(P0_OUT)) {
-            y[uint(P0_OUT_OFFSET) + output] = T(q_total);
-        }
-        float k_total = simd_sum(k_accumulators[row]);
-        float v_total = simd_sum(v_accumulators[row]);
-        if (lane == 0u && output < uint(P1_OUT)) {
-            y[uint(P1_OUT_OFFSET) + output] = T(k_total);
-            y[uint(P2_OUT_OFFSET) + output] = T(v_total);
-        }
-    }
-)METAL";
-}
-
-const mlx::core::fast::CustomKernelFunction& partitioned_nint4_qkv_kernel(
-    const std::vector<DirectProjectionLayout>& layouts,
-    int input_size) {
-    if (input_size <= 0 ||
-        input_size > layouts.front().groups * layouts.front().group_size) {
-        throw MlxGroupedLinearUnsupported(
-            "partitioned NINT4 QKV input width is inconsistent");
-    }
-    using Kernel = mlx::core::fast::CustomKernelFunction;
-    struct LocalEntry {
-        int input_size;
-        int groups;
-        int output0;
-        int output1;
-        int output2;
-        const Kernel* kernel;
-    };
-    thread_local std::vector<LocalEntry> local_cache;
-    for (const auto& entry : local_cache) {
-        if (entry.input_size == input_size &&
-            entry.groups == layouts.front().groups &&
-            entry.output0 == layouts[0].output_size &&
-            entry.output1 == layouts[1].output_size &&
-            entry.output2 == layouts[2].output_size) {
-            return *entry.kernel;
-        }
-    }
-    static std::mutex mutex;
-    static std::unordered_map<
-        std::string,
-        mlx::core::fast::CustomKernelFunction> kernels;
-    std::string key = single_row_nint_kernel_key(layouts) + "_partitioned";
-    key += "_k" + std::to_string(input_size);
-    key += "_g" + std::to_string(layouts.front().groups);
-    for (const auto& layout : layouts) {
-        key += "_o" + std::to_string(layout.output_size);
-    }
-    std::lock_guard<std::mutex> lock(mutex);
-    const auto found = kernels.find(key);
-    if (found != kernels.end()) {
-        local_cache.push_back({
-            input_size,
-            layouts.front().groups,
-            layouts[0].output_size,
-            layouts[1].output_size,
-            layouts[2].output_size,
-            &found->second,
-        });
-        return found->second;
-    }
-
-    CompileOptions options;
-    options.math_mode = MathMode::Fast;
-    std::string source;
-    source += "#define T half\n";
-    source += "#define K " + std::to_string(input_size) + "\n";
-    source += "#define NG " + std::to_string(
-        layouts.front().groups) + "\n";
-    int tile_begin = 0;
-    for (std::size_t projection = 0;
-         projection < layouts.size();
-         ++projection) {
-        const auto& layout = layouts[projection];
-        const int tile_end = tile_begin +
-            (layout.output_size + 15) / 16;
-        const auto prefix = "P" + std::to_string(projection) + "_";
-        source += "#define " + prefix + "OUT " +
-            std::to_string(layout.output_size) + "\n";
-        source += "#define " + prefix + "OUT_OFFSET " +
-            std::to_string(layout.output_offset) + "\n";
-        source += "#define " + prefix + "TILE_BEGIN " +
-            std::to_string(tile_begin) + "\n";
-        source += "#define " + prefix + "TILE_END " +
-            std::to_string(tile_end) + "\n";
-        tile_begin = tile_end;
-    }
-    source += make_interleaved_nint4_qkv_source();
-    auto kernel = mlx::core::fast::metal_kernel(
-        "mfq_cpp_interleaved_grouped_nint4_v7_" + key,
-        direct_input_names(layouts),
-        {"y"},
-        std::move(source),
-        "",
-        true,
-        false,
-        options);
-    const auto [inserted, unused] = kernels.emplace(key, std::move(kernel));
-    (void)unused;
-    local_cache.push_back({
-        input_size,
-        layouts.front().groups,
-        layouts[0].output_size,
-        layouts[1].output_size,
-        layouts[2].output_size,
-        &inserted->second,
-    });
-    return inserted->second;
-}
-
 std::string make_single_row_mxfp8_source(
     const std::vector<DirectProjectionLayout>& layouts) {
     std::string source = R"METAL(
@@ -4076,6 +3301,19 @@ int weight_output_size(const MlxGroupedLinearWeightRef& value) {
         value);
 }
 
+std::size_t weight_packed_nbytes(
+    const MlxGroupedLinearWeightRef& value) {
+    return std::visit(
+        [](const auto* weight) -> std::size_t {
+            if (weight == nullptr) {
+                throw std::invalid_argument(
+                    "grouped linear weight cannot be null");
+            }
+            return weight->packed_nbytes();
+        },
+        value);
+}
+
 } // namespace
 
 struct MlxGroupedLinear::Impl {
@@ -4089,17 +3327,28 @@ struct MlxGroupedLinear::Impl {
     std::optional<array> nint_anchor_min;
     std::optional<array> q8_q;
     std::optional<array> q8_scales;
+    std::vector<RetainedProjection> common_kernel_weights;
     std::vector<DirectProjectionLayout> direct_layouts;
     std::vector<array> direct_weight_inputs;
     std::vector<int> output_sizes;
     int input_size = 0;
     int total_output_size = 0;
     int total_tiles = 0;
-    int single_row_tiles = 0;
-    int partitioned_nint4_tiles = 0;
     int single_row_mxfp8_tiles = 0;
     std::size_t packed_bytes = 0;
     std::size_t copied_packed_bytes = 0;
+
+    Impl(
+        std::vector<RetainedProjection> weights,
+        std::vector<int> widths,
+        int width,
+        int total_output,
+        std::size_t bytes)
+        : common_kernel_weights(std::move(weights)),
+          output_sizes(std::move(widths)),
+          input_size(width),
+          total_output_size(total_output),
+          packed_bytes(bytes) {}
 
     Impl(
         array descriptors_value,
@@ -4151,25 +3400,6 @@ struct MlxGroupedLinear::Impl {
           total_output_size(total_output),
           total_tiles(tiles),
           packed_bytes(bytes) {
-        if (supports_single_row_nint_fast_path(
-                direct_layouts)) {
-            for (const auto& layout : direct_layouts) {
-                single_row_tiles = std::max(
-                    single_row_tiles,
-                    (layout.output_size + 7) / 8);
-            }
-        }
-        if (supports_partitioned_nint4_qkv(direct_layouts)) {
-            const int common_tiles =
-                (direct_layouts[1].output_size + 15) / 16;
-            const int common_outputs = std::min(
-                direct_layouts[0].output_size,
-                common_tiles * 16);
-            const int remaining_outputs =
-                direct_layouts[0].output_size - common_outputs;
-            partitioned_nint4_tiles = common_tiles
-                + (remaining_outputs + 31) / 32;
-        }
         if (supports_single_row_mxfp8_fast_path(
                 direct_layouts)) {
             for (const auto& layout : direct_layouts) {
@@ -4181,19 +3411,12 @@ struct MlxGroupedLinear::Impl {
     }
 
     bool uses_zero_copy_storage() const noexcept {
-        return !direct_layouts.empty();
-    }
-
-    bool has_single_row_nint_fast_path() const noexcept {
-        return single_row_tiles > 0;
+        return !common_kernel_weights.empty()
+            || !direct_layouts.empty();
     }
 
     bool has_single_row_mxfp8_fast_path() const noexcept {
         return single_row_mxfp8_tiles > 0;
-    }
-
-    bool has_partitioned_nint4_qkv() const noexcept {
-        return partitioned_nint4_tiles > 0;
     }
 
     bool supports_single_row_swiglu() const noexcept {
@@ -4202,14 +3425,13 @@ struct MlxGroupedLinear::Impl {
             || output_sizes[0] != output_sizes[1]) {
             return false;
         }
-        const bool nint_pair = has_single_row_nint_fast_path();
         const bool mxfp8_pair =
             has_single_row_mxfp8_fast_path()
             && direct_layouts[0].family == kFamilyMx
             && direct_layouts[0].bits == 8
             && direct_layouts[1].family == kFamilyMx
             && direct_layouts[1].bits == 8;
-        return nint_pair || mxfp8_pair;
+        return mxfp8_pair;
     }
 
     bool supports_bf16_single_row_swiglu() const noexcept {
@@ -4234,6 +3456,66 @@ MlxGroupedLinear::MlxGroupedLinear(
     if (shared_input <= 0) {
         throw std::invalid_argument(
             "grouped linear input width must be positive");
+    }
+
+    // NINT v2 has one metadata-driven matmul kernel for every q/k profile.
+    // Keep grouped projection orchestration at the graph level instead of
+    // compiling q-specific, projection-fused, or heterogeneous NINT kernels.
+    // This also makes adaptive and uniform rows use exactly the same path.
+    const bool contains_nint = std::any_of(
+        weights.begin(),
+        weights.end(),
+        [](const MlxGroupedLinearWeightRef& weight) {
+            return std::holds_alternative<
+                const MlxNintWeight*>(weight);
+        });
+    if (contains_nint) {
+        std::vector<RetainedProjection> retained;
+        std::vector<int> output_sizes;
+        retained.reserve(weights.size());
+        output_sizes.reserve(weights.size());
+        int total_output = 0;
+        std::size_t packed_bytes = 0;
+        for (const auto& weight : weights) {
+            if (const auto* value = std::get_if<
+                    const MlxVqWeight*>(&weight);
+                value != nullptr && *value != nullptr &&
+                ((*value)->output_shape().size() != 1 ||
+                 (*value)->rotation_block() != 0)) {
+                throw MlxGroupedLinearUnsupported(
+                    "ordinary grouped linear rejects "
+                    "expert-shaped or rotated NEPQ weights");
+            }
+            if (weight_input_size(weight) != shared_input) {
+                throw std::invalid_argument(
+                    "grouped linear projections must share one input width");
+            }
+            const int output = weight_output_size(weight);
+            if (output <= 0) {
+                throw std::invalid_argument(
+                    "grouped linear output width must be positive");
+            }
+            total_output = checked_int(
+                static_cast<std::size_t>(total_output)
+                    + static_cast<std::size_t>(output),
+                "total output width");
+            const auto bytes = weight_packed_nbytes(weight);
+            if (bytes > std::numeric_limits<std::size_t>::max()
+                    - packed_bytes) {
+                throw MlxGroupedLinearUnsupported(
+                    "grouped linear packed stream size overflows");
+            }
+            packed_bytes += bytes;
+            output_sizes.push_back(output);
+            retained.push_back(retain_projection(weight));
+        }
+        impl_ = std::make_shared<Impl>(
+            std::move(retained),
+            std::move(output_sizes),
+            shared_input,
+            total_output,
+            packed_bytes);
+        return;
     }
 
     // Q/K/V and gate/up are the production hot paths. Binding the source
@@ -4314,12 +3596,15 @@ MlxGroupedLinear::MlxGroupedLinear(
                     if constexpr (
                         std::is_same_v<Weight, MlxNintWeight>
                     ) {
+                        if (!weight->has_uniform_q_bits()) {
+                            throw MlxGroupedLinearUnsupported(
+                                "grouped linear falls back for adaptive NINT q widths");
+                        }
                         layout.family = kFamilyNint;
                         layout.bits = weight->bits();
                         layout.group_size = weight->group_size();
                         layout.groups = weight->groups();
-                        layout.q5_execution =
-                            weight->q5_execution_layout();
+                        layout.q5_execution = false;
                         validate_direct_array(
                             weight->packed_values(),
                             mlx::core::uint8,
@@ -4632,6 +3917,10 @@ MlxGroupedLinear::MlxGroupedLinear(
                 if constexpr (
                     std::is_same_v<Weight, MlxNintWeight>
                 ) {
+                    if (!weight->has_uniform_q_bits()) {
+                        throw MlxGroupedLinearUnsupported(
+                            "grouped linear falls back for adaptive NINT q widths");
+                    }
                     descriptors[base + kFamily] = kFamilyNint;
                     descriptors[base + kNintBits] =
                         weight->bits();
@@ -4650,9 +3939,7 @@ MlxGroupedLinear::MlxGroupedLinear(
                             nint_anchor_scale.size() /
                                 sizeof(float),
                             "NINT anchor offset");
-                    descriptors[base + kNintQ5Execution] =
-                        static_cast<int>(
-                            weight->q5_execution_layout());
+                    descriptors[base + kNintQ5Execution] = 0;
 
                     append_raw(
                         nint_q,
@@ -4825,7 +4112,7 @@ array MlxGroupedLinear::single_row_swiglu(
     if (!supports_single_row_swiglu(input)) {
         throw MlxGroupedLinearUnsupported(
             "grouped SwiGLU requires one FP16/BF16 row and two "
-            "equal-width NINT or MXFP8 projections");
+            "equal-width MXFP8 projections");
     }
     if (!std::isfinite(limit) || limit < 0.0f) {
         throw std::invalid_argument(
@@ -4842,91 +4129,28 @@ array MlxGroupedLinear::single_row_swiglu(
             input,
             Shape{1, impl_->input_size}));
     const array params({limit}, mlx::core::float32);
-    const bool mxfp8_pair =
-        impl_->has_single_row_mxfp8_fast_path()
-        && impl_->direct_layouts[0].family == kFamilyMx
-        && impl_->direct_layouts[0].bits == 8
-        && impl_->direct_layouts[1].family == kFamilyMx
-        && impl_->direct_layouts[1].bits == 8;
     auto inputs = impl_->direct_weight_inputs;
     inputs.push_back(source);
     inputs.push_back(params);
-
-    if (mxfp8_pair) {
-        const auto workgroups =
-            (static_cast<std::size_t>(impl_->output_sizes[0]) + 3) / 4;
-        const auto grid = workgroups * 128;
-        auto result =
-            single_row_mxfp8_pair_swiglu_kernel(source.dtype())(
-            inputs,
-            {Shape{1, impl_->output_sizes[0]}},
-            {source.dtype()},
-            {
-                checked_int(grid, "MXFP8 SwiGLU Metal grid"),
-                1,
-                1,
-            },
-            {128, 1, 1},
-            {
-                {"K", impl_->input_size},
-                {"OUT", impl_->output_sizes[0]},
-                {"M", 1},
-            },
-            std::nullopt,
-            false,
-            {}).front();
-        return mlx::core::reshape(
-            std::move(result),
-            std::move(output_shape));
-    }
-
-    std::vector<
-        std::pair<
-            std::string,
-            mlx::core::fast::TemplateArg>>
-        templates{
-            {"T", source.dtype()},
-            {"K", impl_->input_size},
-            {
-                "GS",
-                impl_->direct_layouts.front().group_size,
-            },
-            {
-                "NG",
-                impl_->direct_layouts.front().groups,
-            },
-        };
-    for (
-        std::size_t projection = 0;
-        projection < impl_->direct_layouts.size();
-        ++projection
-    ) {
-        const auto& layout = impl_->direct_layouts[projection];
-        const auto name =
-            "P" + std::to_string(projection) + "_";
-        templates.emplace_back(
-            name + "OUT",
-            layout.output_size);
-        templates.emplace_back(
-            name + "OUT_OFFSET",
-            layout.output_offset);
-    }
-
-    const auto grid = static_cast<std::size_t>(
-        impl_->single_row_tiles) * 64;
-    auto result = single_row_nint_kernel(
-        impl_->direct_layouts,
-        true)(
+    const auto workgroups =
+        (static_cast<std::size_t>(impl_->output_sizes[0]) + 3) / 4;
+    const auto grid = workgroups * 128;
+    auto result =
+        single_row_mxfp8_pair_swiglu_kernel(source.dtype())(
         inputs,
         {Shape{1, impl_->output_sizes[0]}},
         {source.dtype()},
         {
-            checked_int(grid, "SwiGLU Metal grid"),
+            checked_int(grid, "MXFP8 SwiGLU Metal grid"),
             1,
             1,
         },
-        {64, 1, 1},
-        std::move(templates),
+        {128, 1, 1},
+        {
+            {"K", impl_->input_size},
+            {"OUT", impl_->output_sizes[0]},
+            {"M", 1},
+        },
         std::nullopt,
         false,
         {}).front();
@@ -5014,6 +4238,19 @@ std::vector<array> MlxGroupedLinear::matmul(
             "grouped linear supports one through 16 input rows");
     }
 
+    if (!impl_->common_kernel_weights.empty()) {
+        std::vector<array> outputs;
+        outputs.reserve(impl_->common_kernel_weights.size());
+        for (const auto& weight : impl_->common_kernel_weights) {
+            outputs.push_back(std::visit(
+                [&input](const auto& retained) {
+                    return retained.matmul(input);
+                },
+                weight));
+        }
+        return outputs;
+    }
+
     auto source = mlx::core::contiguous(
         mlx::core::reshape(
             input,
@@ -5021,19 +4258,6 @@ std::vector<array> MlxGroupedLinear::matmul(
                 static_cast<std::int32_t>(rows),
                 impl_->input_size,
             }));
-    const auto* grouped_qkv_layout =
-        std::getenv("MFQ_METAL_GROUPED_QKV_LAYOUT");
-    const bool use_partitioned_nint4_qkv =
-        rows == 1 &&
-        source.dtype() == mlx::core::float16 &&
-        impl_->has_partitioned_nint4_qkv() &&
-        (grouped_qkv_layout == nullptr ||
-         std::strcmp(grouped_qkv_layout, "shared") != 0);
-    const bool use_single_row_nint_fast_path =
-        rows == 1 &&
-        source.dtype() == mlx::core::float16 &&
-        impl_->has_single_row_nint_fast_path() &&
-        !use_partitioned_nint4_qkv;
     const bool use_single_row_mxfp8_fast_path =
         rows == 1 &&
         source.dtype() == mlx::core::float16 &&
@@ -5143,12 +4367,8 @@ std::vector<array> MlxGroupedLinear::matmul(
                 "small-M blockwise tile count");
         }
     }
-    const int work_tiles = use_partitioned_nint4_qkv
-        ? impl_->partitioned_nint4_tiles
-        : use_single_row_mxfp8_fast_path
+    const int work_tiles = use_single_row_mxfp8_fast_path
         ? impl_->single_row_mxfp8_tiles
-        : use_single_row_nint_fast_path
-        ? impl_->single_row_tiles
         : (use_small_m_blockwise
             ? small_m_blockwise_tiles
             : impl_->total_tiles);
@@ -5157,7 +4377,7 @@ std::vector<array> MlxGroupedLinear::matmul(
         ? specialized_simd_groups * 32
         : (use_single_row_mxfp8_fast_path
             ? 128
-            : (use_partitioned_nint4_qkv ? 256 : 64));
+            : 64);
     const auto grid = (use_small_m_batched_path ? 1 : rows)
         * static_cast<std::size_t>(work_tiles)
         * static_cast<std::size_t>(grouped_threads);
@@ -5191,20 +4411,6 @@ std::vector<array> MlxGroupedLinear::matmul(
         if (impl_->uses_zero_copy_storage()) {
             auto inputs = impl_->direct_weight_inputs;
             inputs.push_back(source);
-            if (use_partitioned_nint4_qkv) {
-                return partitioned_nint4_qkv_kernel(
-                    impl_->direct_layouts,
-                    impl_->input_size)(
-                    inputs,
-                    output_shapes,
-                    output_dtypes,
-                    grid_shape,
-                    threadgroup,
-                    {},
-                    std::nullopt,
-                    false,
-                    {}).front();
-            }
             if (use_single_row_mxfp8_fast_path) {
                 std::vector<
                     std::pair<
@@ -5235,51 +4441,6 @@ std::vector<array> MlxGroupedLinear::matmul(
                     }
                 }
                 return single_row_mxfp8_kernel(
-                    impl_->direct_layouts)(
-                    inputs,
-                    output_shapes,
-                    output_dtypes,
-                    grid_shape,
-                    threadgroup,
-                    std::move(templates),
-                    std::nullopt,
-                    false,
-                    {}).front();
-            }
-            if (use_single_row_nint_fast_path) {
-                std::vector<
-                    std::pair<
-                        std::string,
-                        mlx::core::fast::TemplateArg>>
-                    templates{
-                        {"T", source.dtype()},
-                        {"K", impl_->input_size},
-                        {
-                            "GS",
-                            impl_->direct_layouts.front().group_size,
-                        },
-                        {
-                            "NG",
-                            impl_->direct_layouts.front().groups,
-                        },
-                    };
-                for (
-                    std::size_t projection = 0;
-                    projection < impl_->direct_layouts.size();
-                    ++projection
-                ) {
-                    const auto& layout =
-                        impl_->direct_layouts[projection];
-                    const auto prefix =
-                        "P" + std::to_string(projection) + "_";
-                    templates.emplace_back(
-                        prefix + "OUT",
-                        layout.output_size);
-                    templates.emplace_back(
-                        prefix + "OUT_OFFSET",
-                        layout.output_offset);
-                }
-                return single_row_nint_kernel(
                     impl_->direct_layouts)(
                     inputs,
                     output_shapes,
@@ -5521,11 +4682,6 @@ bool MlxGroupedLinear::uses_zero_copy_storage() const noexcept {
 std::size_t
 MlxGroupedLinear::copied_packed_nbytes() const noexcept {
     return impl_->copied_packed_bytes;
-}
-
-bool MlxGroupedLinear::has_single_row_nint_fast_path()
-    const noexcept {
-    return impl_->has_single_row_nint_fast_path();
 }
 
 bool MlxGroupedLinear::has_single_row_mxfp8_fast_path()

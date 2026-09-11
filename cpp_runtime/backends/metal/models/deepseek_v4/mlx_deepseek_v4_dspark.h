@@ -105,7 +105,7 @@ public:
         const MlxEmbedding& embedding,
         const MlxLinear& output,
         int max_context,
-        std::shared_ptr<MlxNintMoeOffloadCache> expert_offload =
+        std::shared_ptr<MlxMfeOffloadCache> expert_offload =
             nullptr,
         std::size_t expert_layer_base = 0);
 

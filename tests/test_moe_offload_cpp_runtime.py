@@ -14,7 +14,7 @@ if not torch.cuda.is_available():
 
 from mfq.formats import io  # noqa: E402
 from mfq.formats.header import FileHeader  # noqa: E402
-from mfq.formats.moe import NintMoePool, NintMoeTensor  # noqa: E402
+from mfq.formats.mfe import MfePool, MfeTensor  # noqa: E402
 from mfq.formats.mx import MxTensor  # noqa: E402
 from mfq.formats.nepq import (  # noqa: E402
     NEPQ0_A,
@@ -119,7 +119,7 @@ def _aligned_nepq(spec):
     )
 
 
-def _container(family: str) -> NintMoeTensor:
+def _container(family: str) -> MfeTensor:
     experts = 4
     rows = 4
     neuron_len = 96
@@ -134,10 +134,10 @@ def _container(family: str) -> NintMoeTensor:
             NintSpec(6, 24, 6),
             NintSpec(8, 48, 8),
         )
-        return NintMoeTensor(
+        return MfeTensor(
             (experts, rows, neuron_len),
             tuple(
-                NintMoePool(
+                MfePool(
                     np.asarray([expert], dtype=np.int32),
                     quantize(values[expert], specs[expert], axis=0),
                 )
@@ -191,10 +191,10 @@ def _container(family: str) -> NintMoeTensor:
         )
     elif family == "NEPQ0-S":
         tensor = _aligned_nepq(NEPQ0_S)
-        return NintMoeTensor(
+        return MfeTensor(
             tensor.shape,
             (
-                NintMoePool(
+                MfePool(
                     np.arange(tensor.n_experts, dtype=np.int32),
                     tensor,
                 ),
@@ -202,10 +202,10 @@ def _container(family: str) -> NintMoeTensor:
         )
     elif family == "NEPQ1-L":
         tensor = _aligned_nepq(NEPQ1_L)
-        return NintMoeTensor(
+        return MfeTensor(
             tensor.shape,
             (
-                NintMoePool(
+                MfePool(
                     np.arange(tensor.n_experts, dtype=np.int32),
                     tensor,
                 ),
@@ -213,10 +213,10 @@ def _container(family: str) -> NintMoeTensor:
         )
     elif family == "NEPQ0-A":
         tensor = _aligned_nepq(NEPQ0_A)
-        return NintMoeTensor(
+        return MfeTensor(
             tensor.shape,
             (
-                NintMoePool(
+                MfePool(
                     np.arange(tensor.n_experts, dtype=np.int32),
                     tensor,
                 ),
@@ -224,10 +224,10 @@ def _container(family: str) -> NintMoeTensor:
         )
     elif family == "NEPQ1-A":
         tensor = _aligned_nepq(NEPQ1_A)
-        return NintMoeTensor(
+        return MfeTensor(
             tensor.shape,
             (
-                NintMoePool(
+                MfePool(
                     np.arange(tensor.n_experts, dtype=np.int32),
                     tensor,
                 ),
@@ -235,10 +235,10 @@ def _container(family: str) -> NintMoeTensor:
         )
     else:
         raise ValueError(family)
-    return NintMoeTensor(
+    return MfeTensor(
         (experts, rows, neuron_len),
         (
-            NintMoePool(
+            MfePool(
                 np.arange(experts, dtype=np.int32),
                 tensor,
             ),
@@ -262,7 +262,7 @@ def _mxfp4_moe(
     rows: int,
     neuron_len: int,
     seed: int,
-) -> NintMoeTensor:
+) -> MfeTensor:
     rng = np.random.default_rng(seed)
     tensor = MxTensor(
         "MXFP4",
@@ -280,10 +280,10 @@ def _mxfp4_moe(
             dtype=np.uint8,
         ),
     )
-    return NintMoeTensor(
+    return MfeTensor(
         (experts, rows, neuron_len),
         (
-            NintMoePool(
+            MfePool(
                 np.arange(experts, dtype=np.int32),
                 tensor,
             ),
@@ -356,13 +356,13 @@ def _run_check(
         str(executable),
         "--mfq",
         str(model),
-        "--check-nintm-tensor",
+        "--check-mfe-tensor",
         "experts.weight",
-        "--check-nintm-tokens",
+        "--check-mfe-tokens",
         str(tokens),
-        "--check-nintm-routes",
+        "--check-mfe-routes",
         "2",
-        "--check-nintm-reps",
+        "--check-mfe-reps",
         "3",
     ]
     if cached:
@@ -381,7 +381,7 @@ def _run_check(
     result_line = next(
         line
         for line in completed.stdout.splitlines()
-        if line.startswith("nintm_tensor_check ")
+        if line.startswith("mfe_tensor_check ")
     )
     stats_lines = [
         line
@@ -404,13 +404,13 @@ def _run_profile_check(
             str(executable),
             "--mfq",
             str(model),
-            "--check-nintm-tensor",
+            "--check-mfe-tensor",
             "experts.weight",
-            "--check-nintm-tokens",
+            "--check-mfe-tokens",
             "1",
-            "--check-nintm-routes",
+            "--check-mfe-routes",
             "2",
-            "--check-nintm-reps",
+            "--check-mfe-reps",
             "3",
             "--moe-gpu-cache-gb",
             "0.01",
@@ -504,7 +504,7 @@ def _run_gemma_overlap_check(
         "NEPQ1-A",
     ),
 )
-def test_cached_nintm_is_bit_exact_to_resident(
+def test_cached_mfe_is_bit_exact_to_resident(
     tmp_path: Path,
     family: str,
 ) -> None:
@@ -626,7 +626,7 @@ def test_generic_cache_rejects_legacy_layer_offload(
             str(executable),
             "--mfq",
             str(model),
-            "--check-nintm-tensor",
+            "--check-mfe-tensor",
             "experts.weight",
             "--moe-gpu-cache-gb",
             "0.01",
@@ -701,7 +701,7 @@ def test_profile_requires_gpu_cache(tmp_path: Path) -> None:
             str(executable),
             "--mfq",
             str(model),
-            "--check-nintm-tensor",
+            "--check-mfe-tensor",
             "experts.weight",
             "--moe-cache-profile",
             str(profile),

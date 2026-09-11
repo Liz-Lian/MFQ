@@ -1038,18 +1038,18 @@ static FFN load_moe_at(
     }
     result.moe_split_gate_up = split_gate;
     if (split_gate) {
-        result.moe_gate = load_nint_moe_gpu(
+        result.moe_gate = load_mfe_gpu(
             model, prefix + "experts.gate.weight", cacheable,
             static_cast<int>(layer), "gate");
-        result.moe_up = load_nint_moe_gpu(
+        result.moe_up = load_mfe_gpu(
             model, prefix + "experts.up.weight", cacheable,
             static_cast<int>(layer), "up");
     } else {
-        result.moe_gate_up = load_nint_moe_gpu(
+        result.moe_gate_up = load_mfe_gpu(
             model, prefix + "experts.gate_up.weight", cacheable,
             static_cast<int>(layer), "gate_up");
     }
-    result.moe_down = load_nint_moe_gpu(
+    result.moe_down = load_mfe_gpu(
         model, prefix + "experts.down.weight", cacheable,
         static_cast<int>(layer), "down");
     result.moe_router = load_dense_gpu(model, prefix + "router.weight")

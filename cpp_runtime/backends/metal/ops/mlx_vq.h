@@ -34,7 +34,7 @@ VqTensorMetadata inspect_vq_blob(
 // Indices, group states, signs, and delta selectors remain bit packed.
 // Only the small shared codebook/table payloads are expanded to an int8
 // Metal lookup layout. Rotated NEPQ cohorts consume the HSG1 runtime payload
-// stored alongside their tensor payload in a NINTM v2 pool.
+// stored alongside their tensor payload in a MFE v2 pool.
 class MlxVqWeight {
 public:
     static MlxVqWeight from_blob(

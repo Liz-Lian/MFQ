@@ -13,19 +13,19 @@
 
 namespace mfq::metal {
 
-class MlxNintMxfp4Unsupported : public std::runtime_error {
+class MlxMfeMxfp4Unsupported : public std::runtime_error {
 public:
     using std::runtime_error::runtime_error;
 };
 
 // Architecture-neutral exact-range view over three canonical routed MoE
-// projections. It accepts any NIM2 layout whose experts are stored as native
+// projections. It accepts any MFE layout whose experts are stored as native
 // MXFP4 cohorts, including virtual views over untouched HF checkpoints.
-class MlxNintMxfp4ExpertStore {
+class MlxMfeMxfp4ExpertStore {
 public:
     static constexpr std::size_t kParts = 6;
 
-    MlxNintMxfp4ExpertStore(
+    MlxMfeMxfp4ExpertStore(
         const MfqContainer& model,
         std::vector<std::string> layer_prefixes,
         std::vector<std::size_t> experts_per_layer,

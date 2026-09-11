@@ -296,11 +296,11 @@ std::vector<std::uint8_t> tpq_int4_payload(
     return result;
 }
 
-std::vector<std::uint8_t> nint_moe_payload(
+std::vector<std::uint8_t> mfe_payload(
     const std::vector<std::int64_t>& shape) {
     require(
         shape.size() == 3,
-        "invalid synthetic NINTM shape");
+        "invalid synthetic MFE shape");
     std::vector<std::uint8_t> result;
     append_bytes(result, "NIM2");
     append_scalar<std::uint32_t>(
@@ -332,8 +332,8 @@ Record record_for_binding(
         DeepseekV4TensorKind::routed_experts) {
         return {
             binding.name,
-            "NINTM",
-            nint_moe_payload(binding.shape),
+            "MFE",
+            mfe_payload(binding.shape),
         };
     }
     if (binding.kind ==

@@ -1,4 +1,4 @@
-"""NINT adapter for architecture-neutral GPTQ and GSQ weight solvers."""
+"""Direct NINT GPTQ and GSQ quantization functions."""
 
 from __future__ import annotations
 
@@ -14,16 +14,17 @@ from mfq.formats.nint import (
     normalize_row_q_bits,
     normalize_row_sub_bits,
 )
-from mfq.quantize.weight_solver import (
-    ImportanceMap,
-    ScalarGridCodec,
-    ScalarGridTensor,
-    WeightSolverProblem,
-    WeightSolverResult,
+from mfq.quantize._scalar_grid import (
+    QuantizationResult,
+    _build_importance_view,
+    _ImportanceView,
+    _QuantizationInput,
+    _ScalarGrid,
+    _ScalarGridCodec,
 )
 
 
-class NintGridCodec(ScalarGridCodec):
+class _NintGridCodec(_ScalarGridCodec):
     """Expose NINT's two-level affine representation as a tied scalar grid.
 
     The subgroup integer metadata is initialized by the existing NINT solver.
@@ -47,9 +48,9 @@ class NintGridCodec(ScalarGridCodec):
 
     def initialize(
         self,
-        problem: WeightSolverProblem,
-        imap: ImportanceMap | None = None,
-    ) -> ScalarGridTensor:
+        problem: _QuantizationInput,
+        imap: _ImportanceView | None = None,
+    ) -> _ScalarGrid:
         rows, columns = map(int, problem.weight.shape)
         row_q_bits = normalize_row_q_bits(self.spec, self.row_q_bits, rows)
         row_sub_bits = normalize_row_sub_bits(self.spec, self.row_sub_bits, rows)
@@ -87,7 +88,7 @@ class NintGridCodec(ScalarGridCodec):
         device = problem.weight.device
         groups = int(encoded.q.shape[1])
         zeros = torch.zeros((rows, groups), device=device, dtype=torch.int64)
-        return ScalarGridTensor(
+        return _ScalarGrid(
             codes=torch.as_tensor(
                 encoded.q.reshape(rows, -1), device=device, dtype=torch.int16
             ),
@@ -123,7 +124,7 @@ class NintGridCodec(ScalarGridCodec):
             },
         )
 
-    def _validate_grid(self, grid: ScalarGridTensor) -> None:
+    def _validate_grid(self, grid: _ScalarGrid) -> None:
         if grid.metadata.get("codec") != "nint-grid-v1":
             raise TypeError("NINT codec received a scalar grid from another format")
         if grid.group_size != self.spec.groupsize:
@@ -131,7 +132,7 @@ class NintGridCodec(ScalarGridCodec):
         if grid.scale_parameters.shape[1] != 1 or grid.offset_parameters.shape[1] != 1:
             raise ValueError("NINT scalar grid must retain one pair of anchors per neuron")
 
-    def canonicalize(self, grid: ScalarGridTensor) -> ScalarGridTensor:
+    def canonicalize(self, grid: _ScalarGrid) -> _ScalarGrid:
         self._validate_grid(grid)
         scale = torch.clamp(grid.scale_parameters, min=0).to(torch.float16).to(torch.float32)
         minimum = (
@@ -149,7 +150,7 @@ class NintGridCodec(ScalarGridCodec):
             offset_parameters=-minimum,
         )
 
-    def finalize(self, grid: ScalarGridTensor) -> NintTensor:
+    def finalize(self, grid: _ScalarGrid) -> NintTensor:
         grid = self.canonicalize(grid)
         metadata = grid.metadata
         row_q_bits = np.ascontiguousarray(metadata["row_q_bits"], dtype=np.uint8)
@@ -191,24 +192,28 @@ def quantize_nint_gptq(
     *,
     calibration_inputs: torch.Tensor | np.ndarray | None = None,
     hessian: torch.Tensor | np.ndarray | None = None,
-    imap: ImportanceMap | None = None,
+    importance: torch.Tensor | np.ndarray | None = None,
+    neuron_importance: torch.Tensor | np.ndarray | None = None,
     row_q_bits: np.ndarray | None = None,
     row_sub_bits: np.ndarray | None = None,
-    tensor_key: str = "anonymous.weight",
     config: Any = None,
-) -> WeightSolverResult:
-    from mfq.quantize.gptq import GptqSolver
+) -> QuantizationResult:
+    from mfq.quantize.gptq import _GptqImplementation
 
-    problem = WeightSolverProblem(
-        tensor_key,
+    problem = _QuantizationInput(
         weight,
         calibration_inputs=calibration_inputs,
         hessian=hessian,
     )
-    codec = NintGridCodec(
+    imap = _build_importance_view(
+        importance,
+        neuron_importance,
+        tuple(map(int, problem.weight.shape)),
+    )
+    codec = _NintGridCodec(
         spec, row_q_bits=row_q_bits, row_sub_bits=row_sub_bits
     )
-    return GptqSolver(config=config).solve(problem, codec, imap)
+    return _GptqImplementation(config=config).solve(problem, codec, imap)
 
 
 def quantize_nint_gsq(
@@ -217,27 +222,31 @@ def quantize_nint_gsq(
     *,
     calibration_inputs: torch.Tensor | np.ndarray | None = None,
     hessian: torch.Tensor | np.ndarray | None = None,
-    imap: ImportanceMap | None = None,
+    importance: torch.Tensor | np.ndarray | None = None,
+    neuron_importance: torch.Tensor | np.ndarray | None = None,
     row_q_bits: np.ndarray | None = None,
     row_sub_bits: np.ndarray | None = None,
-    tensor_key: str = "anonymous.weight",
     config: Any = None,
     gptq_config: Any = None,
-) -> WeightSolverResult:
-    from mfq.quantize.gsq import GsqSolver
+) -> QuantizationResult:
+    from mfq.quantize.gsq import _GsqImplementation
 
-    problem = WeightSolverProblem(
-        tensor_key,
+    problem = _QuantizationInput(
         weight,
         calibration_inputs=calibration_inputs,
         hessian=hessian,
     )
-    codec = NintGridCodec(
+    imap = _build_importance_view(
+        importance,
+        neuron_importance,
+        tuple(map(int, problem.weight.shape)),
+    )
+    codec = _NintGridCodec(
         spec, row_q_bits=row_q_bits, row_sub_bits=row_sub_bits
     )
-    return GsqSolver(config=config, gptq_config=gptq_config).solve(
+    return _GsqImplementation(config=config, gptq_config=gptq_config).solve(
         problem, codec, imap
     )
 
 
-__all__ = ["NintGridCodec", "quantize_nint_gptq", "quantize_nint_gsq"]
+__all__ = ["quantize_nint_gptq", "quantize_nint_gsq"]

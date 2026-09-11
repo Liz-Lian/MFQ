@@ -22,15 +22,17 @@ from typing import BinaryIO
 
 _U32 = struct.Struct("<I")
 _U64 = struct.Struct("<Q")
-_NINT_MOE_HDR = struct.Struct("<4sIIII")
-_NINT_MOE_POOL_HDR = struct.Struct("<IIQQ")
+_MFE_HDR = struct.Struct("<4sIIII")
+_MFE_POOL_HDR = struct.Struct("<IIQQ")
 _NINT_HDR = struct.Struct("<BBiii")
 _NVQ_HDR = struct.Struct("<4sBBHiiI")
 _NEPQ_HDR = struct.Struct("<4sBBBBIIIIIQ")
 _MX_HDR = struct.Struct("<4sBBHQQQQQQ")
 
-_NIM2 = b"NIM2"
-_NID2 = b"NID2"
+_MFE1 = b"MFE1"
+_LEGACY_NIM2 = b"NIM2"
+_MFD1 = b"MFD1"
+_LEGACY_NID2 = b"NID2"
 _NVQ_MAGIC = {b"NVQ1", b"NIQ1"}
 _NVQ_JSC_FLAG = 0x20
 _NVQ_FLAG_MASK = 0xE0
@@ -171,15 +173,15 @@ def validate_materialized_mfq(
     with index.path.open("rb") as handle:
         handles = {"standalone": handle}
         for record in index.records:
-            if record.dtype == "NINTMD":
+            if record.dtype == "MFED":
                 raise ValueError(f"standalone file still contains an overlay record: {record.name}")
-            if record.dtype != "NINTM":
+            if record.dtype != "MFE":
                 continue
             container = _parse_moe_container(
                 handle,
                 record,
                 source="standalone",
-                expected_magic=_NIM2,
+                expected_magic=(_MFE1, _LEGACY_NIM2),
                 require_full_coverage=True,
             )
             moe_records += 1
@@ -294,12 +296,15 @@ def _parse_moe_container(
     record: MfqRecord,
     *,
     source: str,
-    expected_magic: bytes,
+    expected_magic: bytes | tuple[bytes, ...],
     require_full_coverage: bool,
 ) -> MoeContainer:
-    header = _read_exact(handle, record.offset, _NINT_MOE_HDR.size)
-    magic, n_experts, out_per_expert, neuron_len, pool_count = _NINT_MOE_HDR.unpack(header)
-    if magic != expected_magic:
+    header = _read_exact(handle, record.offset, _MFE_HDR.size)
+    magic, n_experts, out_per_expert, neuron_len, pool_count = _MFE_HDR.unpack(header)
+    expected_magics = (
+        expected_magic if isinstance(expected_magic, tuple) else (expected_magic,)
+    )
+    if magic not in expected_magics:
         raise ValueError(f"{record.name}: expected {expected_magic!r}, found {magic!r}")
     if (
         n_experts <= 0
@@ -308,19 +313,19 @@ def _parse_moe_container(
         or pool_count <= 0
         or pool_count > n_experts
     ):
-        raise ValueError(f"{record.name}: invalid NINTM dimensions")
+        raise ValueError(f"{record.name}: invalid MFE dimensions")
 
-    offset = record.offset + _NINT_MOE_HDR.size
+    offset = record.offset + _MFE_HDR.size
     record_end = record.offset + record.nbytes
     owners = set()
     pools = []
     for _ in range(pool_count):
         serial_offset = offset
-        raw = _read_exact(handle, offset, _NINT_MOE_POOL_HDR.size)
-        expert_count, dtype_nbytes, payload_nbytes, runtime_nbytes = _NINT_MOE_POOL_HDR.unpack(raw)
-        offset += _NINT_MOE_POOL_HDR.size
+        raw = _read_exact(handle, offset, _MFE_POOL_HDR.size)
+        expert_count, dtype_nbytes, payload_nbytes, runtime_nbytes = _MFE_POOL_HDR.unpack(raw)
+        offset += _MFE_POOL_HDR.size
         if expert_count <= 0 or dtype_nbytes <= 0 or dtype_nbytes > 32:
-            raise ValueError(f"{record.name}: invalid NINTM pool header")
+            raise ValueError(f"{record.name}: invalid MFE pool header")
         ids_raw = _read_exact(handle, offset, int(expert_count) * 4)
         expert_ids = tuple(int(value) for value in struct.unpack(f"<{int(expert_count)}i", ids_raw))
         offset += int(expert_count) * 4
@@ -342,7 +347,7 @@ def _parse_moe_container(
         payload_offset = offset
         offset += int(payload_nbytes)
         if offset > record_end:
-            raise ValueError(f"{record.name}: truncated NINTM pool")
+            raise ValueError(f"{record.name}: truncated MFE pool")
         pools.append(
             MoePool(
                 source=source,
@@ -357,10 +362,10 @@ def _parse_moe_container(
             )
         )
     if offset != record_end:
-        raise ValueError(f"{record.name}: NINTM tail mismatch")
+        raise ValueError(f"{record.name}: MFE tail mismatch")
     if require_full_coverage and owners != set(range(int(n_experts))):
         missing = sorted(set(range(int(n_experts))) - owners)
-        raise ValueError(f"{record.name}: base NINTM misses experts {missing[:16]}")
+        raise ValueError(f"{record.name}: base MFE misses experts {missing[:16]}")
     return MoeContainer(
         magic=magic,
         n_experts=int(n_experts),
@@ -722,8 +727,7 @@ def _subset_nvq_jsc_payload(
         raise ValueError(f"{pool.dtype} has invalid JSC metadata")
     group64 = metadata_version == 2
     if group64 and (
-        pool.dtype != "NVQ2J-XL"
-        or codebook_id != 5
+        codebook_id != 5
         or vector_size != 8
         or index_bits != 12
         or groupsize != 24
@@ -838,7 +842,6 @@ def _subset_nepq_payload(
     if (
         magic != _NEPQ_MAGIC
         or version != _NEPQ_VERSION
-        or pool.dtype != expected_dtype
         or groups_per_supergroup != 4
         or flags & ~_NEPQ_ROTATED_FLAG
         or bool(flags & _NEPQ_ROTATED_FLAG) != bool(rotation_block)
@@ -1004,7 +1007,7 @@ def _subset_pool(
     neuron_len: int,
 ) -> tuple[tuple[Segment, ...], int]:
     handle = handles[pool.source]
-    if pool.dtype.startswith("NINT") and pool.dtype != "NINTM":
+    if pool.dtype == "NINT":
         payload_segments, payload_nbytes = _subset_nint_payload(
             handle,
             pool,
@@ -1012,10 +1015,7 @@ def _subset_pool(
             rows_per_expert=rows_per_expert,
             neuron_len=neuron_len,
         )
-    elif pool.dtype in {
-        "NVQ2J", "NVQ2J-L", "NVQ2J-XL",
-        "NVQ3J", "NVQ3J-512", "NVQ3J-L",
-    }:
+    elif pool.dtype == "NVQ":
         payload_segments, payload_nbytes = _subset_nvq_jsc_payload(
             handle,
             pool,
@@ -1023,7 +1023,7 @@ def _subset_pool(
             rows_per_expert=rows_per_expert,
             neuron_len=neuron_len,
         )
-    elif pool.dtype.startswith("NEPQ"):
+    elif pool.dtype == "NEPQ":
         payload_segments, payload_nbytes = _subset_nepq_payload(
             handle,
             pool,
@@ -1048,7 +1048,7 @@ def _subset_pool(
     dtype_bytes = pool.dtype.encode("ascii")
     segments: list[Segment] = [
         _literal(
-            _NINT_MOE_POOL_HDR.pack(
+            _MFE_POOL_HDR.pack(
                 len(selected_ids),
                 len(dtype_bytes),
                 payload_nbytes,
@@ -1073,14 +1073,14 @@ def _merge_moe_record(
         handles["base"],
         base_record,
         source="base",
-        expected_magic=_NIM2,
+        expected_magic=(_MFE1, _LEGACY_NIM2),
         require_full_coverage=True,
     )
     delta = _parse_moe_container(
         handles["overlay"],
         overlay_record,
         source="overlay",
-        expected_magic=_NID2,
+        expected_magic=(_MFD1, _LEGACY_NID2),
         require_full_coverage=False,
     )
     if (
@@ -1128,12 +1128,12 @@ def _merge_moe_record(
         family_counts[pool.dtype] = family_counts.get(pool.dtype, 0) + len(pool.expert_ids)
     if final_owners != set(range(base.n_experts)):
         missing = sorted(set(range(base.n_experts)) - final_owners)
-        raise ValueError(f"{base_record.name}: merged NINTM misses experts {missing[:16]}")
+        raise ValueError(f"{base_record.name}: merged MFE misses experts {missing[:16]}")
 
     segments: list[Segment] = [
         _literal(
-            _NINT_MOE_HDR.pack(
-                _NIM2,
+            _MFE_HDR.pack(
+                _MFE1,
                 base.n_experts,
                 base.out_per_expert,
                 base.neuron_len,
@@ -1223,11 +1223,11 @@ def build_materialization_plan(
     unknown = sorted(set(overlay_records) - set(base.by_name))
     if unknown:
         raise ValueError(f"overlay contains unknown tensors: {unknown[:8]}")
-    if any(record.dtype != "NINTMD" for record in overlay.records):
-        raise ValueError("overlay may contain only NINTMD records")
+    if any(record.dtype != "MFED" for record in overlay.records):
+        raise ValueError("overlay may contain only MFED records")
     for name in overlay_records:
-        if base.by_name[name].dtype != "NINTM":
-            raise ValueError(f"overlay target is not NINTM: {name}")
+        if base.by_name[name].dtype != "MFE":
+            raise ValueError(f"overlay target is not MFE: {name}")
 
     base_allocation = overlay.extra.get("base_allocation_sha256")
     if base_allocation and base.extra.get("allocation_sha256") != base_allocation:
@@ -1246,12 +1246,12 @@ def build_materialization_plan(
         for record in base.records:
             delta_record = overlay_records.get(record.name)
             if delta_record is None:
-                if record.dtype == "NINTM":
+                if record.dtype == "MFE":
                     unchanged = _parse_moe_container(
                         base_handle,
                         record,
                         source="base",
-                        expected_magic=_NIM2,
+                        expected_magic=(_MFE1, _LEGACY_NIM2),
                         require_full_coverage=True,
                     )
                     for pool in unchanged.pools:

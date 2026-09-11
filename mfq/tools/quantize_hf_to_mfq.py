@@ -62,13 +62,13 @@ from mfq.formats.header import MFQ_MAGIC, FileHeader
 from mfq.formats.io import (
     _DENSE_NAMES,
     _NINT_HDR,
-    _NINT_MOE_HDR,
-    _NINT_MOE_MAGIC_V2,
-    _NINT_MOE_POOL_V2_HDR,
-    _NINT_MOE_ROTATION_HDR,
-    _pack_nint_moe_runtime,
+    _MFE_HDR,
+    _MFE_MAGIC,
+    _MFE_POOL_HDR,
+    _MFE_ROTATION_HDR,
+    _pack_mfe_runtime,
     _u32,
-    inspect_nint_moe_header,
+    inspect_mfe_header,
     open_mmap,
     pack_bits,
 )
@@ -104,11 +104,12 @@ from mfq.formats.nepq import (
 )
 from mfq.formats.nint import (
     NINT2_SPEC,
-    NINT_V2_FLAG,
-    NINT_V2_K_SELECTOR_BITS,
-    NINT_V2_Q_SELECTOR_BITS,
+    NINT_ADAPTIVE_FLAG,
+    NINT_K_SELECTOR_BITS,
+    NINT_Q_SELECTOR_BITS,
     NintSpec,
 )
+from mfq.formats.compat import NINT_DTYPE, canonical_dtype
 from mfq.formats.npq0_l import (
     _HEADER as _NPQ0_L_HEADER,
 )
@@ -235,10 +236,13 @@ from mfq.quantize.nepq_a import (
 )
 from mfq.quantize.nint_quant import quantize as nint_quantize
 from mfq.quantize.nint_quant_torch import quantize_axis0 as nint_quantize_axis0_torch
-from mfq.quantize.nint_v2 import (
+from mfq.quantize.nint import (
     allocate_row_profiles,
-    candidate_profiles as nint_v2_candidate_profiles,
     measure_row_profile_losses,
+    profile_variable_bits,
+)
+from mfq.quantize.nint import (
+    candidate_profiles as nint_candidate_profiles,
 )
 from mfq.quantize.npq0_l import Npq0LConfig, Npq0LTables, quantize_npq0_l_fixed
 from mfq.quantize.npq0_s import Npq0SConfig, Npq0STables, quantize_npq0_s_fixed
@@ -1001,7 +1005,14 @@ _NVQ_SPECS = {
     "NVQ3J-512": NVQ3_D4_512,
     "NVQ3J-L": NVQ3_D4_1024,
 }
-_IMATRIX_NINT_DTYPES = {"NINT2", "NINT3", "NINT4", "NINT5", "NINT6"}
+_IMATRIX_NINT_DTYPES = {
+    NINT_DTYPE,
+    "NINT2",
+    "NINT3",
+    "NINT4",
+    "NINT5",
+    "NINT6",
+}
 _IMATRIX_OPTIONAL_TENSORS = {"token_embd.weight", "output.weight"}
 _NEPQ_SPECS = {
     "NEPQ0-A": NEPQ0_A,
@@ -1094,7 +1105,7 @@ def _validate_native_source_precision(plan: Sequence[TensorPlan]) -> None:
             continue
         families = (
             [value.family for value in item.expert_precisions]
-            if item.target_dtype == "NINTM" and item.expert_precisions is not None
+            if item.target_dtype == "MFE" and item.expert_precisions is not None
             else [item.target_dtype]
         )
         for family in families:
@@ -1503,16 +1514,16 @@ def _base_model_config(store) -> dict[str, object]:
     return value
 
 
-def _base_nintm_expert_precisions(
+def _base_mfe_expert_precisions(
     store,
     name: str,
     expected_shape: tuple[int, ...],
 ) -> tuple[ExpertPrecision, ...]:
-    """Recover an expert-wise NINTM policy without decoding its weight payload."""
+    """Recover an expert-wise MFE policy without decoding its weight payload."""
 
     blob = store.blob_view(name)
     try:
-        shape, pools = inspect_nint_moe_header(blob)
+        shape, pools = inspect_mfe_header(blob)
     finally:
         blob.release()
     if tuple(shape) != tuple(expected_shape):
@@ -1527,7 +1538,7 @@ def _base_nintm_expert_precisions(
         for expert in pool.expert_ids:
             precisions[int(expert)] = precision
     if any(precision is None for precision in precisions):  # pragma: no cover
-        raise ValueError(f"base NINTM tensor has an incomplete expert policy: {name}")
+        raise ValueError(f"base MFE tensor has an incomplete expert policy: {name}")
     return tuple(precision for precision in precisions if precision is not None)
 
 
@@ -1639,8 +1650,8 @@ def _mtp_plan_from_base(
                 f"MTP/backbone shape mismatch: {item.name} {item.shape} != "
                 f"{analogue} {source_analogue.shape}"
             )
-        if base_record.dtype == "NINTM":
-            expert_precisions = _base_nintm_expert_precisions(
+        if base_record.dtype == "MFE":
+            expert_precisions = _base_mfe_expert_precisions(
                 base_store,
                 base_name,
                 item.shape,
@@ -1648,9 +1659,9 @@ def _mtp_plan_from_base(
             selected.append(
                 replace(
                     item,
-                    target_dtype="NINTM",
+                    target_dtype="MFE",
                     target_spec=None,
-                    gguf_type="NINTM",
+                    gguf_type="MFE",
                     expert_shape=item.shape,
                     expert_precisions=expert_precisions,
                 )
@@ -1663,7 +1674,7 @@ def _mtp_plan_from_base(
                 f"MTP/base shape mismatch: {item.name} {item.shape} != {analogue} {base_shape}"
             )
         target_spec = None
-        if base_record.dtype.startswith("NINT") and base_record.dtype != "NINT8-0":
+        if base_record.dtype == "NINT":
             target_spec = getattr(base_tensor, "spec", None)
             if target_spec is None:
                 raise ValueError(f"base NINT tensor lacks its precision spec: {analogue}")
@@ -1739,7 +1750,7 @@ def _hf_plan_supports_imatrix(item: TensorPlan) -> bool:
     if item.target_dtype.startswith("NVQ") or item.target_dtype in _IMATRIX_NINT_DTYPES:
         return True
     return bool(
-        item.target_dtype == "NINTM"
+        item.target_dtype == "MFE"
         and item.expert_precisions is not None
         and any(
             precision.family in _IMATRIX_NINT_DTYPES
@@ -1878,7 +1889,7 @@ def _hf_expert_importance(
     if binding is None:
         return None
     if item.expert_shape is None:
-        raise ValueError(f"NINTM plan lacks expert shape: {item.name}")
+        raise ValueError(f"MFE plan lacks expert shape: {item.name}")
     n_experts, rows_per_expert, _ = item.expert_shape
     row_ids = np.arange(n_experts, dtype=np.int64) * rows_per_expert
     return np.ascontiguousarray(
@@ -1896,7 +1907,7 @@ def _hf_neuron_importance(
     if binding is None or binding.neuron_rows is None:
         return None
     if item.expert_shape is None:
-        raise ValueError(f"NINTM plan lacks expert shape: {item.name}")
+        raise ValueError(f"MFE plan lacks expert shape: {item.name}")
     n_experts, rows_per_expert, _ = item.expert_shape
     return binding.neuron_rows(0, n_experts * rows_per_expert)
 
@@ -1976,7 +1987,7 @@ def _apply_tensor_precision_overrides(
             result.append(
                 replace(
                     item,
-                    target_dtype="NINTM",
+                    target_dtype="MFE",
                     target_spec=None,
                     expert_shape=tuple(int(value) for value in item.shape),
                     expert_precisions=(precision,) * int(item.shape[0]),
@@ -2049,11 +2060,11 @@ def _apply_recipe_family_mappings(
 def _normalize_hf_expert_storage(
     plan: list[TensorPlan],
 ) -> list[TensorPlan]:
-    """Store homogeneous rank-3 compact recipes in runtime NINTM layout."""
+    """Store homogeneous rank-3 compact recipes in runtime MFE layout."""
 
     result: list[TensorPlan] = []
     for item in plan:
-        if item.target_dtype == "NINTM":
+        if item.target_dtype == "MFE":
             if (
                 len(item.shape) != 3
                 or item.expert_shape != tuple(item.shape)
@@ -2079,7 +2090,7 @@ def _normalize_hf_expert_storage(
         result.append(
             replace(
                 item,
-                target_dtype="NINTM",
+                target_dtype="MFE",
                 target_spec=None,
                 expert_shape=expert_shape,
                 expert_precisions=(precision,) * expert_shape[0],
@@ -2265,7 +2276,7 @@ def _apply_balanced_random_expert_mix(
         return plan
     result: list[TensorPlan] = []
     for item in plan:
-        if item.target_dtype != "NINTM" or item.expert_shape is None or item.precision_locked:
+        if item.target_dtype != "MFE" or item.expert_shape is None or item.precision_locked:
             result.append(item)
             continue
         n_experts = int(item.expert_shape[0])
@@ -2393,7 +2404,7 @@ def _apply_standard_preset(
             result.append(
                 replace(
                     item,
-                    target_dtype="NINTM",
+                    target_dtype="MFE",
                     gguf_name=gguf_name,
                     gguf_type=None,
                     target_spec=None,
@@ -2421,9 +2432,9 @@ def _spec_for_plan(item: TensorPlan, default_spec: NintSpec) -> NintSpec:
 
 
 def _runtime_precision_signature(item: TensorPlan) -> tuple[object, ...]:
-    if item.target_dtype == "NINTM":
-        return ("NINTM", item.expert_precisions)
-    if item.target_dtype.startswith("NINT") and item.target_dtype != "NINTM":
+    if item.target_dtype == "MFE":
+        return ("MFE", item.expert_precisions)
+    if item.target_dtype.startswith("NINT") and item.target_dtype != "MFE":
         spec = _spec_for_plan(item, NintSpec())
         return ("NINT", spec.bits, spec.groupsize, spec.sub_bits)
     return (item.target_dtype,)
@@ -2738,7 +2749,7 @@ def _separate_hf_expert_plans(
             )
             if preserve_source and native_mxfp4:
                 return {
-                    "target_dtype": "NINTM",
+                    "target_dtype": "MFE",
                     "expert_shape": target_shape,
                     "expert_precisions": (ExpertPrecision(family="MXFP4"),) * target_shape[0],
                     "precision_locked": True,
@@ -2758,7 +2769,7 @@ def _separate_hf_expert_plans(
                     "precision_locked": True,
                 }
             return {
-                "target_dtype": "NINTM",
+                "target_dtype": "MFE",
                 "expert_shape": target_shape,
                 "expert_precisions": _glm_expert_precisions(
                     target_name,
@@ -2858,7 +2869,7 @@ def _glm_derived_plans(
                     shard=weight_map[kv_source],
                     shape=shape,
                     source_dtype=source_dtypes[kv_source],
-                    target_dtype="NINTM",
+                    target_dtype="MFE",
                     source_name=kv_source,
                     expert_shape=shape,
                     expert_precisions=_glm_expert_precisions(target, shape, calibration_scheme),
@@ -2880,7 +2891,7 @@ def _glm5_next_mla_derived_plans(
 
     The runtime never needs to materialize the checkpoint's
     ``[heads * (qk + value), kv_rank]`` matrix.  Splitting it into an
-    ``embed_q`` and ``unembed_out`` NINTM pair keeps the cache in the
+    ``embed_q`` and ``unembed_out`` MFE pair keeps the cache in the
     512-wide MLA latent space and also covers the appended MTP layer.
     """
 
@@ -2933,7 +2944,7 @@ def _glm5_next_mla_derived_plans(
                     shard=metadata.shard,
                     shape=shape,
                     source_dtype=metadata.dtype,
-                    target_dtype="NINTM",
+                    target_dtype="MFE",
                     source_name=source_name,
                     expert_shape=shape,
                     expert_precisions=_glm_expert_precisions(
@@ -3394,7 +3405,7 @@ def _plan(
             elif expert_selection is not None:
                 expert_shape = _expert_plan_shape(shape, expert_selection)
                 expert_precisions = expert_selection.precisions
-                target = "NINTM"
+                target = "MFE"
             out.append(
                 TensorPlan(
                     canonical_name,
@@ -3682,12 +3693,12 @@ def _nint_blob_public_dtype(blob_path: Path) -> str:
     if len(header) != 2:
         raise ValueError(f"truncated NINT blob header: {blob_path}")
     raw_bits, raw_sub_bits = header
-    bits = raw_bits & ~NINT_V2_FLAG
+    bits = raw_bits & ~NINT_ADAPTIVE_FLAG
     if not 1 <= bits <= 8:
         raise ValueError(f"invalid NINT primary width {bits}: {blob_path}")
     if not 1 <= raw_sub_bits <= 8:
         raise ValueError(f"invalid NINT subgroup width {raw_sub_bits}: {blob_path}")
-    return "NINTv2" if raw_bits & NINT_V2_FLAG else f"NINT{bits}"
+    return NINT_DTYPE
 
 
 def _allocate_nint_v2_rows(
@@ -3700,10 +3711,10 @@ def _allocate_nint_v2_rows(
     importance_rows,
     neuron_importance_rows,
 ):
-    """Measure and allocate one common NAQ-guided q+k profile map."""
+    """Measure and allocate one common SSE/NAQ-guided q+k profile map."""
 
     out, neuron_len = shape
-    profiles = nint_v2_candidate_profiles(spec)
+    profiles = nint_candidate_profiles(spec)
     losses = np.empty((out, len(profiles)), dtype=np.float64)
     for start in range(0, out, row_chunk):
         end = min(start + row_chunk, out)
@@ -3719,7 +3730,7 @@ def _allocate_nint_v2_rows(
             importance=importance,
             device=(device if quant_backend in ACCELERATOR_BACKENDS else "cpu"),
         )
-        if importance is None:
+        if importance is None and neuron_importance_rows is not None:
             neuron_importance = neuron_importance_rows(start, end)
             if isinstance(neuron_importance, torch.Tensor):
                 neuron_importance = neuron_importance.detach().cpu().numpy()
@@ -3734,12 +3745,20 @@ def _allocate_nint_v2_rows(
         del chunk, importance
 
     groups = (neuron_len + int(spec.groupsize) - 1) // int(spec.groupsize)
+    values_per_row = groups * int(spec.groupsize)
+    uniform_variable_bits = out * profile_variable_bits(
+        spec.bits,
+        spec.sub_bits,
+        values_per_row=values_per_row,
+        groups_per_row=groups,
+    )
     return allocate_row_profiles(
         losses,
         profiles,
         spec,
-        values_per_row=groups * int(spec.groupsize),
+        values_per_row=values_per_row,
         groups_per_row=groups,
+        target_variable_bits=uniform_variable_bits,
     )
 
 
@@ -3753,6 +3772,7 @@ def _write_nint_axis0_blob(
     device: str,
     importance_rows=None,
     neuron_importance_rows=None,
+    nint_data_free: bool = False,
     synthetic: bool = False,
 ) -> int:
     if len(shape) != 2:
@@ -3764,7 +3784,7 @@ def _write_nint_axis0_blob(
     q_nbytes = (out * ng * gs * spec.bits + 7) // 8
     row_q_bits = None
     row_sub_bits = None
-    if neuron_importance_rows is not None and not synthetic:
+    if (nint_data_free or neuron_importance_rows is not None) and not synthetic:
         allocation = _allocate_nint_v2_rows(
             sl,
             (out, neuron_len),
@@ -3777,18 +3797,11 @@ def _write_nint_axis0_blob(
         )
         row_q_bits = allocation.row_q_bits
         row_sub_bits = allocation.row_sub_bits
-    is_nint_v2 = row_q_bits is not None
-    if not is_nint_v2 and (row_chunk * ng * spec.sub_bits) % 8 != 0:
-        raise ValueError(
-            f"row_chunk={row_chunk} does not align sub_bits={spec.sub_bits}, ng={ng} to byte boundary"
-        )
-    if not is_nint_v2 and (row_chunk * ng * gs * spec.bits) % 8 != 0:
-        raise ValueError(
-            f"row_chunk={row_chunk} does not align bits={spec.bits}, ng={ng}, gs={gs} to byte boundary"
-        )
-
+    if row_q_bits is None:
+        row_q_bits = np.full(out, int(spec.bits), dtype=np.uint8)
+        row_sub_bits = np.full(out, int(spec.sub_bits), dtype=np.uint8)
     with blob_path.open("wb+") as f:
-        raw_bits = int(spec.bits) | (NINT_V2_FLAG if is_nint_v2 else 0)
+        raw_bits = int(spec.bits) | NINT_ADAPTIVE_FLAG
         f.write(_NINT_HDR.pack(raw_bits, spec.sub_bits, spec.groupsize, 0, neuron_len))
         f.write(struct.pack("<I", len(shape)))
         f.write(struct.pack(f"<{len(shape)}q", *shape))
@@ -3800,58 +3813,44 @@ def _write_nint_axis0_blob(
             int, tuple[_PackedBitRegionWriter, _PackedBitRegionWriter]
         ] = {}
         q_writers: dict[int, _PackedBitRegionWriter] = {}
-        if is_nint_v2:
-            k_selectors = np.ascontiguousarray(
-                row_sub_bits.astype(np.int16) - (int(spec.sub_bits) - 1),
-                dtype=np.uint8,
+        k_selectors = np.ascontiguousarray(
+            row_sub_bits.astype(np.int16) - (int(spec.sub_bits) - 1),
+            dtype=np.uint8,
+        )
+        selector_nbytes = (out * NINT_K_SELECTOR_BITS + 7) // 8
+        cursor = metadata_off + selector_nbytes
+        for selector in range(1 << NINT_K_SELECTOR_BITS):
+            bits = int(spec.sub_bits) - 1 + selector
+            rows = int(np.count_nonzero(k_selectors == selector))
+            count = rows * ng
+            if not count:
+                continue
+            scale_stream_off = cursor
+            cursor += (count * bits + 7) // 8
+            min_stream_off = cursor
+            cursor += (count * bits + 7) // 8
+            metadata_writers[selector] = (
+                _PackedBitRegionWriter(f, scale_stream_off, bits, count),
+                _PackedBitRegionWriter(f, min_stream_off, bits, count),
             )
-            selector_nbytes = (
-                out * NINT_V2_K_SELECTOR_BITS + 7
-            ) // 8
-            cursor = metadata_off + selector_nbytes
-            for selector in range(1 << NINT_V2_K_SELECTOR_BITS):
-                bits = int(spec.sub_bits) - 1 + selector
-                rows = int(np.count_nonzero(k_selectors == selector))
-                count = rows * ng
-                if not count:
-                    continue
-                scale_stream_off = cursor
-                cursor += (count * bits + 7) // 8
-                min_stream_off = cursor
-                cursor += (count * bits + 7) // 8
-                metadata_writers[selector] = (
-                    _PackedBitRegionWriter(f, scale_stream_off, bits, count),
-                    _PackedBitRegionWriter(f, min_stream_off, bits, count),
-                )
-            q_selector_off = cursor
-            q_selector_nbytes = (out * NINT_V2_Q_SELECTOR_BITS + 7) // 8
-            cursor = q_selector_off + q_selector_nbytes
-            q_selectors = np.ascontiguousarray(row_q_bits - 1, dtype=np.uint8)
-            for selector in range(1 << NINT_V2_Q_SELECTOR_BITS):
-                bits = selector + 1
-                rows = int(np.count_nonzero(q_selectors == selector))
-                count = rows * ng * gs
-                if not count:
-                    continue
-                q_writers[selector] = _PackedBitRegionWriter(
-                    f, cursor, bits, count
-                )
-                cursor += (count * bits + 7) // 8
-            blob_end = cursor
-            sub_scale_off = sub_min_off = -1
-            q_off = -1
-        else:
-            sub_nbytes = (out * ng * spec.sub_bits + 7) // 8
-            sub_scale_off = metadata_off
-            sub_min_off = sub_scale_off + sub_nbytes
-            q_off = sub_min_off + sub_nbytes
-            blob_end = q_off + q_nbytes
+        q_selector_off = cursor
+        q_selector_nbytes = (out * NINT_Q_SELECTOR_BITS + 7) // 8
+        cursor = q_selector_off + q_selector_nbytes
+        q_selectors = np.ascontiguousarray(row_q_bits - 1, dtype=np.uint8)
+        for selector in range(1 << NINT_Q_SELECTOR_BITS):
+            bits = selector + 1
+            rows = int(np.count_nonzero(q_selectors == selector))
+            count = rows * ng * gs
+            if not count:
+                continue
+            q_writers[selector] = _PackedBitRegionWriter(f, cursor, bits, count)
+            cursor += (count * bits + 7) // 8
+        blob_end = cursor
         f.truncate(blob_end)
-        if is_nint_v2:
-            f.seek(metadata_off)
-            f.write(pack_bits(k_selectors, NINT_V2_K_SELECTOR_BITS))
-            f.seek(q_selector_off)
-            f.write(pack_bits(q_selectors, NINT_V2_Q_SELECTOR_BITS))
+        f.seek(metadata_off)
+        f.write(pack_bits(k_selectors, NINT_K_SELECTOR_BITS))
+        f.seek(q_selector_off)
+        f.write(pack_bits(q_selectors, NINT_Q_SELECTOR_BITS))
 
         if synthetic:
             return int(blob_end)
@@ -3892,25 +3891,15 @@ def _write_nint_axis0_blob(
             f.write(np.ascontiguousarray(nt.neuron_scale, dtype=np.float16).tobytes())
             f.seek(min_off + start * 2)
             f.write(np.ascontiguousarray(nt.neuron_min, dtype=np.float16).tobytes())
-            if is_nint_v2:
-                chunk_selectors = k_selectors[start:end]
-                for selector, (scale_writer, min_writer) in metadata_writers.items():
-                    local_rows = np.flatnonzero(chunk_selectors == selector)
-                    scale_writer.append(nt.sub_scale[local_rows])
-                    min_writer.append(nt.sub_min[local_rows])
-            else:
-                f.seek(sub_scale_off + (start * ng * spec.sub_bits) // 8)
-                f.write(pack_bits(nt.sub_scale, spec.sub_bits))
-                f.seek(sub_min_off + (start * ng * spec.sub_bits) // 8)
-                f.write(pack_bits(nt.sub_min, spec.sub_bits))
-            if is_nint_v2:
-                chunk_q_selectors = q_selectors[start:end]
-                for selector, q_writer in q_writers.items():
-                    local_rows = np.flatnonzero(chunk_q_selectors == selector)
-                    q_writer.append(nt.q[local_rows])
-            else:
-                f.seek(q_off + (start * ng * gs * spec.bits) // 8)
-                f.write(pack_bits(nt.q, spec.bits))
+            chunk_selectors = k_selectors[start:end]
+            for selector, (scale_writer, min_writer) in metadata_writers.items():
+                local_rows = np.flatnonzero(chunk_selectors == selector)
+                scale_writer.append(nt.sub_scale[local_rows])
+                min_writer.append(nt.sub_min[local_rows])
+            chunk_q_selectors = q_selectors[start:end]
+            for selector, q_writer in q_writers.items():
+                local_rows = np.flatnonzero(chunk_q_selectors == selector)
+                q_writer.append(nt.q[local_rows])
             del chunk, nt, importance
         for scale_writer, min_writer in metadata_writers.values():
             scale_writer.finish()
@@ -4331,9 +4320,10 @@ def _write_nint_moe_axis0_blob(
     device: str,
     importance: np.ndarray | torch.Tensor | None = None,
     neuron_importance: np.ndarray | torch.Tensor | None = None,
+    nint_data_free: bool = False,
     synthetic: bool = False,
 ) -> int:
-    """Stream a mixed-profile expert tensor into the ``NINTM`` container."""
+    """Stream a mixed-profile expert tensor into the ``MFE`` container."""
 
     n_experts, rows_per_expert, columns = expert_shape
     if len(expert_specs) != n_experts:
@@ -4356,8 +4346,8 @@ def _write_nint_moe_axis0_blob(
     try:
         with blob_path.open("wb") as output:
             output.write(
-                _NINT_MOE_HDR.pack(
-                    _NINT_MOE_MAGIC_V2,
+                _MFE_HDR.pack(
+                    _MFE_MAGIC,
                     n_experts,
                     rows_per_expert,
                     columns,
@@ -4445,11 +4435,12 @@ def _write_nint_moe_axis0_blob(
                         if pool_neuron_importance is not None
                         else None
                     ),
+                    nint_data_free=nint_data_free,
                     synthetic=synthetic,
                 )
                 dtype = _nint_blob_public_dtype(pool_path).encode("ascii")
                 output.write(
-                    _NINT_MOE_POOL_V2_HDR.pack(
+                    _MFE_POOL_HDR.pack(
                         len(expert_ids),
                         len(dtype),
                         pool_nbytes,
@@ -5042,7 +5033,7 @@ def _write_nepq_cohort_blob(
         raise RuntimeError(
             f"{precision.family} stream size mismatch: {payload_nbytes} != {expected_nbytes}"
         )
-    runtime_payload = _pack_nint_moe_runtime(tensor)
+    runtime_payload = _pack_mfe_runtime(tensor)
     return payload_nbytes, runtime_payload
 
 
@@ -5078,9 +5069,10 @@ def _write_mixed_moe_axis0_blob(
     artifact_root: str | Path | None,
     importance: np.ndarray | torch.Tensor | None = None,
     neuron_importance: np.ndarray | torch.Tensor | None = None,
+    nint_data_free: bool = False,
     synthetic: bool = False,
 ) -> int:
-    """Stream all supported precision families into one NIM2 container."""
+    """Stream all supported precision families into one MFE container."""
 
     n_experts, rows_per_expert, columns = expert_shape
     if len(expert_precisions) != n_experts:
@@ -5128,6 +5120,7 @@ def _write_mixed_moe_axis0_blob(
             device,
             importance=importance,
             neuron_importance=neuron_importance_array,
+            nint_data_free=nint_data_free,
             synthetic=synthetic,
         )
 
@@ -5138,8 +5131,8 @@ def _write_mixed_moe_axis0_blob(
     try:
         with blob_path.open("wb") as output:
             output.write(
-                _NINT_MOE_HDR.pack(
-                    _NINT_MOE_MAGIC_V2,
+                _MFE_HDR.pack(
+                    _MFE_MAGIC,
                     n_experts,
                     rows_per_expert,
                     columns,
@@ -5248,6 +5241,7 @@ def _write_mixed_moe_axis0_blob(
                             if pool_neuron_importance is not None
                             else None
                         ),
+                        nint_data_free=nint_data_free,
                         synthetic=synthetic,
                     )
                     runtime_payload = b""
@@ -5294,10 +5288,10 @@ def _write_mixed_moe_axis0_blob(
                 dtype = (
                     _nint_blob_public_dtype(pool_path)
                     if precision.nint_spec is not None
-                    else precision.family
+                    else canonical_dtype(precision.family)
                 ).encode("ascii")
                 output.write(
-                    _NINT_MOE_POOL_V2_HDR.pack(
+                    _MFE_POOL_HDR.pack(
                         len(expert_ids),
                         len(dtype),
                         pool_nbytes,
@@ -5368,9 +5362,11 @@ def _write_mfq(
 def _nint_blob_nbytes(rows: int, columns: int, spec: NintSpec) -> int:
     groups = (columns + spec.groupsize - 1) // spec.groupsize
     header = _NINT_HDR.size + 4 + 2 * 8 + 8
+    k_selectors = (rows * NINT_K_SELECTOR_BITS + 7) // 8
     sub = (rows * groups * spec.sub_bits + 7) // 8
+    q_selectors = (rows * NINT_Q_SELECTOR_BITS + 7) // 8
     q = (rows * groups * spec.groupsize * spec.bits + 7) // 8
-    return int(header + rows * 4 + 2 * sub + q)
+    return int(header + rows * 4 + k_selectors + 2 * sub + q_selectors + q)
 
 
 def _nint_moe_blob_nbytes(
@@ -5383,10 +5379,10 @@ def _nint_moe_blob_nbytes(
     cohorts: dict[NintSpec, int] = {}
     for profile in expert_specs:
         cohorts[profile] = cohorts.get(profile, 0) + 1
-    total = _NINT_MOE_HDR.size
+    total = _MFE_HDR.size
     for profile, count in cohorts.items():
-        dtype_nbytes = len(f"NINT{profile.bits}".encode("ascii"))
-        total += _NINT_MOE_POOL_V2_HDR.size + count * np.dtype(np.int32).itemsize + dtype_nbytes
+        dtype_nbytes = len(NINT_DTYPE.encode("ascii"))
+        total += _MFE_POOL_HDR.size + count * np.dtype(np.int32).itemsize + dtype_nbytes
         total += _nint_blob_nbytes(count * rows_per_expert, columns, profile)
     return int(total)
 
@@ -5406,7 +5402,7 @@ def _mixed_moe_blob_nbytes(
     cohorts: dict[ExpertPrecision, int] = {}
     for precision in expert_precisions:
         cohorts[precision] = cohorts.get(precision, 0) + 1
-    total = _NINT_MOE_HDR.size
+    total = _MFE_HDR.size
     flat_shape_header = 2 * 8 + 4
     for precision, expert_count in cohorts.items():
         rows = expert_count * rows_per_expert
@@ -5560,12 +5556,12 @@ def _mixed_moe_blob_nbytes(
                             int(requested_records) * nepq_spec.residual_record_bits / 8
                         )
             if int(precision.option("rotation_block", 2048 if nepq_spec.is_residual else 0)):
-                runtime_nbytes = _NINT_MOE_ROTATION_HDR.size + columns
+                runtime_nbytes = _MFE_ROTATION_HDR.size + columns
         else:
             raise ValueError(f"unsupported expert precision: {precision.family}")
-        dtype_nbytes = len(precision.family.encode("ascii"))
+        dtype_nbytes = len(canonical_dtype(precision.family).encode("ascii"))
         total += (
-            _NINT_MOE_POOL_V2_HDR.size
+            _MFE_POOL_HDR.size
             + expert_count * np.dtype(np.int32).itemsize
             + dtype_nbytes
             + runtime_nbytes
@@ -5587,9 +5583,9 @@ def _estimate_bytes(
     dense_total = 0
     for item in plan:
         n = int(np.prod(item.shape))
-        if item.target_dtype == "NINTM":
+        if item.target_dtype == "MFE":
             if item.expert_shape is None or item.expert_precisions is None:
-                raise ValueError(f"NINTM plan lacks expert metadata: {item.name}")
+                raise ValueError(f"MFE plan lacks expert metadata: {item.name}")
             nint_total += _mixed_moe_blob_nbytes(
                 item.expert_shape,
                 item.expert_precisions,
@@ -5634,9 +5630,9 @@ def _plan_blob_nbytes(
     nvq_jsc_banks: int = 4,
 ) -> int:
     n = int(np.prod(item.shape))
-    if item.target_dtype == "NINTM":
+    if item.target_dtype == "MFE":
         if item.expert_shape is None or item.expert_precisions is None:
-            raise ValueError(f"NINTM plan lacks expert metadata: {item.name}")
+            raise ValueError(f"MFE plan lacks expert metadata: {item.name}")
         return _mixed_moe_blob_nbytes(
             item.expert_shape,
             item.expert_precisions,
@@ -5770,6 +5766,7 @@ def convert(args: argparse.Namespace) -> None:
     random_expert_mix_arg = getattr(args, "random_expert_mix", "")
     random_expert_mix = _parse_expert_mix_profiles(random_expert_mix_arg)
     random_expert_mix_seed = int(getattr(args, "random_expert_mix_seed", 20260908))
+    nint_data_free = bool(getattr(args, "nint_data_free", False))
     quantize_vision = bool(getattr(args, "quantize_vision", False))
     quantize_mtp = bool(getattr(args, "quantize_mtp", False))
     quantize_ple = bool(getattr(args, "quantize_ple", False))
@@ -5805,6 +5802,14 @@ def convert(args: argparse.Namespace) -> None:
         raise ValueError(
             "--quantize-vision, --quantize-mtp, and --quantize-ple do not apply to --bf16"
         )
+    if mostly_bf16 and nint_data_free:
+        raise ValueError("--nint-data-free does not apply to --bf16")
+    if nint_data_free and (
+        calibration_scheme is not None or getattr(args, "imatrix", "")
+    ):
+        raise ValueError(
+            "--nint-data-free cannot be combined with a calibration scheme or imatrix"
+        )
     if synthetic_expert_weights and not random_expert_mix:
         raise ValueError("--synthetic-expert-weights requires --random-expert-mix")
     if base_store is not None and (
@@ -5816,6 +5821,7 @@ def convert(args: argparse.Namespace) -> None:
         or getattr(args, "tensor_precision_overrides", "")
         or random_expert_mix
         or quantize_ple
+        or nint_data_free
     ):
         raise ValueError(
             "--base-mfq derives the complete MTP precision policy from the base; "
@@ -5966,6 +5972,7 @@ def convert(args: argparse.Namespace) -> None:
                 "random_expert_mix": [value.family for value in random_expert_mix],
                 "random_expert_mix_seed": (random_expert_mix_seed if random_expert_mix else None),
                 "synthetic_expert_weights": synthetic_expert_weights,
+                "nint_data_free": nint_data_free,
                 "quantize_vision": quantize_vision,
                 "quantize_mtp": quantize_mtp,
                 "quantize_ple": quantize_ple,
@@ -6131,6 +6138,12 @@ def convert(args: argparse.Namespace) -> None:
                 ):
                     variable_codebook_size = True
                 if (
+                    nint_data_free
+                    and item.target_dtype.startswith("NINT")
+                    and item.target_dtype != "NINT8-0"
+                ):
+                    variable_codebook_size = True
+                if (
                     resume_temp
                     and blob_path.is_file()
                     and blob_path.stat().st_size > 0
@@ -6140,7 +6153,7 @@ def convert(args: argparse.Namespace) -> None:
                     reused_dtype = (
                         _nint_blob_public_dtype(blob_path)
                         if item.target_dtype.startswith("NINT")
-                        and item.target_dtype not in {"NINT8-0", "NINTM"}
+                        and item.target_dtype not in {"NINT8-0", "MFE"}
                         else item.target_dtype
                     )
                     records.append(
@@ -6192,10 +6205,10 @@ def convert(args: argparse.Namespace) -> None:
                         )
                     )
                     try:
-                        if item.target_dtype == "NINTM":
+                        if item.target_dtype == "MFE":
                             if item.expert_shape is None or item.expert_precisions is None:
                                 raise ValueError(
-                                    f"NINTM plan lacks HF expert precision metadata: {item.name}"
+                                    f"MFE plan lacks HF expert precision metadata: {item.name}"
                                 )
                             expert_importance = _hf_expert_importance(
                                 item, imatrix_bindings.get(item.name)
@@ -6219,6 +6232,7 @@ def convert(args: argparse.Namespace) -> None:
                                 artifact_root,
                                 importance=expert_importance,
                                 neuron_importance=neuron_importance,
+                                nint_data_free=nint_data_free,
                                 synthetic=synthetic_expert_weights,
                             )
                         elif item.target_dtype in {"BF16", "F16", "F32"}:
@@ -6273,9 +6287,9 @@ def convert(args: argparse.Namespace) -> None:
                                 if preserve_raw_e4m3
                                 else _raw_source_for_plan(root, item)
                             )
-                    if item.target_dtype == "NINTM":
+                    if item.target_dtype == "MFE":
                         if item.expert_shape is None or item.expert_precisions is None:
-                            raise ValueError(f"NINTM plan lacks expert metadata: {item.name}")
+                            raise ValueError(f"MFE plan lacks expert metadata: {item.name}")
                         if item.transform is not None:
                             source = _transform_glm_kv_b(raw_source.tensor(), item)
                         else:
@@ -6298,6 +6312,7 @@ def convert(args: argparse.Namespace) -> None:
                             artifact_root,
                             importance=expert_importance,
                             neuron_importance=neuron_importance,
+                            nint_data_free=nint_data_free,
                             synthetic=synthetic_expert_weights,
                         )
                     elif preserve_raw_e4m3:
@@ -6360,6 +6375,7 @@ def convert(args: argparse.Namespace) -> None:
                                 if item.name not in imatrix_bindings
                                 else imatrix_bindings[item.name].neuron_rows
                             ),
+                            nint_data_free=nint_data_free,
                         )
                     elif item.target_dtype.startswith("NVQ") or item.target_dtype == "NPQ0-L":
                         source = _HfPlanRowSource(raw_source, item)
@@ -6506,7 +6522,7 @@ def convert(args: argparse.Namespace) -> None:
                 record_dtype = (
                     _nint_blob_public_dtype(blob_path)
                     if item.target_dtype.startswith("NINT")
-                    and item.target_dtype not in {"NINT8-0", "NINTM"}
+                    and item.target_dtype not in {"NINT8-0", "MFE"}
                     else item.target_dtype
                 )
                 record = BlobRecord(item.name, record_dtype, nbytes, blob_path)
@@ -6521,7 +6537,7 @@ def convert(args: argparse.Namespace) -> None:
                             "total": len(plan),
                             "name": item.name,
                             "shape": item.shape,
-                            "dtype": item.target_dtype,
+                            "dtype": record_dtype,
                             "gguf_name": item.gguf_name,
                             "gguf_type": item.gguf_type,
                             "blob_mb": round(nbytes / 1e6, 2),
@@ -6531,6 +6547,11 @@ def convert(args: argparse.Namespace) -> None:
                     ),
                     flush=True,
                 )
+
+        if nint_data_free:
+            target_counts = {}
+            for record in records:
+                target_counts[record.dtype] = target_counts.get(record.dtype, 0) + 1
 
         config_path_arg = getattr(args, "model_config", "")
         if config_path_arg:
@@ -6695,7 +6716,11 @@ def convert(args: argparse.Namespace) -> None:
                         else (
                             "minicpmo45-module-matrices=NINT-axis0,raw-parameters=source-dtype"
                             if _is_minicpmo45_config(config)
-                            else "2d=NINT-axis0,other=dense"
+                            else (
+                                "2d=NINTv2-data-free-axis0,other=dense"
+                                if nint_data_free
+                                else "2d=NINT-axis0,other=dense"
+                            )
                         )
                     )
                 )
@@ -6865,6 +6890,7 @@ def convert(args: argparse.Namespace) -> None:
                 "random_expert_mix": [value.family for value in random_expert_mix],
                 "random_expert_mix_seed": (random_expert_mix_seed if random_expert_mix else None),
                 "synthetic_expert_weights": synthetic_expert_weights,
+                "nint_data_free": nint_data_free,
                 "quantize_vision": quantize_vision,
                 "quantize_mtp": quantize_mtp,
                 "quantize_ple": quantize_ple,
@@ -6973,6 +6999,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--bits", type=int, default=4)
     parser.add_argument("--groupsize", type=int, default=24)
     parser.add_argument("--sub-bits", type=int, default=6)
+    parser.add_argument(
+        "--nint-data-free",
+        action="store_true",
+        help=(
+            "allocate per-neuron q+k profiles from reconstruction SSE at the "
+            "matched uniform-NINT packed-bit budget"
+        ),
+    )
     parser.add_argument("--row-chunk", type=int, default=0)
     parser.add_argument("--quant-backend", choices=QUANT_BACKENDS, default="auto")
     parser.add_argument("--device", default="cuda")
@@ -7050,7 +7084,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--imatrix",
         default="",
-        help=("optional llama.cpp GGUF or legacy importance matrix for HF NINT/NINTM calibration"),
+        help=("optional llama.cpp GGUF or legacy importance matrix for HF NINT/MFE calibration"),
     )
     parser.add_argument(
         "--tensor-precision-overrides",

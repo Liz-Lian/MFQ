@@ -1,10 +1,11 @@
 #include "mlx_moe.h"
 
 #include "mfq_container.h"
-#include "mfq_nintm_prefill_embedded.h"
+#include "mfq_mfe_prefill_embedded.h"
 #include "mlx_nint.h"
 #include "mlx_nint8_zero.h"
 #include "mlx_mx.h"
+#include "mlx_mxfp4_sq.h"
 #include "mlx_reference.h"
 #include "mlx_staging_allocator.h"
 #include "mlx_vq.h"
@@ -66,8 +67,8 @@ constexpr int kNintQOffset = 7;
 constexpr int kNintSubOffset = 8;
 constexpr int kNintAnchorOffset = 9;
 constexpr int kNintQ5Execution = 10;
-constexpr int kNintRowQBitsOffset = 11;
-constexpr int kNintRowQBitOffsetsOffset = 12;
+constexpr int kNintRowQLayoutOffset = 11;
+constexpr int kNintRowQByteOffsetsOffset = 12;
 constexpr int kNintV2 = 13;
 
 // Keep the same family value and fields as the Python Metal descriptor.  The
@@ -109,34 +110,6 @@ bool apple_m5_family() noexcept {
         return name.rfind("Apple M5", 0) == 0;
     }();
     return is_m5;
-}
-
-bool nint_grouped_nax_enabled() noexcept {
-    const char* value = std::getenv("MFQ_METAL_NINT_PREFILL_NAX");
-    if (value != nullptr) {
-        return std::string_view(value) != "0"
-            && std::string_view(value) != "false"
-            && std::string_view(value) != "off";
-    }
-    return apple_m5_family();
-}
-
-bool nint_grouped_nax_direct_enabled(
-    int input_width,
-    int output_width) noexcept {
-    const char* value = std::getenv(
-        "MFQ_METAL_NINT_PREFILL_NAX_DIRECT");
-    if (value != nullptr) {
-        return std::string_view(value) != "0"
-            && std::string_view(value) != "false"
-            && std::string_view(value) != "off";
-    }
-    // The WM=2/WN=2 cooperative staging path is faster on current M5
-    // hardware.  Keep direct packed-fragment decode available for explicit
-    // architecture experiments without selecting it in production.
-    (void)input_width;
-    (void)output_width;
-    return false;
 }
 
 bool mixed_grouped_nax_enabled(int route_count) noexcept {
@@ -190,7 +163,7 @@ int grouped_mmq_tile_columns(
 bool mxfp4_nax_prefill_enabled(int route_count) noexcept {
     constexpr int kDefaultMinRoutes = 1024;
     const char* value = std::getenv(
-        "MFQ_METAL_NINTM_PREFILL_NAX");
+        "MFQ_METAL_MFE_PREFILL_NAX");
     if (value == nullptr) {
         return false;
     }
@@ -212,7 +185,7 @@ bool mxfp4_nax_smallm_preferred(
     int tokens,
     int experts) noexcept {
     const char* value = std::getenv(
-        "MFQ_METAL_NINTM_SMALLM_NAX");
+        "MFQ_METAL_MFE_SMALLM_NAX");
     const auto setting = value == nullptr
         ? std::string_view("auto")
         : std::string_view(value);
@@ -247,7 +220,7 @@ bool mxfp4_nax_smallm_preferred(
 
 bool mxfp4_decode_down_reduce_enabled() noexcept {
     const char* value = std::getenv(
-        "MFQ_METAL_NINTM_DECODE_DOWN_REDUCE");
+        "MFQ_METAL_MFE_DECODE_DOWN_REDUCE");
     if (value == nullptr) {
         return true;
     }
@@ -259,7 +232,7 @@ bool mxfp4_decode_down_reduce_enabled() noexcept {
 
 int mxfp4_decode_down_reduce_rows() noexcept {
     const char* value = std::getenv(
-        "MFQ_METAL_NINTM_DECODE_DOWN_REDUCE_ROWS");
+        "MFQ_METAL_MFE_DECODE_DOWN_REDUCE_ROWS");
     if (value != nullptr) {
         const auto setting = std::string_view(value);
         if (setting == "1") return 1;
@@ -270,7 +243,7 @@ int mxfp4_decode_down_reduce_rows() noexcept {
 
 int mxfp4_decode_rows_per_simd() noexcept {
     const char* value = std::getenv(
-        "MFQ_METAL_NINTM_DECODE_ROWS_PER_SIMD");
+        "MFQ_METAL_MFE_DECODE_ROWS_PER_SIMD");
     if (value != nullptr) {
         const auto setting = std::string_view(value);
         if (setting == "1") return 1;
@@ -284,7 +257,7 @@ bool routed_sort_enabled(int tokens) noexcept {
         return false;
     }
     const char* value = std::getenv(
-        "MFQ_METAL_NINTM_SORT_ROUTES");
+        "MFQ_METAL_MFE_SORT_ROUTES");
     if (value == nullptr) {
         return true;
     }
@@ -402,70 +375,6 @@ inline uint3 mfq_moe_read_npq_group_indices(
         (packed >> shift) & mask,
         (packed >> (shift + BITS)) & mask,
         (packed >> (shift + 2u * BITS)) & mask);
-}
-
-template <typename Stream>
-inline uint mfq_moe_nint_read_bits(
-    Stream stream,
-    uint value_index,
-    uint bits
-) {
-    uint residual_bits = (value_index & 7u) * bits;
-    uint byte_index =
-        (value_index >> 3) * bits + (residual_bits >> 3);
-    uint shift = residual_bits & 7u;
-    uint packed = uint(stream[byte_index]);
-    if (shift + bits > 8u) {
-        packed |= uint(stream[byte_index + 1u]) << 8;
-    }
-    return (packed >> shift) & ((1u << bits) - 1u);
-}
-
-template <typename Stream>
-inline uint mfq_moe_nint_read_bit_offset(
-    Stream stream,
-    uint bit_offset,
-    uint bits
-) {
-    uint byte_index = bit_offset >> 3;
-    uint shift = bit_offset & 7u;
-    uint packed = uint(stream[byte_index]);
-    if (shift + bits > 8u) {
-        packed |= uint(stream[byte_index + 1u]) << 8;
-    }
-    return (packed >> shift) & ((1u << bits) - 1u);
-}
-
-template <typename Stream>
-inline uint mfq_moe_nint_read_value(
-    Stream stream,
-    uint value_index,
-    uint bits,
-    uint group_size,
-    uint q5_execution
-) {
-    if (q5_execution != 0u && bits == 5u) {
-        uint metadata_index = value_index / group_size;
-        uint element = value_index - metadata_index * group_size;
-        uint low_bytes = (group_size + 1u) >> 1;
-        uint high_bytes = (group_size + 7u) >> 3;
-        uint group_offset =
-            metadata_index * (low_bytes + high_bytes);
-        uint low_packed =
-            uint(stream[group_offset + (element >> 1)]);
-        uint low =
-            (low_packed >> ((element & 1u) * 4u)) & 15u;
-        uint high = (
-            uint(stream[
-                group_offset + low_bytes + (element >> 3)])
-            >> (element & 7u)
-        ) & 1u;
-        return low | (high << 4u);
-    }
-    return mfq_moe_nint_read_bits(
-        stream,
-        value_index,
-        bits);
 }
 
 constant constexpr float mfq_moe_mxfp4_lut[16] = {
@@ -800,516 +709,6 @@ constexpr const char* kMoeSource = R"METAL(
     float accumulators[MATRIX_ROWS] = {0.0f};
 
     if (
-        (uint(FAMILY_MASK) & 1u) != 0u
-        && family == 0u
-    ) {
-        uint bits =
-            uint(descriptors[descriptor_base + 4u]);
-        uint group_size =
-            uint(descriptors[descriptor_base + 5u]);
-        uint groups =
-            uint(descriptors[descriptor_base + 6u]);
-        uint q_offset =
-            uint(descriptors[descriptor_base + 7u]);
-        uint sub_offset =
-            uint(descriptors[descriptor_base + 8u]);
-        uint anchor_offset =
-            uint(descriptors[descriptor_base + 9u]);
-        uint q5_execution =
-            uint(descriptors[descriptor_base + 10u]);
-        uint row_q_bits_offset =
-            uint(descriptors[descriptor_base + 11u]);
-        uint row_q_bit_offsets_offset =
-            uint(descriptors[descriptor_base + 12u]);
-        uint nint_v2 =
-            uint(descriptors[descriptor_base + 13u]);
-
-        for (
-            uint group = k_lane;
-            group < groups;
-            group += K_LANES
-        ) {
-            ulong outputs[MATRIX_ROWS];
-            float scales[MATRIX_ROWS];
-            float minimums[MATRIX_ROWS];
-            for (
-                uint row = 0u;
-                row < MATRIX_ROWS;
-                ++row
-            ) {
-                uint output = min(
-                    output_base + (
-                        uint(FUSED_SWIGLU) != 0u
-                            ? (row / ROWS_PER_SIMD) * uint(OUT)
-                                + row % ROWS_PER_SIMD
-                            : row
-                    ),
-                    uint(MATRIX_OUT) - 1u);
-                uint pool_output =
-                    local_expert * uint(MATRIX_OUT) + output;
-                uint metadata =
-                    pool_output * groups + group;
-                outputs[row] = pool_output;
-                scales[row] =
-                    nint_anchor_scale[
-                        anchor_offset + pool_output]
-                    * float(
-                        nint_sub_scale[
-                            sub_offset + metadata]);
-                minimums[row] =
-                    nint_anchor_min[
-                        anchor_offset + pool_output]
-                    * float(
-                        nint_sub_min[
-                            sub_offset + metadata]);
-            }
-
-            if (nint_v2 != 0u) {
-                device const uint* row_q_bit_offsets =
-                    (device const uint*)(
-                        nint_q + row_q_bit_offsets_offset);
-                for (
-                    uint element = 0u;
-                    element < group_size;
-                    ++element
-                ) {
-                    uint column =
-                        group * group_size + element;
-                    float activation =
-                        column < uint(K)
-                            ? float(x[x_offset + column])
-                            : 0.0f;
-                    for (
-                        uint row = 0u;
-                        row < MATRIX_ROWS;
-                        ++row
-                    ) {
-                        uint pool_output = uint(outputs[row]);
-                        uint row_bits = uint(nint_q[
-                            row_q_bits_offset + pool_output]);
-                        uint bit_offset =
-                            row_q_bit_offsets[pool_output]
-                            + column * row_bits;
-                        uint quantized =
-                            mfq_moe_nint_read_bit_offset(
-                                nint_q + q_offset,
-                                bit_offset,
-                                row_bits);
-                        accumulators[row] = fma(
-                            activation,
-                            scales[row] * float(quantized)
-                                - minimums[row],
-                            accumulators[row]);
-                    }
-                }
-            } else if (
-                bits == 2u
-                && (group_size % 4u) == 0u
-            ) {
-                for (
-                    uint element = 0u;
-                    element < group_size;
-                    element += 4u
-                ) {
-                    uint column_base =
-                        group * group_size + element;
-                    float activations[4];
-                    for (
-                        uint component = 0u;
-                        component < 4u;
-                        ++component
-                    ) {
-                        uint column =
-                            column_base + component;
-                        activations[component] =
-                            column < uint(K)
-                                ? float(
-                                    x[x_offset + column])
-                                : 0.0f;
-                    }
-                    for (
-                        uint row = 0u;
-                        row < MATRIX_ROWS;
-                        ++row
-                    ) {
-                        uint quantized_index = (
-                            outputs[row] * groups + group
-                        ) * group_size + element;
-                        uint packed = uint(nint_q[
-                            q_offset
-                            + (quantized_index >> 2)
-                        ]);
-                        for (
-                            uint component = 0u;
-                            component < 4u;
-                            ++component
-                        ) {
-                            uint quantized =
-                                (
-                                    packed
-                                    >> (component * 2u)
-                                ) & 3u;
-                            accumulators[row] = fma(
-                                activations[component],
-                                scales[row]
-                                    * float(quantized)
-                                    - minimums[row],
-                                accumulators[row]);
-                        }
-                    }
-                }
-            } else if (
-                bits == 3u
-                && (group_size % 8u) == 0u
-            ) {
-                for (
-                    uint element = 0u;
-                    element < group_size;
-                    element += 8u
-                ) {
-                    uint column_base =
-                        group * group_size + element;
-                    float activations[8];
-                    for (
-                        uint component = 0u;
-                        component < 8u;
-                        ++component
-                    ) {
-                        uint column =
-                            column_base + component;
-                        activations[component] =
-                            column < uint(K)
-                                ? float(
-                                    x[x_offset + column])
-                                : 0.0f;
-                    }
-                    for (
-                        uint row = 0u;
-                        row < MATRIX_ROWS;
-                        ++row
-                    ) {
-                        uint quantized_index = (
-                            outputs[row] * groups + group
-                        ) * group_size + element;
-                        uint byte_index =
-                            (quantized_index >> 3) * 3u
-                            + (((quantized_index & 7u) * 3u) >> 3);
-                        uint packed =
-                            uint(nint_q[
-                                q_offset + byte_index])
-                            | (
-                                uint(nint_q[
-                                    q_offset
-                                    + byte_index + 1u])
-                                << 8
-                            )
-                            | (
-                                uint(nint_q[
-                                    q_offset
-                                    + byte_index + 2u])
-                                << 16
-                            );
-                        for (
-                            uint component = 0u;
-                            component < 8u;
-                            ++component
-                        ) {
-                            uint quantized =
-                                (
-                                    packed
-                                    >> (component * 3u)
-                                ) & 7u;
-                            accumulators[row] = fma(
-                                activations[component],
-                                scales[row]
-                                    * float(quantized)
-                                    - minimums[row],
-                                accumulators[row]);
-                        }
-                    }
-                }
-            } else if (
-                bits == 4u
-                && (group_size % 2u) == 0u
-            ) {
-                for (
-                    uint element = 0u;
-                    element < group_size;
-                    element += 2u
-                ) {
-                    uint column =
-                        group * group_size + element;
-                    float activation0 =
-                        column < uint(K)
-                            ? float(x[x_offset + column])
-                            : 0.0f;
-                    float activation1 =
-                        column + 1u < uint(K)
-                            ? float(
-                                x[x_offset + column + 1u])
-                            : 0.0f;
-                    for (
-                        uint row = 0u;
-                        row < MATRIX_ROWS;
-                        ++row
-                    ) {
-                        uint quantized_index = (
-                            outputs[row] * groups + group
-                        ) * group_size + element;
-                        uint packed = uint(nint_q[
-                            q_offset
-                            + (quantized_index >> 1)
-                        ]);
-                        accumulators[row] = fma(
-                            activation0,
-                            scales[row]
-                                * float(packed & 15u)
-                                - minimums[row],
-                            accumulators[row]);
-                        accumulators[row] = fma(
-                            activation1,
-                            scales[row]
-                                * float(packed >> 4)
-                                - minimums[row],
-                            accumulators[row]);
-                    }
-                }
-            } else if (
-                bits == 5u
-                && q5_execution != 0u
-            ) {
-                uint low_bytes =
-                    (group_size + 1u) >> 1;
-                uint execution_bytes =
-                    low_bytes
-                    + ((group_size + 7u) >> 3);
-                for (
-                    uint element = 0u;
-                    element < group_size;
-                    element += 8u
-                ) {
-                    float activations[8];
-                    for (
-                        uint component = 0u;
-                        component < 8u;
-                        ++component
-                    ) {
-                        uint column =
-                            group * group_size
-                            + element + component;
-                        activations[component] =
-                            element + component
-                                        < group_size
-                                    && column < uint(K)
-                                ? float(
-                                    x[x_offset + column])
-                                : 0.0f;
-                    }
-                    for (
-                        uint row = 0u;
-                        row < MATRIX_ROWS;
-                        ++row
-                    ) {
-                        uint metadata =
-                            outputs[row] * groups + group;
-                        uint group_offset =
-                            q_offset
-                            + metadata * execution_bytes;
-                        uint high = uint(nint_q[
-                            group_offset
-                            + low_bytes
-                            + (element >> 3)
-                        ]);
-                        for (
-                            uint component = 0u;
-                            component < 8u;
-                            ++component
-                        ) {
-                            if (
-                                element + component
-                                >= group_size
-                            ) {
-                                break;
-                            }
-                            uint low_packed =
-                                uint(nint_q[
-                                    group_offset
-                                    + (
-                                        (
-                                            element
-                                            + component
-                                        ) >> 1
-                                    )
-                                ]);
-                            uint low = (
-                                low_packed
-                                >> (
-                                    (
-                                        (
-                                            element
-                                            + component
-                                        ) & 1u
-                                    ) * 4u
-                                )
-                            ) & 15u;
-                            uint quantized =
-                                low
-                                | (
-                                    (
-                                        (
-                                            high
-                                            >> component
-                                        ) & 1u
-                                    ) << 4u
-                                );
-                            accumulators[row] = fma(
-                                activations[component],
-                                scales[row]
-                                    * float(quantized)
-                                    - minimums[row],
-                                accumulators[row]);
-                        }
-                    }
-                }
-            } else if (
-                bits == 6u
-                && (group_size % 4u) == 0u
-            ) {
-                for (
-                    uint element = 0u;
-                    element < group_size;
-                    element += 4u
-                ) {
-                    uint column_base =
-                        group * group_size + element;
-                    float activations[4];
-                    for (
-                        uint component = 0u;
-                        component < 4u;
-                        ++component
-                    ) {
-                        uint column =
-                            column_base + component;
-                        activations[component] =
-                            column < uint(K)
-                                ? float(
-                                    x[x_offset + column])
-                                : 0.0f;
-                    }
-                    for (
-                        uint row = 0u;
-                        row < MATRIX_ROWS;
-                        ++row
-                    ) {
-                        uint quantized_index = (
-                            outputs[row] * groups + group
-                        ) * group_size + element;
-                        uint byte_index =
-                            (quantized_index >> 3) * 6u
-                            + (((quantized_index & 7u) * 6u) >> 3);
-                        uint packed =
-                            uint(nint_q[
-                                q_offset + byte_index])
-                            | (
-                                uint(nint_q[
-                                    q_offset
-                                    + byte_index + 1u])
-                                << 8
-                            )
-                            | (
-                                uint(nint_q[
-                                    q_offset
-                                    + byte_index + 2u])
-                                << 16
-                            );
-                        for (
-                            uint component = 0u;
-                            component < 4u;
-                            ++component
-                        ) {
-                            uint quantized =
-                                (
-                                    packed
-                                    >> (component * 6u)
-                                ) & 63u;
-                            accumulators[row] = fma(
-                                activations[component],
-                                scales[row]
-                                    * float(quantized)
-                                    - minimums[row],
-                                accumulators[row]);
-                        }
-                    }
-                }
-            } else if (bits == 8u) {
-                for (
-                    uint element = 0u;
-                    element < group_size;
-                    ++element
-                ) {
-                    uint column =
-                        group * group_size + element;
-                    float activation =
-                        column < uint(K)
-                            ? float(x[x_offset + column])
-                            : 0.0f;
-                    for (
-                        uint row = 0u;
-                        row < MATRIX_ROWS;
-                        ++row
-                    ) {
-                        uint quantized_index = (
-                            outputs[row] * groups + group
-                        ) * group_size + element;
-                        uint quantized = uint(nint_q[
-                            q_offset + quantized_index
-                        ]);
-                        accumulators[row] = fma(
-                            activation,
-                            scales[row]
-                                * float(quantized)
-                                - minimums[row],
-                            accumulators[row]);
-                    }
-                }
-            } else {
-                for (
-                    uint element = 0u;
-                    element < group_size;
-                    ++element
-                ) {
-                    uint column =
-                        group * group_size + element;
-                    float activation =
-                        column < uint(K)
-                            ? float(x[x_offset + column])
-                            : 0.0f;
-                    for (
-                        uint row = 0u;
-                        row < MATRIX_ROWS;
-                        ++row
-                    ) {
-                        uint quantized_index = (
-                            outputs[row] * groups + group
-                        ) * group_size + element;
-                        uint quantized =
-                            mfq_moe_nint_read_value(
-                                nint_q + q_offset,
-                                quantized_index,
-                                bits,
-                                group_size,
-                                q5_execution);
-                        accumulators[row] = fma(
-                            activation,
-                            scales[row]
-                                * float(quantized)
-                                - minimums[row],
-                            accumulators[row]);
-                    }
-                }
-            }
-        }
-    } else if (
         (uint(FAMILY_MASK) & 2u) != 0u
         && family == 1u
     ) {
@@ -2746,7 +2145,7 @@ private:
         const char* name) const {
         if (count > blob_.size() - offset_) {
             throw std::runtime_error(
-                std::string("truncated NINTM ") + name);
+                std::string("truncated MFE ") + name);
         }
     }
 
@@ -2763,7 +2162,7 @@ std::size_t checked_size(
             std::numeric_limits<std::size_t>::max())
     ) {
         throw std::runtime_error(
-            std::string("NINTM ") + name
+            std::string("MFE ") + name
             + " exceeds addressable memory");
     }
     return static_cast<std::size_t>(value);
@@ -2780,7 +2179,7 @@ std::size_t checked_product(
                 / right
     ) {
         throw std::runtime_error(
-            std::string("NINTM ") + name
+            std::string("MFE ") + name
             + " overflows");
     }
     return left * right;
@@ -2796,7 +2195,7 @@ std::size_t checked_add(
             - left
     ) {
         throw std::runtime_error(
-            std::string("NINTM ") + name
+            std::string("MFE ") + name
             + " overflows");
     }
     return left + right;
@@ -2822,7 +2221,7 @@ std::int32_t checked_int(
             std::numeric_limits<std::int32_t>::max())
     ) {
         throw std::runtime_error(
-            std::string("NINTM ") + name
+            std::string("MFE ") + name
             + " exceeds int32 range");
     }
     return static_cast<std::int32_t>(value);
@@ -2838,7 +2237,7 @@ int checked_positive(
                 std::numeric_limits<std::int32_t>::max())
     ) {
         throw std::runtime_error(
-            std::string("invalid NINTM ") + name);
+            std::string("invalid MFE ") + name);
     }
     return static_cast<int>(value);
 }
@@ -2854,7 +2253,7 @@ void append_raw(
         || !source.flags().row_contiguous
     ) {
         throw std::runtime_error(
-            std::string("invalid NINTM packed ") + name);
+            std::string("invalid MFE packed ") + name);
     }
     auto evaluated = source;
     evaluated.eval();
@@ -2864,7 +2263,7 @@ void append_raw(
             - target.size()
     ) {
         throw std::runtime_error(
-            "NINTM packed stream size overflows");
+            "MFE packed stream size overflows");
     }
     const auto previous = target.size();
     target.resize(previous + evaluated.nbytes());
@@ -2885,7 +2284,7 @@ void append_bytes(
             - target.size()
     ) {
         throw std::runtime_error(
-            std::string("NINTM packed ") + name
+            std::string("MFE packed ") + name
             + " stream size overflows");
     }
     target.insert(
@@ -2903,7 +2302,7 @@ array make_raw_array(
     }
     if (bytes.size() % dtype.size() != 0) {
         throw std::runtime_error(
-            "NINTM packed stream is misaligned");
+            "MFE packed stream is misaligned");
     }
     const auto elements = checked_int(
         bytes.size() / dtype.size(),
@@ -2983,7 +2382,6 @@ struct GroupedMmqConfig {
     int fused_swiglu = 0;
     int has_nepq_residual = 0;
     int family_mask = 127;
-    int nint_profile_mask = 127;
     int vq_profile_mask = 0;
     bool use_nax = false;
     bool direct_nax = false;
@@ -3291,7 +2689,7 @@ std::string native_moe_kernel_name(
     const NativeMoeConfig& config) {
     std::ostringstream name;
     name
-        << "mfq_native_nintm_"
+        << "mfq_native_mfe_"
         << (config.dtype == mlx::core::float16 ? "f16" : "f32")
         << "_t" << config.tokens
         << "_r" << config.routes
@@ -3414,10 +2812,10 @@ std::string make_native_moe_source(
     return source.str();
 }
 
-class NativeNintMoePrimitive final
+class NativeMfePrimitive final
     : public mlx::core::UnaryPrimitive {
 public:
-    NativeNintMoePrimitive(
+    NativeMfePrimitive(
         mlx::core::Stream stream,
         NativeMoeConfig config)
         : UnaryPrimitive(stream),
@@ -3428,7 +2826,7 @@ public:
         const std::vector<array>&,
         array&) override {
         throw std::runtime_error(
-            "native NINTM primitive has no CPU path");
+            "native MFE primitive has no CPU path");
     }
 
     void eval_gpu(
@@ -3438,7 +2836,7 @@ public:
             config_.expert_map_size != 0 ? 27 : 26;
         if (inputs.size() != static_cast<std::size_t>(input_count)) {
             throw std::logic_error(
-                "native NINTM primitive input count mismatch");
+                "native MFE primitive input count mismatch");
         }
         output.set_data(
             mlx::core::allocator::malloc(output.nbytes()));
@@ -3474,13 +2872,13 @@ public:
     }
 
     const char* name() const override {
-        return "NativeNintMoePrimitive";
+        return "NativeMfePrimitive";
     }
 
     bool is_equivalent(
         const mlx::core::Primitive& other) const override {
         const auto* primitive =
-            dynamic_cast<const NativeNintMoePrimitive*>(&other);
+            dynamic_cast<const NativeMfePrimitive*>(&other);
         return primitive != nullptr
             && primitive->kernel_name_ == kernel_name_;
     }
@@ -3502,14 +2900,14 @@ array native_moe_dispatch(
         mlx::core::default_device());
     if (stream.device != mlx::core::Device::gpu) {
         throw std::invalid_argument(
-            "native NINTM primitive requires the Metal device");
+            "native MFE primitive requires the Metal device");
     }
     auto shape = config.output_shape;
     auto dtype = config.dtype;
     return array(
         std::move(shape),
         dtype,
-        std::make_shared<NativeNintMoePrimitive>(
+        std::make_shared<NativeMfePrimitive>(
             stream,
             std::move(config)),
         std::move(inputs));
@@ -3842,8 +3240,7 @@ public:
                     : "mfq_grouped_mmq_v13");
         }
         if (config_.use_nax) {
-            library_name += "_fm" + std::to_string(config_.family_mask)
-                + "_nm" + std::to_string(config_.nint_profile_mask);
+            library_name += "_fm" + std::to_string(config_.family_mask);
         }
         auto* library = device.get_library(
             library_name,
@@ -3854,9 +3251,6 @@ public:
                 vector_jsc_extended,
                 family_mask = config_.use_nax
                     ? config_.family_mask
-                    : 127,
-                nint_profile_mask = config_.use_nax
-                    ? config_.nint_profile_mask
                     : 127
             ] {
                 std::string source;
@@ -3864,7 +3258,7 @@ public:
                     (use_nax
                         ? sizeof(detail::kSteelNaxSource)
                         : sizeof(detail::kSteelMmaSource))
-                    + sizeof(detail::kNintmPrefillSource)
+                    + sizeof(detail::kMfePrefillSource)
                     + 256);
                 source += "#include <metal_stdlib>\n";
                 source += "#include <metal_simdgroup>\n";
@@ -3887,7 +3281,7 @@ public:
                     source += std::to_string(family_mask);
                     source += "\n";
                     source += "#define MFQ_GROUPED_NINT_PROFILE_MASK ";
-                    source += std::to_string(nint_profile_mask);
+                    source += "0";
                     source += "\n";
                 }
                 source += "using namespace metal;\n";
@@ -3895,7 +3289,7 @@ public:
                 source += use_nax
                     ? detail::kSteelNaxSource
                     : detail::kSteelMmaSource;
-                source += detail::kNintmPrefillSource;
+                source += detail::kMfePrefillSource;
                 return source;
             });
         auto& encoder =
@@ -4032,8 +3426,6 @@ public:
             && primitive->config_.has_nepq_residual
                 == config_.has_nepq_residual
             && primitive->config_.family_mask == config_.family_mask
-            && primitive->config_.nint_profile_mask
-                == config_.nint_profile_mask
             && primitive->config_.vq_profile_mask == config_.vq_profile_mask
             && primitive->config_.use_nax == config_.use_nax
             && primitive->config_.direct_nax == config_.direct_nax
@@ -4073,7 +3465,7 @@ make_moe_kernel() {
     CompileOptions options;
     options.math_mode = MathMode::Fast;
     return mlx::core::fast::metal_kernel(
-        "mfq_cpp_heterogeneous_nint_moe",
+        "mfq_cpp_heterogeneous_mfe",
         {
             "descriptors",
             "nint_q",
@@ -4216,11 +3608,22 @@ using ReferenceMoeWeight = std::variant<
     MlxNint8ZeroWeight,
     MlxVqWeight,
     MlxMxWeight,
+    MlxMxfp4SqWeight,
     DenseReferenceMoeWeight>;
 
 struct ReferenceMoeCohort {
     std::vector<std::int32_t> expert_ids;
     ReferenceMoeWeight weight;
+};
+
+struct NintMoeCohort {
+    array expert_map;
+    MlxNintWeight weight;
+};
+
+struct Mxfp4SqMoeCohort {
+    array expert_map;
+    MlxMxfp4SqWeight weight;
 };
 
 void validate_nint_payload_shape(
@@ -4257,7 +3660,7 @@ void validate_nint_payload_shape(
         || dimensions != 2
     ) {
         throw std::runtime_error(
-            "NINTM NINT cohort shape is inconsistent");
+            "MFE NINT cohort shape is inconsistent");
     }
     const auto rows =
         cursor.scalar<std::int64_t>(
@@ -4289,7 +3692,7 @@ void validate_nint_payload_shape(
         || groups != expected_groups
     ) {
         throw std::runtime_error(
-            "NINTM NINT cohort shape is inconsistent");
+            "MFE NINT cohort shape is inconsistent");
     }
 
     const auto metadata_count = checked_product(
@@ -4347,7 +3750,7 @@ void validate_nint_payload_shape(
             "NINTv2 minimum payload");
         if (remaining < minimum_v2) {
             throw std::runtime_error(
-                "invalid NINTM NINTv2 cohort payload length");
+                "invalid MFE NINTv2 cohort payload length");
         }
         return;
     }
@@ -4364,7 +3767,7 @@ void validate_nint_payload_shape(
                 "legacy NINT payload bytes")
     ) {
         throw std::runtime_error(
-            "invalid NINTM NINT cohort payload length");
+            "invalid MFE NINT cohort payload length");
     }
 }
 
@@ -4380,11 +3783,11 @@ void claim_experts(
                     owners.size())
         ) {
             throw std::runtime_error(
-                "NINTM pool contains an invalid expert id");
+                "MFE pool contains an invalid expert id");
         }
         if (owners[static_cast<std::size_t>(expert)] >= 0) {
             throw std::runtime_error(
-                "an expert belongs to multiple NINTM pools");
+                "an expert belongs to multiple MFE pools");
         }
         owners[static_cast<std::size_t>(expert)] = pool;
     }
@@ -4395,9 +3798,7 @@ MlxNintWeight add_nint_pool(
     const std::vector<std::int32_t>& expert_ids,
     int out_per_expert,
     int neuron_len,
-    PackedStreams& streams,
-    std::vector<std::int32_t>& descriptors,
-    bool pack_execution = true) {
+    std::vector<std::int32_t>& descriptors) {
     const auto expected_rows = checked_product(
         expert_ids.size(),
         static_cast<std::size_t>(out_per_expert),
@@ -4419,115 +3820,26 @@ MlxNintWeight add_nint_pool(
             ) / weight.group_size()
     ) {
         throw std::runtime_error(
-            "NINTM NINT cohort shape is inconsistent");
+            "MFE NINT cohort shape is inconsistent");
     }
 
-    if (!pack_execution) {
-        return weight;
-    }
-
-    int row_q_bits_offset = 0;
-    int row_q_bit_offsets_offset = 0;
-    if (weight.is_nint_v2()) {
-        row_q_bits_offset = checked_int(
-            streams.nint_q.size(),
-            "NINTv2 q-width offset");
-        append_raw(
-            streams.nint_q,
-            weight.row_q_bits(),
-            mlx::core::uint8,
-            "NINTv2 q widths");
-        while ((streams.nint_q.size() & 3u) != 0u) {
-            streams.nint_q.push_back(0);
-        }
-        row_q_bit_offsets_offset = checked_int(
-            streams.nint_q.size(),
-            "NINTv2 q-bit-offset offset");
-        append_raw(
-            streams.nint_q,
-            weight.row_q_bit_offsets(),
-            mlx::core::uint32,
-            "NINTv2 q bit offsets");
-    }
-    const int q_offset =
-        checked_int(streams.nint_q.size(), "NINT q offset");
-    const int sub_offset =
-        checked_int(
-            streams.nint_sub_scale.size(),
-            "NINT sub offset");
-    const int anchor_offset =
-        checked_int(
-            streams.nint_anchor_scale.size()
-                / sizeof(float),
-            "NINT anchor offset");
-
-    for (
-        std::size_t local_expert = 0;
-        local_expert < expert_ids.size();
-        ++local_expert
-    ) {
-        const int expert =
-            expert_ids[local_expert];
-        const auto base =
-            checked_product(
-                static_cast<std::size_t>(expert),
-                static_cast<std::size_t>(
-                    kDescriptorSize),
-                "descriptor offset");
+    for (std::size_t local_expert = 0;
+         local_expert < expert_ids.size(); ++local_expert) {
+        const int expert = expert_ids[local_expert];
+        const auto base = checked_product(
+            static_cast<std::size_t>(expert),
+            static_cast<std::size_t>(kDescriptorSize),
+            "descriptor offset");
         descriptors[base + kFamily] = kFamilyNint;
         descriptors[base + kLocalExpert] =
             checked_int(local_expert, "local expert");
         descriptors[base + kOut] = out_per_expert;
         descriptors[base + kInput] = neuron_len;
         descriptors[base + kNintBits] = weight.bits();
-        descriptors[base + kNintGroupSize] =
-            weight.group_size();
-        descriptors[base + kNintGroups] =
-            weight.groups();
-        descriptors[base + kNintQOffset] = q_offset;
-        descriptors[base + kNintSubOffset] =
-            sub_offset;
-        descriptors[base + kNintAnchorOffset] =
-            anchor_offset;
-        descriptors[base + kNintQ5Execution] =
-            static_cast<int>(
-                weight.q5_execution_layout());
-        descriptors[base + kNintRowQBitsOffset] =
-            row_q_bits_offset;
-        descriptors[base + kNintRowQBitOffsetsOffset] =
-            row_q_bit_offsets_offset;
-        descriptors[base + kNintV2] =
-            static_cast<int>(weight.is_nint_v2());
+        descriptors[base + kNintGroupSize] = weight.group_size();
+        descriptors[base + kNintGroups] = weight.groups();
+        descriptors[base + kNintV2] = 1;
     }
-
-    append_raw(
-        streams.nint_q,
-        weight.packed_values(),
-        mlx::core::uint8,
-        "NINT values");
-    // Fixed 3/6-bit and dynamic-q paths load beyond the logical packet.
-    streams.nint_q.insert(streams.nint_q.end(), 4, 0);
-    append_raw(
-        streams.nint_sub_scale,
-        weight.sub_scales(),
-        mlx::core::uint8,
-        "NINT sub scales");
-    append_raw(
-        streams.nint_sub_min,
-        weight.sub_mins(),
-        mlx::core::uint8,
-        "NINT sub minima");
-    append_raw(
-        streams.nint_anchor_scale,
-        weight.neuron_scales(),
-        mlx::core::float32,
-        "NINT neuron scales");
-    append_raw(
-        streams.nint_anchor_min,
-        weight.neuron_mins(),
-        mlx::core::float32,
-        "NINT neuron minima");
-
     return weight;
 }
 
@@ -4554,7 +3866,7 @@ MlxNint8ZeroWeight add_q8_pool(
         || weight.groups() != neuron_len / 32
     ) {
         throw std::runtime_error(
-            "NINTM NINT8-0 cohort shape is inconsistent");
+            "MFE NINT8-0 cohort shape is inconsistent");
     }
 
     if (!pack_execution) {
@@ -4621,7 +3933,7 @@ std::optional<MlxMxWeight> add_mx_pool(
     const bool mxfp4 = dtype == "MXFP4";
     const bool mxfp8 = dtype == "MXFP8";
     if (!mxfp4 && !mxfp8) {
-        throw std::invalid_argument("unsupported NINTM MX cohort dtype");
+        throw std::invalid_argument("unsupported MFE MX cohort dtype");
     }
     const std::string label(dtype);
     const auto field = [&](const char* suffix) {
@@ -4642,7 +3954,7 @@ std::optional<MlxMxWeight> add_mx_pool(
         || cursor.scalar<std::uint16_t>(reserved_name.c_str()) != 0
     ) {
         throw std::runtime_error(
-            "invalid NINTM " + label + " payload header");
+            "invalid MFE " + label + " payload header");
     }
     const auto rows_name = field("rows");
     const auto columns_name = field("columns");
@@ -4675,7 +3987,7 @@ std::optional<MlxMxWeight> add_mx_pool(
         || scale_columns != columns / block
     ) {
         throw std::runtime_error(
-            "NINTM " + label + " cohort shape is inconsistent");
+            "MFE " + label + " cohort shape is inconsistent");
     }
     const auto value_count = checked_product(
         checked_size(storage_rows, "MX storage rows"),
@@ -4692,7 +4004,7 @@ std::optional<MlxMxWeight> add_mx_pool(
     if (std::find(scales.begin(), scales.end(), std::uint8_t{255})
         != scales.end()) {
         throw std::runtime_error(
-            "NINTM " + label + " contains an E8M0 NaN scale");
+            "MFE " + label + " contains an E8M0 NaN scale");
     }
     if (
         mxfp8
@@ -4704,11 +4016,11 @@ std::optional<MlxMxWeight> add_mx_pool(
             })
     ) {
         throw std::runtime_error(
-            "NINTM MXFP8 contains an E4M3 NaN code");
+            "MFE MXFP8 contains an E4M3 NaN code");
     }
     if (cursor.remaining() != 0) {
         throw std::runtime_error(
-            "trailing bytes in NINTM " + label + " cohort");
+            "trailing bytes in MFE " + label + " cohort");
     }
     if (!pack_execution) {
         return MlxMxWeight::from_blob(label, payload);
@@ -4757,12 +4069,12 @@ std::optional<DenseReferenceMoeWeight> add_dense_pool(
     bool pack_execution = true) {
     const bool bf16 = dtype == "BF16";
     if (!bf16 && dtype != "F16") {
-        throw std::invalid_argument("unsupported NINTM dense cohort dtype");
+        throw std::invalid_argument("unsupported MFE dense cohort dtype");
     }
     BlobCursor cursor(payload);
     if (cursor.scalar<std::uint32_t>("dense dimension count") != 2) {
         throw std::runtime_error(
-            "NINTM dense expert cohort must be rank 2");
+            "MFE dense expert cohort must be rank 2");
     }
     const auto rows = cursor.scalar<std::int64_t>("dense rows");
     const auto columns = cursor.scalar<std::int64_t>("dense columns");
@@ -4784,7 +4096,7 @@ std::optional<DenseReferenceMoeWeight> add_dense_pool(
         || cursor.remaining() != value_bytes
     ) {
         throw std::runtime_error(
-            "NINTM dense expert cohort shape is inconsistent");
+            "MFE dense expert cohort shape is inconsistent");
     }
     const auto values = cursor.bytes(value_bytes, "dense values");
     if (!pack_execution) {
@@ -4837,7 +4149,7 @@ std::vector<std::int8_t> int8_values(
         || !source.flags().row_contiguous
     ) {
         throw std::runtime_error(
-            std::string("invalid NINTM packed ") + name);
+            std::string("invalid MFE packed ") + name);
     }
     auto evaluated = source;
     evaluated.eval();
@@ -4864,7 +4176,7 @@ int rotation_variant(
             weight.input_size())
     ) {
         throw std::runtime_error(
-            "rotated NINTM VQ sign width mismatch");
+            "rotated MFE VQ sign width mismatch");
     }
     for (
         std::size_t index = 0;
@@ -4878,7 +4190,7 @@ int rotation_variant(
         ) {
             if (rotation.sign_values != values) {
                 throw std::runtime_error(
-                    "conflicting NINTM HSG1 sign "
+                    "conflicting MFE HSG1 sign "
                     "vectors share one rotation key");
             }
             return checked_int(
@@ -4915,7 +4227,7 @@ int rotation_variant(
                 != source.sign_values
             ) {
                 throw std::runtime_error(
-                    "conflicting NINTM HSG1 sign "
+                    "conflicting MFE HSG1 sign "
                     "vectors share one rotation key");
             }
             return checked_int(
@@ -4977,7 +4289,7 @@ MlxVqWeight add_vq_pool(
         )
     ) {
         throw std::runtime_error(
-            "NINTM VQ cohort shape is inconsistent");
+            "MFE VQ cohort shape is inconsistent");
     }
     // Every supported VQ profile stores one FP16 anchor per flattened output
     // row.  Reject impossible dimensions before the full parser allocates
@@ -4987,7 +4299,7 @@ MlxVqWeight add_vq_pool(
         > payload.size() / sizeof(std::uint16_t)
     ) {
         throw std::runtime_error(
-            "NINTM VQ cohort dimensions exceed "
+            "MFE VQ cohort dimensions exceed "
             "its payload");
     }
     auto weight = MlxVqWeight::from_blob(
@@ -5004,7 +4316,7 @@ MlxVqWeight add_vq_pool(
             != metadata.rotation_seed
     ) {
         throw std::runtime_error(
-            "NINTM VQ header/full parse mismatch");
+            "MFE VQ header/full parse mismatch");
     }
     if (!pack_execution) {
         return weight;
@@ -5016,15 +4328,16 @@ MlxVqWeight add_vq_pool(
     // padding bit per eight weights for one sequential read in the decode
     // kernel instead of independent packed index and 7-bit auxiliary reads.
     const char* jsc_exec_env = std::getenv(
-        "MFQ_METAL_NINTM_JSC_EXEC");
+        "MFQ_METAL_MFE_JSC_EXEC");
+    const auto& profile = weight.format_label();
     const bool packed_jsc_execution =
-        (dtype == "NVQ2J" || dtype == "NVQ3J")
+        (profile == "NVQ2J" || profile == "NVQ3J")
         && (
             jsc_exec_env == nullptr
             || std::string_view(jsc_exec_env) != "0"
         );
     const bool group64_execution =
-        dtype == "NVQ2J-XL"
+        profile == "NVQ2J-XL"
         && weight.execution_layout() == 1;
     const bool jsc_execution =
         packed_jsc_execution || group64_execution;
@@ -5230,30 +4543,31 @@ MlxVqWeight add_vq_pool(
             parameter_offset;
         descriptors[base + kVqRotationVariant] =
             rotation;
+        const auto& profile = weight.format_label();
         const int execution_profile =
-            dtype == "NVQ2J-L" || dtype == "NVQ2J-XL"
+            profile == "NVQ2J-L" || profile == "NVQ2J-XL"
                 ? kVqProfileJscExtended8
-                : dtype == "NVQ2J" || dtype == "NVQ3J"
+                : profile == "NVQ2J" || profile == "NVQ3J"
                 ? (
                     weight.vector_size() == 4
                         ? kVqProfileJsc4
                         : kVqProfileJsc8
                 )
                 : (
-                    dtype == "NPQ0-S" || dtype == "NPQ0-L"
+                    profile == "NPQ0-S" || profile == "NPQ0-L"
                         ? (
-                            dtype == "NPQ0-S"
+                            profile == "NPQ0-S"
                                 ? kVqProfileNpqS
                                 : kVqProfileNpqL
                         )
                         : (
-                            dtype == "NVQ1-L"
+                            profile == "NVQ1-L"
                                     && weight.group_size() == 24
                                     && weight.vector_size() == 8
                                     && weight.index_bits() == 11
                                 ? kVqProfileNvq1L
                                 : (
-                                    dtype == "NVQ1-S"
+                                    profile == "NVQ1-S"
                                             && weight.group_size() == 24
                                             && weight.vector_size() == 8
                                             && weight.index_bits() == 9
@@ -5396,7 +4710,7 @@ array apply_rotation(
             != static_cast<std::size_t>(width)
     ) {
         throw std::runtime_error(
-            "invalid NINTM HSG1 rotation layout");
+            "invalid MFE HSG1 rotation layout");
     }
     const auto grid = checked_product(
         static_cast<std::size_t>(rows),
@@ -5408,7 +4722,7 @@ array apply_rotation(
             std::numeric_limits<int>::max())
     ) {
         throw std::runtime_error(
-            "NINTM HSG1 Metal grid exceeds MLX limits");
+            "MFE HSG1 Metal grid exceeds MLX limits");
     }
     auto outputs = moe_hadamard_kernel()(
         {source, rotation.signs},
@@ -5438,7 +4752,7 @@ int descriptor_with_offset(
     const char* name) {
     if (value < 0) {
         throw std::runtime_error(
-            std::string("invalid NINTM ") + name);
+            std::string("invalid MFE ") + name);
     }
     return checked_int(
         checked_add(
@@ -5480,7 +4794,7 @@ TpqTierLayout tpq_tier_layout(
             "dtype: " + std::string(dtype));
     }
     throw TpqStreamUnsupported(
-        "NINTM contains a non-TPQ cohort");
+        "MFE contains a non-TPQ cohort");
 }
 
 bool tpq_index_layout_allowed(
@@ -5774,7 +5088,7 @@ struct MlxTpqRoutedWeight::Impl {
     std::size_t codebook_bytes = 0;
 };
 
-struct MlxNintMoeOffloadCache::Impl {
+struct MlxMfeOffloadCache::Impl {
     struct Key {
         std::string name;
         std::int32_t expert = 0;
@@ -5829,7 +5143,7 @@ struct MlxNintMoeOffloadCache::Impl {
           experts(expert_count) {
         if (experts <= 0) {
             throw std::invalid_argument(
-                "NINTM offload expert count must "
+                "MFE offload expert count must "
                 "be positive");
         }
     }
@@ -5838,9 +5152,9 @@ struct MlxNintMoeOffloadCache::Impl {
     parse_projection(
         const std::string& name) {
         const auto& record = model.record(name);
-        if (record.dtype != "NINTM") {
+        if (record.dtype != "MFE") {
             throw TpqStreamUnsupported(
-                "expert record is not NINTM: "
+                "expert record is not MFE: "
                 + name);
         }
         constexpr std::uint64_t header_size = 20;
@@ -5848,7 +5162,7 @@ struct MlxNintMoeOffloadCache::Impl {
         constexpr std::uint64_t pq_prefix_size = 44;
         if (record.nbytes < header_size) {
             throw std::runtime_error(
-                "truncated streamed NINTM header: "
+                "truncated streamed MFE header: "
                 + name);
         }
         const auto header =
@@ -5865,31 +5179,31 @@ struct MlxNintMoeOffloadCache::Impl {
                 "NIM1 expert records are not "
                 "streamable");
         }
-        if (magic != "NIM2") {
+        if (magic != "MFE1" && magic != "NIM2") {
             throw std::runtime_error(
-                "invalid streamed NINTM magic: "
+                "invalid streamed MFE magic: "
                 + name);
         }
         const auto record_experts =
             tpq_scalar<std::uint32_t>(
                 header,
                 4,
-                "NINTM expert count");
+                "MFE expert count");
         const auto rows_per_expert =
             tpq_scalar<std::uint32_t>(
                 header,
                 8,
-                "NINTM output width");
+                "MFE output width");
         const auto columns =
             tpq_scalar<std::uint32_t>(
                 header,
                 12,
-                "NINTM input width");
+                "MFE input width");
         const auto pool_count =
             tpq_scalar<std::uint32_t>(
                 header,
                 16,
-                "NINTM pool count");
+                "MFE pool count");
         if (
             record_experts
                 != static_cast<std::uint32_t>(
@@ -5906,7 +5220,7 @@ struct MlxNintMoeOffloadCache::Impl {
             || pool_count > record_experts
         ) {
             throw std::runtime_error(
-                "invalid streamed NINTM dimensions: "
+                "invalid streamed MFE dimensions: "
                 + name);
         }
 
@@ -5930,7 +5244,7 @@ struct MlxNintMoeOffloadCache::Impl {
                     > record.nbytes - offset
             ) {
                 throw std::runtime_error(
-                    "truncated streamed NINTM pool "
+                    "truncated streamed MFE pool "
                     "header: " + name);
             }
             const auto pool_header =
@@ -5965,7 +5279,7 @@ struct MlxNintMoeOffloadCache::Impl {
                 || dtype_bytes > 32
             ) {
                 throw std::runtime_error(
-                    "invalid streamed NINTM pool "
+                    "invalid streamed MFE pool "
                     "metadata: " + name);
             }
             offset = checked_range_add(
@@ -5999,7 +5313,7 @@ struct MlxNintMoeOffloadCache::Impl {
                     "pool payload end");
             if (payload_end > record.nbytes) {
                 throw std::runtime_error(
-                    "truncated streamed NINTM pool: "
+                    "truncated streamed MFE pool: "
                     + name);
             }
             const auto metadata =
@@ -6274,7 +5588,7 @@ struct MlxNintMoeOffloadCache::Impl {
         }
         if (offset != record.nbytes) {
             throw std::runtime_error(
-                "invalid streamed NINTM tail: "
+                "invalid streamed MFE tail: "
                 + name);
         }
         array combined = codebooks.size() == 1
@@ -6578,7 +5892,7 @@ MlxTpqRoutedWeight::shared_codebook_nbytes() const noexcept {
     return impl_->codebook_bytes;
 }
 
-MlxNintMoeOffloadCache::MlxNintMoeOffloadCache(
+MlxMfeOffloadCache::MlxMfeOffloadCache(
     const MfqContainer& model,
     std::size_t cache_limit_bytes,
     int experts)
@@ -6587,10 +5901,10 @@ MlxNintMoeOffloadCache::MlxNintMoeOffloadCache(
           cache_limit_bytes,
           experts)) {}
 
-MlxNintMoeOffloadCache::~MlxNintMoeOffloadCache() =
+MlxMfeOffloadCache::~MlxMfeOffloadCache() =
     default;
 
-bool MlxNintMoeOffloadCache::can_offload(
+bool MlxMfeOffloadCache::can_offload(
     const std::string& name) {
     std::lock_guard lock(impl_->mutex);
     try {
@@ -6601,13 +5915,13 @@ bool MlxNintMoeOffloadCache::can_offload(
     }
 }
 
-MlxNintMoeProjectionInfo
-MlxNintMoeOffloadCache::projection_info(
+MlxMfeProjectionInfo
+MlxMfeOffloadCache::projection_info(
     const std::string& name) {
     std::lock_guard lock(impl_->mutex);
     const auto projection =
         impl_->projection_locked(name);
-    MlxNintMoeProjectionInfo result;
+    MlxMfeProjectionInfo result;
     result.experts = projection->experts;
     result.out_per_expert =
         projection->out_per_expert;
@@ -6633,7 +5947,7 @@ MlxNintMoeOffloadCache::projection_info(
 }
 
 std::vector<std::uint8_t>
-MlxNintMoeOffloadCache::availability(
+MlxMfeOffloadCache::availability(
     const std::string& name) {
     std::lock_guard lock(impl_->mutex);
     const auto projection =
@@ -6658,7 +5972,7 @@ MlxNintMoeOffloadCache::availability(
 }
 
 MlxTpqRoutedWeight
-MlxNintMoeOffloadCache::grouped(
+MlxMfeOffloadCache::grouped(
     const std::string& name,
     const std::vector<std::int32_t>&
         active_experts) {
@@ -6947,23 +6261,23 @@ MlxNintMoeOffloadCache::grouped(
 }
 
 std::size_t
-MlxNintMoeOffloadCache::cache_limit_bytes() const noexcept {
+MlxMfeOffloadCache::cache_limit_bytes() const noexcept {
     return impl_->cache_limit;
 }
 
 std::size_t
-MlxNintMoeOffloadCache::resident_packed_bytes() const {
+MlxMfeOffloadCache::resident_packed_bytes() const {
     std::lock_guard lock(impl_->mutex);
     return impl_->resident_bytes;
 }
 
 std::size_t
-MlxNintMoeOffloadCache::cached_expert_count() const {
+MlxMfeOffloadCache::cached_expert_count() const {
     std::lock_guard lock(impl_->mutex);
     return impl_->cache.size();
 }
 
-void MlxNintMoeOffloadCache::discard_record(
+void MlxMfeOffloadCache::discard_record(
     const std::string& name) noexcept {
     std::lock_guard lock(impl_->mutex);
     for (
@@ -6986,7 +6300,7 @@ void MlxNintMoeOffloadCache::discard_record(
     impl_->projections.erase(name);
 }
 
-void MlxNintMoeOffloadCache::clear() {
+void MlxMfeOffloadCache::clear() {
     std::lock_guard lock(impl_->mutex);
     impl_->cache.clear();
     impl_->lru.clear();
@@ -6994,7 +6308,7 @@ void MlxNintMoeOffloadCache::clear() {
     impl_->resident_bytes = 0;
 }
 
-struct MlxNintMoeWeight::Impl {
+struct MlxMfeWeight::Impl {
     array descriptors;
     array nint_q;
     array nint_sub_scale;
@@ -7022,18 +6336,20 @@ struct MlxNintMoeWeight::Impl {
     std::vector<std::shared_ptr<const Impl>> projection_views;
     std::optional<array> expert_order;
     std::vector<ReferenceMoeCohort> reference_cohorts;
+    std::vector<NintMoeCohort> nint_cohorts;
+    std::vector<Mxfp4SqMoeCohort> mxfp4_sq_cohorts;
+    std::optional<array> standalone_owner;
+    bool has_generic_cohorts = false;
     int experts = 0;
     int out_per_expert = 0;
     int neuron_len = 0;
     int projections = 0;
     std::uint32_t family_mask = 0;
-    std::uint32_t nint_profile_mask = 0;
     std::uint32_t vq_profile_mask = 0;
     bool jsc_execution_layout = false;
     bool npq_grouped_indices = true;
     bool native_primitive = true;
     bool grouped_mmq = false;
-    bool grouped_nint4_group24 = false;
     bool has_nepq_residual = false;
     std::optional<array> mxfp4_slot_ids;
     bool mxfp4_slot_ids_sorted = false;
@@ -7107,7 +6423,6 @@ struct MlxNintMoeWeight::Impl {
           neuron_len(input_width),
           projections(projection_count) {
         grouped_mmq = !descriptor_values.empty();
-        grouped_nint4_group24 = grouped_mmq;
         for (
             std::size_t base = 0;
             base + kDescriptorSize
@@ -7116,29 +6431,9 @@ struct MlxNintMoeWeight::Impl {
         ) {
             const auto family = descriptor_values[
                 base + kFamily];
-            if (family >= 0 && family < 7) {
+            if (family >= 0 && family < 7 && family != kFamilyNint) {
                 family_mask |= std::uint32_t{1}
                     << static_cast<unsigned>(family);
-            }
-            if (family == kFamilyNint) {
-                const auto bits = descriptor_values[base + kNintBits];
-                const auto group_size =
-                    descriptor_values[base + kNintGroupSize];
-                std::uint32_t profile = std::uint32_t{1} << 6;
-                if (bits == 2 && group_size == 16) {
-                    profile = std::uint32_t{1} << 0;
-                } else if (bits == 3 && group_size == 24) {
-                    profile = std::uint32_t{1} << 1;
-                } else if (bits == 4 && group_size == 24) {
-                    profile = std::uint32_t{1} << 2;
-                } else if (bits == 5 && group_size == 28) {
-                    profile = std::uint32_t{1} << 3;
-                } else if (bits == 6 && group_size == 24) {
-                    profile = std::uint32_t{1} << 4;
-                } else if (bits == 8 && group_size == 48) {
-                    profile = std::uint32_t{1} << 5;
-                }
-                nint_profile_mask |= profile;
             }
             if (family == kFamilyVq) {
                 const auto profile = descriptor_values[
@@ -7150,18 +6445,6 @@ struct MlxNintMoeWeight::Impl {
                 if ((descriptor_values[base + kVqProfile] >> 8) != 0) {
                     has_nepq_residual = true;
                 }
-            }
-            const bool supported_nint =
-                family == kFamilyNint
-                && descriptor_values[base + kNintV2] == 0;
-            if (
-                family != kFamilyNint
-                || descriptor_values[base + kNintV2] != 0
-                || descriptor_values[base + kNintBits] != 4
-                || descriptor_values[base + kNintGroupSize] != 24
-                || descriptor_values[base + kNintQ5Execution] != 0
-            ) {
-                grouped_nint4_group24 = false;
             }
             const bool supported_q8 =
                 family == kFamilyNint8Zero
@@ -7185,7 +6468,7 @@ struct MlxNintMoeWeight::Impl {
                     == neuron_len / 128;
             const bool supported_dense =
                 family == kFamilyBf16 || family == kFamilyF16;
-            if (!supported_nint && !supported_q8
+            if (!supported_q8
                 && !supported_vq && !supported_mxfp4
                 && !supported_mxfp8 && !supported_dense) {
                 grouped_mmq = false;
@@ -7245,8 +6528,6 @@ struct MlxNintMoeWeight::Impl {
                 Shape{experts}));
         }
         grouped_mmq = grouped_mmq && expert_order.has_value();
-        grouped_nint4_group24 =
-            grouped_nint4_group24 && grouped_mmq;
         if (
             family_mask == (std::uint32_t{1} << kFamilyMxfp4)
             && descriptor_values.size()
@@ -7267,26 +6548,25 @@ struct MlxNintMoeWeight::Impl {
                 Shape{experts}));
         }
         const char* specialize_env = std::getenv(
-            "MFQ_METAL_NINTM_SPECIALIZE");
+            "MFQ_METAL_MFE_SPECIALIZE");
         if (
             specialize_env != nullptr
             && std::string_view(specialize_env) == "0"
         ) {
-            family_mask = 127;
-            nint_profile_mask = 127;
+            family_mask = 126;
             vq_profile_mask = 255;
         }
         const char* npq_indices_env = std::getenv(
-            "MFQ_METAL_NINTM_NPQ_INDICES");
+            "MFQ_METAL_MFE_NPQ_INDICES");
         npq_grouped_indices =
             npq_indices_env == nullptr
             || std::string_view(npq_indices_env) != "0";
         const char* native_env = std::getenv(
-            "MFQ_METAL_NINTM_NATIVE_PRIMITIVE");
+            "MFQ_METAL_MFE_NATIVE_PRIMITIVE");
         native_primitive = native_env == nullptr
             || std::string_view(native_env) != "0";
         const char* k_lanes_env = std::getenv(
-            "MFQ_METAL_NINTM_K_LANES");
+            "MFQ_METAL_MFE_K_LANES");
         if (k_lanes_env != nullptr) {
             const auto value = std::string_view(k_lanes_env);
             if (value == "8") {
@@ -7326,16 +6606,16 @@ struct MlxNintMoeWeight::Impl {
     }
 };
 
-MlxNintMoeWeight::MlxNintMoeWeight(
+MlxMfeWeight::MlxMfeWeight(
     std::shared_ptr<const Impl> impl)
     : impl_(std::move(impl)) {
     if (!impl_) {
         throw std::invalid_argument(
-            "NINTM implementation cannot be null");
+            "MFE implementation cannot be null");
     }
 }
 
-MlxNintMoeWeight MlxNintMoeWeight::from_blob(
+MlxMfeWeight MlxMfeWeight::from_blob(
     std::span<const std::uint8_t> blob) {
     BlobCursor cursor(blob);
     const auto magic_bytes = cursor.bytes(4, "header");
@@ -7343,8 +6623,8 @@ MlxNintMoeWeight MlxNintMoeWeight::from_blob(
         reinterpret_cast<const char*>(
             magic_bytes.data()),
         magic_bytes.size());
-    if (magic != "NIM1" && magic != "NIM2") {
-        throw std::runtime_error("invalid NINTM magic");
+    if (magic != "MFE1" && magic != "NIM1" && magic != "NIM2") {
+        throw std::runtime_error("invalid MFE magic");
     }
 
     const int expert_count = checked_positive(
@@ -7367,14 +6647,14 @@ MlxNintMoeWeight MlxNintMoeWeight::from_blob(
                 expert_count)
     ) {
         throw std::runtime_error(
-            "invalid NINTM pool count");
+            "invalid MFE pool count");
     }
     if (
         static_cast<std::size_t>(expert_count)
         > cursor.remaining() / sizeof(std::int32_t)
     ) {
         throw std::runtime_error(
-            "NINTM expert count exceeds its payload");
+            "MFE expert count exceeds its payload");
     }
 
     std::vector<std::int32_t> descriptors(
@@ -7390,6 +6670,13 @@ MlxNintMoeWeight MlxNintMoeWeight::from_blob(
     std::vector<RotationSpec> rotations;
     std::vector<ReferenceMoeCohort>
         reference_cohorts;
+    std::vector<NintMoeCohort>
+        nint_cohorts;
+    std::vector<Mxfp4SqMoeCohort>
+        mxfp4_sq_cohorts;
+    std::vector<std::int32_t> standalone_owner(
+        static_cast<std::size_t>(expert_count), -1);
+    bool has_generic_cohorts = false;
     const bool reference =
         mlx_reference_enabled();
 
@@ -7429,7 +6716,7 @@ MlxNintMoeWeight MlxNintMoeWeight::from_blob(
                 > static_cast<std::uint32_t>(
                     expert_count)
             || (
-                magic == "NIM2"
+                magic != "NIM1"
                 && (
                     dtype_bytes == 0
                     || dtype_bytes > 32
@@ -7437,7 +6724,7 @@ MlxNintMoeWeight MlxNintMoeWeight::from_blob(
             )
         ) {
             throw std::runtime_error(
-                "invalid NINTM pool metadata");
+                "invalid MFE pool metadata");
         }
 
         std::vector<std::int32_t> expert_ids(count);
@@ -7452,19 +6739,21 @@ MlxNintMoeWeight MlxNintMoeWeight::from_blob(
             static_cast<int>(pool));
 
         std::string dtype = "NINT";
-        if (magic == "NIM2") {
+        if (magic != "NIM1") {
             const auto raw_dtype =
                 cursor.bytes(
                     dtype_bytes,
                     "cohort dtype");
             if (!is_ascii(raw_dtype)) {
                 throw std::runtime_error(
-                    "NINTM cohort dtype must be ASCII");
+                    "MFE cohort dtype must be ASCII");
             }
             dtype.assign(
                 reinterpret_cast<const char*>(
                     raw_dtype.data()),
                 raw_dtype.size());
+            dtype = std::string(
+                mfq::canonical_format_dtype(dtype));
         }
 
         auto runtime = cursor.bytes(
@@ -7481,7 +6770,7 @@ MlxNintMoeWeight MlxNintMoeWeight::from_blob(
         if (is_nint_dtype(dtype)) {
             if (!runtime.empty()) {
                 throw std::runtime_error(
-                    "unexpected NINTM NINT "
+                    "unexpected MFE NINT "
                     "runtime metadata");
             }
             auto weight = add_nint_pool(
@@ -7489,19 +6778,32 @@ MlxNintMoeWeight MlxNintMoeWeight::from_blob(
                 expert_ids,
                 output_width,
                 input_width,
-                streams,
-                descriptors,
-                !reference);
+                descriptors);
             if (reference) {
                 reference_cohorts.push_back({
                     expert_ids,
                     std::move(weight),
                 });
+            } else {
+                std::vector<std::int32_t> local_map(
+                    static_cast<std::size_t>(expert_count), -1);
+                for (std::size_t local = 0;
+                     local < expert_ids.size(); ++local) {
+                    const auto expert = expert_ids[local];
+                    local_map[static_cast<std::size_t>(expert)] =
+                        checked_int(local, "NINT local expert");
+                    standalone_owner[static_cast<std::size_t>(expert)] = 0;
+                }
+                nint_cohorts.push_back({
+                    make_int32_array(local_map, Shape{expert_count}),
+                    std::move(weight),
+                });
             }
         } else if (is_nint8_zero_dtype(dtype)) {
+            has_generic_cohorts = true;
             if (!runtime.empty()) {
                 throw std::runtime_error(
-                    "unexpected NINTM NINT8-0 "
+                    "unexpected MFE NINT8-0 "
                     "runtime metadata");
             }
             auto weight = add_q8_pool(
@@ -7519,9 +6821,10 @@ MlxNintMoeWeight MlxNintMoeWeight::from_blob(
                 });
             }
         } else if (dtype == "MXFP4" || dtype == "MXFP8") {
+            has_generic_cohorts = true;
             if (!runtime.empty()) {
                 throw std::runtime_error(
-                    "unexpected NINTM MX runtime metadata");
+                    "unexpected MFE MX runtime metadata");
             }
             auto weight = add_mx_pool(
                 dtype,
@@ -7539,9 +6842,10 @@ MlxNintMoeWeight MlxNintMoeWeight::from_blob(
                 });
             }
         } else if (dtype == "BF16" || dtype == "F16") {
+            has_generic_cohorts = true;
             if (!runtime.empty()) {
                 throw std::runtime_error(
-                    "unexpected NINTM dense runtime metadata");
+                    "unexpected MFE dense runtime metadata");
             }
             auto weight = add_dense_pool(
                 dtype,
@@ -7559,6 +6863,7 @@ MlxNintMoeWeight MlxNintMoeWeight::from_blob(
                 });
             }
         } else if (is_vq_dtype(dtype)) {
+            has_generic_cohorts = true;
             auto weight = add_vq_pool(
                 dtype,
                 payload,
@@ -7576,16 +6881,51 @@ MlxNintMoeWeight MlxNintMoeWeight::from_blob(
                     std::move(weight),
                 });
             }
+        } else if (is_mxfp4_sq_dtype(dtype)) {
+            if (!runtime.empty()) {
+                throw std::runtime_error(
+                    "unexpected MFE MXFP4-SQ runtime metadata");
+            }
+            auto weight = MlxMxfp4SqWeight::from_blob(payload);
+            if (weight.input_size() != input_width ||
+                weight.output_size() != checked_int(
+                    checked_product(
+                        static_cast<std::size_t>(count),
+                        static_cast<std::size_t>(output_width),
+                        "MXFP4-SQ cohort output width"),
+                    "MXFP4-SQ cohort output width")) {
+                throw std::runtime_error(
+                    "MFE MXFP4-SQ cohort shape is inconsistent");
+            }
+            std::vector<std::int32_t> local_map(
+                static_cast<std::size_t>(expert_count), -1);
+            const int cohort_index = checked_int(
+                mxfp4_sq_cohorts.size(),
+                "MXFP4-SQ cohort count");
+            for (std::size_t local = 0; local < expert_ids.size(); ++local) {
+                const auto expert = expert_ids[local];
+                local_map[static_cast<std::size_t>(expert)] =
+                    checked_int(local, "MXFP4-SQ local expert");
+                standalone_owner[static_cast<std::size_t>(expert)] =
+                    cohort_index;
+            }
+            if (reference) {
+                reference_cohorts.push_back({expert_ids, weight});
+            }
+            mxfp4_sq_cohorts.push_back({
+                make_int32_array(local_map, Shape{expert_count}),
+                std::move(weight),
+            });
         } else {
             throw std::runtime_error(
-                "unsupported nested NINTM cohort dtype: "
+                "unsupported nested MFE cohort dtype: "
                 + dtype);
         }
     }
 
     if (cursor.remaining() != 0) {
         throw std::runtime_error(
-            "trailing bytes in NINTM tensor");
+            "trailing bytes in MFE tensor");
     }
     const auto missing = std::find(
         owners.begin(),
@@ -7593,7 +6933,7 @@ MlxNintMoeWeight MlxNintMoeWeight::from_blob(
         -1);
     if (missing != owners.end()) {
         throw std::runtime_error(
-            "NINTM pools do not cover every expert");
+            "MFE pools do not cover every expert");
     }
 
     const Shape descriptor_shape{
@@ -7676,6 +7016,27 @@ MlxNintMoeWeight MlxNintMoeWeight::from_blob(
         1);
     impl->reference_cohorts =
         std::move(reference_cohorts);
+    impl->nint_cohorts =
+        std::move(nint_cohorts);
+    impl->mxfp4_sq_cohorts =
+        std::move(mxfp4_sq_cohorts);
+    impl->has_generic_cohorts = has_generic_cohorts;
+    if (!impl->nint_cohorts.empty() || !impl->mxfp4_sq_cohorts.empty()) {
+        // NINT and MXFP4-SQ cohorts reuse their standalone Linear kernels;
+        // neither is decoded by the heterogeneous MFE kernels.
+        impl->grouped_mmq = false;
+        impl->standalone_owner.emplace(make_int32_array(
+            standalone_owner,
+            Shape{expert_count}));
+        if (!reference) {
+            for (const auto& cohort : impl->nint_cohorts) {
+                impl->packed_bytes += cohort.weight.packed_nbytes();
+            }
+            for (const auto& cohort : impl->mxfp4_sq_cohorts) {
+                impl->packed_bytes += cohort.weight.packed_nbytes();
+            }
+        }
+    }
     if (reference) {
         impl->grouped_mmq = false;
         impl->native_primitive = false;
@@ -7689,16 +7050,14 @@ MlxNintMoeWeight MlxNintMoeWeight::from_blob(
                 cohort.weight);
         }
     }
-    // NINTM cohorts are parsed through the standalone NINT/VQ loaders and
-    // then repacked into the heterogeneous execution streams above. Those
-    // temporary MLX arrays are dead now, but the Metal allocator otherwise
-    // caches their buffers and can retain almost another model-sized copy
-    // while loading a fully resident MoE. Active arrays are unaffected.
+    // VQ/MX/dense cohorts are parsed through standalone loaders and repacked
+    // into heterogeneous execution streams. Their temporary MLX arrays are
+    // dead now; NINT/SQ arrays remain live as the shared-kernel cohorts.
     mlx::core::clear_cache();
-    return MlxNintMoeWeight(std::move(impl));
+    return MlxMfeWeight(std::move(impl));
 }
 
-MlxNintMoeWeight MlxNintMoeWeight::from_mxfp4_slots(
+MlxMfeWeight MlxMfeWeight::from_mxfp4_slots(
     int experts,
     int out_per_expert,
     int neuron_len,
@@ -7803,14 +7162,14 @@ MlxNintMoeWeight MlxNintMoeWeight::from_mxfp4_slots(
         out_per_expert,
         neuron_len,
         1);
-    return MlxNintMoeWeight(std::move(impl));
+    return MlxMfeWeight(std::move(impl));
 }
 
-MlxNintMoeWeight MlxNintMoeWeight::concatenate_projections(
-    const std::vector<MlxNintMoeWeight>& weights) {
+MlxMfeWeight MlxMfeWeight::concatenate_projections(
+    const std::vector<MlxMfeWeight>& weights) {
     if (weights.empty()) {
         throw std::invalid_argument(
-            "at least one NINTM projection is required");
+            "at least one MFE projection is required");
     }
     const auto& first = *weights.front().impl_;
     for (const auto& weight : weights) {
@@ -7823,7 +7182,7 @@ MlxNintMoeWeight MlxNintMoeWeight::concatenate_projections(
             || current.neuron_len != first.neuron_len
         ) {
             throw std::invalid_argument(
-                "NINTM projections have incompatible shapes");
+                "MFE projections have incompatible shapes");
         }
     }
 
@@ -7945,16 +7304,16 @@ MlxNintMoeWeight MlxNintMoeWeight::concatenate_projections(
                         nint_anchor_offset,
                         "NINT anchor offset");
                 if (descriptor[kNintV2] != 0) {
-                    descriptor[kNintRowQBitsOffset] =
+                    descriptor[kNintRowQLayoutOffset] =
                         descriptor_with_offset(
-                            descriptor[kNintRowQBitsOffset],
+                            descriptor[kNintRowQLayoutOffset],
                             nint_q_offset,
-                            "NINTv2 q-width offset");
-                    descriptor[kNintRowQBitOffsetsOffset] =
+                            "NINTv2 q-layout offset");
+                    descriptor[kNintRowQByteOffsetsOffset] =
                         descriptor_with_offset(
-                            descriptor[kNintRowQBitOffsetsOffset],
+                            descriptor[kNintRowQByteOffsetsOffset],
                             nint_q_offset,
-                            "NINTv2 q-bit-offset offset");
+                            "NINTv2 q-byte-offset offset");
                 }
             } else if (
                 descriptor[kFamily]
@@ -8049,7 +7408,7 @@ MlxNintMoeWeight MlxNintMoeWeight::concatenate_projections(
                         >= rotation_map.size()
                 ) {
                     throw std::runtime_error(
-                        "invalid NINTM VQ rotation "
+                        "invalid MFE VQ rotation "
                         "variant");
                 }
                 descriptor[kVqRotationVariant] =
@@ -8072,7 +7431,7 @@ MlxNintMoeWeight MlxNintMoeWeight::concatenate_projections(
                         "MX scale offset");
             } else {
                 throw std::runtime_error(
-                    "unsupported NINTM descriptor family");
+                    "unsupported MFE descriptor family");
             }
         }
 
@@ -8236,13 +7595,29 @@ MlxNintMoeWeight MlxNintMoeWeight::concatenate_projections(
         first.neuron_len,
         projection_count);
     impl->projection_views.reserve(weights.size());
+    const bool split_standalone_projections = std::any_of(
+        weights.begin(),
+        weights.end(),
+        [](const MlxMfeWeight& weight) {
+            return !weight.impl_->nint_cohorts.empty()
+                || !weight.impl_->mxfp4_sq_cohorts.empty();
+        });
+    if (split_standalone_projections) {
+        impl->packed_bytes = 0;
+    }
     for (const auto& weight : weights) {
         // Keep each projection on its original packed pool.  Evaluating the
         // combined stream would otherwise copy every expert's Gate and Up
         // payload before a one-token decode can touch its selected experts.
         impl->projection_views.push_back(weight.impl_);
+        if (split_standalone_projections) {
+            impl->packed_bytes = checked_add(
+                impl->packed_bytes,
+                weight.impl_->packed_bytes,
+                "split MFE projection bytes");
+        }
     }
-    return MlxNintMoeWeight(std::move(impl));
+    return MlxMfeWeight(std::move(impl));
 }
 
 MlxMoeWeight load_routed_gate_up_weight(
@@ -8258,9 +7633,9 @@ MlxMoeWeight load_routed_gate_up_weight(
             "incomplete routed Gate/Up pair under " + base);
     }
     const auto load = [&model](const std::string& name) {
-        if (model.record(name).dtype != "NINTM") {
+        if (model.record(name).dtype != "MFE") {
             throw std::runtime_error(
-                "routed expert tensor must use NINTM: " + name);
+                "routed expert tensor must use MFE: " + name);
         }
         const auto mapped = model.map_record(name);
         return MlxMoeWeight::from_blob(mapped.view());
@@ -8272,7 +7647,7 @@ MlxMoeWeight load_routed_gate_up_weight(
     return load(base + ".gate_up.weight");
 }
 
-array MlxNintMoeWeight::routed_matmul(
+array MlxMfeWeight::routed_matmul(
     const array& input,
     const array& expert_ids) const {
     return routed_matmul_impl(
@@ -8282,7 +7657,7 @@ array MlxNintMoeWeight::routed_matmul(
         0.0f);
 }
 
-array MlxNintMoeWeight::routed_matmul_mapped(
+array MlxMfeWeight::routed_matmul_mapped(
     const array& input,
     const array& expert_ids,
     const array& expert_map) const {
@@ -8294,7 +7669,7 @@ array MlxNintMoeWeight::routed_matmul_mapped(
         &expert_map);
 }
 
-array MlxNintMoeWeight::routed_matmul_packed(
+array MlxMfeWeight::routed_matmul_packed(
     const array& input,
     const array& packed_expert_ids) const {
     return routed_matmul_impl(
@@ -8306,7 +7681,7 @@ array MlxNintMoeWeight::routed_matmul_packed(
         true);
 }
 
-array MlxNintMoeWeight::routed_swiglu(
+array MlxMfeWeight::routed_swiglu(
     const array& input,
     const array& expert_ids,
     float limit) const {
@@ -8317,18 +7692,18 @@ array MlxNintMoeWeight::routed_swiglu(
         || (!split_gate_up && (impl_->out_per_expert & 1) != 0)
     ) {
         throw std::invalid_argument(
-            "NINTM SwiGLU requires one fused or two split gate/up projections");
+            "MFE SwiGLU requires one fused or two split gate/up projections");
     }
     if (!std::isfinite(limit) || limit < 0.0f) {
         throw std::invalid_argument(
-            "NINTM SwiGLU limit must be finite and non-negative");
+            "MFE SwiGLU limit must be finite and non-negative");
     }
     if (split_gate_up) {
         std::vector<array> projections;
         projections.reserve(impl_->projection_views.size());
         for (const auto& projection : impl_->projection_views) {
             projections.push_back(
-                MlxNintMoeWeight(projection).routed_matmul_impl(
+                MlxMfeWeight(projection).routed_matmul_impl(
                     input,
                     expert_ids,
                     false,
@@ -8347,7 +7722,7 @@ array MlxNintMoeWeight::routed_swiglu(
         limit);
 }
 
-array MlxNintMoeWeight::routed_swiglu_mapped(
+array MlxMfeWeight::routed_swiglu_mapped(
     const array& input,
     const array& expert_ids,
     const array& expert_map,
@@ -8359,18 +7734,18 @@ array MlxNintMoeWeight::routed_swiglu_mapped(
         || (!split_gate_up && (impl_->out_per_expert & 1) != 0)
     ) {
         throw std::invalid_argument(
-            "NINTM SwiGLU requires one fused or two split gate/up projections");
+            "MFE SwiGLU requires one fused or two split gate/up projections");
     }
     if (!std::isfinite(limit) || limit < 0.0f) {
         throw std::invalid_argument(
-            "NINTM SwiGLU limit must be finite and non-negative");
+            "MFE SwiGLU limit must be finite and non-negative");
     }
     if (split_gate_up) {
         std::vector<array> projections;
         projections.reserve(impl_->projection_views.size());
         for (const auto& projection : impl_->projection_views) {
             projections.push_back(
-                MlxNintMoeWeight(projection).routed_matmul_impl(
+                MlxMfeWeight(projection).routed_matmul_impl(
                     input,
                     expert_ids,
                     false,
@@ -8391,7 +7766,7 @@ array MlxNintMoeWeight::routed_swiglu_mapped(
         &expert_map);
 }
 
-array MlxNintMoeWeight::routed_swiglu_packed(
+array MlxMfeWeight::routed_swiglu_packed(
     const array& input,
     const array& packed_expert_ids,
     float limit) const {
@@ -8402,18 +7777,18 @@ array MlxNintMoeWeight::routed_swiglu_packed(
         || (!split_gate_up && (impl_->out_per_expert & 1) != 0)
     ) {
         throw std::invalid_argument(
-            "NINTM SwiGLU requires one fused or two split gate/up projections");
+            "MFE SwiGLU requires one fused or two split gate/up projections");
     }
     if (!std::isfinite(limit) || limit < 0.0f) {
         throw std::invalid_argument(
-            "NINTM SwiGLU limit must be finite and non-negative");
+            "MFE SwiGLU limit must be finite and non-negative");
     }
     if (split_gate_up) {
         std::vector<array> projections;
         projections.reserve(impl_->projection_views.size());
         for (const auto& projection : impl_->projection_views) {
             projections.push_back(
-                MlxNintMoeWeight(projection).routed_matmul_impl(
+                MlxMfeWeight(projection).routed_matmul_impl(
                     input,
                     packed_expert_ids,
                     false,
@@ -8436,7 +7811,7 @@ array MlxNintMoeWeight::routed_swiglu_packed(
         true);
 }
 
-array MlxNintMoeWeight::routed_matmul_reduce(
+array MlxMfeWeight::routed_matmul_reduce(
     const array& input,
     const array& expert_ids,
     const array& route_weights) const {
@@ -8518,7 +7893,7 @@ array MlxNintMoeWeight::routed_matmul_reduce(
         });
 }
 
-bool MlxNintMoeWeight::supports_grouped_mmq() const noexcept {
+bool MlxMfeWeight::supports_grouped_mmq() const noexcept {
     // The block-list builder uses one Metal thread and one threadgroup-array
     // entry per addressable expert. Large shared SSD arenas can expose more
     // than the Metal 1024-thread limit even though a model routes to only a
@@ -8535,7 +7910,7 @@ bool MlxNintMoeWeight::supports_grouped_mmq() const noexcept {
             });
 }
 
-bool MlxNintMoeWeight::prefers_mxfp4_smallm_nax(
+bool MlxMfeWeight::prefers_mxfp4_smallm_nax(
     const array& expert_ids) const noexcept {
     return impl_->mxfp4_slot_ids.has_value()
         && impl_->projections == 1
@@ -8547,31 +7922,22 @@ bool MlxNintMoeWeight::prefers_mxfp4_smallm_nax(
             impl_->experts);
 }
 
-int MlxNintMoeWeight::recommended_grouped_mmq_block_rows(
+int MlxMfeWeight::recommended_grouped_mmq_block_rows(
     int route_count,
     bool fused_swiglu) const noexcept {
     if (!impl_->projection_views.empty()) {
         int selected = 0;
         for (const auto& projection : impl_->projection_views) {
-            const int candidate = MlxNintMoeWeight(projection)
+            const int candidate = MlxMfeWeight(projection)
                 .recommended_grouped_mmq_block_rows(route_count, false);
             if (selected != 0 && selected != candidate) return 32;
             selected = candidate;
         }
         return selected == 0 ? 32 : selected;
     }
-    const bool use_nax = nint_grouped_nax_enabled()
-        && (impl_->grouped_nint4_group24
-            || (!impl_->has_nepq_residual
-                && mixed_grouped_nax_enabled(route_count)));
-    const bool direct_nax = (impl_->grouped_nint4_group24
-            || (mixed_grouped_nax_enabled(route_count)
-                && impl_->family_mask
-                    == (std::uint32_t{1} << kFamilyNint)))
-        && use_nax
-        && nint_grouped_nax_direct_enabled(
-            impl_->neuron_len,
-            impl_->out_per_expert);
+    const bool use_nax = !impl_->has_nepq_residual
+        && mixed_grouped_nax_enabled(route_count);
+    constexpr bool direct_nax = false;
     if (!use_nax || direct_nax || impl_->experts <= 0) {
         return 32;
     }
@@ -8625,7 +7991,7 @@ int MlxNintMoeWeight::recommended_grouped_mmq_block_rows(
     return padded_rows(80) < padded_rows(64) ? 80 : 64;
 }
 
-MlxGroupedMmqPlan MlxNintMoeWeight::build_grouped_mmq_plan(
+MlxGroupedMmqPlan MlxMfeWeight::build_grouped_mmq_plan(
     const array& expert_ids,
     const array& route_order,
     int block_rows) const {
@@ -8634,7 +8000,7 @@ MlxGroupedMmqPlan MlxNintMoeWeight::build_grouped_mmq_plan(
             "weight does not support grouped MMQ");
     }
     if (!impl_->projection_views.empty()) {
-        return MlxNintMoeWeight(impl_->projection_views.front())
+        return MlxMfeWeight(impl_->projection_views.front())
             .build_grouped_mmq_plan(
                 expert_ids,
                 route_order,
@@ -8648,7 +8014,7 @@ MlxGroupedMmqPlan MlxNintMoeWeight::build_grouped_mmq_plan(
         block_rows);
 }
 
-array MlxNintMoeWeight::routed_matmul_sorted(
+array MlxMfeWeight::routed_matmul_sorted(
     const array& input,
     const array& expert_ids,
     const array& route_order_value,
@@ -8670,7 +8036,7 @@ array MlxNintMoeWeight::routed_matmul_sorted(
         outputs.reserve(impl_->projection_views.size());
         for (const auto& projection : impl_->projection_views) {
             outputs.push_back(
-                MlxNintMoeWeight(projection).routed_matmul_sorted(
+                MlxMfeWeight(projection).routed_matmul_sorted(
                     input,
                     expert_ids,
                     route_order_value,
@@ -8932,18 +8298,9 @@ array MlxNintMoeWeight::routed_matmul_sorted(
     const int output_width = fused_swiglu
         ? impl_->out_per_expert / 2
         : impl_->out_per_expert;
-    const bool use_grouped_nax = nint_grouped_nax_enabled()
-        && (impl_->grouped_nint4_group24
-            || (!impl_->has_nepq_residual
-                && mixed_grouped_nax_enabled(route_count)));
-    const bool use_direct_nax = (impl_->grouped_nint4_group24
-            || (mixed_grouped_nax_enabled(route_count)
-                && impl_->family_mask
-                    == (std::uint32_t{1} << kFamilyNint)))
-        && use_grouped_nax
-        && nint_grouped_nax_direct_enabled(
-            impl_->neuron_len,
-            output_width);
+    const bool use_grouped_nax = !impl_->has_nepq_residual
+        && mixed_grouped_nax_enabled(route_count);
+    constexpr bool use_direct_nax = false;
     auto owned_plan = plan == nullptr
         ? std::optional<MlxGroupedMmqPlan>(
             make_grouped_mmq_plan(
@@ -9004,8 +8361,6 @@ array MlxNintMoeWeight::routed_matmul_sorted(
             .has_nepq_residual = static_cast<int>(
                 impl_->has_nepq_residual),
             .family_mask = static_cast<int>(impl_->family_mask),
-            .nint_profile_mask = static_cast<int>(
-                impl_->nint_profile_mask),
             .vq_profile_mask = static_cast<int>(
                 impl_->vq_profile_mask),
             .use_nax = use_grouped_nax,
@@ -9014,13 +8369,38 @@ array MlxNintMoeWeight::routed_matmul_sorted(
         });
 }
 
-array MlxNintMoeWeight::routed_matmul_impl(
+array MlxMfeWeight::routed_matmul_impl(
     const array& input,
     const array& expert_ids,
     bool fused_swiglu,
     float swiglu_limit,
     const array* expert_map,
     bool packed_expert_ids) const {
+    if (impl_->projections > 1 && !impl_->projection_views.empty() &&
+        std::any_of(
+            impl_->projection_views.begin(),
+            impl_->projection_views.end(),
+            [](const auto& projection) {
+                return !projection->nint_cohorts.empty()
+                    || !projection->mxfp4_sq_cohorts.empty();
+            })) {
+        if (fused_swiglu) {
+            throw std::logic_error(
+                "split standalone-kernel projections must use routed_swiglu");
+        }
+        std::vector<array> outputs;
+        outputs.reserve(impl_->projection_views.size());
+        for (const auto& projection : impl_->projection_views) {
+            outputs.push_back(MlxMfeWeight(projection).routed_matmul_impl(
+                input,
+                expert_ids,
+                false,
+                0.0f,
+                expert_map,
+                packed_expert_ids));
+        }
+        return mlx::core::concatenate(std::move(outputs), -1);
+    }
     if (mlx_reference_enabled()) {
         if (expert_map != nullptr) {
             auto mapped_ids = mlx::core::take(
@@ -9061,7 +8441,7 @@ array MlxNintMoeWeight::routed_matmul_impl(
         ? mlx::core::contiguous(
               mlx::core::astype(*expert_map, mlx::core::int32))
         : ids;
-    const int expert_map_size = expert_map != nullptr
+    int expert_map_size = expert_map != nullptr
         ? checked_int(map.size(), "expert page-table size")
         : 0;
     if (expert_map != nullptr && map.ndim() != 1) {
@@ -9129,6 +8509,102 @@ array MlxNintMoeWeight::routed_matmul_impl(
             output_shape,
             source.dtype());
     }
+
+    std::optional<array> standalone_output;
+    if (!impl_->nint_cohorts.empty()
+        || !impl_->mxfp4_sq_cohorts.empty()) {
+        auto physical_ids = ids;
+        if (packed_expert_ids) {
+            physical_ids = mlx::core::floor_divide(
+                ids,
+                array(256, mlx::core::int32)) -
+                array(1, mlx::core::int32);
+        } else if (expert_map != nullptr) {
+            if (expert_map_size <= 0) {
+                physical_ids = mlx::core::full(
+                    ids.shape(), -1, mlx::core::int32);
+            } else {
+                auto valid = mlx::core::logical_and(
+                    mlx::core::greater_equal(
+                        ids, array(0, mlx::core::int32)),
+                    mlx::core::less(
+                        ids,
+                        array(expert_map_size, mlx::core::int32)));
+                auto safe = mlx::core::minimum(
+                    mlx::core::maximum(
+                        ids, array(0, mlx::core::int32)),
+                    array(expert_map_size - 1, mlx::core::int32));
+                physical_ids = mlx::core::where(
+                    valid,
+                    mlx::core::take(map, safe, 0),
+                    mlx::core::full(
+                        ids.shape(), -1, mlx::core::int32));
+            }
+        }
+        physical_ids = mlx::core::contiguous(
+            mlx::core::astype(physical_ids, mlx::core::int32));
+        const auto append_standalone = [&](array projected) {
+            if (fused_swiglu) {
+                projected = moe_limited_swiglu_split(
+                    projected, swiglu_limit);
+            }
+            if (projected.dtype() != source.dtype()) {
+                projected = mlx::core::astype(
+                    projected, source.dtype());
+            }
+            standalone_output = standalone_output.has_value()
+                ? *standalone_output + projected
+                : std::move(projected);
+        };
+        for (const auto& cohort : impl_->nint_cohorts) {
+            append_standalone(cohort.weight.routed_matmul(
+                source,
+                physical_ids,
+                cohort.expert_map,
+                impl_->out_per_expert));
+        }
+        for (const auto& cohort : impl_->mxfp4_sq_cohorts) {
+            append_standalone(cohort.weight.routed_matmul(
+                source,
+                physical_ids,
+                cohort.expert_map,
+                impl_->out_per_expert));
+        }
+        if (!impl_->has_generic_cohorts) {
+            return std::move(*standalone_output);
+        }
+
+        auto valid = mlx::core::logical_and(
+            mlx::core::greater_equal(
+                physical_ids, array(0, mlx::core::int32)),
+            mlx::core::less(
+                physical_ids,
+                array(impl_->experts, mlx::core::int32)));
+        auto safe = mlx::core::minimum(
+            mlx::core::maximum(
+                physical_ids, array(0, mlx::core::int32)),
+            array(impl_->experts - 1, mlx::core::int32));
+        auto owner = mlx::core::take(
+            *impl_->standalone_owner, safe, 0);
+        auto is_standalone = mlx::core::logical_and(
+            valid,
+            mlx::core::greater_equal(
+                owner, array(0, mlx::core::int32)));
+        ids = mlx::core::contiguous(mlx::core::where(
+            is_standalone,
+            mlx::core::full(ids.shape(), -1, mlx::core::int32),
+            physical_ids));
+        map = ids;
+        expert_map = nullptr;
+        expert_map_size = 0;
+        packed_expert_ids = false;
+    }
+
+    const auto merge_standalone = [&](array output) {
+        return standalone_output.has_value()
+            ? output + *standalone_output
+            : output;
+    };
 
     const auto route_count_size = checked_product(
         static_cast<std::size_t>(tokens),
@@ -9264,18 +8740,9 @@ array MlxNintMoeWeight::routed_matmul_impl(
         && impl_->projection_views.empty()
         && supports_grouped_mmq()
     ) {
-        const bool use_grouped_nax = nint_grouped_nax_enabled()
-            && (impl_->grouped_nint4_group24
-                || (!impl_->has_nepq_residual
-                    && mixed_grouped_nax_enabled(variant_stride)));
-        const bool use_direct_nax = (impl_->grouped_nint4_group24
-                || (mixed_grouped_nax_enabled(variant_stride)
-                    && impl_->family_mask
-                        == (std::uint32_t{1} << kFamilyNint)))
-            && use_grouped_nax
-            && nint_grouped_nax_direct_enabled(
-                impl_->neuron_len,
-                logical_output_width);
+        const bool use_grouped_nax = !impl_->has_nepq_residual
+            && mixed_grouped_nax_enabled(variant_stride);
+        constexpr bool use_direct_nax = false;
         auto plan = make_grouped_mmq_plan(
             ids,
             route_order,
@@ -9314,8 +8781,6 @@ array MlxNintMoeWeight::routed_matmul_impl(
                 .has_nepq_residual = static_cast<int>(
                     impl_->has_nepq_residual),
                 .family_mask = static_cast<int>(impl_->family_mask),
-                .nint_profile_mask = static_cast<int>(
-                    impl_->nint_profile_mask),
                 .vq_profile_mask = static_cast<int>(
                     impl_->vq_profile_mask),
                 .use_nax = use_grouped_nax,
@@ -9332,20 +8797,20 @@ array MlxNintMoeWeight::routed_matmul_impl(
                 ids,
                 array(0, mlx::core::int32)),
             -1);
-        return mlx::core::where(
+        return merge_standalone(mlx::core::where(
             valid,
             mlx::core::reshape(
                 std::move(restored),
                 output_shape),
             mlx::core::zeros(
                 output_shape,
-                source.dtype()));
+                source.dtype())));
     }
     if (impl_->native_primitive) {
         if (expert_map != nullptr) {
             kernel_inputs.push_back(map);
         }
-        return native_moe_dispatch(
+        return merge_standalone(native_moe_dispatch(
             std::move(kernel_inputs),
             NativeMoeConfig{
                 .dtype = source.dtype(),
@@ -9377,7 +8842,7 @@ array MlxNintMoeWeight::routed_matmul_impl(
                 .expert_map_size = expert_map_size,
                 .packed_expert_ids = static_cast<int>(packed_expert_ids),
                 .workgroups = static_cast<int>(workgroups),
-            });
+            }));
     }
     const auto grid = checked_product(
         workgroups,
@@ -9389,7 +8854,7 @@ array MlxNintMoeWeight::routed_matmul_impl(
             std::numeric_limits<int>::max())
     ) {
         throw std::runtime_error(
-            "NINTM compatibility grid exceeds MLX limits");
+            "MFE compatibility grid exceeds MLX limits");
     }
     kernel_inputs.push_back(map);
     auto outputs = moe_kernel()(
@@ -9460,10 +8925,10 @@ array MlxNintMoeWeight::routed_matmul_impl(
         std::nullopt,
         false,
         {});
-    return std::move(outputs.front());
+    return merge_standalone(std::move(outputs.front()));
 }
 
-array MlxNintMoeWeight::routed_bf16_reference(
+array MlxMfeWeight::routed_bf16_reference(
     const array& input,
     const array& expert_ids,
     bool fused_swiglu,
@@ -9493,7 +8958,7 @@ array MlxNintMoeWeight::routed_bf16_reference(
     if (impl_->projections != 1
         || impl_->reference_cohorts.empty()) {
         throw std::runtime_error(
-            "unpacked reference NINTM cohorts are unavailable");
+            "unpacked reference MFE cohorts are unavailable");
     }
 
     ids.eval();
@@ -9587,23 +9052,23 @@ array MlxNintMoeWeight::routed_bf16_reference(
         : output;
 }
 
-int MlxNintMoeWeight::experts() const noexcept {
+int MlxMfeWeight::experts() const noexcept {
     return impl_->experts;
 }
 
-int MlxNintMoeWeight::out_per_expert() const noexcept {
+int MlxMfeWeight::out_per_expert() const noexcept {
     return impl_->out_per_expert;
 }
 
-int MlxNintMoeWeight::neuron_len() const noexcept {
+int MlxMfeWeight::neuron_len() const noexcept {
     return impl_->neuron_len;
 }
 
-int MlxNintMoeWeight::projections() const noexcept {
+int MlxMfeWeight::projections() const noexcept {
     return impl_->projections;
 }
 
-std::size_t MlxNintMoeWeight::packed_nbytes() const noexcept {
+std::size_t MlxMfeWeight::packed_nbytes() const noexcept {
     return impl_->packed_bytes;
 }
 
@@ -9612,7 +9077,7 @@ MlxRoutedLinear::MlxRoutedLinear(
     : weight_(std::move(weight)) {
     if (weight_.projections() != 1) {
         throw std::invalid_argument(
-            "routed linear requires one NINTM projection");
+            "routed linear requires one MFE projection");
     }
 }
 

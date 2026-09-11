@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from mfq.formats.compat import NINT_DTYPE, is_nint_dtype
 from mfq.formats.nint import NintSpec
 from mfq.formats.tpq import normalize_tpq_dtype
 
@@ -19,12 +20,7 @@ _FORMAT = _FORMAT_V3
 
 EXPERT_PRECISION_FAMILIES = frozenset(
     {
-        "NINT2",
-        "NINT3",
-        "NINT4",
-        "NINT5",
-        "NINT6",
-        "NINT8",
+        NINT_DTYPE,
         "NINT8-0",
         "MXFP4",
         "NVQ1-L",
@@ -65,18 +61,21 @@ class ExpertPrecision:
 
     def __post_init__(self) -> None:
         family = normalize_tpq_dtype(str(self.family))
+        if is_nint_dtype(family):
+            family = NINT_DTYPE
+        family = {
+            "NIQ2": "NVQ2",
+            "NIQ2J": "NVQ2J",
+            "NIQ3": "NVQ3",
+        }.get(family, family)
         if family not in EXPERT_PRECISION_FAMILIES:
             raise ValueError(f"unsupported expert precision family: {family}")
         if family == "NINT8-0":
             if self.nint_spec is not None:
                 raise ValueError("NINT8-0 cannot carry an affine NINT spec")
-        elif family.startswith("NINT"):
+        elif family == NINT_DTYPE:
             if self.nint_spec is None:
-                raise ValueError(f"{family} requires a NINT spec")
-            if family != f"NINT{self.nint_spec.bits}":
-                raise ValueError(
-                    f"expert precision family/spec mismatch: {family}/{self.nint_spec}"
-                )
+                raise ValueError("NINT requires a NINT spec")
         elif self.nint_spec is not None:
             raise ValueError(f"{family} cannot carry a NINT spec")
         if self.artifact is not None and not str(self.artifact):
@@ -106,7 +105,7 @@ class ExpertPrecision:
 
 
 def nint_expert_precision(spec: NintSpec) -> ExpertPrecision:
-    return ExpertPrecision(family=f"NINT{spec.bits}", nint_spec=spec)
+    return ExpertPrecision(family=NINT_DTYPE, nint_spec=spec)
 
 
 @dataclass(frozen=True)

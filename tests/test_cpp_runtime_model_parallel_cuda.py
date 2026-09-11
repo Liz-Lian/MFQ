@@ -9,7 +9,7 @@ import pytest
 
 from mfq.formats import io
 from mfq.formats.header import FileHeader
-from mfq.formats.moe import NintMoePool, NintMoeTensor
+from mfq.formats.mfe import MfePool, MfeTensor
 from mfq.formats.nint import NintSpec
 from mfq.quantize.nint_quant import quantize
 
@@ -45,9 +45,9 @@ def model_parallel_fixture(
         spec,
         axis=0,
     )
-    routed = NintMoeTensor(
+    routed = MfeTensor(
         (experts, output_per_expert, neuron_len),
-        (NintMoePool(np.arange(experts, dtype=np.int32), expert_weight),),
+        (MfePool(np.arange(experts, dtype=np.int32), expert_weight),),
     )
     path = tmp_path_factory.mktemp("model-parallel") / "fixture.mfq"
     io.save(

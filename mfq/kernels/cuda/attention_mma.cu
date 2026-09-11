@@ -813,9 +813,31 @@ static mfq_tensor_backend::Tensor mfq_attention_mma_decode_impl(
     bool stream_k = cc >= 890 || tile_efficiency < 75;
     const char * stream_k_env = std::getenv("MFQ_MMA_ATTENTION_DECODE_STREAMK");
     if (stream_k_env != nullptr) stream_k = stream_k_env[0] != '0';
-    const int raw_blocks = stream_k
+    int raw_blocks = stream_k
         ? std::min(resident_blocks, ntiles_dst * ntiles_kv)
         : ntiles_dst;
+    if (stream_k && cc >= 800 && cc < 890) {
+        // On Ampere, filling every resident block slot makes the serial fixup
+        // unnecessarily expensive for decode. One block per active SM is
+        // sufficient until each block owns a long run of KV tiles.
+        constexpr int max_kv_tiles_per_reduced_block = 32;
+        const int sm_fill_blocks =
+            (3 * properties.multiProcessorCount + 3) / 4;
+        const int sm_fill_blocks_per_tile =
+            (sm_fill_blocks + ntiles_dst - 1) / ntiles_dst;
+        const int resident_blocks_per_tile =
+            std::max(1, resident_blocks / ntiles_dst);
+        const bool reduced_grid_has_enough_work =
+            ntiles_kv <=
+            sm_fill_blocks_per_tile * max_kv_tiles_per_reduced_block;
+        const int target_blocks_per_tile = std::min(
+            ntiles_kv,
+            reduced_grid_has_enough_work
+                ? std::min(
+                    resident_blocks_per_tile, sm_fill_blocks_per_tile)
+                : resident_blocks_per_tile);
+        raw_blocks = ntiles_dst * target_blocks_per_tile;
+    }
     const int rounded_blocks = std::max(
         ntiles_dst, (raw_blocks / ntiles_dst) * ntiles_dst);
     const int blocks_per_tile = rounded_blocks / ntiles_dst;

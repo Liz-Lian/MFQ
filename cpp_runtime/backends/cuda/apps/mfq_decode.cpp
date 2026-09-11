@@ -28175,8 +28175,8 @@ static int run_moe_check(
 }
 
 static int run_attention_decode_check(int length, int reps, int D, bool sliding, int window) {
-    if (length < 1 || length > 32768) {
-        throw std::runtime_error("--check-attention-decode must be in [1, 32768]");
+    if (length < 1 || length > 262144) {
+        throw std::runtime_error("--check-attention-decode must be in [1, 262144]");
     }
     if (reps < 1) throw std::runtime_error("--check-attention-reps must be positive");
     constexpr int B = 1;

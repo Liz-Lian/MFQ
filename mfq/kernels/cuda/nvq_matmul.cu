@@ -5690,6 +5690,10 @@ mfq_tensor_backend::Tensor nepq_moe_grouped_matmul_ws_cuda(
 // every NVQ cohort without a runtime branch per decoded value.
 constexpr int kNvqMoeF16PoolTileN = 64;
 constexpr int kNvqMoeF16HeteroTileN = 128;
+constexpr int kNvqMoeF16AllFormats = 0;
+constexpr int kNvqMoeF16StandardFormats = 1;
+constexpr int kNvqMoeF16ExtendedFormats = 2;
+constexpr int kNvqMoeF16LegacyFormats = 3;
 
 template <int GROUPS_PER_CHUNK>
 struct NvqMoeF16KLayout {
@@ -6138,10 +6142,12 @@ __global__ void __launch_bounds__(256, 1) nvq_moe_grouped_f16_kernel(
 }
 
 template <int BM, int BN, int ROUTE_TILE_M, int GROUPS_PER_CHUNK,
-          bool NVQ23_ONLY, bool ASYNC_ACTIVATION = false>
+          int FORMAT_GROUP, bool ASYNC_ACTIVATION = false>
 __global__ void __launch_bounds__(
     (BM == 128 ? 2 : 1) * (BN / 16) * 32,
-    BN == 64 || (NVQ23_ONLY && GROUPS_PER_CHUNK == 2) ? 2 : 1)
+    BN == 64 ||
+        (FORMAT_GROUP != kNvqMoeF16AllFormats && GROUPS_PER_CHUNK == 2)
+        ? 2 : 1)
 nvq_moe_grouped_hetero_f16_kernel(
     const int64_t * weight_ptrs,
     const int64_t * weight_sizes,
@@ -6227,7 +6233,7 @@ nvq_moe_grouped_hetero_f16_kernel(
                 nsign, sub_bits, sign_mode, routed_input, local_expert, first,  \
                 last, ntile * BN);                                              \
             break
-        if constexpr (NVQ23_ONLY) {
+        if constexpr (FORMAT_GROUP == kNvqMoeF16StandardFormats) {
             switch (format) {
                 NVQ_MOE_HETERO_F16_CASE(kNvq2);
                 NVQ_MOE_HETERO_F16_CASE(kNvq3);
@@ -6236,6 +6242,24 @@ nvq_moe_grouped_hetero_f16_kernel(
                 NVQ_MOE_HETERO_F16_CASE(kNvq2JscExec);
                 NVQ_MOE_HETERO_F16_CASE(kNvq3Jsc);
                 NVQ_MOE_HETERO_F16_CASE(kNvq3Jsc2);
+            }
+        } else if constexpr (
+            FORMAT_GROUP == kNvqMoeF16ExtendedFormats) {
+            switch (format) {
+                NVQ_MOE_HETERO_F16_CASE(kNvq3Jsc512);
+                NVQ_MOE_HETERO_F16_CASE(kNvq2JscL);
+                NVQ_MOE_HETERO_F16_CASE(kNvq2JscXL);
+                NVQ_MOE_HETERO_F16_CASE(kNvq3JscL);
+                NVQ_MOE_HETERO_F16_CASE(kNvq2JscXLGroupExec);
+                NVQ_MOE_HETERO_F16_CASE(kNvq3JscLGroupExec);
+            }
+        } else if constexpr (
+            FORMAT_GROUP == kNvqMoeF16LegacyFormats) {
+            switch (format) {
+                NVQ_MOE_HETERO_F16_CASE(kNvq1L);
+                NVQ_MOE_HETERO_F16_CASE(kNpq0L);
+                NVQ_MOE_HETERO_F16_CASE(kNvq1S);
+                NVQ_MOE_HETERO_F16_CASE(kNpq0S);
             }
         } else {
             switch (format) {
@@ -6520,7 +6544,7 @@ mfq_tensor_backend::Tensor nvq_moe_grouped_matmul_hetero_f16_cuda(
     mfq_tensor_backend::Tensor expert_bounds,
     mfq_tensor_backend::Tensor tile_bounds,
     mfq_tensor_backend::Tensor tile_experts,
-    bool nvq23_only,
+    int64_t format_group,
     bool masked_experts) {
     MFQ_RUNTIME_CHECK(
         n_experts > 0 && n_experts <= 4096,
@@ -6532,6 +6556,10 @@ mfq_tensor_backend::Tensor nvq_moe_grouped_matmul_hetero_f16_cuda(
     MFQ_RUNTIME_CHECK(
         route_tile_m == 8 || route_tile_m == 64 || route_tile_m == 128,
         "NVQ heterogeneous route tile must be 8, 64, or 128");
+    MFQ_RUNTIME_CHECK(
+        format_group >= kNvqMoeF16AllFormats &&
+            format_group <= kNvqMoeF16LegacyFormats,
+        "NVQ heterogeneous FP16 format group is invalid");
     MFQ_RUNTIME_CHECK(
         weight_ptrs.is_cuda() && weight_ptrs.is_contiguous() &&
             weight_ptrs.scalar_type() == mfq_tensor_backend::kInt64 &&
@@ -6659,7 +6687,7 @@ mfq_tensor_backend::Tensor nvq_moe_grouped_matmul_hetero_f16_cuda(
     const int blocks = static_cast<int>(std::max<int64_t>(
         1, std::min<int64_t>(max_tasks, block_cap)));
 #define NVQ_MOE_HETERO_F16_LAUNCH(                                             \
-    BM_VALUE, BN_VALUE, ROUTE_VALUE, GROUP_VALUE, NVQ23_VALUE)                 \
+    BM_VALUE, BN_VALUE, ROUTE_VALUE, GROUP_VALUE, FORMAT_GROUP_VALUE)          \
     do {                                                                         \
         constexpr int kSharedBytes = sizeof(NvqMoeF16SharedStorage<             \
             BM_VALUE, BN_VALUE, GROUP_VALUE>);                                  \
@@ -6667,7 +6695,7 @@ mfq_tensor_backend::Tensor nvq_moe_grouped_matmul_hetero_f16_cuda(
             static const cudaError_t attribute_status = cudaFuncSetAttribute(   \
                 nvq_moe_grouped_hetero_f16_kernel<                              \
                     BM_VALUE, BN_VALUE, ROUTE_VALUE, GROUP_VALUE,               \
-                    NVQ23_VALUE, true>,                                         \
+                    FORMAT_GROUP_VALUE, true>,                                  \
                 cudaFuncAttributeMaxDynamicSharedMemorySize, kSharedBytes);     \
             MFQ_RUNTIME_CHECK(                                                   \
                 attribute_status == cudaSuccess,                                \
@@ -6675,7 +6703,7 @@ mfq_tensor_backend::Tensor nvq_moe_grouped_matmul_hetero_f16_cuda(
         }                                                                        \
         nvq_moe_grouped_hetero_f16_kernel<                                      \
             BM_VALUE, BN_VALUE, ROUTE_VALUE, GROUP_VALUE,                       \
-            NVQ23_VALUE, true><<<                                               \
+            FORMAT_GROUP_VALUE, true><<<                                        \
             blocks, dim3(32, (BM_VALUE == 128 ? 2 : 1) *                       \
                 (BN_VALUE / 16)), kSharedBytes,                                 \
             mfq_current_cuda_stream()>>>(                                       \
@@ -6690,25 +6718,43 @@ mfq_tensor_backend::Tensor nvq_moe_grouped_matmul_hetero_f16_cuda(
         static_cast<int>(out_per_expert), static_cast<int>(neuron_len),        \
         max_tiles, routed_input);                                                \
     } while (false)
-    // The compact NVQ2/NVQ3 execution streams fit the wide task in 64
-    // registers with G2, so two BM128 CTAs can reside together.  Formats
-    // with larger codebooks keep the full-switch G4 path and its reuse.
-    if (tile_m == 128 && use_narrow_tile && nvq23_only) {
-        NVQ_MOE_HETERO_F16_LAUNCH(128, 64, 128, 4, true);
-    } else if (tile_m == 128 && nvq23_only) {
-        NVQ_MOE_HETERO_F16_LAUNCH(128, 128, 128, 2, true);
+    // A bounded format switch fits the wide G2 task in 64 registers, so two
+    // BM128 CTAs can reside together.  Cross-group mixtures keep the full
+    // switch, G4 path, and its wider K reuse.
+    if (tile_m == 128 && use_narrow_tile &&
+            format_group == kNvqMoeF16StandardFormats) {
+        NVQ_MOE_HETERO_F16_LAUNCH(
+            128, 64, 128, 4, kNvqMoeF16StandardFormats);
+    } else if (tile_m == 128 && !use_narrow_tile &&
+            format_group == kNvqMoeF16StandardFormats) {
+        NVQ_MOE_HETERO_F16_LAUNCH(
+            128, 128, 128, 2, kNvqMoeF16StandardFormats);
+    } else if (tile_m == 128 && !use_narrow_tile &&
+            format_group == kNvqMoeF16ExtendedFormats) {
+        NVQ_MOE_HETERO_F16_LAUNCH(
+            128, 128, 128, 2, kNvqMoeF16ExtendedFormats);
+    } else if (tile_m == 128 && !use_narrow_tile &&
+            format_group == kNvqMoeF16LegacyFormats) {
+        NVQ_MOE_HETERO_F16_LAUNCH(
+            128, 128, 128, 2, kNvqMoeF16LegacyFormats);
     } else if (tile_m == 128 && use_narrow_tile) {
-        NVQ_MOE_HETERO_F16_LAUNCH(128, 64, 128, 4, false);
+        NVQ_MOE_HETERO_F16_LAUNCH(
+            128, 64, 128, 4, kNvqMoeF16AllFormats);
     } else if (tile_m == 128) {
-        NVQ_MOE_HETERO_F16_LAUNCH(128, 128, 128, 4, false);
+        NVQ_MOE_HETERO_F16_LAUNCH(
+            128, 128, 128, 4, kNvqMoeF16AllFormats);
     } else if (tile_m == 64) {
-        NVQ_MOE_HETERO_F16_LAUNCH(128, 128, 64, 4, false);
+        NVQ_MOE_HETERO_F16_LAUNCH(
+            128, 128, 64, 4, kNvqMoeF16AllFormats);
     } else if (fine_bm == 16) {
-        NVQ_MOE_HETERO_F16_LAUNCH(16, 128, 8, 4, false);
+        NVQ_MOE_HETERO_F16_LAUNCH(
+            16, 128, 8, 4, kNvqMoeF16AllFormats);
     } else if (fine_bm == 32) {
-        NVQ_MOE_HETERO_F16_LAUNCH(32, 128, 8, 4, false);
+        NVQ_MOE_HETERO_F16_LAUNCH(
+            32, 128, 8, 4, kNvqMoeF16AllFormats);
     } else {
-        NVQ_MOE_HETERO_F16_LAUNCH(64, 128, 8, 4, false);
+        NVQ_MOE_HETERO_F16_LAUNCH(
+            64, 128, 8, 4, kNvqMoeF16AllFormats);
     }
 #undef NVQ_MOE_HETERO_F16_LAUNCH
     MFQ_CUDA_KERNEL_LAUNCH_CHECK();

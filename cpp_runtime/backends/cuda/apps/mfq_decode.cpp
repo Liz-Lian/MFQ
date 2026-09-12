@@ -367,7 +367,7 @@ mfq_tensor_backend::Tensor nvq_moe_grouped_matmul_hetero_f16_cuda(
     int64_t route_tile_m, mfq_tensor_backend::Tensor out,
     mfq_tensor_backend::Tensor ids_dst,
     mfq_tensor_backend::Tensor expert_bounds, mfq_tensor_backend::Tensor tile_bounds,
-    mfq_tensor_backend::Tensor tile_experts, bool nvq23_only,
+    mfq_tensor_backend::Tensor tile_experts, int64_t format_group,
     bool masked_experts);
 mfq_tensor_backend::Tensor nvq_moe_grouped_matmul_hetero_ws_cuda(
     mfq_tensor_backend::Tensor weight_ptrs, mfq_tensor_backend::Tensor weight_sizes,
@@ -7020,6 +7020,40 @@ struct MixedMoeActivationKeyHash {
     }
 };
 
+enum class MixedNvqF16FormatGroup : int {
+    All = 0,
+    Standard = 1,
+    Extended = 2,
+    Legacy = 3,
+};
+
+static MixedNvqF16FormatGroup mixed_nvq_f16_format_group(int format) {
+    switch (format) {
+        case 2:
+        case 3:
+        case 4:
+        case 5:
+        case 6:
+        case 10:
+        case 11:
+            return MixedNvqF16FormatGroup::Standard;
+        case 12:
+        case 13:
+        case 14:
+        case 15:
+        case 16:
+        case 17:
+            return MixedNvqF16FormatGroup::Extended;
+        case 1:
+        case 7:
+        case 8:
+        case 9:
+            return MixedNvqF16FormatGroup::Legacy;
+        default:
+            return MixedNvqF16FormatGroup::All;
+    }
+}
+
 struct MixedNvqDispatch {
     mfq_tensor_backend::Tensor weight_ptrs;
     mfq_tensor_backend::Tensor weight_sizes;
@@ -7027,7 +7061,8 @@ struct MixedNvqDispatch {
     mfq_tensor_backend::Tensor expert_pool;
     mfq_tensor_backend::Tensor expert_local;
     int pool_count = 0;
-    bool nvq23_only = false;
+    MixedNvqF16FormatGroup f16_format_group =
+        MixedNvqF16FormatGroup::All;
     bool masked_experts = false;
 };
 
@@ -7214,7 +7249,7 @@ struct MixedMoeRuntime {
                 nvq_tile_m, output,
                 route.ids_dst, route.expert_bounds,
                 nvq_tile_bounds, nvq_tile_experts,
-                nvq_dispatch->nvq23_only,
+                static_cast<int>(nvq_dispatch->f16_format_group),
                 nvq_dispatch->masked_experts);
         }
 
@@ -7661,7 +7696,9 @@ static void initialize_mixed_nvq_dispatch(
         mfq_tensor_backend::kCUDA, mfq_current_cuda_device());
     int dispatch_pool = 0;
     int owned_experts = 0;
-    bool nvq23_only = true;
+    MixedNvqF16FormatGroup f16_format_group =
+        MixedNvqF16FormatGroup::All;
+    bool first_nvq_format = true;
     for (const auto & pool : runtime.pools) {
         if (pool.family != MixedMoeFamily::Nvq) continue;
         const auto & weight = pool.nvq;
@@ -7699,11 +7736,13 @@ static void initialize_mixed_nvq_dispatch(
         weight_sizes.push_back(weight.aux_packed.numel());
         weight_sizes.push_back(weight.sub_scale_packed.numel());
         const int format = static_cast<int>(weight.kernel_format);
-        // Standard 256-entry NVQ2/NVQ3 families use formats 2..6 and
-        // 10..11 after the optional execution-metadata repacks.
-        nvq23_only = nvq23_only &&
-            (format == 2 || format == 3 || format == 4 ||
-             format == 5 || format == 6 || format == 10 || format == 11);
+        const auto pool_format_group = mixed_nvq_f16_format_group(format);
+        if (first_nvq_format) {
+            f16_format_group = pool_format_group;
+            first_nvq_format = false;
+        } else if (f16_format_group != pool_format_group) {
+            f16_format_group = MixedNvqF16FormatGroup::All;
+        }
         const bool d4 =
             format == 3 || format == 10 || format == 11 ||
             format == 12 || format == 15 || format == 17;
@@ -7738,7 +7777,7 @@ static void initialize_mixed_nvq_dispatch(
 
     auto dispatch = std::make_shared<MixedNvqDispatch>();
     dispatch->pool_count = dispatch_pool;
-    dispatch->nvq23_only = nvq23_only;
+    dispatch->f16_format_group = f16_format_group;
     dispatch->masked_experts = owned_experts < runtime.n_experts;
     dispatch->weight_ptrs = mfq_tensor_backend::from_blob(
         weight_ptrs.data(), {dispatch_pool, 5},

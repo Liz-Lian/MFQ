@@ -367,7 +367,8 @@ mfq_tensor_backend::Tensor nvq_moe_grouped_matmul_hetero_f16_cuda(
     int64_t route_tile_m, mfq_tensor_backend::Tensor out,
     mfq_tensor_backend::Tensor ids_dst,
     mfq_tensor_backend::Tensor expert_bounds, mfq_tensor_backend::Tensor tile_bounds,
-    mfq_tensor_backend::Tensor tile_experts, bool masked_experts);
+    mfq_tensor_backend::Tensor tile_experts, bool nvq23_only,
+    bool masked_experts);
 mfq_tensor_backend::Tensor nvq_moe_grouped_matmul_hetero_ws_cuda(
     mfq_tensor_backend::Tensor weight_ptrs, mfq_tensor_backend::Tensor weight_sizes,
     mfq_tensor_backend::Tensor pool_params, mfq_tensor_backend::Tensor expert_pool,
@@ -7026,6 +7027,7 @@ struct MixedNvqDispatch {
     mfq_tensor_backend::Tensor expert_pool;
     mfq_tensor_backend::Tensor expert_local;
     int pool_count = 0;
+    bool nvq23_only = false;
     bool masked_experts = false;
 };
 
@@ -7212,6 +7214,7 @@ struct MixedMoeRuntime {
                 nvq_tile_m, output,
                 route.ids_dst, route.expert_bounds,
                 nvq_tile_bounds, nvq_tile_experts,
+                nvq_dispatch->nvq23_only,
                 nvq_dispatch->masked_experts);
         }
 
@@ -7658,6 +7661,7 @@ static void initialize_mixed_nvq_dispatch(
         mfq_tensor_backend::kCUDA, mfq_current_cuda_device());
     int dispatch_pool = 0;
     int owned_experts = 0;
+    bool nvq23_only = true;
     for (const auto & pool : runtime.pools) {
         if (pool.family != MixedMoeFamily::Nvq) continue;
         const auto & weight = pool.nvq;
@@ -7695,6 +7699,10 @@ static void initialize_mixed_nvq_dispatch(
         weight_sizes.push_back(weight.aux_packed.numel());
         weight_sizes.push_back(weight.sub_scale_packed.numel());
         const int format = static_cast<int>(weight.kernel_format);
+        // Plain NVQ2 is repacked to format 4 unless execution repacking is
+        // disabled; NVQ3 remains format 3.
+        nvq23_only = nvq23_only &&
+            (format == 2 || format == 3 || format == 4);
         const bool d4 =
             format == 3 || format == 10 || format == 11 ||
             format == 12 || format == 15 || format == 17;
@@ -7729,6 +7737,7 @@ static void initialize_mixed_nvq_dispatch(
 
     auto dispatch = std::make_shared<MixedNvqDispatch>();
     dispatch->pool_count = dispatch_pool;
+    dispatch->nvq23_only = nvq23_only;
     dispatch->masked_experts = owned_experts < runtime.n_experts;
     dispatch->weight_ptrs = mfq_tensor_backend::from_blob(
         weight_ptrs.data(), {dispatch_pool, 5},

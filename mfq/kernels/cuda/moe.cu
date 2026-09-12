@@ -5280,6 +5280,15 @@ static mfq_tensor_backend::Tensor nint_moe_grouped_matmul_hetero_f16_impl(
     const int64_t max_tasks = max_tiles * ntiles_n;
     int block_cap = forced_block_cap != 0 ? forced_block_cap :
         (pairs >= 32768 ? 8192 : 4096);
+    if (forced_block_cap == 0) {
+        // Retain task reuse without leaving long grid strides on large routes.
+        const int64_t useful_tiles =
+            (pairs + tile_m - 1) / tile_m;
+        const int64_t useful_tasks = useful_tiles * ntiles_n;
+        const int scaled_block_cap = static_cast<int>(
+            std::min<int64_t>(INT_MAX, (useful_tasks + 3) / 4));
+        block_cap = std::max(block_cap, scaled_block_cap);
+    }
     if (forced_block_cap == 0 && max_tasks > block_cap) {
         const int average_route_tiles =
             (rows_per_expert + tile_m - 1) / tile_m;

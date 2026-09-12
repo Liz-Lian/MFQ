@@ -5716,8 +5716,10 @@ struct __align__(16) NvqMoeF16SharedStorage {
 
 static_assert(sizeof(NvqMoeF16SharedStorage<64, 128, 4>) <= 48 * 1024);
 static_assert(sizeof(NvqMoeF16SharedStorage<128, 128, 2>) <= 48 * 1024);
+static_assert(sizeof(NvqMoeF16SharedStorage<128, 64, 4>) <= 48 * 1024);
 
-template <bool ASYNC_COPY, int BM, int GROUPS_PER_CHUNK>
+template <bool ASYNC_COPY, int BM, int GROUPS_PER_CHUNK,
+          int THREAD_WARPS>
 __device__ __forceinline__ void nvq_moe_load_activation_tile(
     const __half * x,
     const int32_t * source_rows,
@@ -5729,7 +5731,7 @@ __device__ __forceinline__ void nvq_moe_load_activation_tile(
         NvqMoeF16KLayout<GROUPS_PER_CHUNK>::kStrideK;
     constexpr int kTileK =
         NvqMoeF16KLayout<GROUPS_PER_CHUNK>::kTileK;
-    constexpr int kThreads = (BM == 128 ? 16 : 8) * 32;
+    constexpr int kThreads = THREAD_WARPS * 32;
     constexpr int kVectorWidth = 8;
     static_assert(kTileK % kVectorWidth == 0);
     static_assert(kThreads % BM == 0);
@@ -5770,7 +5772,7 @@ __device__ __forceinline__ void nvq_moe_load_activation_tile(
 }
 
 template <int FORMAT, int BM, int BN, int GROUPS_PER_CHUNK,
-          bool ASYNC_ACTIVATION = false>
+          int THREAD_WARPS, bool ASYNC_ACTIVATION = false>
 __device__ __forceinline__ void nvq_moe_grouped_f16_task(
     const uint8_t * indices,
     int64_t indices_nbytes,
@@ -5815,9 +5817,10 @@ __device__ __forceinline__ void nvq_moe_grouped_f16_task(
     static_assert(GROUPS_PER_CHUNK == 2 || GROUPS_PER_CHUNK == 4);
     constexpr int kMFragments = BM / 16;
     constexpr int kNFragments = BN / 16;
-    constexpr int kWarps = BM == 128 ? 16 : 8;
+    constexpr int kWarps = THREAD_WARPS;
     constexpr int kComputeWarps = BM == 128
         ? 2 * kNFragments : kNFragments;
+    static_assert(kWarps >= kComputeWarps);
     constexpr int kAccumulatorFragments = BM == 128
         ? kMFragments / 2 : kMFragments;
     constexpr int kThreads = kWarps * 32;
@@ -5846,7 +5849,8 @@ __device__ __forceinline__ void nvq_moe_grouped_f16_task(
         const int group_base = chunk * GROUPS_PER_CHUNK;
         const int k_base = group_base * kGroupSize;
         if constexpr (ASYNC_ACTIVATION) {
-            nvq_moe_load_activation_tile<true, BM, GROUPS_PER_CHUNK>(
+            nvq_moe_load_activation_tile<
+                true, BM, GROUPS_PER_CHUNK, THREAD_WARPS>(
                 x, source_rows, activation_tile, k_base, K, tid);
             mfq::cuda_detail::copy_async_commit();
         }
@@ -5958,7 +5962,8 @@ __device__ __forceinline__ void nvq_moe_grouped_f16_task(
         if constexpr (ASYNC_ACTIVATION) {
             mfq::cuda_detail::copy_async_wait();
         } else {
-            nvq_moe_load_activation_tile<false, BM, GROUPS_PER_CHUNK>(
+            nvq_moe_load_activation_tile<
+                false, BM, GROUPS_PER_CHUNK, THREAD_WARPS>(
                 x, source_rows, activation_tile, k_base, K, tid);
         }
         __syncthreads();
@@ -6118,7 +6123,9 @@ __global__ void __launch_bounds__(256, 1) nvq_moe_grouped_f16_kernel(
         const int first = expert_bounds[expert] + local_fine_tile * 8;
         const int last = min(
             first + BM, expert_bounds[expert + 1]);
-        nvq_moe_grouped_f16_task<FORMAT, BM, BN, GROUPS_PER_CHUNK>(
+        nvq_moe_grouped_f16_task<
+            FORMAT, BM, BN, GROUPS_PER_CHUNK,
+            (BM == 128 ? 16 : 8)>(
             indices, indices_nbytes, aux, aux_nbytes,
             sub_scale, sub_scale_nbytes, neuron_scale, codebook,
             x, ids_dst, output, weight_tile,
@@ -6130,9 +6137,11 @@ __global__ void __launch_bounds__(256, 1) nvq_moe_grouped_f16_kernel(
     }
 }
 
-template <int BM, int ROUTE_TILE_M, int GROUPS_PER_CHUNK,
+template <int BM, int BN, int ROUTE_TILE_M, int GROUPS_PER_CHUNK,
           bool ASYNC_ACTIVATION = false>
-__global__ void __launch_bounds__(BM == 128 ? 512 : 256, 1)
+__global__ void __launch_bounds__(
+    (BM == 128 ? 2 : 1) * (BN / 16) * 32,
+    BN == 64 ? 2 : 1)
 nvq_moe_grouped_hetero_f16_kernel(
     const int64_t * weight_ptrs,
     const int64_t * weight_sizes,
@@ -6152,7 +6161,6 @@ nvq_moe_grouped_hetero_f16_kernel(
     int K,
     int max_tiles,
     bool routed_input) {
-    constexpr int BN = kNvqMoeF16HeteroTileN;
     static_assert(BM % ROUTE_TILE_M == 0);
     constexpr int kStrideK =
         NvqMoeF16KLayout<GROUPS_PER_CHUNK>::kStrideK;
@@ -6209,7 +6217,8 @@ nvq_moe_grouped_hetero_f16_kernel(
 #define NVQ_MOE_HETERO_F16_CASE(FORMAT_VALUE)                                  \
         case FORMAT_VALUE:                                                      \
             nvq_moe_grouped_f16_task<                                           \
-                FORMAT_VALUE, BM, BN, GROUPS_PER_CHUNK, ASYNC_ACTIVATION>(      \
+                FORMAT_VALUE, BM, BN, GROUPS_PER_CHUNK,                         \
+                (BM == 128 ? 2 : 1) * (BN / 16), ASYNC_ACTIVATION>(             \
                 indices, sizes[0], aux, sizes[1], sub_scale, sizes[2],          \
                 neuron_scale, codebook, x, ids_dst, output,                     \
                 weight_tile, activation_tile, output_tile,                     \
@@ -6597,20 +6606,35 @@ mfq_tensor_backend::Tensor nvq_moe_grouped_matmul_hetero_f16_cuda(
         : (rows_per_expert <= 32 ? 32 : 64);
     const int max_tiles =
         (pairs + tile_m - 1) / tile_m + static_cast<int>(n_experts);
-    const int ntiles_n =
-        (static_cast<int>(out_per_expert) + kNvqMoeF16HeteroTileN - 1) /
-        kNvqMoeF16HeteroTileN;
     const int base_block_cap = pairs >= 32768 ? 8192 : 4096;
-    int block_cap = base_block_cap;
+    const int64_t route_tiles =
+        (pairs + tile_m - 1) / tile_m;
+    const int narrow_ntiles_n =
+        (static_cast<int>(out_per_expert) + 63) / 64;
+    // Use two smaller resident CTAs only while each useful tile gets its own
+    // CTA; longer routes retain the wider tile's activation reuse.
+    const bool use_narrow_tile = tile_m == 128 &&
+        route_tiles * narrow_ntiles_n <= base_block_cap;
+    const int tile_n = use_narrow_tile
+        ? 64 : kNvqMoeF16HeteroTileN;
+    const int ntiles_n =
+        (static_cast<int>(out_per_expert) + tile_n - 1) / tile_n;
+    const int64_t useful_tiles =
+        (pairs + tile_m - 1) / tile_m;
+    const int64_t useful_tasks = useful_tiles * ntiles_n;
+    int block_cap = std::max(
+        base_block_cap,
+        static_cast<int>(std::min<int64_t>(
+            INT_MAX, (useful_tasks + 3) / 4)));
     const int64_t max_tasks =
         static_cast<int64_t>(max_tiles) * ntiles_n;
-    if (max_tasks > base_block_cap) {
+    if (max_tasks > block_cap) {
         const int average_route_tiles =
             (rows_per_expert + tile_m - 1) / tile_m;
         const int task_period = average_route_tiles * ntiles_n;
         // Rotate CTAs between expert phases when the grid stride would
         // otherwise repeat the same valid/empty task pattern.
-        if (task_period > 1 && base_block_cap % task_period == 0) {
+        if (task_period > 1 && block_cap % task_period == 0) {
             if (masked_experts && tile_m != 8 && task_period >= 64) {
                 block_cap += task_period;
             } else if (tile_m == 8 && base_block_cap == 4096 &&
@@ -6621,22 +6645,24 @@ mfq_tensor_backend::Tensor nvq_moe_grouped_matmul_hetero_f16_cuda(
     }
     const int blocks = static_cast<int>(std::max<int64_t>(
         1, std::min<int64_t>(max_tasks, block_cap)));
-#define NVQ_MOE_HETERO_F16_LAUNCH(BM_VALUE, ROUTE_VALUE, GROUP_VALUE)           \
+#define NVQ_MOE_HETERO_F16_LAUNCH(                                             \
+    BM_VALUE, BN_VALUE, ROUTE_VALUE, GROUP_VALUE)                              \
     do {                                                                         \
         constexpr int kSharedBytes = sizeof(NvqMoeF16SharedStorage<             \
-            BM_VALUE, kNvqMoeF16HeteroTileN, GROUP_VALUE>);                     \
+            BM_VALUE, BN_VALUE, GROUP_VALUE>);                                  \
         if constexpr (kSharedBytes > 48 * 1024) {                               \
             static const cudaError_t attribute_status = cudaFuncSetAttribute(   \
                 nvq_moe_grouped_hetero_f16_kernel<                              \
-                    BM_VALUE, ROUTE_VALUE, GROUP_VALUE, true>,                  \
+                    BM_VALUE, BN_VALUE, ROUTE_VALUE, GROUP_VALUE, true>,        \
                 cudaFuncAttributeMaxDynamicSharedMemorySize, kSharedBytes);     \
             MFQ_RUNTIME_CHECK(                                                   \
                 attribute_status == cudaSuccess,                                \
                 "failed to opt in to the NVQ MoE shared-memory size");          \
         }                                                                        \
         nvq_moe_grouped_hetero_f16_kernel<                                      \
-            BM_VALUE, ROUTE_VALUE, GROUP_VALUE, true><<<                        \
-            blocks, dim3(32, BM_VALUE == 128 ? 16 : 8), kSharedBytes,           \
+            BM_VALUE, BN_VALUE, ROUTE_VALUE, GROUP_VALUE, true><<<              \
+            blocks, dim3(32, (BM_VALUE == 128 ? 2 : 1) *                       \
+                (BN_VALUE / 16)), kSharedBytes,                                 \
             mfq_current_cuda_stream()>>>(                                       \
         weight_ptrs.data_ptr<int64_t>(), weight_sizes.data_ptr<int64_t>(),      \
         pool_params.data_ptr<int32_t>(), expert_pool.data_ptr<int32_t>(),       \
@@ -6649,16 +6675,18 @@ mfq_tensor_backend::Tensor nvq_moe_grouped_matmul_hetero_f16_cuda(
         static_cast<int>(out_per_expert), static_cast<int>(neuron_len),        \
         max_tiles, routed_input);                                                \
     } while (false)
-    if (tile_m == 128) {
-        NVQ_MOE_HETERO_F16_LAUNCH(128, 128, 4);
+    if (tile_m == 128 && use_narrow_tile) {
+        NVQ_MOE_HETERO_F16_LAUNCH(128, 64, 128, 4);
+    } else if (tile_m == 128) {
+        NVQ_MOE_HETERO_F16_LAUNCH(128, 128, 128, 4);
     } else if (tile_m == 64) {
-        NVQ_MOE_HETERO_F16_LAUNCH(128, 64, 4);
+        NVQ_MOE_HETERO_F16_LAUNCH(128, 128, 64, 4);
     } else if (fine_bm == 16) {
-        NVQ_MOE_HETERO_F16_LAUNCH(16, 8, 4);
+        NVQ_MOE_HETERO_F16_LAUNCH(16, 128, 8, 4);
     } else if (fine_bm == 32) {
-        NVQ_MOE_HETERO_F16_LAUNCH(32, 8, 4);
+        NVQ_MOE_HETERO_F16_LAUNCH(32, 128, 8, 4);
     } else {
-        NVQ_MOE_HETERO_F16_LAUNCH(64, 8, 4);
+        NVQ_MOE_HETERO_F16_LAUNCH(64, 128, 8, 4);
     }
 #undef NVQ_MOE_HETERO_F16_LAUNCH
     MFQ_CUDA_KERNEL_LAUNCH_CHECK();

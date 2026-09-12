@@ -5971,26 +5971,28 @@ __device__ __forceinline__ void nvq_moe_grouped_f16_task(
             for (int k_local = 0;
                  k_local < kTileK;
                  k_local += 16) {
-                FragmentB weight_fragment;
-                wmma::load_matrix_sync(
-                    weight_fragment,
-                    weight_tile + warp_n * 16 * kStrideK + k_local,
-                    kStrideK);
-#pragma unroll
-                for (int fragment = 0;
-                     fragment < kAccumulatorFragments;
-                     ++fragment) {
-                    const int m_fragment = m_fragment_base +
-                        fragment * (BM == 128 ? 2 : 1);
-                    FragmentA activation_fragment;
+                if (BM < 64 || k_base + k_local < K) {
+                    FragmentB weight_fragment;
                     wmma::load_matrix_sync(
-                        activation_fragment,
-                        activation_tile +
-                            m_fragment * 16 * kStrideK + k_local,
+                        weight_fragment,
+                        weight_tile + warp_n * 16 * kStrideK + k_local,
                         kStrideK);
-                    wmma::mma_sync(
-                        accumulators[fragment], activation_fragment,
-                        weight_fragment, accumulators[fragment]);
+#pragma unroll
+                    for (int fragment = 0;
+                         fragment < kAccumulatorFragments;
+                         ++fragment) {
+                        const int m_fragment = m_fragment_base +
+                            fragment * (BM == 128 ? 2 : 1);
+                        FragmentA activation_fragment;
+                        wmma::load_matrix_sync(
+                            activation_fragment,
+                            activation_tile +
+                                m_fragment * 16 * kStrideK + k_local,
+                            kStrideK);
+                        wmma::mma_sync(
+                            accumulators[fragment], activation_fragment,
+                            weight_fragment, accumulators[fragment]);
+                    }
                 }
             }
         }

@@ -14,6 +14,7 @@ from mfq.kernels.cuda.activation import silu_mul
 def _hetero_profile_code(bits: int, gs: int) -> int:
     return {
         (2, 16): 6,
+        (3, 24): 5,
         (4, 24): 0,
         (5, 28): 1,
         (6, 24): 2,

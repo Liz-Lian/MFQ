@@ -3197,7 +3197,7 @@ __device__ __forceinline__ void nint_moe_mma_profile(
     constexpr int ACCS_PER_WARP = (MTILES + 1) / 2;
     constexpr int QBYTES = (GS * BITS + 7) / 8;
     static_assert(BK % 16 == 0 && BK <= kMoeMmaBkStride<BM>);
-    static_assert(BM == 16 || BM == 32 || BM == 64);
+    static_assert(BM == 16 || BM == 32 || BM == 64 || BM == 128);
 
     const int lane = threadIdx.x;
     const int warp = threadIdx.y;
@@ -3349,7 +3349,7 @@ __device__ __forceinline__ void nint_moe_mma_profile(
         __syncthreads();
     }
 
-    if constexpr (BM == 64) {
+    if constexpr (BM >= 64) {
         if (tid < BM) {
             const int compact = first + tid;
             source_rows_s[tid] = compact < last ? ids_dst[compact] : -1;
@@ -3377,7 +3377,7 @@ __device__ __forceinline__ void nint_moe_mma_profile(
                 const int gn = gn0 + c;
                 if (compact < last && gn < out_per_expert) {
                     int pair;
-                    if constexpr (BM == 64) {
+                    if constexpr (BM >= 64) {
                         pair = source_rows_s[mi * 16 + r];
                     } else {
                         pair = ids_dst[compact];
@@ -3611,7 +3611,8 @@ __global__ void __launch_bounds__(256, 1) nint8_zero_moe_mma_kernel(
 
 template <int BM, bool COARSE_TILES = false,
           bool ASYNC_ACTIVATION = false>
-__global__ void __launch_bounds__(256, BM >= 32 ? 3 : 1) nint_moe_hetero_mma_kernel(
+__global__ void __launch_bounds__(256, BM == 128 ? 1 : (BM >= 32 ? 3 : 1))
+nint_moe_hetero_mma_kernel(
         const int64_t * __restrict__ weight_ptrs,
         const int32_t * __restrict__ pool_params,
         const int32_t * __restrict__ expert_pool,
@@ -5191,8 +5192,8 @@ static mfq_tensor_backend::Tensor nint_moe_grouped_matmul_hetero_f16_impl(
         "weight row slice must fit within weight_out_stride");
     MFQ_RUNTIME_CHECK(input_width > 0 && input_width <= INT_MAX, "input_width must be positive");
     MFQ_RUNTIME_CHECK(route_tile_m == kRouteTile || route_tile_m == 16 ||
-        route_tile_m == 32 || route_tile_m == 64,
-        "route_tile_m must be 8, 16, 32, or 64");
+        route_tile_m == 32 || route_tile_m == 64 || route_tile_m == 128,
+        "route_tile_m must be 8, 16, 32, 64, or 128");
     MFQ_RUNTIME_CHECK(weight_ptrs.is_cuda() && weight_ptrs.is_contiguous() &&
         weight_ptrs.scalar_type() == mfq_tensor_backend::kInt64 && weight_ptrs.dim() == 2 &&
         weight_ptrs.size(0) > 0 && weight_ptrs.size(1) == 5,
@@ -5259,7 +5260,8 @@ static mfq_tensor_backend::Tensor nint_moe_grouped_matmul_hetero_f16_impl(
         const char * value = std::getenv("MFQ_MOE_PREFILL_MMA_BM");
         if (value == nullptr) return 0;
         const int parsed = std::atoi(value);
-        return parsed == 16 || parsed == 32 || parsed == 64 ? parsed : 0;
+        return parsed == 16 || parsed == 32 || parsed == 64 || parsed == 128
+            ? parsed : 0;
     }();
     const dim3 threads(32, 8);
     const cudaStream_t stream = mfq_current_cuda_stream();
@@ -5299,7 +5301,7 @@ static mfq_tensor_backend::Tensor nint_moe_grouped_matmul_hetero_f16_impl(
     // Async copies overlap activation fetches with weight unpacking while a
     // CTA handles only a few tasks.  Longer grid-stride loops retain the
     // synchronous path, which benefits more from the repeated L1 accesses.
-    const bool async_activation = bm == 64 &&
+    const bool async_activation = bm >= 64 &&
         max_tasks <= static_cast<int64_t>(blocks) * 5;
 
 #define MFQ_LAUNCH_MOE_MMA(BM_VALUE, COARSE_VALUE, ASYNC_VALUE) \
@@ -5326,17 +5328,29 @@ static mfq_tensor_backend::Tensor nint_moe_grouped_matmul_hetero_f16_impl(
         } else {
             MFQ_LAUNCH_MOE_MMA(32, false, false);
         }
-    } else if (async_activation) {
+    } else if (bm == 64 && async_activation) {
         if (coarse_tiles) {
             MFQ_LAUNCH_MOE_MMA(64, true, true);
         } else {
             MFQ_LAUNCH_MOE_MMA(64, false, true);
         }
-    } else {
+    } else if (bm == 64) {
         if (coarse_tiles) {
             MFQ_LAUNCH_MOE_MMA(64, true, false);
         } else {
             MFQ_LAUNCH_MOE_MMA(64, false, false);
+        }
+    } else if (async_activation) {
+        if (coarse_tiles) {
+            MFQ_LAUNCH_MOE_MMA(128, true, true);
+        } else {
+            MFQ_LAUNCH_MOE_MMA(128, false, true);
+        }
+    } else {
+        if (coarse_tiles) {
+            MFQ_LAUNCH_MOE_MMA(128, true, false);
+        } else {
+            MFQ_LAUNCH_MOE_MMA(128, false, false);
         }
     }
 #undef MFQ_LAUNCH_MOE_MMA

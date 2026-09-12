@@ -221,6 +221,65 @@ def test_expertwise_nint_grouped_down_input_matches_reference():
     assert relative < 0.025, f"relative={relative}"
 
 
+def test_expertwise_nint_wide_mma_matches_64_row_tiles():
+    torch.manual_seed(45128)
+    rng = np.random.default_rng(45128)
+    specs = (
+        NintSpec(2, 16, 5),
+        NintSpec(3, 24, 5),
+        NintSpec(4, 24, 6),
+        NintSpec(5, 28, 6),
+        NintSpec(6, 24, 7),
+        NintSpec(8, 48, 7),
+    )
+    values = rng.normal(0, 0.05, size=(6, 19, 97)).astype(np.float32)
+    tensor = quantize_expertwise(values, specs)
+    weight = to_gpu(tensor)
+    tokens, routes = 128, 4
+    ids = _ids(tokens, tensor.n_experts, routes)
+    route = MoeRoutePlan.build(ids, tensor.n_experts)
+    x = torch.randn(
+        tokens, tensor.neuron_len, device="cuda", dtype=torch.float16
+    ) * 0.1
+    weight_ptrs, pool_params, expert_pool, expert_local = (
+        weight.hetero_metadata(x.device)
+    )
+
+    def run(bounds, experts, tile_m):
+        out = torch.empty(
+            tokens,
+            routes,
+            tensor.out_per_expert,
+            device="cuda",
+            dtype=torch.float16,
+        )
+        return ext().nint_moe_grouped_matmul_hetero_f16_cuda(
+            weight_ptrs,
+            pool_params,
+            expert_pool,
+            expert_local,
+            x,
+            route.ids,
+            tensor.n_experts,
+            tensor.out_per_expert,
+            tensor.neuron_len,
+            False,
+            out,
+            route.ids_dst,
+            route.expert_bounds,
+            bounds,
+            experts,
+            tile_m,
+        )
+
+    baseline = run(route.mma_tile_bounds, route.mma_tile_experts, 64)
+    wide = run(route.wide_tile_bounds, route.wide_tile_experts, 128)
+    torch.testing.assert_close(wide, baseline, rtol=0, atol=0)
+    expected = _reference(tensor, x, ids)
+    relative = ((wide - expected).float().norm() / expected.float().norm()).item()
+    assert relative < 0.025, f"relative={relative}"
+
+
 @pytest.mark.parametrize("tokens", [1, 2])
 def test_expertwise_nint_heterogeneous_launch_matches_legacy(tokens):
     torch.manual_seed(140 + tokens)

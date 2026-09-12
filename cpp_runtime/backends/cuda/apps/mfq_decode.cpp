@@ -3921,6 +3921,17 @@ struct MoeRoutePlan {
         host_unique_experts;
 };
 
+static bool use_wide_nint_mma_tiles(
+        const MoeRoutePlan & route,
+        int tokens,
+        int routes,
+        int experts) {
+    const int routed_rows_per_expert = std::max(
+        1, (tokens * routes + experts - 1) / experts);
+    return routed_rows_per_expert > 64 &&
+        route.wide_tile_m == 128;
+}
+
 static std::atomic<uint64_t> g_moe_route_generation{1};
 
 static mfq_tensor_backend::Tensor tensor_to_cuda_device(
@@ -4334,6 +4345,14 @@ struct NintMoeWeight {
             : mfq_tensor_backend::empty(
                 {tokens, routes, out_per_expert},
                 x.options().dtype(mfq_tensor_backend::kFloat16));
+        const bool use_wide_tiles = use_wide_nint_mma_tiles(
+            route, tokens, routes, n_experts);
+        const auto & prefill_tile_bounds = use_wide_tiles
+            ? route.wide_tile_bounds : route.mma_tile_bounds;
+        const auto & prefill_tile_experts = use_wide_tiles
+            ? route.wide_tile_experts : route.mma_tile_experts;
+        const int prefill_tile_m = use_wide_tiles
+            ? route.wide_tile_m : route.mma_tile_m;
         if (g_kl_mmq_mode != KlMmqMode::Default) {
             MFQ_RUNTIME_CHECK(
                 hetero_supported && route.map_ready &&
@@ -4345,8 +4364,8 @@ struct NintMoeWeight {
                 weight_ptrs, pool_params, expert_pool, expert_local,
                 prepared, route.ids, n_experts, out_per_expert,
                 neuron_len, x.dim() == 3, output, route.ids_dst,
-                route.expert_bounds, route.mma_tile_bounds,
-                route.mma_tile_experts, route.mma_tile_m);
+                route.expert_bounds, prefill_tile_bounds,
+                prefill_tile_experts, prefill_tile_m);
         }
         if (!moe_prefill_mma_disabled_by_env() &&
                 !g_force_moe_prefill_mma_off && hetero_supported &&
@@ -4355,8 +4374,8 @@ struct NintMoeWeight {
             return nint_moe_grouped_matmul_hetero_f16_cuda(
                 weight_ptrs, pool_params, expert_pool, expert_local, x, route.ids,
                 n_experts, out_per_expert, neuron_len, x.dim() == 3, output,
-                route.ids_dst, route.expert_bounds, route.mma_tile_bounds,
-                route.mma_tile_experts, route.mma_tile_m);
+                route.ids_dst, route.expert_bounds, prefill_tile_bounds,
+                prefill_tile_experts, prefill_tile_m);
         }
         if (hetero_supported && moe_small_hetero_enabled(tokens) &&
                 hetero_workspaces.find(input_rows) == hetero_workspaces.end()) {
@@ -7151,6 +7170,8 @@ struct MixedMoeRuntime {
         }
 
         if (use_nint_prefill) {
+            const bool use_wide_nint_tiles = use_wide_nint_mma_tiles(
+                route, tokens, routes, n_experts);
             nint_moe_grouped_matmul_hetero_masked_f16_cuda(
                 nint_dispatch->weight_ptrs,
                 nint_dispatch->pool_params,
@@ -7159,8 +7180,12 @@ struct MixedMoeRuntime {
                 x, route.ids, n_experts, out_per_expert,
                 neuron_len, x.dim() == 3, output,
                 route.ids_dst, route.expert_bounds,
-                route.mma_tile_bounds, route.mma_tile_experts,
-                route.mma_tile_m);
+                use_wide_nint_tiles
+                    ? route.wide_tile_bounds : route.mma_tile_bounds,
+                use_wide_nint_tiles
+                    ? route.wide_tile_experts : route.mma_tile_experts,
+                use_wide_nint_tiles
+                    ? route.wide_tile_m : route.mma_tile_m);
         } else if (use_nint_decode) {
             output = input_prequantized
                 ? nint_dispatch->forward_prequantized(x, route)

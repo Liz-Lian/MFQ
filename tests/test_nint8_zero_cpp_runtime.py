@@ -24,15 +24,14 @@ from mfq.quantize.nint_quant import quantize  # noqa: E402
 
 
 def _executable() -> Path:
-    path = (
-        Path(__file__).resolve().parents[1]
-        / "build"
-        / "cpp_runtime"
-        / "mfq-decode.exe"
-    )
-    if not path.exists():
-        pytest.skip("C++ runtime is not built")
-    return path
+    root = Path(__file__).resolve().parents[1]
+    for path in (
+        root / "build" / "cpp_runtime" / "mfq-decode.exe",
+        root / "build" / "cuda-native" / "mfq-decode.exe",
+    ):
+        if path.exists():
+            return path
+    pytest.skip("C++ runtime is not built")
 
 
 def _runtime_env(executable: Path) -> dict[str, str]:
@@ -137,7 +136,7 @@ def test_cpp_tensor_overlay_replaces_base_record(tmp_path):
     assert "dtype=NINT8-0" in completed.stdout
 
 
-@pytest.mark.parametrize("tokens", (1, 13, 80, 512))
+@pytest.mark.parametrize("tokens", (1, 13, 80, 512, 4096))
 def test_cpp_nint8_zero_moe_paths_match_dense_reference(tmp_path, tokens):
     executable = _executable()
     experts, rows, neuron_len, routes = 4, 5, 96, 2

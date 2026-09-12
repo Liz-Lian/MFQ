@@ -623,6 +623,7 @@ def _grouped_matmul_mixed(
                 route.expert_bounds,
                 route.tile_bounds,
                 route.tile_experts,
+                8,
             )
         elif pool.family == "nvq":
             nvq_grouped_matmul_pool(

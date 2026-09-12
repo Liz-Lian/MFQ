@@ -142,7 +142,7 @@ torch::Tensor nint8_zero_moe_grouped_matmul_pool_ws_cuda(
     torch::Tensor qx, torch::Tensor xscale, torch::Tensor counts,
     torch::Tensor cursors, torch::Tensor ids_dst,
     torch::Tensor expert_bounds, torch::Tensor tile_bounds,
-    torch::Tensor tile_experts);
+    torch::Tensor tile_experts, int64_t route_tile_m);
 torch::Tensor moe_weighted_reduce_cuda(torch::Tensor pair_output, torch::Tensor weights);
 torch::Tensor moe_swiglu_split_cuda(torch::Tensor gate_up);
 torch::Tensor moe_geglu_split_cuda(torch::Tensor gate_up);

@@ -3557,7 +3557,7 @@ __device__ __forceinline__ void nint8_zero_moe_mma_profile(
     }
 }
 
-template <int BM>
+template <int BM, bool COARSE_TILES = false>
 __global__ void __launch_bounds__(256, 1) nint8_zero_moe_mma_kernel(
         const uint8_t * __restrict__ q,
         const __half * __restrict__ scale,
@@ -3581,22 +3581,25 @@ __global__ void __launch_bounds__(256, 1) nint8_zero_moe_mma_kernel(
     __shared__ float C_s[8][16][16];
 
     const int ntiles_n = (out_per_expert + kMoeMmaBn - 1) / kMoeMmaBn;
-    const int total_fine_tiles = tile_bounds[experts];
-    const int64_t total_tasks = static_cast<int64_t>(total_fine_tiles) * ntiles_n;
+    const int total_tiles = tile_bounds[experts];
+    const int64_t total_tasks = static_cast<int64_t>(total_tiles) * ntiles_n;
     for (int64_t task = blockIdx.x; task < total_tasks; task += gridDim.x) {
-        const int fine_tile = static_cast<int>(task / ntiles_n);
+        const int tile = static_cast<int>(task / ntiles_n);
         const int ntile =
-            static_cast<int>(task - static_cast<int64_t>(fine_tile) * ntiles_n);
-        const int expert = tile_experts[fine_tile];
-        const int local_fine_tile = fine_tile - tile_bounds[expert];
-        if (local_fine_tile % fine_tiles_per_mma != 0) {
-            continue;
+            static_cast<int>(task - static_cast<int64_t>(tile) * ntiles_n);
+        const int expert = tile_experts[tile];
+        const int local_tile = tile - tile_bounds[expert];
+        if constexpr (!COARSE_TILES) {
+            if (local_tile % fine_tiles_per_mma != 0) {
+                continue;
+            }
         }
         const int local_expert = expert_local[expert];
         if (local_expert < 0) {
             continue;
         }
-        const int first = expert_bounds[expert] + local_fine_tile * kRouteTile;
+        const int first = expert_bounds[expert] + local_tile *
+            (COARSE_TILES ? BM : kRouteTile);
         const int last = min(first + BM, expert_bounds[expert + 1]);
         const int n0 = ntile * kMoeMmaBn;
         nint8_zero_moe_mma_profile<groups_per_chunk, BM>(
@@ -4164,16 +4167,20 @@ void launch_nint8_zero_moe_mma(
         int groups,
         int k_real,
         bool routed_input,
+        int route_tile_m,
         cudaStream_t stream) {
     const int ntiles_n =
         (out_per_expert + kMoeMmaBn - 1) / kMoeMmaBn;
     const int pairs = tokens * routes;
-    const int64_t max_fine_tiles =
-        (pairs + kRouteTile - 1) / kRouteTile + experts;
-    const int64_t max_tasks = max_fine_tiles * ntiles_n;
+    MFQ_RUNTIME_CHECK(route_tile_m == kRouteTile || route_tile_m == 16 ||
+        route_tile_m == 32 || route_tile_m == 64,
+        "NINT8-0 route tile must be 8, 16, 32, or 64");
+    const int64_t max_tiles =
+        (pairs + route_tile_m - 1) / route_tile_m + experts;
+    const int64_t max_tasks = max_tiles * ntiles_n;
     static const int block_cap = [] {
         const char * value = std::getenv("MFQ_MOE_PREFILL_MMA_BLOCKS");
-        return value == nullptr ? 4096 : std::max(1, std::atoi(value));
+        return value == nullptr ? 0 : std::max(1, std::atoi(value));
     }();
     static const int forced_bm = [] {
         const char * value = std::getenv("MFQ_MOE_PREFILL_MMA_BM");
@@ -4181,13 +4188,22 @@ void launch_nint8_zero_moe_mma(
         const int parsed = std::atoi(value);
         return parsed == 16 || parsed == 32 || parsed == 64 ? parsed : 0;
     }();
-    const int blocks = static_cast<int>(
-        std::max<int64_t>(1, std::min<int64_t>(block_cap, max_tasks)));
+    const int effective_block_cap = block_cap != 0 ? block_cap :
+        (pairs >= 32768 ? 12288 : 4096);
+    const int blocks = static_cast<int>(std::max<int64_t>(
+        1, std::min<int64_t>(effective_block_cap, max_tasks)));
     const dim3 threads(32, 8);
-    const int bm = forced_bm != 0 ? forced_bm :
-        (tokens <= 128 ? 64 : (tokens <= 512 ? 32 : 64));
-#define MFQ_Q8_ZERO_MOE_MMA(BM_VALUE) \
-    nint8_zero_moe_mma_kernel<BM_VALUE><<<blocks, threads, 0, stream>>>( \
+    const int rows_per_expert = std::max(
+        1, (pairs + experts - 1) / experts);
+    const int bm = route_tile_m != kRouteTile ? route_tile_m :
+        (forced_bm != 0 ? forced_bm :
+            (rows_per_expert <= 16 ? 16 :
+             rows_per_expert <= 32 ? 32 : 64));
+    const bool coarse_tiles = route_tile_m == bm;
+    MFQ_RUNTIME_CHECK(route_tile_m == kRouteTile || coarse_tiles,
+        "coarse NINT8-0 route tile must match the MMA row tile");
+#define MFQ_Q8_ZERO_MOE_MMA(BM_VALUE, COARSE_VALUE) \
+    nint8_zero_moe_mma_kernel<BM_VALUE, COARSE_VALUE><<<blocks, threads, 0, stream>>>( \
         q.data_ptr<uint8_t>(), \
         reinterpret_cast<const __half *>(scale.data_ptr<mfq_half>()), \
         expert_local.data_ptr<int32_t>(), \
@@ -4197,11 +4213,14 @@ void launch_nint8_zero_moe_mma(
         reinterpret_cast<__half *>(out.data_ptr<mfq_half>()), routes, experts, \
         out_per_expert, groups, k_real, routed_input)
     if (bm == 16) {
-        MFQ_Q8_ZERO_MOE_MMA(16);
+        if (coarse_tiles) MFQ_Q8_ZERO_MOE_MMA(16, true);
+        else MFQ_Q8_ZERO_MOE_MMA(16, false);
     } else if (bm == 32) {
-        MFQ_Q8_ZERO_MOE_MMA(32);
+        if (coarse_tiles) MFQ_Q8_ZERO_MOE_MMA(32, true);
+        else MFQ_Q8_ZERO_MOE_MMA(32, false);
     } else {
-        MFQ_Q8_ZERO_MOE_MMA(64);
+        if (coarse_tiles) MFQ_Q8_ZERO_MOE_MMA(64, true);
+        else MFQ_Q8_ZERO_MOE_MMA(64, false);
     }
 #undef MFQ_Q8_ZERO_MOE_MMA
 }
@@ -5734,7 +5753,8 @@ mfq_tensor_backend::Tensor nint8_zero_moe_grouped_matmul_pool_ws_cuda(
         mfq_tensor_backend::Tensor ids_dst,
         mfq_tensor_backend::Tensor expert_bounds,
         mfq_tensor_backend::Tensor tile_bounds,
-        mfq_tensor_backend::Tensor tile_experts) {
+        mfq_tensor_backend::Tensor tile_experts,
+        int64_t route_tile_m) {
     MFQ_RUNTIME_CHECK(
         n_experts > 0 && n_experts <= 4096,
         "n_experts must be in [1, 4096]");
@@ -5839,7 +5859,7 @@ mfq_tensor_backend::Tensor nint8_zero_moe_grouped_matmul_pool_ws_cuda(
         launch_nint8_zero_moe_mma(
             q, scale, expert_local, x, ids_dst, expert_bounds, tile_bounds,
             tile_experts, out, tokens, routes, experts, output_width, groups,
-            input_width, routed_input, stream);
+            input_width, routed_input, static_cast<int>(route_tile_m), stream);
         MFQ_CUDA_KERNEL_LAUNCH_CHECK();
         return out;
     }

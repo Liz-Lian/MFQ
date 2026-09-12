@@ -340,7 +340,8 @@ mfq_tensor_backend::Tensor nint8_zero_moe_grouped_matmul_pool_ws_cuda(
     bool input_quantized, bool use_f16_mma, mfq_tensor_backend::Tensor out, mfq_tensor_backend::Tensor qx,
     mfq_tensor_backend::Tensor xscale, mfq_tensor_backend::Tensor counts, mfq_tensor_backend::Tensor cursors,
     mfq_tensor_backend::Tensor ids_dst, mfq_tensor_backend::Tensor expert_bounds,
-    mfq_tensor_backend::Tensor tile_bounds, mfq_tensor_backend::Tensor tile_experts);
+    mfq_tensor_backend::Tensor tile_bounds, mfq_tensor_backend::Tensor tile_experts,
+    int64_t route_tile_m);
 mfq_tensor_backend::Tensor nvq_moe_grouped_matmul_pool_ws_cuda(
     mfq_tensor_backend::Tensor indices, mfq_tensor_backend::Tensor aux, mfq_tensor_backend::Tensor sub_scale,
     mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor codebook, mfq_tensor_backend::Tensor x,
@@ -1178,6 +1179,23 @@ static bool g_force_moe_pool_path = false;
 static bool g_force_moe_unfused_reduce = false;
 static bool g_force_moe_materialized_swiglu = false;
 static bool g_force_moe_prefill_mma_off = false;
+
+static bool moe_prefill_mma_disabled_by_env() {
+    static const bool disabled = [] {
+        const char * value = std::getenv("MFQ_DISABLE_MOE_PREFILL_MMA");
+        return value != nullptr && std::atoi(value) != 0;
+    }();
+    return disabled;
+}
+
+static int moe_prefill_mma_min_tokens() {
+    static const int minimum = [] {
+        const char * value = std::getenv("MFQ_MOE_PREFILL_MMA_MIN_TOKENS");
+        return value == nullptr ? 9 : std::max(9, std::atoi(value));
+    }();
+    return minimum;
+}
+
 enum class KlMmqMode {
     Default,
     Nint8One,
@@ -4330,16 +4348,9 @@ struct NintMoeWeight {
                 route.expert_bounds, route.mma_tile_bounds,
                 route.mma_tile_experts, route.mma_tile_m);
         }
-        static const bool disable_prefill_mma = [] {
-            const char * value = std::getenv("MFQ_DISABLE_MOE_PREFILL_MMA");
-            return value != nullptr && std::atoi(value) != 0;
-        }();
-        static const int prefill_mma_min_tokens = [] {
-            const char * value = std::getenv("MFQ_MOE_PREFILL_MMA_MIN_TOKENS");
-            return value == nullptr ? 9 : std::max(9, std::atoi(value));
-        }();
-        if (!disable_prefill_mma && !g_force_moe_prefill_mma_off && hetero_supported &&
-                tokens >= prefill_mma_min_tokens &&
+        if (!moe_prefill_mma_disabled_by_env() &&
+                !g_force_moe_prefill_mma_off && hetero_supported &&
+                tokens >= moe_prefill_mma_min_tokens() &&
                 route.map_ready && route.ids_dst.numel() == route.ids.numel()) {
             return nint_moe_grouped_matmul_hetero_f16_cuda(
                 weight_ptrs, pool_params, expert_pool, expert_local, x, route.ids,
@@ -7090,14 +7101,6 @@ struct MixedMoeRuntime {
         prepared_inputs.emplace(identity, x);
         std::unordered_set<
             MixedMoeActivationKey, MixedMoeActivationKeyHash> quantized;
-        static const bool disable_prefill_mma = [] {
-            const char * value = std::getenv("MFQ_DISABLE_MOE_PREFILL_MMA");
-            return value != nullptr && std::atoi(value) != 0;
-        }();
-        static const int prefill_mma_min_tokens = [] {
-            const char * value = std::getenv("MFQ_MOE_PREFILL_MMA_MIN_TOKENS");
-            return value == nullptr ? 256 : std::max(9, std::atoi(value));
-        }();
         static const bool disable_nvq_hetero_decode = [] {
             const char * disabled =
                 std::getenv("MFQ_DISABLE_MOE_NVQ_HETERO_DECODE");
@@ -7114,8 +7117,9 @@ struct MixedMoeRuntime {
                 rows != nullptr || warps != nullptr || shared != nullptr;
         }();
         const bool use_f16_mma =
-            !disable_prefill_mma && !g_force_moe_prefill_mma_off &&
-            tokens >= prefill_mma_min_tokens && route.map_ready &&
+            !moe_prefill_mma_disabled_by_env() &&
+            !g_force_moe_prefill_mma_off &&
+            tokens >= moe_prefill_mma_min_tokens() && route.map_ready &&
             route.ids_dst.numel() == route.ids.numel();
         const bool use_kl_mmq = g_kl_mmq_mode != KlMmqMode::Default;
         const bool use_nint_prefill =
@@ -7398,14 +7402,26 @@ struct MixedMoeRuntime {
                     route.ids_dst, route.expert_bounds, route.tile_bounds,
                     route.tile_experts);
             } else if (pool.family == MixedMoeFamily::Nint8Zero) {
+                const int routed_rows_per_expert = std::max(
+                    1, (tokens * routes + n_experts - 1) / n_experts);
+                const bool use_q8_f16_mma = use_f16_mma &&
+                    (routed_rows_per_expert >= 5 ||
+                     tokens >= n_experts * 4);
+                const bool use_coarse_q8_tiles = use_q8_f16_mma &&
+                    route.mma_tile_m == 64 && routed_rows_per_expert > 32;
                 nint8_zero_moe_grouped_matmul_pool_ws_cuda(
                     pool.q8_zero.q_packed, pool.q8_zero.q8_zero_scale, value,
                     route.ids, pool.expert_local, n_experts,
                     pool.local_experts, out_per_expert, route.map_ready,
-                    input_quantized, use_f16_mma, output,
+                    input_quantized, use_q8_f16_mma, output,
                     qx, xscale,
                     route.counts, route.cursors, route.ids_dst,
-                    route.expert_bounds, route.tile_bounds, route.tile_experts);
+                    route.expert_bounds,
+                    use_coarse_q8_tiles
+                        ? route.mma_tile_bounds : route.tile_bounds,
+                    use_coarse_q8_tiles
+                        ? route.mma_tile_experts : route.tile_experts,
+                    use_coarse_q8_tiles ? route.mma_tile_m : 8);
             } else if (pool.family == MixedMoeFamily::Nvq) {
                 nvq_moe_grouped_matmul_pool_ws_cuda(
                     pool.nvq.indices_packed, pool.nvq.aux_packed,
@@ -7524,7 +7540,8 @@ struct MixedMoeRuntime {
                     pool.local_experts, out_per_expert, route.map_ready,
                     true, false, output, workspace.qx, workspace.xscale,
                     route.counts, route.cursors, route.ids_dst,
-                    route.expert_bounds, route.tile_bounds, route.tile_experts);
+                    route.expert_bounds, route.tile_bounds, route.tile_experts,
+                    8);
             } else {
                 nvq_moe_grouped_matmul_pool_ws_cuda(
                     pool.nvq.indices_packed, pool.nvq.aux_packed,

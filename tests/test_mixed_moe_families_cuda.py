@@ -171,6 +171,7 @@ def test_cpp_runtime_matches_python_for_all_nintm_families(tmp_path, tokens: int
         (
             candidate
             for candidate in (
+                root / "build" / "cuda-native" / "mfq-decode.exe",
                 root / "build" / "cpp_runtime" / "mfq-decode.exe",
                 root / "build" / "cuda-local" / "mfq-decode.exe",
             )

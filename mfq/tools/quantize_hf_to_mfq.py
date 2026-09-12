@@ -109,6 +109,10 @@ from mfq.formats.nint import (
     NINT_V2_Q_SELECTOR_BITS,
     NintSpec,
 )
+from mfq.formats.nint8_zero import (
+    pack_nint8_zero_header,
+    payload_nbytes as nint8_zero_payload_nbytes,
+)
 from mfq.formats.npq0_l import (
     _HEADER as _NPQ0_L_HEADER,
 )
@@ -5066,6 +5070,21 @@ def _write_synthetic_mxfp4_axis0_blob(
     return int(size)
 
 
+def _write_synthetic_nint8_zero_axis0_blob(
+    shape: tuple[int, int],
+    blob_path: Path,
+) -> int:
+    """Write a structurally valid all-zero NINT8-0 matrix for performance tests."""
+
+    rows, columns = (int(value) for value in shape)
+    header = pack_nint8_zero_header((rows, columns), 0, columns)
+    size = nint8_zero_payload_nbytes((rows, columns), 0, columns)
+    with blob_path.open("wb+") as output:
+        output.write(header)
+        output.truncate(size)
+    return int(size)
+
+
 def _write_mixed_moe_axis0_blob(
     source,
     source_shape: tuple[int, ...],
@@ -5251,6 +5270,24 @@ def _write_mixed_moe_axis0_blob(
                         synthetic=synthetic,
                     )
                     runtime_payload = b""
+                elif precision.family == "NINT8-0":
+                    if synthetic:
+                        pool_nbytes = _write_synthetic_nint8_zero_axis0_blob(
+                            (len(expert_ids) * rows_per_expert, columns),
+                            pool_path,
+                        )
+                    else:
+                        from mfq.tools import quantize_gguf_to_mfq as gguf_quantizer
+
+                        pool_nbytes = gguf_quantizer._write_nint8_zero_axis0_blob(
+                            pool_source,
+                            (len(expert_ids) * rows_per_expert, columns),
+                            pool_path,
+                            row_chunk,
+                            quant_backend,
+                            device,
+                        )
+                    runtime_payload = b""
                 elif precision.family == "MXFP4":
                     if synthetic:
                         pool_nbytes = _write_synthetic_mxfp4_axis0_blob(
@@ -5414,6 +5451,10 @@ def _mixed_moe_blob_nbytes(
         runtime_nbytes = 0
         if precision.nint_spec is not None:
             payload_nbytes = _nint_blob_nbytes(rows, columns, precision.nint_spec)
+        elif precision.family == "NINT8-0":
+            payload_nbytes = nint8_zero_payload_nbytes(
+                (rows, columns), 0, columns
+            )
         elif precision.family == "MXFP4":
             payload_nbytes = len(
                 mx_header_bytes(

@@ -243,6 +243,35 @@ def test_mixed_moe_writer_size_and_roundtrip(tmp_path):
     assert io.pack_nint_moe(tensor) == path.read_bytes()
 
 
+def test_mixed_moe_writer_supports_nint8_zero_pool(tmp_path):
+    rng = np.random.default_rng(20260912)
+    shape = (2, 3, 96)
+    weight = rng.normal(0, 0.04, shape).astype(np.float32)
+    precisions = (
+        ExpertPrecision("NINT4", nint_spec=NintSpec(4, 24, 6)),
+        ExpertPrecision("NINT8-0"),
+    )
+    path = tmp_path / "mixed-nint8-zero.blob"
+
+    nbytes = _write_mixed_moe_axis0_blob(
+        weight,
+        shape,
+        shape,
+        precisions,
+        path,
+        row_chunk=8,
+        quant_backend="cpu",
+        device="cpu",
+        artifact_root=tmp_path,
+    )
+
+    assert nbytes == _mixed_moe_blob_nbytes(shape, precisions, tmp_path)
+    restored = io.unpack_nint_moe(path.read_bytes())
+    assert restored.expert_profiles == ("NINT4-24", "NINT8-0")
+    assert np.isfinite(dequantize_expertwise(restored)).all()
+    assert io.pack_nint_moe(restored) == path.read_bytes()
+
+
 def test_mixed_moe_preserves_native_mxfp4_bytes(tmp_path):
     shape = (2, 2, 32)
     values = np.arange(2 * 2 * 16, dtype=np.uint8).reshape(2, 2, 16)
@@ -286,8 +315,9 @@ def test_mixed_moe_preserves_native_mxfp4_bytes(tmp_path):
 def test_synthetic_mixed_moe_writer_covers_all_runtime_families(tmp_path):
     shape = (9, 2, 96)
     precisions = _parse_expert_mix_profiles(
-        "NINT2,NINT3,NINT4,NINT5,NINT6,NINT8,NVQ2J,NVQ3J,MXFP4"
+        "NINT2,NINT3,NINT4,NINT5,NINT6,NINT8,NINT8-0,NVQ2J,NVQ3J,MXFP4"
     )
+    shape = (len(precisions), shape[1], shape[2])
 
     class NoReadSource:
         def read_rows(self, *_args, **_kwargs):
@@ -316,6 +346,7 @@ def test_synthetic_mixed_moe_writer_covers_all_runtime_families(tmp_path):
         "NINT5-28",
         "NINT6-24",
         "NINT8-48",
+        "NINT8-0",
         "NVQ2J",
         "NVQ3J",
         "MXFP4",

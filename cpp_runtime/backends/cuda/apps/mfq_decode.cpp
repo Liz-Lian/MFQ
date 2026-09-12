@@ -4336,7 +4336,7 @@ struct NintMoeWeight {
         }();
         static const int prefill_mma_min_tokens = [] {
             const char * value = std::getenv("MFQ_MOE_PREFILL_MMA_MIN_TOKENS");
-            return value == nullptr ? 256 : std::max(9, std::atoi(value));
+            return value == nullptr ? 9 : std::max(9, std::atoi(value));
         }();
         if (!disable_prefill_mma && !g_force_moe_prefill_mma_off && hetero_supported &&
                 tokens >= prefill_mma_min_tokens &&

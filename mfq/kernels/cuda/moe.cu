@@ -3330,7 +3330,8 @@ __device__ __forceinline__ void nint_moe_mma_profile(
         const bool warp_active = warp_m0 < MTILES;
 #pragma unroll
         for (int ks = 0; ks < BK; ks += 16) {
-            if (warp_active) {
+            if (warp_active &&
+                    (BM < 64 || kb + ks < k_real)) {
                 FragB bfrag;
                 nvcuda::wmma::load_matrix_sync(
                     bfrag, &W_s[warp_n * 16][ks], kMoeMmaBkStride<BM>);

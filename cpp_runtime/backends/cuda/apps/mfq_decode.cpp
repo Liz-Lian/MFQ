@@ -7699,10 +7699,11 @@ static void initialize_mixed_nvq_dispatch(
         weight_sizes.push_back(weight.aux_packed.numel());
         weight_sizes.push_back(weight.sub_scale_packed.numel());
         const int format = static_cast<int>(weight.kernel_format);
-        // Plain NVQ2 is repacked to format 4 unless execution repacking is
-        // disabled; NVQ3 remains format 3.
+        // Standard 256-entry NVQ2/NVQ3 families use formats 2..6 and
+        // 10..11 after the optional execution-metadata repacks.
         nvq23_only = nvq23_only &&
-            (format == 2 || format == 3 || format == 4);
+            (format == 2 || format == 3 || format == 4 ||
+             format == 5 || format == 6 || format == 10 || format == 11);
         const bool d4 =
             format == 3 || format == 10 || format == 11 ||
             format == 12 || format == 15 || format == 17;

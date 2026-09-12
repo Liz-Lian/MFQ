@@ -6232,6 +6232,10 @@ nvq_moe_grouped_hetero_f16_kernel(
                 NVQ_MOE_HETERO_F16_CASE(kNvq2);
                 NVQ_MOE_HETERO_F16_CASE(kNvq3);
                 NVQ_MOE_HETERO_F16_CASE(kNvq2Exec);
+                NVQ_MOE_HETERO_F16_CASE(kNvq2Jsc);
+                NVQ_MOE_HETERO_F16_CASE(kNvq2JscExec);
+                NVQ_MOE_HETERO_F16_CASE(kNvq3Jsc);
+                NVQ_MOE_HETERO_F16_CASE(kNvq3Jsc2);
             }
         } else {
             switch (format) {

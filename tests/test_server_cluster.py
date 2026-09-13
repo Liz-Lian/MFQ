@@ -16,12 +16,23 @@ from mfq.server.storage import SessionStore
 from tests.test_server_service import FakeBackend
 
 
-def _remote_app(response_requests: list[dict[str, object]] | None = None):
+def _remote_app(
+    response_requests: list[dict[str, object]] | None = None,
+    requested_paths: list[str] | None = None,
+    *,
+    legacy_models_endpoint: bool = False,
+):
     async def handler(request: httpx.Request) -> httpx.Response:
         path = request.url.path
+        if requested_paths is not None:
+            requested_paths.append(path)
         if path == "/health":
             return httpx.Response(200, json={"service": "mfq-server"})
-        if path == "/api/v1/runtime/models":
+        if path == "/v1/models":
+            if legacy_models_endpoint:
+                return httpx.Response(404)
+            return httpx.Response(200, json={"data": [{"id": "remote-model"}]})
+        if path == "/api/v1/runtime/models" and legacy_models_endpoint:
             return httpx.Response(200, json={"data": [{"id": "remote-model"}]})
         if path == "/api/v1/runtime/status":
             return httpx.Response(200, json={"total_requests": 7, "process_resident_bytes": 1024})
@@ -122,7 +133,10 @@ def test_cluster_registers_probes_and_routes_matching_model(tmp_path: Path) -> N
     async def run() -> None:
         store = SessionStore(tmp_path / "mfq.server.sqlite3")
         response_requests: list[dict[str, object]] = []
-        client = httpx.AsyncClient(transport=_remote_app(response_requests))
+        requested_paths: list[str] = []
+        client = httpx.AsyncClient(
+            transport=_remote_app(response_requests, requested_paths)
+        )
         local = FakeBackend()
         cluster = ClusterBackend(local, store, client=client)
         service = ServerService(store, cluster, cluster=cluster)
@@ -139,6 +153,8 @@ def test_cluster_registers_probes_and_routes_matching_model(tmp_path: Path) -> N
             listed = await api.get("/api/v1/cluster/nodes?refresh=true")
             assert listed.json()["data"][0]["healthy"] is True
             assert listed.json()["data"][0]["metrics"]["total_requests"] == 7
+            assert "/v1/models" in requested_paths
+            assert "/api/v1/runtime/models" not in requested_paths
             models = await cluster.runtime_models()
             assert any(item["id"] == "remote-model" for item in models["data"])
 
@@ -230,3 +246,31 @@ def test_remote_node_configuration_never_persists_secret(tmp_path: Path, monkeyp
     )
     assert node.api_key_env == "REMOTE_NODE_TOKEN"
     assert b"private-token" not in (tmp_path / "mfq.server.sqlite3").read_bytes()
+
+
+def test_cluster_falls_back_to_legacy_runtime_inventory(tmp_path: Path) -> None:
+    async def run() -> None:
+        store = SessionStore(tmp_path / "mfq.server.sqlite3")
+        requested_paths: list[str] = []
+        client = httpx.AsyncClient(
+            transport=_remote_app(
+                requested_paths=requested_paths,
+                legacy_models_endpoint=True,
+            )
+        )
+        cluster = ClusterBackend(FakeBackend(), store, client=client)
+        service = ServerService(store, cluster, cluster=cluster)
+        transport = httpx.ASGITransport(app=create_app(service))
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as api:
+            created = await api.post(
+                "/api/v1/cluster/nodes",
+                json={"name": "legacy-worker", "url": "http://legacy-worker:8090"},
+            )
+            assert created.status_code == 201
+            assert created.json()["models"] == ["remote-model"]
+            assert "/v1/models" in requested_paths
+            assert "/api/v1/runtime/models" in requested_paths
+
+        await client.aclose()
+
+    asyncio.run(run())

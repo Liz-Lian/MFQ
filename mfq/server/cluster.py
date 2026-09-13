@@ -112,7 +112,7 @@ class ClusterBackend:
             headers = self._headers(state.resource)
             health, models, status = await asyncio.gather(
                 self._client.get(f"{state.resource.url}/health", headers=headers),
-                self._client.get(f"{state.resource.url}/api/v1/runtime/models", headers=headers),
+                self._remote_models(state.resource, headers),
                 self._client.get(f"{state.resource.url}/api/v1/runtime/status", headers=headers),
             )
             health.raise_for_status()
@@ -132,6 +132,19 @@ class ClusterBackend:
             state.models = []
             state.status = {}
             state.error = str(error)[:512]
+
+    async def _remote_models(
+        self,
+        node: RemoteNodeResource,
+        headers: dict[str, str],
+    ) -> httpx.Response:
+        response = await self._client.get(f"{node.url}/v1/models", headers=headers)
+        if response.status_code in {404, 405}:
+            return await self._client.get(
+                f"{node.url}/api/v1/runtime/models",
+                headers=headers,
+            )
+        return response
 
     @staticmethod
     def _public(state: _NodeState) -> RemoteNodeResource:

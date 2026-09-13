@@ -1881,6 +1881,76 @@ def test_hf_imatrix_binds_an_ordinary_vq_tensor(tmp_path):
     np.testing.assert_array_equal(binding.rows(0, 4), values[0])
 
 
+def test_hf_imatrix_slices_fused_source_neuron_rows_for_split_plans(tmp_path):
+    source_name = "model.language_model.layers.0.linear_attn.in_proj_qkv.weight"
+    gguf_name = "blk.0.attn_qkv.weight"
+    qk = TensorPlan(
+        name="model.block.0.linear_attention.qk.weight",
+        shard="model.safetensors",
+        shape=(2, 4),
+        source_dtype="BF16",
+        target_dtype="NINT4",
+        gguf_name=gguf_name,
+        gguf_type="Q4_K",
+        source_name=source_name,
+        row_start=0,
+        row_end=2,
+    )
+    value = TensorPlan(
+        name="model.block.0.linear_attention.value.weight",
+        shard="model.safetensors",
+        shape=(3, 4),
+        source_dtype="BF16",
+        target_dtype="NINT4",
+        gguf_name=gguf_name,
+        gguf_type="Q4_K",
+        source_name=source_name,
+        row_start=2,
+        row_end=5,
+    )
+    input_importance = np.asarray([[1.0, 2.0, 3.0, 4.0]], dtype=np.float32)
+    neuron_importance = np.asarray([10.0, 20.0, 30.0, 40.0, 50.0], dtype=np.float32)
+    imatrix = ImportanceMatrix(
+        path=tmp_path / "naq-imatrix.npz",
+        entries={
+            source_name: ImportanceEntry(
+                values=input_importance,
+                counts=np.asarray([32], dtype=np.int64),
+                row_importance=neuron_importance,
+            )
+        },
+        datasets=("test",),
+        chunk_count=1,
+        chunk_size=4,
+        legacy=False,
+    )
+
+    bindings = _bind_hf_imatrix(imatrix, [qk, value])
+
+    np.testing.assert_array_equal(
+        bindings[qk.name].rows(0, 2),
+        input_importance * np.asarray([[10.0], [20.0]], dtype=np.float32),
+    )
+    np.testing.assert_array_equal(
+        bindings[value.name].rows(0, 3),
+        input_importance * np.asarray([[30.0], [40.0], [50.0]], dtype=np.float32),
+    )
+    np.testing.assert_array_equal(
+        bindings[value.name].selected(np.asarray([0, 2], dtype=np.int64)),
+        input_importance * np.asarray([[30.0], [50.0]], dtype=np.float32),
+    )
+    np.testing.assert_array_equal(
+        bindings[value.name].input_selected(np.asarray([0, 2], dtype=np.int64)),
+        input_importance[0],
+    )
+    np.testing.assert_array_equal(
+        bindings[qk.name].neuron_rows(0, 2), [10.0, 20.0]
+    )
+    np.testing.assert_array_equal(
+        bindings[value.name].neuron_rows(0, 3), [30.0, 40.0, 50.0]
+    )
+
+
 def test_hf_convert_passes_imatrix_rows_to_nint_writer(
     tmp_path,
     monkeypatch,

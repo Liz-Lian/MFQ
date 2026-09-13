@@ -1906,16 +1906,58 @@ def _bind_hf_imatrix(
             continue
         names = _hf_imatrix_names(item)
         original_shape, storage_shape = _hf_imatrix_shapes(item)
-        match = imatrix.for_rows(
-            names,
-            original_shape,
-            storage_shape,
-            slice(0, min(1, storage_shape[0])),
-        )
+        match = imatrix.find(names)
         if match is None:
             if not any(name in _IMATRIX_OPTIONAL_TENSORS for name in names):
                 missing.append(names[0] if names else item.name)
             continue
+        entry_name, entry = match
+
+        # A fused HF matrix can be exposed as multiple canonical tensors.  The
+        # Qwen linear-attention QKV import is one example: QK and V plans retain
+        # the source row interval while an HF/NAQ imatrix remains keyed by the
+        # complete fused source matrix.  Input-only imatrices broadcast one
+        # vector and hid this distinction; NAQ's output-neuron vector must be
+        # sliced in source-row coordinates.
+        local_rows = int(storage_shape[0])
+        row_offset = 0
+        binding_original_shape = original_shape
+        binding_storage_shape = storage_shape
+        if item.row_start is not None or item.row_end is not None:
+            source_start = int(item.row_start or 0)
+            source_end = (
+                int(item.row_end)
+                if item.row_end is not None
+                else source_start + local_rows
+            )
+            if source_end - source_start != local_rows:
+                raise ValueError(
+                    f"imatrix row view does not match tensor shape for {item.name}: "
+                    f"[{source_start}, {source_end}) vs {local_rows} rows"
+                )
+            source_rows = None
+            if entry.row_importance is not None:
+                source_rows = int(np.asarray(entry.row_importance).size)
+            elif entry.matrices not in (1, local_rows):
+                source_rows = int(entry.matrices)
+            if source_rows is not None and source_rows != local_rows:
+                if source_end > source_rows:
+                    raise ValueError(
+                        f"imatrix row view exceeds fused source for {item.name}: "
+                        f"{source_end} > {source_rows}"
+                    )
+                row_offset = source_start
+                binding_original_shape = (source_rows, int(storage_shape[1]))
+                binding_storage_shape = binding_original_shape
+
+        match = imatrix.for_rows(
+            names,
+            binding_original_shape,
+            binding_storage_shape,
+            slice(row_offset, row_offset + min(1, local_rows)),
+        )
+        if match is None:  # pragma: no cover - guarded by imatrix.find above
+            raise RuntimeError(f"imatrix binding disappeared for {item.name}")
         entry_name, _ = match
 
         def rows(
@@ -1923,15 +1965,16 @@ def _bind_hf_imatrix(
             end: int,
             *,
             _names=names,
-            _original_shape=original_shape,
-            _storage_shape=storage_shape,
+            _original_shape=binding_original_shape,
+            _storage_shape=binding_storage_shape,
+            _row_offset=row_offset,
             _item=item,
         ) -> np.ndarray:
             resolved = imatrix.for_rows(
                 _names,
                 _original_shape,
                 _storage_shape,
-                slice(start, end),
+                slice(_row_offset + start, _row_offset + end),
             )
             if resolved is None:
                 raise RuntimeError(f"imatrix binding disappeared for {_item.name}")
@@ -1941,15 +1984,16 @@ def _bind_hf_imatrix(
             row_ids: np.ndarray,
             *,
             _names=names,
-            _original_shape=original_shape,
-            _storage_shape=storage_shape,
+            _original_shape=binding_original_shape,
+            _storage_shape=binding_storage_shape,
+            _row_offset=row_offset,
             _item=item,
         ) -> np.ndarray:
             resolved = imatrix.for_rows(
                 _names,
                 _original_shape,
                 _storage_shape,
-                np.asarray(row_ids, dtype=np.int64),
+                np.asarray(row_ids, dtype=np.int64) + _row_offset,
             )
             if resolved is None:
                 raise RuntimeError(f"imatrix binding disappeared for {_item.name}")
@@ -1959,15 +2003,16 @@ def _bind_hf_imatrix(
             row_ids: np.ndarray,
             *,
             _names=names,
-            _original_shape=original_shape,
-            _storage_shape=storage_shape,
+            _original_shape=binding_original_shape,
+            _storage_shape=binding_storage_shape,
+            _row_offset=row_offset,
             _item=item,
         ) -> np.ndarray:
             resolved = imatrix.input_for_rows(
                 _names,
                 _original_shape,
                 _storage_shape,
-                np.asarray(row_ids, dtype=np.int64),
+                np.asarray(row_ids, dtype=np.int64) + _row_offset,
             )
             if resolved is None:
                 raise RuntimeError(f"imatrix binding disappeared for {_item.name}")
@@ -1975,8 +2020,8 @@ def _bind_hf_imatrix(
 
         neuron_probe = imatrix.neuron_importance_for_rows(
             names,
-            storage_shape,
-            slice(0, min(1, storage_shape[0])),
+            binding_storage_shape,
+            slice(row_offset, row_offset + min(1, local_rows)),
         )
         neuron_rows = None
         if neuron_probe is not None:
@@ -1986,13 +2031,14 @@ def _bind_hf_imatrix(
                 end: int,
                 *,
                 _names=names,
-                _storage_shape=storage_shape,
+                _storage_shape=binding_storage_shape,
+                _row_offset=row_offset,
                 _item=item,
             ) -> np.ndarray:
                 resolved = imatrix.neuron_importance_for_rows(
                     _names,
                     _storage_shape,
-                    slice(start, end),
+                    slice(_row_offset + start, _row_offset + end),
                 )
                 if resolved is None:
                     raise RuntimeError(

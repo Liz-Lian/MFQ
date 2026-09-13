@@ -65,11 +65,13 @@ class ClusterBackend:
         store: SessionStore,
         *,
         health_ttl_seconds: float = 5.0,
+        probe_timeout_seconds: float = 5.0,
         client: httpx.AsyncClient | None = None,
     ) -> None:
         self.local = local
         self.store = store
         self.health_ttl_seconds = max(0.25, health_ttl_seconds)
+        self.probe_timeout_seconds = max(0.25, probe_timeout_seconds)
         self._owns_client = client is None
         self._client = client or httpx.AsyncClient(
             timeout=httpx.Timeout(connect=3.0, read=None, write=30.0, pool=3.0),
@@ -78,6 +80,7 @@ class ClusterBackend:
         self._states: dict[UUID, _NodeState] = {}
         self._sessions: dict[tuple[UUID, UUID], _RemoteSession] = {}
         self._lock = asyncio.Lock()
+        self._refresh_lock = asyncio.Lock()
 
     @staticmethod
     def _headers(node: RemoteNodeResource) -> dict[str, str]:
@@ -92,34 +95,48 @@ class ClusterBackend:
         return {"Authorization": f"Bearer {token}"}
 
     async def refresh(self, *, force: bool = False) -> list[RemoteNodeResource]:
-        resources = await asyncio.to_thread(self.store.list_remote_nodes)
-        configured = {item.id for item in resources}
-        retired: list[RemoteNodeResource] = []
-        async with self._lock:
-            for stale in set(self._states) - configured:
-                state = self._states.pop(stale, None)
-                if state is not None and state.active_requests == 0:
-                    retired.append(state.resource)
-            for resource in resources:
-                state = self._states.get(resource.id)
-                if state is None:
-                    self._states[resource.id] = _NodeState(resource=resource)
-                else:
-                    state.resource = resource
-                    if not resource.enabled:
-                        state.healthy = False
-                        state.models = []
-                        state.status = {}
-                        state.error = None
-            states = list(self._states.values())
-        if retired:
+        async with self._refresh_lock:
+            resources = await asyncio.to_thread(self.store.list_remote_nodes)
+            configured = {item.id for item in resources}
+            retired: list[RemoteNodeResource] = []
+            async with self._lock:
+                for stale in set(self._states) - configured:
+                    state = self._states.pop(stale, None)
+                    if state is not None and state.active_requests == 0:
+                        retired.append(state.resource)
+                for resource in resources:
+                    state = self._states.get(resource.id)
+                    if state is None:
+                        self._states[resource.id] = _NodeState(resource=resource)
+                    else:
+                        changed = state.resource != resource
+                        state.resource = resource
+                        if changed:
+                            state.checked_at = 0.0
+                            state.checked_at_wall = None
+                            state.healthy = False
+                            state.models = []
+                            state.status = {}
+                            state.error = None
+                        elif not resource.enabled:
+                            state.healthy = False
+                            state.models = []
+                            state.status = {}
+                            state.error = None
+                states = list(self._states.values())
+            if retired:
+                await asyncio.gather(
+                    *(self._release_node_sessions(node) for node in retired)
+                )
             await asyncio.gather(
-                *(self._release_node_sessions(node) for node in retired)
+                *(
+                    self._probe(state, force=force)
+                    for state in states
+                    if state.resource.enabled
+                )
             )
-        await asyncio.gather(
-            *(self._probe(state, force=force) for state in states if state.resource.enabled)
-        )
-        return [self._public(state) for state in states]
+            async with self._lock:
+                return [self._public(state) for state in self._states.values()]
 
     async def _probe(self, state: _NodeState, *, force: bool) -> None:
         now = time.monotonic()
@@ -130,7 +147,11 @@ class ClusterBackend:
         try:
             headers = self._headers(state.resource)
             health, models, status = await asyncio.gather(
-                self._client.get(f"{state.resource.url}/health", headers=headers),
+                self._client.get(
+                    f"{state.resource.url}/health",
+                    headers=headers,
+                    timeout=self.probe_timeout_seconds,
+                ),
                 self._remote_models(state.resource, headers),
                 self._remote_status(state.resource, headers),
             )
@@ -155,11 +176,16 @@ class ClusterBackend:
         node: RemoteNodeResource,
         headers: dict[str, str],
     ) -> httpx.Response:
-        response = await self._client.get(f"{node.url}/v1/models", headers=headers)
+        response = await self._client.get(
+            f"{node.url}/v1/models",
+            headers=headers,
+            timeout=self.probe_timeout_seconds,
+        )
         if response.status_code in {404, 405}:
             return await self._client.get(
                 f"{node.url}/api/v1/runtime/models",
                 headers=headers,
+                timeout=self.probe_timeout_seconds,
             )
         return response
 
@@ -172,6 +198,7 @@ class ClusterBackend:
             response = await self._client.get(
                 f"{node.url}/api/v1/runtime/status",
                 headers=headers,
+                timeout=self.probe_timeout_seconds,
             )
             if response.status_code >= 400:
                 return {}

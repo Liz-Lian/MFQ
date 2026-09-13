@@ -11,6 +11,7 @@ import httpx
 
 from mfq.server.api import create_app
 from mfq.server.cluster import ClusterBackend
+from mfq.server.models import CreateRemoteNodeRequest, UpdateRemoteNodeRequest
 from mfq.server.service import ServerService
 from mfq.server.storage import SessionStore
 from tests.test_server_service import FakeBackend
@@ -383,6 +384,58 @@ def test_cluster_routes_when_remote_metrics_are_unavailable(tmp_path: Path) -> N
             assert created.json()["models"] == ["remote-model"]
             assert created.json()["metrics"] == {}
 
+        await client.aclose()
+
+    asyncio.run(run())
+
+
+def test_cluster_serializes_probe_with_node_configuration_changes(
+    tmp_path: Path,
+) -> None:
+    async def run() -> None:
+        old_probe_started = asyncio.Event()
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            host = request.url.host
+            path = request.url.path
+            if path == "/health":
+                if host == "old-worker":
+                    old_probe_started.set()
+                    await asyncio.sleep(0.05)
+                return httpx.Response(200)
+            if path == "/v1/models":
+                model = "old-model" if host == "old-worker" else "new-model"
+                return httpx.Response(200, json={"data": [{"id": model}]})
+            if path == "/api/v1/runtime/status":
+                return httpx.Response(200, json={})
+            return httpx.Response(404)
+
+        store = SessionStore(tmp_path / "mfq.server.sqlite3")
+        resource = store.create_remote_node(
+            CreateRemoteNodeRequest(
+                name="worker-a",
+                url="http://old-worker:8090",
+            )
+        )
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        cluster = ClusterBackend(FakeBackend(), store, client=client)
+
+        old_refresh = asyncio.create_task(cluster.nodes(force=True))
+        await old_probe_started.wait()
+        await asyncio.to_thread(
+            store.update_remote_node,
+            resource.id,
+            UpdateRemoteNodeRequest(
+                name="worker-a",
+                url="http://new-worker:8090",
+            ),
+        )
+        new_refresh = asyncio.create_task(cluster.nodes(force=True))
+        await asyncio.gather(old_refresh, new_refresh)
+
+        [node] = await cluster.nodes()
+        assert node.url == "http://new-worker:8090"
+        assert node.models == ["new-model"]
         await client.aclose()
 
     asyncio.run(run())

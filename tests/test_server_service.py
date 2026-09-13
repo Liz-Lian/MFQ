@@ -270,6 +270,61 @@ def test_stream_disconnect_closes_backend_and_terminates_response(tmp_path: Path
     asyncio.run(run())
 
 
+def test_session_stream_keeps_slow_prefill_alive_and_cancels_pending_read(
+    tmp_path: Path,
+) -> None:
+    class SlowBackend(FakeBackend):
+        def __init__(self) -> None:
+            super().__init__()
+            self.started = asyncio.Event()
+            self.stream_closed = False
+
+        async def stream(self, **kwargs: Any) -> AsyncIterator[BackendDelta]:
+            self.calls.append(kwargs)
+            self.started.set()
+            try:
+                await asyncio.Event().wait()
+                yield BackendDelta(content_delta="unreachable")
+            finally:
+                self.stream_closed = True
+
+    async def run() -> None:
+        backend = SlowBackend()
+        service = ServerService(
+            SessionStore(tmp_path / "mfq.server.sqlite3"),
+            backend,
+            stream_keepalive_seconds=0.01,
+        )
+        await asyncio.to_thread(
+            service.store.create_session,
+            CreateSessionRequest(model="model-a"),
+            session_id=SESSION_ID,
+        )
+        prepared = await service.prepare_response(
+            SESSION_ID,
+            CreateResponseRequest(
+                request_id=REQUEST_ID,
+                expected_revision=0,
+                input=[{"type": "text", "text": "question"}],
+                stream=True,
+            ),
+        )
+
+        stream = service.stream_response(prepared)
+        assert "session.state" in await anext(stream)
+        keepalive = asyncio.create_task(anext(stream))
+        await backend.started.wait()
+        assert await keepalive == ": keep-alive\n\n"
+        await stream.aclose()
+
+        assert backend.stream_closed
+        assert SESSION_ID not in service._active_responses
+        response = (await service.list_responses(SESSION_ID)).data[0]
+        assert response.status == ResponseStatus.CANCELLED
+
+    asyncio.run(run())
+
+
 def test_session_mutations_survive_runtime_cache_failures(tmp_path: Path) -> None:
     class FailingCacheBackend(FakeBackend):
         async def fork_session(

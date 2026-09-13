@@ -8,6 +8,7 @@ import hashlib
 import json
 import time
 from collections.abc import AsyncIterator, Sequence
+from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
@@ -282,6 +283,7 @@ class ServerService:
         tool_handlers: Any | None = None,
         cluster: Any | None = None,
         voice_component: Any | None = None,
+        stream_keepalive_seconds: float = 15.0,
     ) -> None:
         self.store = store
         self.backend = backend
@@ -292,6 +294,7 @@ class ServerService:
         self.tool_handlers = tool_handlers
         self.cluster = cluster
         self.voice_component = voice_component
+        self.stream_keepalive_seconds = max(0.01, stream_keepalive_seconds)
         self._active_responses: dict[UUID, tuple[UUID, asyncio.Task[Any]]] = {}
         self._runtime_metric_state: dict[str, tuple[float, tuple[Any, ...]]] = {}
         if runtime_manager is not None:
@@ -1646,16 +1649,41 @@ class ServerService:
                     response_format=prepared.request.response_format,
                 )
             ) as backend_stream:
-                async for delta in backend_stream:
-                    accumulator.apply(delta)
-                    payloads = self._delta_payloads(prepared.begin.response.id, delta)
-                    for payload in payloads:
-                        yield self._encode_sse(
-                            payload,
-                            sequence,
-                            session_id=prepared.begin.session.id,
+                iterator = backend_stream.__aiter__()
+                pending: asyncio.Task[BackendDelta] | None = None
+                try:
+                    while True:
+                        if pending is None:
+                            pending = asyncio.create_task(anext(iterator))
+                        done, _ = await asyncio.wait(
+                            {pending},
+                            timeout=self.stream_keepalive_seconds,
                         )
-                        sequence += 1
+                        if not done:
+                            yield ": keep-alive\n\n"
+                            continue
+                        task, pending = pending, None
+                        try:
+                            delta = task.result()
+                        except StopAsyncIteration:
+                            break
+                        accumulator.apply(delta)
+                        payloads = self._delta_payloads(
+                            prepared.begin.response.id,
+                            delta,
+                        )
+                        for payload in payloads:
+                            yield self._encode_sse(
+                                payload,
+                                sequence,
+                                session_id=prepared.begin.session.id,
+                            )
+                            sequence += 1
+                finally:
+                    if pending is not None and not pending.done():
+                        pending.cancel()
+                        with suppress(asyncio.CancelledError, StopAsyncIteration):
+                            await pending
             finish_reason = self._require_finish_reason(accumulator)
             completed = await asyncio.to_thread(
                 self.store.complete_response,

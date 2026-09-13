@@ -420,6 +420,78 @@ def test_empty_runtime_pool_keeps_management_api_available(tmp_path: Path) -> No
     asyncio.run(run())
 
 
+def test_openai_models_advertises_complete_catalog_models_before_load(
+    tmp_path: Path,
+) -> None:
+    async def run() -> None:
+        model_dir = tmp_path / "models"
+        model_dir.mkdir()
+        _model(model_dir / "available.mfq", architecture="qwen35")
+        source = tmp_path / "source.mfq"
+        _model(source, architecture="qwen35")
+        shards = split_mfq(source, model_dir / "incomplete.mfq", split_max_tensors=1)
+        shards[1].unlink()
+
+        catalog = ModelCatalog([model_dir], cache_seconds=0)
+        pool = ManagedRuntimePool(catalog, tmp_path / "runtime")
+        service = ServerService(
+            SessionStore(tmp_path / "mfq.server.sqlite3"),
+            pool,
+            catalog=catalog,
+            runtime_manager=pool,
+        )
+        transport = httpx.ASGITransport(app=create_app(service))
+        try:
+            async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+                runtime_models = await client.get("/api/v1/runtime/models")
+                assert runtime_models.json() == {"object": "list", "data": []}
+
+                response = await client.get("/v1/models")
+                assert response.status_code == 200
+                assert response.json() == {
+                    "object": "list",
+                    "data": [
+                        {
+                            "id": "available",
+                            "object": "model",
+                            "created": 0,
+                            "owned_by": "mfq",
+                        }
+                    ],
+                }
+        finally:
+            await service.aclose()
+
+    asyncio.run(run())
+
+
+def test_openai_models_keeps_local_catalog_visible_when_runtime_listing_fails(
+    tmp_path: Path,
+) -> None:
+    class UnavailableBackend(IdleBackend):
+        async def runtime_models(self) -> dict[str, object]:
+            raise BackendError("backend_unavailable", "runtime is offline", retryable=True)
+
+    async def run() -> None:
+        _model(tmp_path / "available.mfq", architecture="qwen35")
+        catalog = ModelCatalog([tmp_path], cache_seconds=0)
+        service = ServerService(
+            SessionStore(tmp_path / "mfq.server.sqlite3"),
+            UnavailableBackend(),
+            catalog=catalog,
+        )
+        transport = httpx.ASGITransport(app=create_app(service))
+        try:
+            async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+                response = await client.get("/v1/models")
+                assert response.status_code == 200
+                assert [item["id"] for item in response.json()["data"]] == ["available"]
+        finally:
+            await service.aclose()
+
+    asyncio.run(run())
+
+
 def test_catalog_rejects_duplicate_mfq_file_stems(tmp_path: Path) -> None:
     async def run() -> None:
         first = tmp_path / "first"

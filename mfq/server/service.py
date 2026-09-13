@@ -1192,6 +1192,33 @@ class ServerService:
     async def runtime_models(self) -> dict[str, Any]:
         return await self._runtime_request("runtime_models")
 
+    async def advertised_models(self) -> dict[str, Any]:
+        """List every model that the OpenAI endpoint can resolve on demand."""
+
+        advertised: dict[str, dict[str, Any]] = {}
+        if self.catalog is not None:
+            artifacts = await self.catalog.list()
+            for artifact in artifacts.data:
+                if artifact.complete and artifact.loadable:
+                    advertised[artifact.name] = {
+                        "id": artifact.name,
+                        "object": "model",
+                    }
+        try:
+            runtime_models = await self.runtime_models()
+        except ServiceError:
+            if advertised:
+                return {"object": "list", "data": list(advertised.values())}
+            raise
+        runtime_data = runtime_models.get("data") if isinstance(runtime_models, dict) else None
+        for item in runtime_data if isinstance(runtime_data, list) else []:
+            if not isinstance(item, dict):
+                continue
+            model_id = item.get("id")
+            if isinstance(model_id, str) and model_id:
+                advertised.setdefault(model_id, item)
+        return {"object": "list", "data": list(advertised.values())}
+
     async def realtime_capabilities(self) -> dict[str, Any]:
         return await self._runtime_request("realtime_capabilities")
 

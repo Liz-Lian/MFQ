@@ -257,7 +257,7 @@ def create_app(
 
     @app.get("/v1/models", include_in_schema=False)
     async def openai_models() -> dict[str, Any]:
-        models = await require_service().runtime_models()
+        models = await require_service().advertised_models()
         data = models.get("data") if isinstance(models, dict) else None
         return {
             "object": "list",

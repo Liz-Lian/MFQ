@@ -66,6 +66,9 @@ class _Service:
     async def runtime_models(self) -> dict[str, Any]:
         return {"object": "list", "data": [{"id": "DeepSeek-V4-Flash"}]}
 
+    async def advertised_models(self) -> dict[str, Any]:
+        return await self.runtime_models()
+
 
 def _request(**updates: Any):
     body: dict[str, Any] = {

@@ -757,6 +757,21 @@ def test_stale_load_cleanup_cannot_release_a_new_load_reservation() -> None:
     assert 32123 in pool._reserved_ports
 
 
+def test_runtime_memory_accounting_uses_backend_device_metrics() -> None:
+    observed = ManagedRuntimePool._observed_runtime_bytes(
+        100,
+        {
+            "mlx_active_bytes": 80,
+            "mlx_cache_bytes": 70,
+            "cuda_allocated_bytes": 175,
+            "cuda_reserved_bytes": 200,
+        },
+    )
+    assert observed == 200
+    assert ManagedRuntimePool._observed_runtime_bytes(100, {}) == 100
+    assert ManagedRuntimePool._observed_runtime_bytes(None, {}) is None
+
+
 def test_request_driven_load_waiters_receive_the_same_startup_error(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

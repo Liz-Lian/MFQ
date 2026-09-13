@@ -576,6 +576,7 @@ class ManagedRuntimePool:
             instance.state = RuntimeInstanceState.READY
             instance.last_used_at = datetime.now(timezone.utc)
             self._last_instance_id = instance.id
+        await self._refresh_instance_usage(instance)
         instance.monitor_task = asyncio.create_task(
             self._monitor(instance), name=f"mfq-server-runtime-monitor-{instance.id}"
         )
@@ -872,10 +873,14 @@ class ManagedRuntimePool:
                 "prefix_cache_hot_bytes",
                 status.get("prefix_cache_bytes"),
             )
+            observed_resident_bytes = self._observed_runtime_bytes(
+                resident_bytes,
+                status,
+            )
             async with self._lock:
                 if self._instances.get(instance.id) is instance:
-                    if resident_bytes is not None:
-                        instance.resident_bytes = resident_bytes
+                    if observed_resident_bytes is not None:
+                        instance.resident_bytes = observed_resident_bytes
                     if isinstance(kv_value, (int, float)) and kv_value >= 0:
                         instance.kv_bytes = int(kv_value)
         return status
@@ -1310,10 +1315,34 @@ class ManagedRuntimePool:
 
     @staticmethod
     def _committed_runtime_bytes(instance: _ManagedRuntime) -> int:
-        return max(
-            instance.artifact.resource.total_bytes,
-            instance.resident_bytes or 0,
-        )
+        return instance.resident_bytes or instance.artifact.resource.total_bytes
+
+    @staticmethod
+    def _observed_runtime_bytes(
+        process_resident_bytes: int | None,
+        status: dict[str, Any] | None,
+    ) -> int | None:
+        candidates = [
+            process_resident_bytes
+            if process_resident_bytes is not None and process_resident_bytes >= 0
+            else 0
+        ]
+        if status is not None:
+            mlx_active = status.get("mlx_active_bytes")
+            mlx_cache = status.get("mlx_cache_bytes")
+            if (
+                isinstance(mlx_active, (int, float))
+                and mlx_active >= 0
+                and isinstance(mlx_cache, (int, float))
+                and mlx_cache >= 0
+            ):
+                candidates.append(int(mlx_active + mlx_cache))
+            for name in ("cuda_reserved_bytes", "cuda_allocated_bytes"):
+                value = status.get(name)
+                if isinstance(value, (int, float)) and value >= 0:
+                    candidates.append(int(value))
+        observed = max(candidates)
+        return observed if observed > 0 else None
 
     def _detach_instance_locked(self, instance: _ManagedRuntime) -> None:
         self._instances.pop(instance.id, None)
@@ -1483,6 +1512,7 @@ class ManagedRuntimePool:
             except Exception:
                 pass
         resident = await resident_task if resident_task is not None else None
+        observed_resident = self._observed_runtime_bytes(resident, status)
         kv_bytes: int | None = None
         if status is not None:
             value = status.get("prefix_cache_hot_bytes", status.get("prefix_cache_bytes"))
@@ -1491,8 +1521,8 @@ class ManagedRuntimePool:
         async with self._lock:
             if self._instances.get(instance.id) is not instance:
                 return
-            if resident is not None:
-                instance.resident_bytes = resident
+            if observed_resident is not None:
+                instance.resident_bytes = observed_resident
             if kv_bytes is not None:
                 instance.kv_bytes = kv_bytes
 

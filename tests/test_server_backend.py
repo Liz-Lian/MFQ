@@ -202,7 +202,6 @@ def test_backend_splits_deepseek_v4_raw_reasoning_across_sse_chunks() -> None:
     async def run() -> None:
         client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
         backend = OpenAIChatBackend("http://backend", client=client)
-        backend._model_type = "deepseek_v4_vision"
         deltas = [
             delta
             async for delta in backend.stream(
@@ -221,6 +220,7 @@ def test_backend_splits_deepseek_v4_raw_reasoning_across_sse_chunks() -> None:
     payload = captured["payload"]
     assert isinstance(payload, dict)
     assert payload["reasoning_format"] == "none"
+    assert "mfq_preformatted_prompt" in payload
 
 
 def test_backend_converts_deepseek_v4_dsml_content_to_openai_tool_calls() -> None:
@@ -271,8 +271,11 @@ def test_backend_converts_deepseek_v4_dsml_content_to_openai_tool_calls() -> Non
 
     async def run() -> None:
         client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-        backend = OpenAIChatBackend("http://backend", client=client)
-        backend._model_type = "deepseek_v4_vision"
+        backend = OpenAIChatBackend(
+            "http://backend",
+            client=client,
+            model_type="deepseek_v4_vision",
+        )
         tool = ToolDefinition.model_validate(
             {
                 "type": "function",
@@ -322,6 +325,77 @@ def test_backend_converts_deepseek_v4_dsml_content_to_openai_tool_calls() -> Non
     assert '"name": "write"' in prompt
     assert "<｜DSML｜tool_calls>" in prompt
     assert prompt.endswith("<｜Assistant｜></think>")
+
+
+def test_backend_uses_v41_prompt_and_spaced_dsml_parser() -> None:
+    captured: dict[str, object] = {}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        captured["payload"] = json.loads(request.content)
+        event = {
+            "id": "native-v41-tool-id",
+            "choices": [
+                {
+                    "delta": {
+                        "content": (
+                            "<｜DSML｜ calls>\n"
+                            '<｜DSML｜ invoke name="write">\n'
+                            '<｜DSML｜ parameter name="content" string="true">'
+                            "hello</｜DSML｜ parameter>\n"
+                            "</｜DSML｜ invoke>\n</｜DSML｜ calls>"
+                        )
+                    },
+                    "finish_reason": "stop",
+                }
+            ],
+        }
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            text=f"data: {json.dumps(event)}\n\ndata: [DONE]\n\n",
+        )
+
+    async def run() -> None:
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        backend = OpenAIChatBackend(
+            "http://backend",
+            client=client,
+            model_type="deepseek_v41_vision",
+        )
+        tool = ToolDefinition.model_validate(
+            {
+                "type": "function",
+                "function": {
+                    "name": "write",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"content": {"type": "string"}},
+                    },
+                },
+            }
+        )
+        deltas = [
+            delta
+            async for delta in backend.stream(
+                model="DeepSeek-V4.1-Flash",
+                messages=[{"role": "user", "content": "write hello"}],
+                sampling=SamplingParams(enable_thinking=False),
+                tools=[tool],
+            )
+        ]
+        await client.aclose()
+
+        calls = [call for delta in deltas for call in delta.tool_calls]
+        assert len(calls) == 1
+        assert calls[0].name == "write"
+        assert json.loads(calls[0].arguments_delta) == {"content": "hello"}
+        assert deltas[-1].finish_reason == "tool_calls"
+
+    asyncio.run(run())
+    payload = captured["payload"]
+    assert isinstance(payload, dict)
+    assert "<｜System｜>" in payload["mfq_preformatted_prompt"]
+    assert "<｜DSML｜ calls>" in payload["mfq_preformatted_prompt"]
 
 
 @pytest.mark.parametrize(

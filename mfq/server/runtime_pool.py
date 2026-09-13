@@ -363,6 +363,7 @@ class ManagedRuntimePool:
         backend = OpenAIChatBackend(
             f"http://127.0.0.1:{port}",
             local_tensor_files=True,
+            model_type=artifact.resource.architecture,
             avfoundation_video_library=(
                 avfoundation_video_library
                 if avfoundation_video_library is not None

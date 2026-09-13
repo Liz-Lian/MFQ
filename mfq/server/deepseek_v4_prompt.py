@@ -23,7 +23,6 @@ from mfq.server.models import (
     ToolDefinition,
 )
 
-
 _REQUIRED_TOOL_INSTRUCTION = (
     "You MUST call at least one available tool before giving your response."
 )

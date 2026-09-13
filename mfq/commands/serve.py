@@ -308,6 +308,7 @@ def _run(args: argparse.Namespace) -> int:
                     runtime.base_url,
                     local_tensor_files=True,
                     avfoundation_video_library=_avfoundation_video_library(executable),
+                    model_type=initial_artifact.resource.architecture,
                 ),
                 port=runtime.port,
                 context_size=args.context_size,

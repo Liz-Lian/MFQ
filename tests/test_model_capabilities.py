@@ -109,7 +109,6 @@ def test_unknown_architecture_keeps_text_and_a_stable_family_key() -> None:
 def test_generated_output_protocol_is_resolved_by_the_registry() -> None:
     for model_type in (
         "deepseek_v4",
-        "deepseek_v41_vision",
         "DeepSeek-V4-Flash",
     ):
         protocol = output_protocol_for_architecture(model_type)
@@ -117,6 +116,12 @@ def test_generated_output_protocol_is_resolved_by_the_registry() -> None:
         assert protocol.create_reasoning_parser() is not None
         assert protocol.create_tool_call_parser({}) is not None
         assert protocol.tool_call_protocol_name == "dsml"
+
+    protocol = output_protocol_for_architecture("deepseek_v41_vision")
+    assert protocol.reasoning_format == "none"
+    assert protocol.create_reasoning_parser() is not None
+    assert protocol.create_tool_call_parser({}) is not None
+    assert protocol.tool_call_protocol_name == "dsml_v41"
 
     for model_type in (
         "qwen3_5",

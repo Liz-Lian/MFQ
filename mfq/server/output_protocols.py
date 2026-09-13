@@ -76,6 +76,12 @@ def _deepseek_reasoning_parser() -> IncrementalReasoningParser:
     return TaggedReasoningParser(start_in_reasoning=True)
 
 
+def _deepseek_v41_tool_call_parser(
+    schemas: Mapping[str, Mapping[str, Any]],
+) -> IncrementalToolCallParser:
+    return DSMLStreamParser(schemas, spaced_tags=True)
+
+
 def _prompt_open_reasoning_parser() -> IncrementalReasoningParser:
     return TaggedReasoningParser(start_in_reasoning=True)
 
@@ -92,11 +98,18 @@ def _glm_tool_call_parser(
     return XMLToolCallStreamParser(schemas, dialect="glm")
 
 
-_DEEPSEEK_PROTOCOL = ModelOutputProtocol(
+_DEEPSEEK_V4_PROTOCOL = ModelOutputProtocol(
     reasoning_format="none",
     reasoning_parser_factory=_deepseek_reasoning_parser,
     tool_call_parser_factory=DSMLStreamParser,
     tool_call_protocol_name="dsml",
+)
+
+_DEEPSEEK_V41_PROTOCOL = ModelOutputProtocol(
+    reasoning_format="none",
+    reasoning_parser_factory=_deepseek_reasoning_parser,
+    tool_call_parser_factory=_deepseek_v41_tool_call_parser,
+    tool_call_protocol_name="dsml_v41",
 )
 
 _QWEN_PROTOCOL = ModelOutputProtocol(
@@ -113,18 +126,23 @@ _GLM_PROTOCOL = ModelOutputProtocol(
 
 _REGISTRY = (
     _OutputProtocolRegistration(
-        families=frozenset({"deepseek_v4", "deepseek_v41"}),
+        families=frozenset({"deepseek_v41"}),
+        aliases=frozenset(
+            {"deepseek_v41", "deepseek_v41_text", "deepseek_v41_vision"}
+        ),
+        prefixes=("deepseek_v41",),
+        protocol=_DEEPSEEK_V41_PROTOCOL,
+    ),
+    _OutputProtocolRegistration(
+        families=frozenset({"deepseek_v4"}),
         aliases=frozenset(
             {
                 "deepseek_v4",
                 "deepseek_v4_vision",
-                "deepseek_v41",
-                "deepseek_v41_text",
-                "deepseek_v41_vision",
             }
         ),
-        prefixes=("deepseek_v4", "deepseek_v41"),
-        protocol=_DEEPSEEK_PROTOCOL,
+        prefixes=("deepseek_v4",),
+        protocol=_DEEPSEEK_V4_PROTOCOL,
     ),
     _OutputProtocolRegistration(
         families=frozenset({"qwen3_5", "qwen4_exp"}),

@@ -17,7 +17,7 @@ from uuid import UUID, uuid4
 import httpx
 
 from mfq.server.capabilities import capabilities_for_architecture
-from mfq.server.deepseek_v4_prompt import render_deepseek_v4_prompt
+from mfq.server.input_protocols import render_preformatted_prompt
 from mfq.server.models import (
     ModelCapabilities,
     ResponseFormat,
@@ -125,6 +125,7 @@ class OpenAIChatBackend:
         client: httpx.AsyncClient | None = None,
         avfoundation_video_library: str | Path | None = None,
         local_tensor_files: bool = False,
+        model_type: str | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
@@ -137,7 +138,11 @@ class OpenAIChatBackend:
             # checks hang and could expose local inference traffic.
             trust_env=hostname not in {"127.0.0.1", "localhost", "::1"},
         )
-        self._model_type: str | None = None
+        # Managed local workers already have a canonical architecture from the
+        # model catalog.  Seed it here so the first text-only request selects
+        # the correct prompt/output protocol without depending on a prior
+        # /health request from the UI.
+        self._model_type = model_type
         self._vision_processor = MiniCPMO45VisionProcessor(
             avfoundation_library=avfoundation_video_library
         )
@@ -256,25 +261,20 @@ class OpenAIChatBackend:
             payload["mfq_session_id"] = str(session_id)
         if multimodal is not None:
             payload["mfq_multimodal"] = multimodal
-        if (
-            self._model_type is not None
-            and capabilities_for_architecture(
-                self._model_type
-            ).architecture_family == "deepseek_v4"
-        ):
-            # DeepSeek-V4 publishes a processor-side encoder rather than a HF
-            # chat_template.  Match mlx-vlm and send the native worker the
-            # canonical rendered prompt, while retaining messages/tools above
-            # so its output grammar and structured parser remain active.
-            payload["mfq_preformatted_prompt"] = render_deepseek_v4_prompt(
-                backend_messages,
-                tools=tools,
-                tool_choice=tool_choice,
-                response_format=response_format,
-                enable_thinking=sampling.enable_thinking,
-                reasoning_effort=sampling.reasoning_effort,
-                parallel_tool_calls=True,
-            )
+        preformatted_prompt = render_preformatted_prompt(
+            self._model_type or model,
+            backend_messages,
+            tools=tools,
+            tool_choice=tool_choice,
+            response_format=response_format,
+            enable_thinking=sampling.enable_thinking,
+            reasoning_effort=sampling.reasoning_effort,
+            parallel_tool_calls=True,
+        )
+        if preformatted_prompt is not None:
+            # Processor-owned prompt protocols are selected by the registry;
+            # messages and tools remain present for native output constraints.
+            payload["mfq_preformatted_prompt"] = preformatted_prompt
         headers = {"Accept": "text/event-stream"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"

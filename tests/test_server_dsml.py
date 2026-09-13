@@ -71,6 +71,26 @@ def test_dsml_parser_supports_parallel_function_calls_and_json_values() -> None:
     assert parser.finish() == ("", ())
 
 
+def test_dsml_parser_supports_v41_spaced_tags() -> None:
+    parser = DSMLStreamParser(TOOLS, spaced_tags=True)
+    content, calls = parser.feed(
+        "<｜DSML｜ calls>\n"
+        '<｜DSML｜ invoke name="write">\n'
+        '<｜DSML｜ parameter name="content" string="true">hello'
+        "</｜DSML｜ parameter>\n"
+        '<｜DSML｜ parameter name="count" string="false">2'
+        "</｜DSML｜ parameter>\n"
+        "</｜DSML｜ invoke>\n"
+        "</｜DSML｜ calls>"
+    )
+
+    assert content == ""
+    assert len(calls) == 1
+    assert calls[0].name == "write"
+    assert json.loads(calls[0].arguments) == {"content": "hello", "count": 2}
+    assert parser.finish() == ("", ())
+
+
 def test_dsml_parser_recovers_false_flag_for_schema_declared_string() -> None:
     parser = DSMLStreamParser(TOOLS)
     _content, calls = parser.feed(

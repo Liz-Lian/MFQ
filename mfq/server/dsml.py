@@ -15,7 +15,6 @@ from typing import Any
 
 _DSML_PREFIX = "<｜DSML｜"
 _BLOCK_NAMES = ("tool_calls", "function_calls")
-_BLOCK_STARTS = tuple(f"{_DSML_PREFIX}{name}>" for name in _BLOCK_NAMES)
 
 
 class DSMLParseError(ValueError):
@@ -31,8 +30,19 @@ class DSMLToolCall:
 class DSMLStreamParser:
     """Extract complete DSML calls from arbitrarily fragmented text."""
 
-    def __init__(self, tool_schemas: Mapping[str, Mapping[str, Any]]) -> None:
+    def __init__(
+        self,
+        tool_schemas: Mapping[str, Mapping[str, Any]],
+        *,
+        spaced_tags: bool = False,
+    ) -> None:
         self._tool_schemas = dict(tool_schemas)
+        self._block_names = (" calls",) if spaced_tags else _BLOCK_NAMES
+        self._block_starts = tuple(
+            f"{_DSML_PREFIX}{name}>" for name in self._block_names
+        )
+        self._invoke_tag = " invoke" if spaced_tags else "invoke"
+        self._parameter_tag = " parameter" if spaced_tags else "parameter"
         self._buffer = ""
         self._block_name: str | None = None
 
@@ -113,16 +123,16 @@ class DSMLStreamParser:
         name, position = self._read_name_attribute(
             value,
             position,
-            prefix=f'{_DSML_PREFIX}invoke name="',
+            prefix=f'{_DSML_PREFIX}{self._invoke_tag} name="',
         )
         schema = self._tool_schemas.get(name)
         if schema is None:
             raise DSMLParseError(f"DSML invokes unavailable tool {name!r}")
 
         arguments: dict[str, Any] = {}
-        close_invoke = f"</{_DSML_PREFIX[1:]}invoke>"
-        parameter_prefix = f'{_DSML_PREFIX}parameter name="'
-        close_parameter = f"</{_DSML_PREFIX[1:]}parameter>"
+        close_invoke = f"</{_DSML_PREFIX[1:]}{self._invoke_tag}>"
+        parameter_prefix = f'{_DSML_PREFIX}{self._parameter_tag} name="'
+        close_parameter = f"</{_DSML_PREFIX[1:]}{self._parameter_tag}>"
 
         while True:
             position = self._skip_whitespace(value, position)
@@ -218,7 +228,11 @@ class DSMLStreamParser:
             if marker_at >= 0:
                 fragment = self._buffer[marker_at:]
                 complete = next(
-                    (marker for marker in _BLOCK_STARTS if fragment.startswith(marker)),
+                    (
+                        marker
+                        for marker in self._block_starts
+                        if fragment.startswith(marker)
+                    ),
                     None,
                 )
                 if complete is not None:
@@ -226,7 +240,7 @@ class DSMLStreamParser:
                     self._buffer = fragment[len(complete) :]
                     self._block_name = complete[len(_DSML_PREFIX) : -1]
                     continue
-                if any(marker.startswith(fragment) for marker in _BLOCK_STARTS):
+                if any(marker.startswith(fragment) for marker in self._block_starts):
                     visible.append(self._buffer[:marker_at])
                     self._buffer = fragment
                     break

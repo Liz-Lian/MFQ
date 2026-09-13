@@ -23,6 +23,7 @@ from mfq.formats.io import save
 from mfq.server.catalog import ModelCatalog
 from mfq.server.hf_tokenizer import (
     DEEPSEEK_V4_CHAT_TEMPLATE,
+    DEEPSEEK_V41_CHAT_TEMPLATE,
     ensure_hf_tokenizer_gguf,
     ensure_mfq_tokenizer_gguf,
     native_hf_asset_environment,
@@ -288,6 +289,67 @@ def test_deepseek_v4_without_hf_template_uses_processor_fallback(
     assert (
         reader.get_field("tokenizer.chat_template").contents()
         == DEEPSEEK_V4_CHAT_TEMPLATE
+    )
+
+
+def test_deepseek_v41_without_hf_template_uses_processor_bootstrap(
+    tmp_path: Path,
+) -> None:
+    model = tmp_path / "DeepSeek-V41-Vision-Test"
+    _hf_fixture(model, model_type="deepseek_v41", tensor_name="embed.weight")
+    tokenizer_config_path = model / "tokenizer_config.json"
+    tokenizer_config = json.loads(tokenizer_config_path.read_text())
+    tokenizer_config.pop("chat_template")
+    tokenizer_config_path.write_text(json.dumps(tokenizer_config))
+
+    tokenizer = ensure_hf_tokenizer_gguf(model, tmp_path / "cache")
+    reader = GGUFReader(tokenizer, "r")
+
+    assert reader.get_field("tokenizer.chat_template").contents() == (
+        DEEPSEEK_V41_CHAT_TEMPLATE
+    )
+
+
+def test_native_hf_uses_standalone_chat_template_and_fingerprints_it(
+    tmp_path: Path,
+) -> None:
+    model = tmp_path / "GLM-Test"
+    cache = tmp_path / "cache"
+    _hf_fixture(model, model_type="glm5_next")
+    tokenizer_config_path = model / "tokenizer_config.json"
+    tokenizer_config = json.loads(tokenizer_config_path.read_text())
+    tokenizer_config.pop("chat_template")
+    tokenizer_config_path.write_text(json.dumps(tokenizer_config))
+    template_path = model / "chat_template.jinja"
+    template_path.write_text("{{ messages[0].content }}-first")
+
+    first = ensure_hf_tokenizer_gguf(model, cache)
+    first_reader = GGUFReader(first, "r")
+    assert first_reader.get_field("tokenizer.chat_template").contents() == (
+        "{{ messages[0].content }}-first"
+    )
+
+    template_path.write_text("{{ messages[0].content }}-second")
+    second = ensure_hf_tokenizer_gguf(model, cache)
+    second_reader = GGUFReader(second, "r")
+    assert second != first
+    assert second_reader.get_field("tokenizer.chat_template").contents() == (
+        "{{ messages[0].content }}-second"
+    )
+
+
+def test_native_hf_prefers_tokenizer_config_template_over_standalone_file(
+    tmp_path: Path,
+) -> None:
+    model = tmp_path / "Qwen-Test"
+    _hf_fixture(model)
+    (model / "chat_template.jinja").write_text("standalone")
+
+    tokenizer = ensure_hf_tokenizer_gguf(model, tmp_path / "cache")
+    reader = GGUFReader(tokenizer, "r")
+
+    assert reader.get_field("tokenizer.chat_template").contents() == (
+        "{{ messages[0].content }}"
     )
 
 

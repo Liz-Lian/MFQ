@@ -110,6 +110,7 @@ from mfq.server.models import (
     RewindSessionRequest,
     RuntimeCapabilitiesResource,
     RuntimeInstanceList,
+    RuntimeInstanceResource,
     RuntimeLogLevel,
     RuntimeLogList,
     RuntimeMetricList,
@@ -130,6 +131,7 @@ from mfq.server.models import (
     UpdateGenerationPresetRequest,
     UpdateMcpServerRequest,
     UpdateRemoteNodeRequest,
+    UpdateRuntimeInstanceRequest,
     UpdateRuntimeProfileRequest,
     UpdateSessionRequest,
     VideoPart,
@@ -1355,6 +1357,19 @@ class ServerService:
             CreateJobRequest(kind="model.unload", payload=request.model_dump(mode="json"))
         )
         return OperationAccepted(operation_id=job.id)
+
+    async def update_runtime_instance(
+        self,
+        instance_id: UUID,
+        request: UpdateRuntimeInstanceRequest,
+    ) -> RuntimeInstanceResource:
+        if self.runtime_manager is None:
+            raise ServiceError(
+                501,
+                "model_management_unavailable",
+                "managed model runtime is not available",
+            )
+        return await self.runtime_manager.update_instance(instance_id, request)
 
     async def prepare_response(
         self,

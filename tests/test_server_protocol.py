@@ -166,6 +166,7 @@ def test_openapi_contract_has_all_native_routes_and_realtime_extension() -> None
         "/api/v1/hub/models",
         "/api/v1/hub/models/{provider}/{owner}/{name}",
         "/api/v1/runtime/instances",
+        "/api/v1/runtime/instances/{instance_id}",
         "/api/v1/runtime/logs",
         "/api/v1/runtime/metrics",
         "/api/v1/runtime/capabilities",

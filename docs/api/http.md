@@ -254,6 +254,7 @@ by environment-variable name and are not persisted as plaintext values.
 | `POST` | `/api/v1/runtime/cache/clear` | — | `200 Object` |
 | `GET` | `/api/v1/runtime/capabilities` | — | `200 RuntimeCapabilitiesResource` |
 | `GET` | `/api/v1/runtime/instances` | — | `200 RuntimeInstanceList` |
+| `PATCH` | `/api/v1/runtime/instances/{instance_id}` | `UpdateRuntimeInstanceRequest` | `200 RuntimeInstanceResource` |
 | `GET` | `/api/v1/runtime/logs` | — | `200 RuntimeLogList` |
 | `GET` | `/api/v1/runtime/metrics` | — | `200 RuntimeMetricList` |
 | `GET` | `/api/v1/runtime/models` | — | `200 Object` |
@@ -468,6 +469,15 @@ curl -X POST http://127.0.0.1:8090/api/v1/models/load \
 The response is `202 OperationAccepted`. Track the returned operation through
 the jobs API and inspect active instances through
 `GET /api/v1/runtime/instances`.
+
+Pinning and idle TTL can be changed on a resident instance without reloading
+it. The updated policy is also retained for later request-driven reloads.
+
+```shell
+curl -X PATCH http://127.0.0.1:8090/api/v1/runtime/instances/INSTANCE_ID \
+  -H 'Content-Type: application/json' \
+  --data '{"pinned":true}'
+```
 
 ### 5.2 Jobs
 

@@ -79,6 +79,7 @@ from mfq.server.models import (
     RuntimeCacheClearRequest,
     RuntimeCapabilitiesResource,
     RuntimeInstanceList,
+    RuntimeInstanceResource,
     RuntimeLogLevel,
     RuntimeLogList,
     RuntimeMetricList,
@@ -93,6 +94,7 @@ from mfq.server.models import (
     UpdateGenerationPresetRequest,
     UpdateMcpServerRequest,
     UpdateRemoteNodeRequest,
+    UpdateRuntimeInstanceRequest,
     UpdateRuntimeProfileRequest,
     UpdateSessionRequest,
 )
@@ -1120,6 +1122,18 @@ def create_app(
     )
     async def runtime_instances() -> RuntimeInstanceList:
         return await require_service().runtime_instances()
+
+    @app.patch(
+        "/api/v1/runtime/instances/{instance_id}",
+        response_model=RuntimeInstanceResource,
+        responses=ERROR_RESPONSES,
+        tags=["runtime"],
+    )
+    async def update_runtime_instance(
+        instance_id: UUID,
+        body: UpdateRuntimeInstanceRequest,
+    ) -> RuntimeInstanceResource:
+        return await require_service().update_runtime_instance(instance_id, body)
 
     @app.get(
         "/api/v1/runtime/capabilities",

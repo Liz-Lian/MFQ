@@ -36,6 +36,7 @@ from mfq.server.models import (
     SamplingParams,
     ToolChoice,
     ToolDefinition,
+    UpdateRuntimeInstanceRequest,
 )
 from mfq.server.native import (
     find_native_runtime_resource,
@@ -697,6 +698,65 @@ class ManagedRuntimePool:
                 for item in values
             ]
         )
+
+    async def update_instance(
+        self,
+        instance_id: UUID,
+        request: UpdateRuntimeInstanceRequest,
+    ) -> RuntimeInstanceResource:
+        async with self._lock:
+            instance = self._instances.get(instance_id)
+            if instance is None:
+                raise BackendError(
+                    "runtime_instance_not_found",
+                    f"runtime instance was not found: {instance_id}",
+                    status_code=404,
+                )
+            if instance.state not in {
+                RuntimeInstanceState.READY,
+                RuntimeInstanceState.BUSY,
+            }:
+                raise BackendError(
+                    "model_not_ready",
+                    f"model runtime is {instance.state.value}",
+                    retryable=True,
+                    status_code=409,
+                )
+            updates: dict[str, Any] = {}
+            if "pinned" in request.model_fields_set:
+                instance.pinned = bool(request.pinned)
+                updates["pin"] = instance.pinned
+            if "idle_ttl_seconds" in request.model_fields_set:
+                instance.idle_ttl_seconds = request.idle_ttl_seconds
+                updates["idle_ttl_seconds"] = request.idle_ttl_seconds
+            model_name = instance.artifact.resource.name
+            load_request = self._load_requests.get(model_name)
+            if load_request is not None and updates:
+                self._load_requests[model_name] = load_request.model_copy(
+                    update=updates
+                )
+            active_sessions = sum(
+                routed_id == instance.id
+                for routed_id in self._session_routes.values()
+            )
+            resource = RuntimeInstanceResource(
+                id=instance.id,
+                model=model_name,
+                state=instance.state,
+                devices=[self.backend],
+                active_sessions=active_sessions,
+                queued_requests=instance.queued_requests,
+                resident_bytes=instance.resident_bytes,
+                kv_bytes=instance.kv_bytes,
+                context_size=instance.context_size,
+                started_at=instance.started_at,
+                last_used_at=instance.last_used_at,
+                idle_ttl_seconds=instance.idle_ttl_seconds,
+                pinned=instance.pinned,
+                error=instance.error,
+            )
+            self._idle_reaper_wakeup.set()
+        return resource
 
     async def stream(
         self,

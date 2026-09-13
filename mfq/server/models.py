@@ -749,6 +749,19 @@ class RuntimeInstanceResource(ProtocolModel):
     error: ErrorDetail | None = None
 
 
+class UpdateRuntimeInstanceRequest(ProtocolModel):
+    pinned: bool | None = None
+    idle_ttl_seconds: int | None = Field(default=None, ge=0)
+
+    @model_validator(mode="after")
+    def validate_update(self) -> UpdateRuntimeInstanceRequest:
+        if not self.model_fields_set:
+            raise ValueError("at least one runtime policy field is required")
+        if "pinned" in self.model_fields_set and self.pinned is None:
+            raise ValueError("pinned must be boolean")
+        return self
+
+
 class RuntimeInstanceList(ProtocolModel):
     data: list[RuntimeInstanceResource]
 

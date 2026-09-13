@@ -29,6 +29,7 @@ from mfq.server.catalog import (
 from mfq.server.jobs import JobExecutionError
 from mfq.server.models import (
     JobStatus,
+    ModelLoadRequest,
     RuntimeCapabilitiesResource,
     RuntimeInstanceState,
     SamplingParams,
@@ -1851,6 +1852,72 @@ def test_managed_runtime_closes_backend_stream_when_consumer_stops(
         assert instance.state == RuntimeInstanceState.READY
         assert instance.request_slots is not None
         assert not instance.request_slots.locked()
+
+    asyncio.run(run())
+
+
+def test_runtime_instance_policy_updates_without_reload(tmp_path: Path) -> None:
+    async def run() -> None:
+        model = tmp_path / "policy.mfq"
+        _model(model)
+        catalog = ModelCatalog([tmp_path], cache_seconds=0)
+        artifact = await catalog.resolve((await catalog.list()).data[0].id)
+        instance = _ManagedRuntime(
+            id=uuid4(),
+            artifact=artifact,
+            process=SimpleNamespace(returncode=None),
+            backend=IdleBackend(),
+            port=0,
+            context_size=4096,
+            idle_ttl_seconds=300,
+            state=RuntimeInstanceState.READY,
+            request_slots=asyncio.Semaphore(1),
+        )
+        pool = ManagedRuntimePool(catalog, tmp_path / "runtime")
+        pool._instances[instance.id] = instance
+        pool._load_requests[artifact.resource.name] = ModelLoadRequest(
+            model=artifact.resource.name,
+            idle_ttl_seconds=300,
+        )
+        service = ServerService(
+            SessionStore(tmp_path / "mfq.server.sqlite3"),
+            pool,
+            catalog=catalog,
+            runtime_manager=pool,
+        )
+        transport = httpx.ASGITransport(app=create_app(service))
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            pinned = await client.patch(
+                f"/api/v1/runtime/instances/{instance.id}",
+                json={"pinned": True},
+            )
+            assert pinned.status_code == 200
+            assert pinned.json()["pinned"] is True
+            assert pinned.json()["idle_ttl_seconds"] == 300
+            assert pool._load_requests[artifact.resource.name].pin is True
+
+            unpinned = await client.patch(
+                f"/api/v1/runtime/instances/{instance.id}",
+                json={"pinned": False, "idle_ttl_seconds": None},
+            )
+            assert unpinned.status_code == 200
+            assert unpinned.json()["pinned"] is False
+            assert unpinned.json()["idle_ttl_seconds"] is None
+            remembered = pool._load_requests[artifact.resource.name]
+            assert remembered.pin is False
+            assert remembered.idle_ttl_seconds is None
+
+            assert (
+                await client.patch(
+                    f"/api/v1/runtime/instances/{instance.id}", json={}
+                )
+            ).status_code == 422
+            assert (
+                await client.patch(
+                    f"/api/v1/runtime/instances/{instance.id}",
+                    json={"pinned": None},
+                )
+            ).status_code == 422
 
     asyncio.run(run())
 

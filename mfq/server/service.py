@@ -874,7 +874,19 @@ class ServerService:
         except StorageError as error:
             raise ServiceError(409, "session_state_conflict", str(error)) from error
         if request.at_message_id is None and forked.model == source.model:
-            await self.backend.fork_session(session_id, forked.id)
+            try:
+                await self.backend.fork_session(session_id, forked.id)
+            except BackendError as error:
+                await asyncio.to_thread(
+                    self.store.append_runtime_log,
+                    RuntimeLogLevel.WARNING,
+                    "Session fork completed without copying the runtime cache",
+                    fields={
+                        "source_session_id": str(session_id),
+                        "target_session_id": str(forked.id),
+                        "error": str(error),
+                    },
+                )
         return forked
 
     async def rewind_session(
@@ -911,7 +923,15 @@ class ServerService:
             raise ServiceError(404, "session_not_found", str(error)) from error
         except ResponseInProgressError as error:
             raise ServiceError(409, "response_in_progress", str(error), retryable=True) from error
-        await self.backend.close_session(session_id)
+        try:
+            await self.backend.close_session(session_id)
+        except BackendError as error:
+            await asyncio.to_thread(
+                self.store.append_runtime_log,
+                RuntimeLogLevel.WARNING,
+                "Session deleted while runtime-cache cleanup was unavailable",
+                fields={"session_id": str(session_id), "error": str(error)},
+            )
 
     async def runtime_instances(self) -> RuntimeInstanceList:
         if self.runtime_manager is not None:

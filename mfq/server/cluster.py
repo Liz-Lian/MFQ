@@ -286,6 +286,12 @@ class ClusterBackend:
         ephemeral = session_id is None
         key = (node.id, session_id or uuid4())
         remote = self._sessions.get(key)
+        stale_remote = (
+            remote
+            if remote is not None
+            and remote.synchronized_messages > len(messages)
+            else None
+        )
         if remote is None or remote.synchronized_messages > len(messages):
             created = await self._request_json(
                 node,
@@ -300,6 +306,12 @@ class ClusterBackend:
                 synchronized_messages=0,
             )
             self._sessions[key] = remote
+            if stale_remote is not None:
+                await self._discard_remote_session(
+                    node,
+                    stale_remote,
+                    headers,
+                )
         try:
             async for delta in self._remote_session_stream(
                 node,
@@ -314,11 +326,7 @@ class ClusterBackend:
                 yield delta
         finally:
             if ephemeral and self._sessions.pop(key, None) is not None:
-                with suppress(httpx.HTTPError):
-                    await self._client.delete(
-                        f"{node.url}/api/v1/sessions/{remote.remote_id}",
-                        headers=headers,
-                    )
+                await self._discard_remote_session(node, remote, headers)
 
     async def _remote_session_stream(
         self,
@@ -469,11 +477,19 @@ class ClusterBackend:
         except BackendError:
             return
         for remote in sessions:
-            with suppress(httpx.HTTPError):
-                await self._client.delete(
-                    f"{node.url}/api/v1/sessions/{remote.remote_id}",
-                    headers=headers,
-                )
+            await self._discard_remote_session(node, remote, headers)
+
+    async def _discard_remote_session(
+        self,
+        node: RemoteNodeResource,
+        remote: _RemoteSession,
+        headers: dict[str, str],
+    ) -> None:
+        with suppress(httpx.HTTPError):
+            await self._client.delete(
+                f"{node.url}/api/v1/sessions/{remote.remote_id}",
+                headers=headers,
+            )
 
     async def _parts(
         self,

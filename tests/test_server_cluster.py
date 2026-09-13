@@ -23,7 +23,10 @@ def _remote_app(
     legacy_models_endpoint: bool = False,
     runtime_status_code: int = 200,
 ):
+    session_count = 0
+
     async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal session_count
         path = request.url.path
         if requested_paths is not None:
             requested_paths.append(path)
@@ -55,10 +58,15 @@ def _remote_app(
                 },
             )
         if path == "/api/v1/sessions":
+            remote_session_id = (
+                "11111111-1111-4111-8111-"
+                f"{111111111111 + session_count:012d}"
+            )
+            session_count += 1
             return httpx.Response(
                 201,
                 json={
-                    "id": "11111111-1111-4111-8111-111111111111",
+                    "id": remote_session_id,
                     "model": "remote-model",
                     "mode": "text",
                     "state": "idle",
@@ -187,6 +195,32 @@ def test_cluster_registers_probes_and_routes_matching_model(tmp_path: Path) -> N
             assert "".join(item.content_delta for item in chunks) == "remote"
             assert chunks[-1].finish_reason == "stop"
             assert response_requests[0]["sampling"] == {}
+            replacement = [
+                delta
+                async for delta in cluster.stream(
+                    model="remote-model",
+                    messages=[{"role": "user", "content": "edited"}],
+                    sampling=__import__(
+                        "mfq.server.models", fromlist=["SamplingParams"]
+                    ).SamplingParams(),
+                    session_id=UUID("33333333-3333-4333-8333-333333333333"),
+                )
+            ]
+            assert replacement[-1].finish_reason == "stop"
+            assert requested_paths.count("/api/v1/sessions") == 2
+            assert (
+                "/api/v1/sessions/11111111-1111-4111-8111-111111111111"
+                in requested_paths
+            )
+            remote = cluster._sessions[
+                (
+                    UUID(node_id),
+                    UUID("33333333-3333-4333-8333-333333333333"),
+                )
+            ]
+            assert remote.remote_id == UUID(
+                "11111111-1111-4111-8111-111111111112"
+            )
             assert await cluster.cancel_response(
                 UUID("33333333-3333-4333-8333-333333333333")
             )

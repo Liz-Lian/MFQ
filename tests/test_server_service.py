@@ -18,6 +18,7 @@ from mfq.server.capabilities import capabilities_for_architecture
 from mfq.server.models import (
     CreateResponseRequest,
     CreateSessionRequest,
+    ForkSessionRequest,
     MessageRole,
     ResponseStatus,
     RewindSessionRequest,
@@ -265,6 +266,49 @@ def test_stream_disconnect_closes_backend_and_terminates_response(tmp_path: Path
         assert responses.data[0].status == ResponseStatus.CANCELLED
         session = await service.get_session(SESSION_ID)
         assert session.state == SessionState.INTERRUPTED
+
+    asyncio.run(run())
+
+
+def test_session_mutations_survive_runtime_cache_failures(tmp_path: Path) -> None:
+    class FailingCacheBackend(FakeBackend):
+        async def fork_session(
+            self,
+            source_session_id: UUID,
+            target_session_id: UUID,
+        ) -> bool:
+            del source_session_id, target_session_id
+            raise BackendError("backend_connection_error", "runtime is gone")
+
+        async def close_session(self, session_id: UUID) -> bool:
+            del session_id
+            raise BackendError("backend_connection_error", "runtime is gone")
+
+    async def run() -> None:
+        service = make_service(tmp_path, FailingCacheBackend())
+        await asyncio.to_thread(
+            service.store.create_session,
+            CreateSessionRequest(model="model-a"),
+            session_id=SESSION_ID,
+        )
+
+        forked = await service.fork_session(SESSION_ID, ForkSessionRequest())
+        assert await service.get_session(forked.id) == forked
+
+        await service.delete_session(SESSION_ID)
+        with pytest.raises(ServiceError) as missing:
+            await service.get_session(SESSION_ID)
+        assert missing.value.status_code == 404
+        warnings = await service.runtime_logs(
+            instance_id=None,
+            level=None,
+            after=0,
+            limit=20,
+        )
+        assert [entry.level.value for entry in warnings.data] == [
+            "warning",
+            "warning",
+        ]
 
     asyncio.run(run())
 

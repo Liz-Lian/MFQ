@@ -1369,7 +1369,15 @@ class ServerService:
                 "model_management_unavailable",
                 "managed model runtime is not available",
             )
-        return await self.runtime_manager.update_instance(instance_id, request)
+        try:
+            return await self.runtime_manager.update_instance(instance_id, request)
+        except BackendError as error:
+            raise ServiceError(
+                error.status_code or 503,
+                error.code,
+                str(error),
+                retryable=error.retryable,
+            ) from error
 
     async def prepare_response(
         self,

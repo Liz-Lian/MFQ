@@ -1918,6 +1918,12 @@ def test_runtime_instance_policy_updates_without_reload(tmp_path: Path) -> None:
                     json={"pinned": None},
                 )
             ).status_code == 422
+            missing = await client.patch(
+                f"/api/v1/runtime/instances/{uuid4()}",
+                json={"pinned": True},
+            )
+            assert missing.status_code == 404
+            assert missing.json()["error"]["code"] == "runtime_instance_not_found"
 
     asyncio.run(run())
 

@@ -705,7 +705,7 @@ class ManagedRuntimePool:
     ) -> AsyncIterator[BackendDelta]:
         instance = await self._select(model, session_id=session_id)
         if instance is not None and instance.state == RuntimeInstanceState.LOADING:
-            await self._wait_for_model_ready(model)
+            await self._wait_for_model_ready(instance.artifact.resource.name)
             instance = await self._select(model, session_id=session_id)
         if instance is None:
             instance = await self._ensure_model_loaded(model)
@@ -1049,6 +1049,7 @@ class ManagedRuntimePool:
             await self.fallback.aclose()
 
     async def _select(self, model: str, *, session_id: UUID | None) -> _ManagedRuntime | None:
+        stale_backend: ChatBackend | None = None
         async with self._lock:
             if session_id is not None:
                 instance_id = self._session_routes.get(session_id)
@@ -1056,7 +1057,7 @@ class ManagedRuntimePool:
                     routed = self._instances.get(instance_id)
                     if (
                         routed is not None
-                        and routed.artifact.resource.name == model
+                        and self._matches_model(routed, model)
                         and routed.state in {
                             RuntimeInstanceState.READY,
                             RuntimeInstanceState.BUSY,
@@ -1064,10 +1065,15 @@ class ManagedRuntimePool:
                     ):
                         return routed
                     self._session_routes.pop(session_id, None)
+                    if routed is not None and routed.state in {
+                        RuntimeInstanceState.READY,
+                        RuntimeInstanceState.BUSY,
+                    }:
+                        stale_backend = routed.backend
             matches = [
                 item
                 for item in self._instances.values()
-                if model == item.artifact.resource.name
+                if self._matches_model(item, model)
                 and item.state in {
                     RuntimeInstanceState.LOADING,
                     RuntimeInstanceState.READY,
@@ -1076,7 +1082,17 @@ class ManagedRuntimePool:
             ]
         if len(matches) > 1:
             raise BackendError("ambiguous_model", f"multiple loaded runtimes match {model}")
+        if stale_backend is not None and session_id is not None:
+            close = getattr(stale_backend, "close_session", None)
+            if callable(close):
+                with suppress(Exception):
+                    await close(session_id)
         return matches[0] if matches else None
+
+    @staticmethod
+    def _matches_model(instance: _ManagedRuntime, model: str) -> bool:
+        resource = instance.artifact.resource
+        return model == resource.name or model == resource.id
 
     async def _ensure_model_loaded(self, model: str) -> _ManagedRuntime | None:
         try:

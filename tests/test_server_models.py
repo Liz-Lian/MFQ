@@ -1438,6 +1438,14 @@ def test_started_runtime_monitor_reports_abnormal_exit(tmp_path: Path) -> None:
 def test_runtime_selection_does_not_route_a_session_to_the_wrong_model(
     tmp_path: Path,
 ) -> None:
+    class TrackingBackend(IdleBackend):
+        def __init__(self) -> None:
+            self.closed_sessions: list[object] = []
+
+        async def close_session(self, session_id: object) -> bool:
+            self.closed_sessions.append(session_id)
+            return True
+
     async def run() -> None:
         first_path = tmp_path / "first.mfq"
         second_path = tmp_path / "second.mfq"
@@ -1447,11 +1455,12 @@ def test_runtime_selection_does_not_route_a_session_to_the_wrong_model(
         first_artifact = await catalog.resolve_path(first_path)
         second_artifact = await catalog.resolve_path(second_path)
         pool = ManagedRuntimePool(catalog, tmp_path / "runtime", max_instances=2)
+        first_backend = TrackingBackend()
         first = _ManagedRuntime(
             id=uuid4(),
             artifact=first_artifact,
             process=SimpleNamespace(returncode=None),
-            backend=IdleBackend(),
+            backend=first_backend,
             port=1,
             context_size=4096,
             state=RuntimeInstanceState.READY,
@@ -1471,12 +1480,64 @@ def test_runtime_selection_does_not_route_a_session_to_the_wrong_model(
         session_id = uuid4()
         pool._session_routes[session_id] = first.id
 
-        assert await pool._select("second", session_id=session_id) is second
+        assert await pool._select(first_artifact.resource.id, session_id=session_id) is first
+        assert pool._session_routes[session_id] == first.id
+        assert first_backend.closed_sessions == []
+
+        assert await pool._select(second_artifact.resource.id, session_id=session_id) is second
         assert session_id not in pool._session_routes
+        assert first_backend.closed_sessions == [session_id]
 
         first.state = RuntimeInstanceState.FAILED
         pool._last_instance_id = first.id
         assert pool._current_instance_locked() is second
+
+    asyncio.run(run())
+
+
+def test_artifact_id_request_waits_on_the_canonical_model_load(
+    tmp_path: Path,
+) -> None:
+    class StreamingBackend(IdleBackend):
+        async def stream(self, **_options: object):
+            yield BackendDelta(content_delta="ok", finish_reason="stop")
+
+    async def run() -> None:
+        model_path = tmp_path / "loading.mfq"
+        _model(model_path)
+        catalog = ModelCatalog([tmp_path], cache_seconds=0)
+        artifact = await catalog.resolve_path(model_path)
+        pool = ManagedRuntimePool(catalog, tmp_path / "runtime")
+        instance = _ManagedRuntime(
+            id=uuid4(),
+            artifact=artifact,
+            process=SimpleNamespace(returncode=None),
+            backend=StreamingBackend(),
+            port=1,
+            context_size=4096,
+            state=RuntimeInstanceState.LOADING,
+            request_slots=asyncio.Semaphore(1),
+        )
+        pool._instances[instance.id] = instance
+        waited: list[str] = []
+
+        async def wait_for_model_ready(model: str) -> bool:
+            waited.append(model)
+            instance.state = RuntimeInstanceState.READY
+            return True
+
+        pool._wait_for_model_ready = wait_for_model_ready  # type: ignore[method-assign]
+        deltas = [
+            delta
+            async for delta in pool.stream(
+                model=artifact.resource.id,
+                messages=({"role": "user", "content": "hello"},),
+                sampling=SamplingParams(),
+            )
+        ]
+
+        assert waited == [artifact.resource.name]
+        assert [delta.content_delta for delta in deltas] == ["ok"]
 
     asyncio.run(run())
 

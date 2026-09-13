@@ -859,6 +859,12 @@ class ManagedRuntimePool:
                 if instance.state == RuntimeInstanceState.BUSY and instance.active_requests == 0:
                     instance.state = RuntimeInstanceState.READY
                 instance.last_used_at = datetime.now(timezone.utc)
+                # A memory-budget pass may have skipped this runtime while its
+                # request was active. Re-evaluate as soon as the final request
+                # drains instead of retaining an over-budget process until the
+                # next periodic metrics tick.
+                if instance.active_requests == 0:
+                    self._idle_reaper_wakeup.set()
 
     @staticmethod
     def _sampling_for_instance(

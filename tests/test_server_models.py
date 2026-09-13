@@ -952,6 +952,76 @@ def test_runtime_memory_enforcement_evicts_only_idle_unpinned_instances(
     asyncio.run(run())
 
 
+def test_runtime_memory_enforcement_rechecks_when_a_busy_runtime_drains(
+    tmp_path: Path,
+) -> None:
+    async def run() -> None:
+        release = asyncio.Event()
+
+        class BlockingBackend(IdleBackend):
+            async def stream(self, **_options: object):
+                await release.wait()
+                yield BackendDelta(content_delta="ok", finish_reason="stop")
+
+        _model(tmp_path / "busy.mfq")
+        catalog = ModelCatalog([tmp_path], cache_seconds=0)
+        artifact = await catalog.resolve("busy")
+        instance = _ManagedRuntime(
+            id=uuid4(),
+            artifact=artifact,
+            process=SimpleNamespace(returncode=None),
+            backend=BlockingBackend(),
+            port=0,
+            context_size=4096,
+            state=RuntimeInstanceState.READY,
+            resident_bytes=101,
+            request_slots=asyncio.Semaphore(1),
+        )
+        pool = ManagedRuntimePool(
+            catalog,
+            tmp_path / "runtime",
+            max_runtime_memory_bytes=100,
+            metric_interval_seconds=60,
+        )
+        pool._instances[instance.id] = instance
+        stopped = asyncio.Event()
+
+        async def stop_process(victim: _ManagedRuntime) -> None:
+            assert victim is instance
+            stopped.set()
+
+        async def refresh_usage(_instance: _ManagedRuntime) -> None:
+            return None
+
+        pool._stop_process = stop_process  # type: ignore[method-assign]
+        pool._refresh_instance_usage = refresh_usage  # type: ignore[method-assign]
+        pool._idle_reaper_task = asyncio.create_task(pool._idle_reaper())
+
+        async def consume() -> None:
+            async for _ in pool.stream(
+                model=artifact.resource.name,
+                messages=[{"role": "user", "content": "hello"}],
+                sampling=SamplingParams(),
+            ):
+                pass
+
+        response = asyncio.create_task(consume())
+        for _ in range(100):
+            if instance.active_requests == 1:
+                break
+            await asyncio.sleep(0)
+        assert instance.active_requests == 1
+        assert not stopped.is_set()
+
+        release.set()
+        await response
+        await asyncio.wait_for(stopped.wait(), timeout=1)
+        assert instance.id not in pool._instances
+        await pool.aclose()
+
+    asyncio.run(run())
+
+
 def test_runtime_controls_target_the_requested_model_instance(tmp_path: Path) -> None:
     async def run() -> None:
         class ControlBackend:

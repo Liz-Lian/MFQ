@@ -834,6 +834,53 @@ def test_runtime_controls_target_the_requested_model_instance(tmp_path: Path) ->
     asyncio.run(run())
 
 
+def test_unexpected_runtime_exit_is_contained_until_explicit_retry(
+    tmp_path: Path,
+) -> None:
+    async def run() -> None:
+        class ExitedProcess:
+            returncode = 9
+
+            async def wait(self) -> int:
+                return 9
+
+        class ClosedBackend:
+            closed = False
+
+            async def aclose(self) -> None:
+                self.closed = True
+
+        _model(tmp_path / "unstable.mfq")
+        catalog = ModelCatalog([tmp_path], cache_seconds=0)
+        artifact = await catalog.resolve("unstable")
+        backend = ClosedBackend()
+        instance = _ManagedRuntime(
+            id=uuid4(),
+            artifact=artifact,
+            process=ExitedProcess(),  # type: ignore[arg-type]
+            backend=backend,  # type: ignore[arg-type]
+            port=0,
+            context_size=4096,
+            state=RuntimeInstanceState.READY,
+        )
+        pool = ManagedRuntimePool(
+            catalog,
+            tmp_path / "runtime",
+            load_failure_cooldown_seconds=60,
+        )
+        pool._instances[instance.id] = instance
+
+        await pool._monitor(instance)
+
+        assert instance.state == RuntimeInstanceState.FAILED
+        assert backend.closed
+        with pytest.raises(BackendError) as contained:
+            await pool._ensure_model_loaded("unstable")
+        assert contained.value.code == "runtime_exited"
+
+    asyncio.run(run())
+
+
 def test_request_driven_load_waiters_receive_the_same_startup_error(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

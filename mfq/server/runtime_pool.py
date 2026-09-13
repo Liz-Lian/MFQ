@@ -1502,6 +1502,13 @@ class ManagedRuntimePool:
                 return
             instance.state = RuntimeInstanceState.FAILED
             instance.error = error
+            model_name = instance.artifact.resource.name
+            self._load_errors[model_name] = error
+            self._load_failures[model_name] = _CachedLoadFailure(
+                artifact_id=instance.artifact.resource.id,
+                detail=error,
+                failed_at=time.monotonic(),
+            )
             self._session_routes = {
                 session_id: instance_id
                 for session_id, instance_id in self._session_routes.items()

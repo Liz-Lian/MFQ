@@ -66,12 +66,19 @@ class ClusterBackend:
         *,
         health_ttl_seconds: float = 5.0,
         probe_timeout_seconds: float = 5.0,
+        control_timeout_seconds: float = 30.0,
+        media_upload_timeout_seconds: float = 300.0,
         client: httpx.AsyncClient | None = None,
     ) -> None:
         self.local = local
         self.store = store
         self.health_ttl_seconds = max(0.25, health_ttl_seconds)
         self.probe_timeout_seconds = max(0.25, probe_timeout_seconds)
+        self.control_timeout_seconds = max(0.25, control_timeout_seconds)
+        self.media_upload_timeout_seconds = max(
+            self.control_timeout_seconds,
+            media_upload_timeout_seconds,
+        )
         self._owns_client = client is None
         self._client = client or httpx.AsyncClient(
             timeout=httpx.Timeout(connect=3.0, read=None, write=30.0, pool=3.0),
@@ -405,66 +412,93 @@ class ClusterBackend:
             ),
             "stream": True,
         }
-        async with self._client.stream(
-            "POST",
-            f"{node.url}/api/v1/sessions/{remote.remote_id}/responses",
-            json=request,
-            headers=headers,
-        ) as response:
-            if response.status_code >= 400:
-                body = await response.aread()
-                raise BackendError(
-                    "remote_node_error",
-                    body.decode("utf-8", errors="replace")[:1024],
-                    retryable=response.status_code >= 500,
-                    status_code=response.status_code,
-                )
-            async for line in response.aiter_lines():
-                if not line.startswith("data: "):
-                    continue
-                frame = json.loads(line[6:])
-                payload = frame.get("payload", {})
-                kind = payload.get("type")
-                if kind == "response.text.delta":
-                    yield BackendDelta(content_delta=str(payload.get("delta", "")))
-                elif kind == "response.reasoning.delta":
-                    yield BackendDelta(reasoning_delta=str(payload.get("delta", "")))
-                elif kind == "response.tool_call.delta":
-                    yield BackendDelta(
-                        tool_calls=(
-                            BackendToolCallDelta(
-                                index=int(payload.get("index", 0)),
-                                call_id=payload.get("call_id"),
-                                name=payload.get("name"),
-                                arguments_delta=str(payload.get("arguments_delta", "")),
-                            ),
-                        )
-                    )
-                elif kind == "response.completed":
-                    usage = (
-                        TokenUsage.model_validate(payload["usage"])
-                        if payload.get("usage")
-                        else None
-                    )
-                    performance = (
-                        ResponsePerformance.model_validate(payload["performance"])
-                        if payload.get("performance")
-                        else None
-                    )
-                    yield BackendDelta(
-                        finish_reason=str(payload.get("finish_reason", "stop")),
-                        usage=usage,
-                        performance=performance,
-                    )
-                elif kind == "session.state":
-                    remote.revision = int(payload.get("revision", remote.revision))
-                elif kind == "error":
-                    detail = payload.get("error", {})
+        try:
+            async with self._client.stream(
+                "POST",
+                f"{node.url}/api/v1/sessions/{remote.remote_id}/responses",
+                json=request,
+                headers=headers,
+            ) as response:
+                if response.status_code >= 400:
+                    body = await response.aread()
                     raise BackendError(
-                        str(detail.get("code", "remote_node_error")),
-                        str(detail.get("message", "remote node failed")),
-                        retryable=bool(detail.get("retryable", False)),
+                        "remote_node_error",
+                        body.decode("utf-8", errors="replace")[:1024],
+                        retryable=response.status_code >= 500,
+                        status_code=response.status_code,
                     )
+                async for line in response.aiter_lines():
+                    if not line.startswith("data: "):
+                        continue
+                    frame = json.loads(line[6:])
+                    if not isinstance(frame, dict):
+                        raise ValueError("remote SSE frame must be an object")
+                    payload = frame.get("payload", {})
+                    if not isinstance(payload, dict):
+                        raise ValueError("remote SSE payload must be an object")
+                    kind = payload.get("type")
+                    if kind == "response.text.delta":
+                        yield BackendDelta(content_delta=str(payload.get("delta", "")))
+                    elif kind == "response.reasoning.delta":
+                        yield BackendDelta(reasoning_delta=str(payload.get("delta", "")))
+                    elif kind == "response.tool_call.delta":
+                        yield BackendDelta(
+                            tool_calls=(
+                                BackendToolCallDelta(
+                                    index=int(payload.get("index", 0)),
+                                    call_id=payload.get("call_id"),
+                                    name=payload.get("name"),
+                                    arguments_delta=str(payload.get("arguments_delta", "")),
+                                ),
+                            )
+                        )
+                    elif kind == "response.completed":
+                        usage = (
+                            TokenUsage.model_validate(payload["usage"])
+                            if payload.get("usage")
+                            else None
+                        )
+                        performance = (
+                            ResponsePerformance.model_validate(payload["performance"])
+                            if payload.get("performance")
+                            else None
+                        )
+                        yield BackendDelta(
+                            finish_reason=str(payload.get("finish_reason", "stop")),
+                            usage=usage,
+                            performance=performance,
+                        )
+                    elif kind == "session.state":
+                        remote.revision = int(payload.get("revision", remote.revision))
+                    elif kind == "error":
+                        detail = payload.get("error", {})
+                        raise BackendError(
+                            str(detail.get("code", "remote_node_error")),
+                            str(detail.get("message", "remote node failed")),
+                            retryable=bool(detail.get("retryable", False)),
+                        )
+        except BackendError:
+            raise
+        except httpx.TimeoutException as error:
+            raise BackendError(
+                "remote_node_timeout",
+                str(error),
+                retryable=True,
+                status_code=504,
+            ) from error
+        except httpx.HTTPError as error:
+            raise BackendError(
+                "remote_node_unavailable",
+                str(error),
+                retryable=True,
+                status_code=502,
+            ) from error
+        except (json.JSONDecodeError, TypeError, ValueError) as error:
+            raise BackendError(
+                "remote_node_protocol_error",
+                str(error),
+                status_code=502,
+            ) from error
         remote.synchronized_messages = len(messages) + 1
 
     async def _request_json(
@@ -475,8 +509,12 @@ class ClusterBackend:
         body: dict[str, Any],
         headers: dict[str, str],
     ) -> dict[str, Any]:
-        response = await self._client.request(
-            method, f"{node.url}{path}", json=body, headers=headers
+        response = await self._control_request(
+            node,
+            method,
+            path,
+            headers=headers,
+            json_body=body,
         )
         if response.status_code >= 400:
             raise BackendError(
@@ -485,10 +523,60 @@ class ClusterBackend:
                 retryable=response.status_code >= 500,
                 status_code=response.status_code,
             )
-        value = response.json()
+        try:
+            value = response.json()
+        except ValueError as error:
+            raise BackendError(
+                "remote_node_protocol_error",
+                f"remote {path} response is not valid JSON: {error}",
+                status_code=502,
+            ) from error
         if not isinstance(value, dict):
-            raise BackendError("remote_node_protocol_error", "remote response must be an object")
+            raise BackendError(
+                "remote_node_protocol_error",
+                f"remote {path} response must be an object",
+                status_code=502,
+            )
         return value
+
+    async def _control_request(
+        self,
+        node: RemoteNodeResource,
+        method: str,
+        path: str,
+        *,
+        headers: dict[str, str],
+        json_body: dict[str, Any] | None = None,
+        content: bytes | None = None,
+        timeout: float | None = None,
+    ) -> httpx.Response:
+        try:
+            return await self._client.request(
+                method,
+                f"{node.url}{path}",
+                json=json_body,
+                content=content,
+                headers=headers,
+                timeout=(
+                    self.control_timeout_seconds
+                    if timeout is None
+                    else timeout
+                ),
+            )
+        except httpx.TimeoutException as error:
+            raise BackendError(
+                "remote_node_timeout",
+                str(error),
+                retryable=True,
+                status_code=504,
+            ) from error
+        except httpx.HTTPError as error:
+            raise BackendError(
+                "remote_node_unavailable",
+                str(error),
+                retryable=True,
+                status_code=502,
+            ) from error
 
     async def _release_node_sessions(self, node: RemoteNodeResource) -> None:
         async with self._lock:
@@ -512,9 +600,11 @@ class ClusterBackend:
         remote: _RemoteSession,
         headers: dict[str, str],
     ) -> None:
-        with suppress(httpx.HTTPError):
-            await self._client.delete(
-                f"{node.url}/api/v1/sessions/{remote.remote_id}",
+        with suppress(BackendError):
+            await self._control_request(
+                node,
+                "DELETE",
+                f"/api/v1/sessions/{remote.remote_id}",
                 headers=headers,
             )
 
@@ -642,14 +732,17 @@ class ClusterBackend:
         headers: dict[str, str],
     ) -> dict[str, Any]:
         digest = hashlib.sha256(data).hexdigest()
-        response = await self._client.post(
-            f"{node.url}/api/v1/media",
+        response = await self._control_request(
+            node,
+            "POST",
+            "/api/v1/media",
             content=data,
             headers={
                 **headers,
                 "Content-Type": mime_type,
                 "X-Content-SHA256": digest,
             },
+            timeout=self.media_upload_timeout_seconds,
         )
         if response.status_code >= 400:
             raise BackendError(
@@ -658,11 +751,19 @@ class ClusterBackend:
                 retryable=response.status_code >= 500,
                 status_code=response.status_code,
             )
-        value = response.json()
+        try:
+            value = response.json()
+        except ValueError as error:
+            raise BackendError(
+                "remote_node_protocol_error",
+                f"remote media response is not valid JSON: {error}",
+                status_code=502,
+            ) from error
         if not isinstance(value, dict) or not isinstance(value.get("media"), dict):
             raise BackendError(
                 "remote_node_protocol_error",
                 "remote media response is invalid",
+                status_code=502,
             )
         return value["media"]
 
@@ -711,8 +812,10 @@ class ClusterBackend:
             if remote is not None and state is not None:
                 removed.append((state, remote))
         for state, remote in removed:
-            response = await self._client.delete(
-                f"{state.resource.url}/api/v1/sessions/{remote.remote_id}",
+            response = await self._control_request(
+                state.resource,
+                "DELETE",
+                f"/api/v1/sessions/{remote.remote_id}",
                 headers=self._headers(state.resource),
             )
             if response.status_code not in {204, 404}:
@@ -731,8 +834,10 @@ class ClusterBackend:
             state = self._states.get(node_id)
             if state is None:
                 continue
-            response = await self._client.post(
-                f"{state.resource.url}/api/v1/sessions/{remote.remote_id}/responses/cancel",
+            response = await self._control_request(
+                state.resource,
+                "POST",
+                f"/api/v1/sessions/{remote.remote_id}/responses/cancel",
                 headers=self._headers(state.resource),
             )
             if response.status_code == 200:

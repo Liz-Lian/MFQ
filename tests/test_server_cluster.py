@@ -8,8 +8,10 @@ from pathlib import Path
 from uuid import UUID
 
 import httpx
+import pytest
 
 from mfq.server.api import create_app
+from mfq.server.backend import BackendError
 from mfq.server.cluster import ClusterBackend
 from mfq.server.models import CreateRemoteNodeRequest, UpdateRemoteNodeRequest
 from mfq.server.service import ServerService
@@ -470,6 +472,63 @@ def test_disabled_remote_node_stops_advertising_stale_models(tmp_path: Path) -> 
             models = await cluster.runtime_models()
             assert all(item["id"] != "remote-model" for item in models["data"])
 
+        await client.aclose()
+
+    asyncio.run(run())
+
+
+def test_cluster_bounds_control_and_media_requests(tmp_path: Path) -> None:
+    async def run() -> None:
+        observed_timeouts: dict[str, float] = {}
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            timeout = request.extensions.get("timeout", {})
+            observed_timeouts[request.url.path] = float(timeout["read"])
+            if request.url.path == "/api/v1/sessions":
+                raise httpx.ReadTimeout("remote control stalled", request=request)
+            if request.url.path == "/api/v1/media":
+                return httpx.Response(
+                    201,
+                    json={
+                        "media": {
+                            "id": "66666666-6666-4666-8666-666666666666",
+                            "sha256": hashlib.sha256(b"image").hexdigest(),
+                            "mime_type": "image/png",
+                            "byte_size": 5,
+                        }
+                    },
+                )
+            return httpx.Response(404)
+
+        store = SessionStore(tmp_path / "mfq.server.sqlite3")
+        node = store.create_remote_node(
+            CreateRemoteNodeRequest(name="worker-a", url="http://worker-a:8090")
+        )
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        cluster = ClusterBackend(
+            FakeBackend(),
+            store,
+            client=client,
+            control_timeout_seconds=7,
+            media_upload_timeout_seconds=11,
+        )
+
+        with pytest.raises(BackendError) as stalled:
+            await cluster._request_json(
+                node,
+                "POST",
+                "/api/v1/sessions",
+                {"model": "remote-model"},
+                {},
+            )
+        assert stalled.value.code == "remote_node_timeout"
+        assert stalled.value.retryable
+        assert stalled.value.status_code == 504
+
+        media = await cluster._upload_bytes(node, b"image", "image/png", {})
+        assert media["byte_size"] == 5
+        assert observed_timeouts["/api/v1/sessions"] == 7
+        assert observed_timeouts["/api/v1/media"] == 11
         await client.aclose()
 
     asyncio.run(run())

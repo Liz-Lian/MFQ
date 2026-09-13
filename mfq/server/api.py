@@ -1127,8 +1127,10 @@ def create_app(
         responses=ERROR_RESPONSES,
         tags=["runtime"],
     )
-    async def runtime_capabilities() -> RuntimeCapabilitiesResource:
-        return await require_service().runtime_capabilities()
+    async def runtime_capabilities(
+        instance_id: UUID | None = None,
+    ) -> RuntimeCapabilitiesResource:
+        return await require_service().runtime_capabilities(instance_id)
 
     @app.get(
         "/api/v1/runtime/status",
@@ -1136,8 +1138,8 @@ def create_app(
         responses=ERROR_RESPONSES,
         tags=["runtime"],
     )
-    async def runtime_status() -> dict[str, Any]:
-        return await require_service().runtime_status()
+    async def runtime_status(instance_id: UUID | None = None) -> dict[str, Any]:
+        return await require_service().runtime_status(instance_id)
 
     @app.get(
         "/api/v1/runtime/metrics",

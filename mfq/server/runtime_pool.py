@@ -835,16 +835,52 @@ class ManagedRuntimePool:
         cancel = getattr(backend, "cancel_response", None)
         return bool(await cancel(session_id)) if callable(cancel) else False
 
-    async def capabilities(self) -> RuntimeCapabilitiesResource:
-        backend = await self._current_backend()
+    async def capabilities(
+        self,
+        instance_id: UUID | None = None,
+    ) -> RuntimeCapabilitiesResource:
+        if instance_id is None:
+            backend = await self._current_backend()
+        else:
+            _instance, backend = await self._runtime_control_target(instance_id)
         if backend is None:
             raise BackendError("model_not_loaded", "no runtime is available")
         return await backend.capabilities()
 
-    async def runtime_status(self) -> dict[str, Any]:
+    async def runtime_status(
+        self,
+        instance_id: UUID | None = None,
+    ) -> dict[str, Any]:
         async with self._lock:
-            instance = self._current_instance_locked()
+            instance = (
+                self._current_instance_locked()
+                if instance_id is None
+                else self._instances.get(instance_id)
+            )
+            if instance_id is not None and instance is None:
+                raise BackendError(
+                    "runtime_instance_not_found",
+                    f"runtime instance was not found: {instance_id}",
+                    status_code=404,
+                )
             backend = instance.backend if instance is not None else self.fallback
+            if instance is not None and instance.state not in {
+                RuntimeInstanceState.READY,
+                RuntimeInstanceState.BUSY,
+            }:
+                return {
+                    "instance_id": str(instance.id),
+                    "runtime_state": instance.state.value,
+                    "model": instance.artifact.resource.name,
+                    "active_requests": instance.active_requests,
+                    "queued_requests": instance.queued_requests,
+                    "reloading": False,
+                    "error": (
+                        instance.error.model_dump(mode="json")
+                        if instance.error is not None
+                        else None
+                    ),
+                }
         if backend is None:
             return {
                 "runtime_state": "idle",

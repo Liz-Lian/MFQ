@@ -863,12 +863,14 @@ export const api = {
     });
   },
 
-  runtimeCapabilities(): Promise<RuntimeCapabilities> {
-    return request("/api/v1/runtime/capabilities");
+  runtimeCapabilities(instanceId?: string | null): Promise<RuntimeCapabilities> {
+    const suffix = instanceId ? `?instance_id=${encodeURIComponent(instanceId)}` : "";
+    return request(`/api/v1/runtime/capabilities${suffix}`);
   },
 
-  runtimeStatus(): Promise<RuntimeStatus> {
-    return request("/api/v1/runtime/status");
+  runtimeStatus(instanceId?: string | null): Promise<RuntimeStatus> {
+    const suffix = instanceId ? `?instance_id=${encodeURIComponent(instanceId)}` : "";
+    return request(`/api/v1/runtime/status${suffix}`);
   },
 
   async runtimeModels(): Promise<RuntimeModel[]> {

@@ -18,6 +18,7 @@ from mfq.formats.header import FileHeader
 from mfq.formats.io import save
 from mfq.server.api import create_app
 from mfq.server.backend import BackendDelta, BackendError
+from mfq.server.capabilities import capabilities_for_architecture
 from mfq.server.catalog import (
     MODEL_FILE_INDEX,
     DiscoveredModel,
@@ -25,7 +26,12 @@ from mfq.server.catalog import (
     ModelCatalog,
 )
 from mfq.server.jobs import JobExecutionError
-from mfq.server.models import JobStatus, RuntimeInstanceState, SamplingParams
+from mfq.server.models import (
+    JobStatus,
+    RuntimeCapabilitiesResource,
+    RuntimeInstanceState,
+    SamplingParams,
+)
 from mfq.server.runtime_pool import ManagedRuntimePool, RuntimeConflictError, _ManagedRuntime
 from mfq.server.service import ServerService
 from mfq.server.storage import SessionStore
@@ -860,6 +866,16 @@ def test_runtime_controls_target_the_requested_model_instance(tmp_path: Path) ->
                 self.cache_clears += 1
                 return {"model": self.name, "released_snapshots": 1}
 
+            async def capabilities(self) -> RuntimeCapabilitiesResource:
+                return RuntimeCapabilitiesResource(
+                    model=self.name,
+                    model_type="qwen35",
+                    model_capabilities=capabilities_for_architecture("qwen35"),
+                )
+
+            async def runtime_status(self) -> dict[str, object]:
+                return {"model": self.name, "active_requests": 0}
+
         _model(tmp_path / "first.mfq")
         _model(tmp_path / "second.mfq")
         catalog = ModelCatalog([tmp_path], cache_seconds=0)
@@ -888,12 +904,41 @@ def test_runtime_controls_target_the_requested_model_instance(tmp_path: Path) ->
         pool = ManagedRuntimePool(catalog, tmp_path / "runtime", max_instances=2)
         pool._instances = {first.id: first, second.id: second}
         pool._last_instance_id = first.id
+        service = ServerService(
+            SessionStore(tmp_path / "mfq.server.sqlite3"),
+            pool,
+            catalog=catalog,
+            runtime_manager=pool,
+        )
 
         reloaded = await pool.reload_runtime(8192, second.id)
         cleared = await pool.clear_runtime_cache(second.id)
+        capabilities = await service.runtime_capabilities(second.id)
+        status = await service.runtime_status(second.id)
+        transport = httpx.ASGITransport(app=create_app(service))
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            api_capabilities = await client.get(
+                "/api/v1/runtime/capabilities",
+                params={"instance_id": str(second.id)},
+            )
+            api_status = await client.get(
+                "/api/v1/runtime/status",
+                params={"instance_id": str(second.id)},
+            )
+            missing_status = await client.get(
+                "/api/v1/runtime/status",
+                params={"instance_id": str(uuid4())},
+            )
 
         assert reloaded["model"] == "second"
         assert cleared["model"] == "second"
+        assert capabilities.model == "second"
+        assert status["model"] == "second"
+        assert status["instance_id"] == str(second.id)
+        assert api_capabilities.json()["model"] == "second"
+        assert api_status.json()["model"] == "second"
+        assert missing_status.status_code == 404
+        assert missing_status.json()["error"]["code"] == "runtime_instance_not_found"
         assert first_backend.reloads == []
         assert first_backend.cache_clears == 0
         assert second_backend.reloads == [8192]
@@ -1616,7 +1661,7 @@ def test_managed_runtime_reports_and_bounds_queued_requests(tmp_path: Path) -> N
         )
         pool._instances[instance.id] = instance
         assert await pool._select(artifact.resource.name, session_id=None) is instance
-        assert await pool._select(artifact.resource.id, session_id=None) is None
+        assert await pool._select(artifact.resource.id, session_id=None) is instance
 
         async def consume(model: str = artifact.resource.name) -> None:
             async for _ in pool.stream(

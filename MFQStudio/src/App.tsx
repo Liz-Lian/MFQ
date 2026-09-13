@@ -1652,6 +1652,7 @@ export default function App() {
   const voiceClipWrites = useRef(new Map<string, Promise<void>>());
   const appliedModeTemplate = useRef("");
   const sessionSwitchRef = useRef("");
+  const selectedRuntimeInstanceIdRef = useRef<string | null>(null);
 
   const english =
     settings.language === "en" ||
@@ -1678,6 +1679,7 @@ export default function App() {
   const selectedRuntimeInstance = instances.find(
     (instance) => instance.model === model && instance.state !== "failed",
   );
+  selectedRuntimeInstanceIdRef.current = selectedRuntimeInstance?.id ?? null;
   const selectedModelLoading = selectedRuntimeInstance?.state === "loading" || jobs.some(
     (job) => job.kind === "model.load"
       && job.payload.model === model
@@ -1740,11 +1742,12 @@ export default function App() {
 
   const refreshRuntime = useCallback(async (quiet = true) => {
     try {
+      const selectedInstanceId = selectedRuntimeInstanceIdRef.current;
       const [runtimeResults, management] = await Promise.all([
         Promise.allSettled([
-          api.runtimeCapabilities(),
+          api.runtimeCapabilities(selectedInstanceId),
           api.runtimeModels(),
-          api.runtimeStatus(),
+          api.runtimeStatus(selectedInstanceId),
           api.realtimeCapabilities(),
           api.voiceOutputComponent(),
         ]),
@@ -2098,6 +2101,31 @@ export default function App() {
     const timer = window.setInterval(() => void refreshRuntime(true), 2500);
     return () => window.clearInterval(timer);
   }, [refreshRuntime]);
+
+  useEffect(() => {
+    const instanceId = selectedRuntimeInstance?.id;
+    if (!instanceId) return;
+    let current = true;
+    void Promise.allSettled([
+      api.runtimeCapabilities(instanceId),
+      api.runtimeStatus(instanceId),
+    ]).then(([capabilityResult, statusResult]) => {
+      if (!current) return;
+      if (capabilityResult.status === "fulfilled") {
+        setCapabilities(capabilityResult.value);
+      }
+      if (statusResult.status === "fulfilled") {
+        setRuntime(statusResult.value);
+        const nextContext = Number(statusResult.value.max_context);
+        if (Number.isFinite(nextContext) && nextContext > 0) {
+          setContextSize(Math.floor(nextContext));
+        }
+      }
+    });
+    return () => {
+      current = false;
+    };
+  }, [selectedRuntimeInstance?.id]);
 
   useEffect(() => {
     if (!activeId) {

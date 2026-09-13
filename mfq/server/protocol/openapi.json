@@ -12918,6 +12918,25 @@
     "/api/v1/runtime/capabilities": {
       "get": {
         "operationId": "runtime_capabilities_api_v1_runtime_capabilities_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "instance_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "format": "uuid",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Instance Id"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "content": {
@@ -14808,6 +14827,25 @@
     "/api/v1/runtime/status": {
       "get": {
         "operationId": "runtime_status_api_v1_runtime_status_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "instance_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "format": "uuid",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Instance Id"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "content": {

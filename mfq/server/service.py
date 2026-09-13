@@ -1109,9 +1109,23 @@ class ServerService:
         if self.cluster is not None:
             await self.cluster.nodes(force=True)
 
-    async def runtime_capabilities(self) -> RuntimeCapabilitiesResource:
+    async def runtime_capabilities(
+        self,
+        instance_id: UUID | None = None,
+    ) -> RuntimeCapabilitiesResource:
+        target = self.backend
+        arguments: tuple[Any, ...] = ()
+        if instance_id is not None:
+            if self.runtime_manager is None:
+                raise ServiceError(
+                    404,
+                    "runtime_instance_not_found",
+                    f"runtime instance was not found: {instance_id}",
+                )
+            target = self.runtime_manager
+            arguments = (instance_id,)
         try:
-            return await self.backend.capabilities()
+            return await target.capabilities(*arguments)
         except BackendError as error:
             raise ServiceError(
                 error.status_code
@@ -1122,8 +1136,28 @@ class ServerService:
                 retryable=error.retryable,
             ) from error
 
-    async def runtime_status(self) -> dict[str, Any]:
-        status = await self._runtime_request("runtime_status")
+    async def runtime_status(
+        self,
+        instance_id: UUID | None = None,
+    ) -> dict[str, Any]:
+        if instance_id is None:
+            status = await self._runtime_request("runtime_status")
+        else:
+            if self.runtime_manager is None:
+                raise ServiceError(
+                    404,
+                    "runtime_instance_not_found",
+                    f"runtime instance was not found: {instance_id}",
+                )
+            try:
+                status = await self.runtime_manager.runtime_status(instance_id)
+            except BackendError as error:
+                raise ServiceError(
+                    error.status_code,
+                    error.code,
+                    str(error),
+                    retryable=error.retryable,
+                ) from error
         instance_id = status.get("instance_id")
         parsed_instance_id = None
         if isinstance(instance_id, str):

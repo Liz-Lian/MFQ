@@ -1861,6 +1861,13 @@ class ManagedRuntimePool:
             ]
             if self.backend == "metal":
                 command.extend(["--prefill-chunk-size", str(request.prefill_chunk_size)])
+            elif self.max_requests_per_instance > 1:
+                command.extend(
+                    [
+                        "--continuous-batching",
+                        str(self.max_requests_per_instance),
+                    ]
+                )
             command.extend(native_tokenizer_arguments(artifact.path))
             if request.moe_gpu_cache_gb is not None:
                 command.extend(["--moe-gpu-cache-gb", str(request.moe_gpu_cache_gb)])

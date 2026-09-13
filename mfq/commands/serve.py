@@ -296,6 +296,12 @@ def _run(args: argparse.Namespace) -> int:
                 backend=selected_backend,
                 context_size=args.context_size,
                 prefill_chunk_size=args.prefill_chunk_size,
+                continuous_batching=(
+                    args.max_requests_per_runtime
+                    if selected_backend == "cuda"
+                    and args.max_requests_per_runtime > 1
+                    else 0
+                ),
                 startup_timeout=args.runtime_startup_timeout,
                 environment=runtime_environment,
                 architecture=initial_artifact.resource.architecture,

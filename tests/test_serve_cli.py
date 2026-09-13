@@ -9,7 +9,11 @@ import pytest
 
 from mfq.cli import _build_parser
 from mfq.commands.serve import _prepare_web_root, _resolve_runtime_executable, _run, _select_backend
-from mfq.server.native import NativeRuntime, native_runtime_environment
+from mfq.server.native import (
+    NativeRuntime,
+    NativeRuntimeError,
+    native_runtime_environment,
+)
 
 
 def test_server_imports_framework_without_loading_quantization_stack() -> None:
@@ -186,6 +190,37 @@ def test_native_cuda_worker_is_private_and_uses_a_loopback_port(tmp_path: Path) 
     assert command[command.index("--port") + 1] == "43123"
     assert command[command.index("--ctx-size") + 1] == "32768"
     assert "--prefill-chunk-size" not in command
+
+
+def test_native_cuda_worker_enables_explicit_continuous_batching(
+    tmp_path: Path,
+) -> None:
+    runtime = NativeRuntime(
+        executable=tmp_path / "mfq-decode",
+        model=tmp_path / "model.mfq",
+        model_name="model",
+        backend="cuda",
+        continuous_batching=8,
+    )
+
+    command = runtime.command(43123)
+
+    assert command[command.index("--continuous-batching") + 1] == "8"
+
+
+def test_native_metal_worker_rejects_cuda_continuous_batching(
+    tmp_path: Path,
+) -> None:
+    runtime = NativeRuntime(
+        executable=tmp_path / "mfq-decode-metal",
+        model=tmp_path / "model.mfq",
+        model_name="model",
+        backend="metal",
+        continuous_batching=2,
+    )
+
+    with pytest.raises(NativeRuntimeError, match="requires CUDA"):
+        runtime.command(43123)
 
 
 def test_native_metal_worker_receives_prefill_chunk_size(tmp_path: Path) -> None:

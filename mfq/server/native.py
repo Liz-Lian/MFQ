@@ -276,6 +276,7 @@ class NativeRuntime:
     backend: str
     context_size: int = 0
     prefill_chunk_size: int = 2048
+    continuous_batching: int = 0
     startup_timeout: float = 1800.0
     environment: Mapping[str, str] | None = None
     architecture: str = ""
@@ -290,6 +291,10 @@ class NativeRuntime:
         return f"http://127.0.0.1:{self.port}"
 
     def command(self, port: int) -> list[str]:
+        if self.continuous_batching < 0:
+            raise NativeRuntimeError("continuous batching must be non-negative")
+        if self.continuous_batching > 0 and self.backend != "cuda":
+            raise NativeRuntimeError("continuous batching currently requires CUDA")
         route = resolve_runtime_route(self.architecture, self.model)
         if route.python_mlx_worker:
             if self.backend != "metal":
@@ -319,6 +324,10 @@ class NativeRuntime:
             command.extend(["--prefill-chunk-size", str(self.prefill_chunk_size)])
         if self.context_size > 0:
             command.extend(["--ctx-size", str(self.context_size)])
+        if self.continuous_batching > 0:
+            command.extend(
+                ["--continuous-batching", str(self.continuous_batching)]
+            )
         command.extend(native_tokenizer_arguments(self.model))
         return command
 

@@ -767,6 +767,33 @@ def test_managed_runtime_dispatches_qwen4_mfq_to_native_cpp(tmp_path: Path) -> N
     asyncio.run(run())
 
 
+def test_managed_cuda_runtime_connects_explicit_request_concurrency(
+    tmp_path: Path,
+) -> None:
+    async def run() -> None:
+        model = tmp_path / "tiny.mfq"
+        _model(model, architecture="qwen35")
+        catalog = ModelCatalog([tmp_path], cache_seconds=0)
+        artifact = await catalog.resolve_path(model)
+        pool = ManagedRuntimePool(
+            catalog,
+            tmp_path / "mfq-decode",
+            backend="cuda",
+            max_requests_per_instance=6,
+        )
+
+        command, _environment = pool._launch_configuration(
+            artifact,
+            ModelLoadRequest(model="tiny"),
+            python_mlx_worker=False,
+            port=43123,
+        )
+
+        assert command[command.index("--continuous-batching") + 1] == "6"
+
+    asyncio.run(run())
+
+
 def test_concurrent_loads_reserve_the_catalog_name(tmp_path: Path) -> None:
     async def run() -> None:
         model_dir = tmp_path / "models"

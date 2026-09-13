@@ -10,10 +10,16 @@
 
 namespace mfq::sq {
 
-// MXFP4-SQ v2 stores one two-bit q selector per neuron.  q=1/2/3 use
-// the scalar palette representation; q=4 is the lossless native-MXFP4
-// endpoint and retains the original block-32 E8M0 scales.  Legacy SQ2/SQ3
-// v1 payloads remain readable and expand to uniform row metadata.
+// Design intent: MXFP4-SQ is a high-fidelity, fine-grained requantization
+// container for weights natively QAT-trained in MXFP4.  Every reconstructed
+// value remains legal MXFP4/E2M1 under native block-32 E8M0 scaling, allowing
+// CUDA runtimes to retain native MXFP4 hardware acceleration.  The packed SQ
+// stream is a storage representation, not a new arithmetic domain.
+//
+// MXFP4-SQ v2 stores one two-bit q selector per neuron.  q=1/2/3 use the
+// scalar palette representation; q=4 is the lossless native-MXFP4 endpoint
+// and retains the original block-32 E8M0 scales.  Legacy SQ2/SQ3 v1 payloads
+// remain readable and expand to uniform row metadata.
 struct Layout {
     int version = 0;
     int bits = 0; // Legacy uniform q; zero for the v2 per-neuron stream.

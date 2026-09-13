@@ -11,6 +11,13 @@
 
 namespace mfq::fp8sq {
 
+// Design intent: MXFP8-SQ and FP8-128SQ are high-fidelity, fine-grained
+// requantization containers for native QAT weights.  They preserve legal E4M3
+// reconstruction values and, respectively, native MXFP8/E8M0 or 128x128
+// block-FP8 scale geometry so CUDA runtimes can retain the corresponding
+// hardware-native acceleration.  Their packed SQ streams are storage
+// representations; they do not define replacement arithmetic formats.
+
 inline constexpr std::size_t kHeaderBytes = 44;
 inline constexpr std::size_t kPaletteBytes = 256;
 

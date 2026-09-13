@@ -10,6 +10,15 @@ The scale contracts deliberately remain distinct.  MXFP8-SQ stores E8M0
 microscales and their native block geometry.  FP8-128SQ stores a 128x128
 BF16/F16/F32 multiplier grid.  A runtime therefore never guesses scale
 semantics from the scale tensor shape.
+
+Design intent: both formats provide high-fidelity, fine-grained requantization
+of native QAT weights while preserving legal E4M3 reconstruction values and
+the source format's scale geometry.  MXFP8-SQ is the native-MXFP8 variant and
+FP8-128SQ is the 128x128 block-FP8 variant.  Keeping those native reconstruction
+domains allows CUDA backends to use the corresponding hardware-accelerated
+MXFP8/FP8 execution paths rather than expanding the model into a non-native
+codebook representation.  The SQ bitstream is storage, not a replacement
+arithmetic format.
 """
 
 from __future__ import annotations

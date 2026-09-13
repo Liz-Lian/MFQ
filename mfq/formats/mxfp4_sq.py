@@ -8,6 +8,14 @@ The current payload assigns one two-bit ``q-1`` descriptor to every neuron:
 
 All four choices are one public ``MXFP4-SQ`` format.  Historical uniform SQ2
 and SQ3 payloads remain readable at this compatibility boundary.
+
+Design intent: this is a high-fidelity, fine-grained requantization format for
+weights that were natively QAT-trained in MXFP4.  Its reconstructed values stay
+on the legal MXFP4/E2M1 lattice with native E8M0 block scales, so a CUDA backend
+can retain native MXFP4 hardware acceleration instead of expanding the model
+into a non-native codebook representation.  The packed SQ payload is the
+storage layer; preserving the native reconstruction domain is what makes that
+accelerated execution possible.
 """
 
 from __future__ import annotations

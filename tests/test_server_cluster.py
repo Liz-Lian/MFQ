@@ -231,6 +231,7 @@ def test_cluster_registers_probes_and_routes_matching_model(tmp_path: Path) -> N
             assert await cluster.close_session(forked_id)
 
             assert (await api.delete(f"/api/v1/cluster/nodes/{node_id}")).status_code == 204
+            assert cluster._sessions == {}
 
         await client.aclose()
 
@@ -347,6 +348,40 @@ def test_cluster_routes_when_remote_metrics_are_unavailable(tmp_path: Path) -> N
             assert created.json()["healthy"] is True
             assert created.json()["models"] == ["remote-model"]
             assert created.json()["metrics"] == {}
+
+        await client.aclose()
+
+    asyncio.run(run())
+
+
+def test_disabled_remote_node_stops_advertising_stale_models(tmp_path: Path) -> None:
+    async def run() -> None:
+        store = SessionStore(tmp_path / "mfq.server.sqlite3")
+        client = httpx.AsyncClient(transport=_remote_app())
+        cluster = ClusterBackend(FakeBackend(), store, client=client)
+        service = ServerService(store, cluster, cluster=cluster)
+        transport = httpx.ASGITransport(app=create_app(service))
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as api:
+            created = await api.post(
+                "/api/v1/cluster/nodes",
+                json={"name": "worker-a", "url": "http://worker-a:8090"},
+            )
+            node_id = created.json()["id"]
+            assert created.json()["models"] == ["remote-model"]
+
+            disabled = await api.put(
+                f"/api/v1/cluster/nodes/{node_id}",
+                json={
+                    "name": "worker-a",
+                    "url": "http://worker-a:8090",
+                    "enabled": False,
+                },
+            )
+            assert disabled.status_code == 200
+            assert disabled.json()["healthy"] is False
+            assert disabled.json()["models"] == []
+            models = await cluster.runtime_models()
+            assert all(item["id"] != "remote-model" for item in models["data"])
 
         await client.aclose()
 

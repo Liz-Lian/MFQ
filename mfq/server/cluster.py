@@ -94,16 +94,28 @@ class ClusterBackend:
     async def refresh(self, *, force: bool = False) -> list[RemoteNodeResource]:
         resources = await asyncio.to_thread(self.store.list_remote_nodes)
         configured = {item.id for item in resources}
+        retired: list[RemoteNodeResource] = []
         async with self._lock:
             for stale in set(self._states) - configured:
-                self._states.pop(stale, None)
+                state = self._states.pop(stale, None)
+                if state is not None and state.active_requests == 0:
+                    retired.append(state.resource)
             for resource in resources:
                 state = self._states.get(resource.id)
                 if state is None:
                     self._states[resource.id] = _NodeState(resource=resource)
                 else:
                     state.resource = resource
+                    if not resource.enabled:
+                        state.healthy = False
+                        state.models = []
+                        state.status = {}
+                        state.error = None
             states = list(self._states.values())
+        if retired:
+            await asyncio.gather(
+                *(self._release_node_sessions(node) for node in retired)
+            )
         await asyncio.gather(
             *(self._probe(state, force=force) for state in states if state.resource.enabled)
         )
@@ -207,6 +219,17 @@ class ClusterBackend:
         response_format: ResponseFormat | None = None,
     ) -> AsyncIterator[BackendDelta]:
         node = await self._select(model)
+        if node is not None:
+            async with self._lock:
+                if (
+                    self._states.get(node.resource.id) is not node
+                    or not node.resource.enabled
+                    or not node.healthy
+                    or model not in node.models
+                ):
+                    node = None
+                else:
+                    node.active_requests += 1
         if node is None:
             async with closing_backend_stream(
                 self.local.stream(
@@ -222,7 +245,6 @@ class ClusterBackend:
                 async for delta in local_stream:
                     yield delta
             return
-        node.active_requests += 1
         try:
             async with closing_backend_stream(
                 self._remote_stream(
@@ -239,7 +261,14 @@ class ClusterBackend:
                 async for delta in remote_stream:
                     yield delta
         finally:
-            node.active_requests = max(0, node.active_requests - 1)
+            async with self._lock:
+                node.active_requests = max(0, node.active_requests - 1)
+                retired = (
+                    node.active_requests == 0
+                    and self._states.get(node.resource.id) is not node
+                )
+            if retired:
+                await self._release_node_sessions(node.resource)
 
     async def _remote_stream(
         self,
@@ -425,6 +454,26 @@ class ClusterBackend:
         if not isinstance(value, dict):
             raise BackendError("remote_node_protocol_error", "remote response must be an object")
         return value
+
+    async def _release_node_sessions(self, node: RemoteNodeResource) -> None:
+        async with self._lock:
+            sessions = [
+                self._sessions.pop(key)
+                for key in list(self._sessions)
+                if key[0] == node.id
+            ]
+        if not sessions:
+            return
+        try:
+            headers = self._headers(node)
+        except BackendError:
+            return
+        for remote in sessions:
+            with suppress(httpx.HTTPError):
+                await self._client.delete(
+                    f"{node.url}/api/v1/sessions/{remote.remote_id}",
+                    headers=headers,
+                )
 
     async def _parts(
         self,
@@ -720,6 +769,13 @@ class ClusterBackend:
         return self.local.realtime_connect(mode=mode)
 
     async def aclose(self) -> None:
+        async with self._lock:
+            nodes = [state.resource for state in self._states.values()]
+        await asyncio.gather(
+            *(self._release_node_sessions(node) for node in nodes)
+        )
+        async with self._lock:
+            self._sessions.clear()
         await self.local.aclose()
         if self._owns_client:
             await self._client.aclose()

@@ -120,19 +120,17 @@ class ClusterBackend:
             health, models, status = await asyncio.gather(
                 self._client.get(f"{state.resource.url}/health", headers=headers),
                 self._remote_models(state.resource, headers),
-                self._client.get(f"{state.resource.url}/api/v1/runtime/status", headers=headers),
+                self._remote_status(state.resource, headers),
             )
             health.raise_for_status()
             models.raise_for_status()
-            status.raise_for_status()
             payload = models.json()
             data = payload.get("data", []) if isinstance(payload, dict) else []
             state.models = sorted(
                 {str(item.get("id")) for item in data if isinstance(item, dict) and item.get("id")}
             )
             state.healthy = True
-            status_payload = status.json()
-            state.status = status_payload if isinstance(status_payload, dict) else {}
+            state.status = status
             state.error = None
         except Exception as error:
             state.healthy = False
@@ -152,6 +150,23 @@ class ClusterBackend:
                 headers=headers,
             )
         return response
+
+    async def _remote_status(
+        self,
+        node: RemoteNodeResource,
+        headers: dict[str, str],
+    ) -> dict[str, Any]:
+        try:
+            response = await self._client.get(
+                f"{node.url}/api/v1/runtime/status",
+                headers=headers,
+            )
+            if response.status_code >= 400:
+                return {}
+            payload = response.json()
+            return payload if isinstance(payload, dict) else {}
+        except (httpx.HTTPError, json.JSONDecodeError):
+            return {}
 
     @staticmethod
     def _public(state: _NodeState) -> RemoteNodeResource:

@@ -21,6 +21,7 @@ def _remote_app(
     requested_paths: list[str] | None = None,
     *,
     legacy_models_endpoint: bool = False,
+    runtime_status_code: int = 200,
 ):
     async def handler(request: httpx.Request) -> httpx.Response:
         path = request.url.path
@@ -35,6 +36,8 @@ def _remote_app(
         if path == "/api/v1/runtime/models" and legacy_models_endpoint:
             return httpx.Response(200, json={"data": [{"id": "remote-model"}]})
         if path == "/api/v1/runtime/status":
+            if runtime_status_code != 200:
+                return httpx.Response(runtime_status_code)
             return httpx.Response(200, json={"total_requests": 7, "process_resident_bytes": 1024})
         if path == "/api/v1/media":
             assert request.headers["content-type"] == "image/png"
@@ -320,6 +323,30 @@ def test_stateless_remote_stream_releases_ephemeral_session(tmp_path: Path) -> N
             assert (await anext(interrupted)).content_delta == "remote"
             await interrupted.aclose()
             assert cluster._sessions == {}
+
+        await client.aclose()
+
+    asyncio.run(run())
+
+
+def test_cluster_routes_when_remote_metrics_are_unavailable(tmp_path: Path) -> None:
+    async def run() -> None:
+        store = SessionStore(tmp_path / "mfq.server.sqlite3")
+        client = httpx.AsyncClient(
+            transport=_remote_app(runtime_status_code=404)
+        )
+        cluster = ClusterBackend(FakeBackend(), store, client=client)
+        service = ServerService(store, cluster, cluster=cluster)
+        transport = httpx.ASGITransport(app=create_app(service))
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as api:
+            created = await api.post(
+                "/api/v1/cluster/nodes",
+                json={"name": "worker-a", "url": "http://worker-a:8090"},
+            )
+            assert created.status_code == 201
+            assert created.json()["healthy"] is True
+            assert created.json()["models"] == ["remote-model"]
+            assert created.json()["metrics"] == {}
 
         await client.aclose()
 

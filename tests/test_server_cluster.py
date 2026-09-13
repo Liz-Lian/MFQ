@@ -16,7 +16,7 @@ from mfq.server.storage import SessionStore
 from tests.test_server_service import FakeBackend
 
 
-def _remote_app():
+def _remote_app(response_requests: list[dict[str, object]] | None = None):
     async def handler(request: httpx.Request) -> httpx.Response:
         path = request.url.path
         if path == "/health":
@@ -57,6 +57,8 @@ def _remote_app():
                 },
             )
         if path.endswith("/responses"):
+            if response_requests is not None:
+                response_requests.append(json.loads(request.content))
             frames = [
                 {
                     "protocol_version": "1.0",
@@ -119,7 +121,8 @@ def _remote_app():
 def test_cluster_registers_probes_and_routes_matching_model(tmp_path: Path) -> None:
     async def run() -> None:
         store = SessionStore(tmp_path / "mfq.server.sqlite3")
-        client = httpx.AsyncClient(transport=_remote_app())
+        response_requests: list[dict[str, object]] = []
+        client = httpx.AsyncClient(transport=_remote_app(response_requests))
         local = FakeBackend()
         cluster = ClusterBackend(local, store, client=client)
         service = ServerService(store, cluster, cluster=cluster)
@@ -164,6 +167,7 @@ def test_cluster_registers_probes_and_routes_matching_model(tmp_path: Path) -> N
                 chunks.append(delta)
             assert "".join(item.content_delta for item in chunks) == "remote"
             assert chunks[-1].finish_reason == "stop"
+            assert response_requests[0]["sampling"] == {}
             assert await cluster.cancel_response(
                 UUID("33333333-3333-4333-8333-333333333333")
             )

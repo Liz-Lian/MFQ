@@ -86,6 +86,25 @@ def test_openai_request_defaults_keep_thinking_vision_and_mtp_enabled() -> None:
     assert request.sampling.enable_vision is True
     assert request.sampling.enable_mtp is True
     assert request.sampling.mtp_max_draft_tokens == 5
+    assert "enable_mtp" not in request.sampling.model_fields_set
+
+
+def test_openai_request_tracks_explicit_sampling_overrides() -> None:
+    request = _request(
+        enable_mtp=False,
+        temperature=0.25,
+        seed=None,
+        chat_template_kwargs={"enable_thinking": False},
+    )
+
+    assert request.sampling.enable_mtp is False
+    assert request.sampling.enable_thinking is False
+    assert request.sampling.model_fields_set == {
+        "enable_mtp",
+        "enable_thinking",
+        "seed",
+        "temperature",
+    }
 
 
 def test_openai_tools_accept_standard_strict_field_and_null_choice() -> None:

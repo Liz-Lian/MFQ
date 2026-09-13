@@ -136,8 +136,38 @@ def parse_chat_request(body: Any) -> OpenAIChatRequest:
         "mtp_max_draft_tokens": _value(body, "mtp_max_draft_tokens", 5),
         "reasoning_effort": reasoning_effort,
     }
+    explicit_sampling_fields = {
+        name
+        for name in (
+            "temperature",
+            "top_k",
+            "top_p",
+            "presence_penalty",
+            "frequency_penalty",
+            "repetition_penalty",
+            "seed",
+            "enable_vision",
+            "enable_mtp",
+            "mtp_max_draft_tokens",
+            "reasoning_effort",
+        )
+        if name in body and (body[name] is not None or name in {"seed", "reasoning_effort"})
+    }
+    if body.get("max_completion_tokens") is not None or body.get("max_tokens") is not None:
+        explicit_sampling_fields.add("max_tokens")
+    if (
+        body.get("enable_thinking") is not None
+        or template_kwargs.get("enable_thinking") is not None
+    ):
+        explicit_sampling_fields.add("enable_thinking")
+    if "reasoning_effort" not in body and "reasoning_effort" in template_kwargs:
+        explicit_sampling_fields.add("reasoning_effort")
     try:
-        sampling = SamplingParams.model_validate(sampling_values)
+        validated_sampling = SamplingParams.model_validate(sampling_values)
+        sampling = SamplingParams.model_construct(
+            _fields_set=explicit_sampling_fields,
+            **validated_sampling.model_dump(),
+        )
     except ValidationError as error:
         raise OpenAIRequestError(str(error)) from error
 

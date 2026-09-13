@@ -254,7 +254,7 @@ class ClusterBackend:
             "expected_revision": remote.revision,
             "input": input_parts,
             "input_role": "tool" if last.get("role") == "tool" else "user",
-            "sampling": sampling.model_dump(mode="json"),
+            "sampling": sampling.model_dump(mode="json", exclude_unset=True),
             "include_reasoning_history": True,
             "tools": [item.model_dump(mode="json") for item in tools],
             "tool_choice": tool_choice

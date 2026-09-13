@@ -765,10 +765,11 @@ class ManagedRuntimePool:
                 self._session_routes[session_id] = instance.id
             self._last_instance_id = instance.id
         try:
+            effective_sampling = self._sampling_for_instance(instance, sampling)
             async for delta in instance.backend.stream(
                 model=instance.artifact.resource.name,
                 messages=messages,
-                sampling=sampling,
+                sampling=effective_sampling,
                 session_id=session_id,
                 tools=tools,
                 tool_choice=tool_choice,
@@ -783,6 +784,21 @@ class ManagedRuntimePool:
                 if instance.state == RuntimeInstanceState.BUSY and instance.active_requests == 0:
                     instance.state = RuntimeInstanceState.READY
                 instance.last_used_at = datetime.now(timezone.utc)
+
+    @staticmethod
+    def _sampling_for_instance(
+        instance: _ManagedRuntime,
+        requested: SamplingParams,
+    ) -> SamplingParams:
+        defaults = instance.sampling_defaults
+        if defaults is None:
+            return requested
+        return defaults.model_copy(
+            update={
+                name: getattr(requested, name)
+                for name in requested.model_fields_set
+            }
+        )
 
     async def fork_session(self, source_session_id: UUID, target_session_id: UUID) -> bool:
         async with self._lock:

@@ -1643,6 +1643,56 @@ def test_artifact_id_request_waits_on_the_canonical_model_load(
     asyncio.run(run())
 
 
+def test_runtime_sampling_defaults_apply_only_to_omitted_request_fields(
+    tmp_path: Path,
+) -> None:
+    class SamplingBackend(IdleBackend):
+        def __init__(self) -> None:
+            self.sampling: list[SamplingParams] = []
+
+        async def stream(self, **options: object):
+            self.sampling.append(options["sampling"])  # type: ignore[arg-type]
+            yield BackendDelta(content_delta="ok", finish_reason="stop")
+
+    async def run() -> None:
+        model_path = tmp_path / "defaults.mfq"
+        _model(model_path)
+        catalog = ModelCatalog([tmp_path], cache_seconds=0)
+        artifact = await catalog.resolve_path(model_path)
+        backend = SamplingBackend()
+        instance = _ManagedRuntime(
+            id=uuid4(),
+            artifact=artifact,
+            process=SimpleNamespace(returncode=None),
+            backend=backend,
+            port=1,
+            context_size=4096,
+            sampling_defaults=SamplingParams(enable_mtp=False, temperature=0.4),
+            state=RuntimeInstanceState.READY,
+            request_slots=asyncio.Semaphore(1),
+        )
+        pool = ManagedRuntimePool(catalog, tmp_path / "runtime")
+        pool._instances[instance.id] = instance
+
+        async def consume(sampling: SamplingParams) -> None:
+            async for _delta in pool.stream(
+                model=artifact.resource.name,
+                messages=({"role": "user", "content": "hello"},),
+                sampling=sampling,
+            ):
+                pass
+
+        await consume(SamplingParams())
+        await consume(SamplingParams(enable_mtp=True))
+
+        assert backend.sampling[0].enable_mtp is False
+        assert backend.sampling[0].temperature == 0.4
+        assert backend.sampling[1].enable_mtp is True
+        assert backend.sampling[1].temperature == 0.4
+
+    asyncio.run(run())
+
+
 def test_request_driven_load_rejects_a_changed_artifact_behind_a_loaded_name(
     tmp_path: Path,
 ) -> None:

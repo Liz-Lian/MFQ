@@ -373,15 +373,27 @@ int main() try {
         BlockHash parent{};
         const auto hot = cache.store(
             parent, tokens.data(), 4, payload({5, 6, 7, 8}));
+        const auto duplicate = cache.store(
+            parent, tokens.data(), 4, payload({9, 9, 9, 9}));
         cache.flush();
         const auto stats = cache.metrics();
+        require(duplicate == hot, "RAM-only duplicate changed its block hash");
         require(stats.disk_blocks == 0 && stats.hot_blocks == 1,
                 "RAM-only prefix block did not survive disk eviction");
+        require(stats.writes == 0 && stats.failed_writes == 0,
+                "RAM-only prefix cache performed a disk write");
+        require(stats.deduplicated_writes == 1,
+                "RAM-only duplicate store was not deduplicated");
         require(cache.match(tokens).matched_tokens == 4,
                 "RAM-only prefix block was not matched");
         const auto loaded = cache.load(hot);
         require(loaded && *loaded == std::vector<std::uint8_t>({5, 6, 7, 8}),
                 "RAM-only prefix block could not be loaded");
+        require(std::none_of(
+                    std::filesystem::recursive_directory_iterator(hot_only_root),
+                    std::filesystem::recursive_directory_iterator(),
+                    [](const auto& entry) { return entry.is_regular_file(); }),
+                "RAM-only prefix cache created a disk payload");
     }
 
     {

@@ -494,6 +494,15 @@ public:
                 ++metrics_.deduplicated_writes;
                 return hash;
             }
+            if (config_.max_disk_bytes == 0) {
+                if (hot_.count(hash) != 0) {
+                    ++metrics_.deduplicated_writes;
+                    return hash;
+                }
+                put_hot_locked(hash, std::move(payload));
+                sync_metrics_locked();
+                return hash;
+            }
             const auto pending_files = static_cast<std::uint64_t>(
                 pending_.size()) + 1;
             const auto pending_headers = pending_files >

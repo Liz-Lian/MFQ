@@ -317,11 +317,29 @@ class ManagedRuntimePool:
                 "runtime_launcher_missing",
                 "the Python MLX worker has no MFQ CLI launcher",
             )
+        model_name = artifact.resource.name
+        incoming_bytes = self._estimated_load_bytes(artifact, request)
+        async with self._lock:
+            if self._closed:
+                raise RuntimeManagementError("runtime pool is closed")
+            if (
+                self.max_runtime_memory_bytes is not None
+                and incoming_bytes > self.max_runtime_memory_bytes
+            ):
+                raise _job_error(
+                    "runtime_model_too_large",
+                    f"model has an estimated resident set of {incoming_bytes} bytes "
+                    f"but the runtime memory budget is "
+                    f"{self.max_runtime_memory_bytes} bytes",
+                )
+        await self._trim_idle_prefix_caches_for_budget(
+            additional_bytes=incoming_bytes,
+            prospective_model=model_name,
+        )
         evicted: list[_ManagedRuntime] = []
         async with self._lock:
             if self._closed:
                 raise RuntimeManagementError("runtime pool is closed")
-            model_name = artifact.resource.name
             existing = next(
                 (
                     item
@@ -352,26 +370,7 @@ class ManagedRuntimePool:
             active_count = len(resident_names) + sum(
                 name not in resident_names for name in self._loading_model_names
             )
-            incoming_bytes = self._estimated_load_bytes(artifact, request)
-            if (
-                self.max_runtime_memory_bytes is not None
-                and incoming_bytes > self.max_runtime_memory_bytes
-            ):
-                raise _job_error(
-                    "runtime_model_too_large",
-                    f"model has an estimated resident set of {incoming_bytes} bytes "
-                    f"but the runtime memory budget is "
-                    f"{self.max_runtime_memory_bytes} bytes",
-                )
-            committed_bytes = sum(
-                self._committed_runtime_bytes(item)
-                for item in self._instances.values()
-                if item.state != RuntimeInstanceState.FAILED
-            ) + sum(
-                reserved_bytes
-                for name, reserved_bytes in self._load_bytes.items()
-                if name not in resident_names
-            )
+            committed_bytes = self._committed_pool_bytes_locked()
             while (
                 active_count >= self.max_instances
                 or (
@@ -1142,6 +1141,28 @@ class ManagedRuntimePool:
             raise BackendError("model_not_loaded", "no runtime is available")
         return await backend.clear_runtime_cache()
 
+    async def trim_runtime_cache(
+        self,
+        target_bytes: int = 0,
+        instance_id: UUID | None = None,
+    ) -> dict[str, Any]:
+        if target_bytes < 0:
+            raise ValueError("target_bytes must be non-negative")
+        instance, backend = await self._runtime_control_target(instance_id)
+        if backend is None:
+            raise BackendError("model_not_loaded", "no runtime is available")
+        trim = getattr(backend, "trim_runtime_cache", None)
+        if not callable(trim):
+            raise BackendError(
+                "unsupported_operation",
+                "this runtime does not expose a tiered prefix cache",
+                status_code=501,
+            )
+        result = await trim(target_bytes)
+        if instance is not None:
+            await self._refresh_instance_usage(instance)
+        return result
+
     def realtime_connect(self, *, mode: str = "audio") -> Any:
         instance = self._instances.get(self._last_instance_id) if self._last_instance_id else None
         if instance is not None:
@@ -1439,11 +1460,7 @@ class ManagedRuntimePool:
     def _detach_over_budget_locked(self) -> list[_ManagedRuntime]:
         if self.max_runtime_memory_bytes is None:
             return []
-        committed = sum(
-            self._committed_runtime_bytes(item)
-            for item in self._instances.values()
-            if item.state != RuntimeInstanceState.FAILED
-        )
+        committed = self._committed_pool_bytes_locked()
         victims = []
         while committed > self.max_runtime_memory_bytes:
             victim = self._detach_lru_instance_locked()
@@ -1455,6 +1472,77 @@ class ManagedRuntimePool:
                 committed - self._committed_runtime_bytes(victim),
             )
         return victims
+
+    async def _trim_idle_prefix_caches_for_budget(
+        self,
+        *,
+        additional_bytes: int = 0,
+        prospective_model: str | None = None,
+    ) -> None:
+        if self.max_runtime_memory_bytes is None:
+            return
+        async with self._lock:
+            if self._closed:
+                return
+            if prospective_model is not None and (
+                prospective_model in self._loading_model_names
+                or any(
+                    item.artifact.resource.name == prospective_model
+                    and item.state != RuntimeInstanceState.FAILED
+                    for item in self._instances.values()
+                )
+            ):
+                return
+            if prospective_model is not None:
+                resident_names = {
+                    item.artifact.resource.name
+                    for item in self._instances.values()
+                    if item.state != RuntimeInstanceState.FAILED
+                }
+                active_count = len(resident_names) + sum(
+                    name not in resident_names for name in self._loading_model_names
+                )
+                if active_count >= self.max_instances:
+                    return
+            committed = self._committed_pool_bytes_locked() + additional_bytes
+            if committed <= self.max_runtime_memory_bytes:
+                return
+            candidates = sorted(
+                (
+                    item
+                    for item in self._instances.values()
+                    if item.state == RuntimeInstanceState.READY
+                    and item.active_requests == 0
+                    and item.queued_requests == 0
+                    and (item.kv_bytes or 0) > 0
+                    and callable(getattr(item.backend, "trim_runtime_cache", None))
+                ),
+                key=lambda item: (item.last_used_at or item.started_at, item.started_at),
+            )
+
+        for instance in candidates:
+            async with self._lock:
+                if (
+                    self._instances.get(instance.id) is not instance
+                    or instance.state != RuntimeInstanceState.READY
+                    or instance.active_requests != 0
+                    or instance.queued_requests != 0
+                ):
+                    continue
+                committed = self._committed_pool_bytes_locked() + additional_bytes
+                excess = committed - self.max_runtime_memory_bytes
+                if excess <= 0:
+                    return
+                hot_bytes = instance.kv_bytes or 0
+                target_bytes = max(0, hot_bytes - excess)
+                trim = getattr(instance.backend, "trim_runtime_cache", None)
+            if not callable(trim):
+                continue
+            try:
+                await asyncio.wait_for(trim(target_bytes), timeout=2.0)
+            except Exception:
+                continue
+            await self._refresh_instance_usage(instance)
 
     def _finish_model_load_locked(
         self,
@@ -1524,6 +1612,22 @@ class ManagedRuntimePool:
             instance.resident_bytes
             or instance.reserved_bytes
             or instance.artifact.resource.total_bytes
+        )
+
+    def _committed_pool_bytes_locked(self) -> int:
+        resident_names = {
+            item.artifact.resource.name
+            for item in self._instances.values()
+            if item.state != RuntimeInstanceState.FAILED
+        }
+        return sum(
+            self._committed_runtime_bytes(item)
+            for item in self._instances.values()
+            if item.state != RuntimeInstanceState.FAILED
+        ) + sum(
+            reserved_bytes
+            for name, reserved_bytes in self._load_bytes.items()
+            if name not in resident_names
         )
 
     @staticmethod
@@ -1612,6 +1716,8 @@ class ManagedRuntimePool:
                 await asyncio.gather(
                     *(self._refresh_instance_usage(item) for item in refresh)
                 )
+
+            await self._trim_idle_prefix_caches_for_budget()
 
             victims: list[tuple[_ManagedRuntime, str]] = []
             now = datetime.now(timezone.utc)

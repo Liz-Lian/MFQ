@@ -1049,6 +1049,101 @@ def test_runtime_memory_enforcement_rechecks_when_a_busy_runtime_drains(
     asyncio.run(run())
 
 
+def test_runtime_memory_enforcement_trims_idle_hot_tiers_before_models(
+    tmp_path: Path,
+) -> None:
+    async def run() -> None:
+        class TrimBackend(IdleBackend):
+            def __init__(self) -> None:
+                self.instance: _ManagedRuntime | None = None
+                self.targets: list[int] = []
+
+            async def trim_runtime_cache(self, target_bytes: int = 0) -> dict[str, object]:
+                self.targets.append(target_bytes)
+                assert self.instance is not None
+                released = max(0, (self.instance.kv_bytes or 0) - target_bytes)
+                self.instance.kv_bytes = target_bytes
+                self.instance.resident_bytes = max(
+                    0,
+                    (self.instance.resident_bytes or 0) - released,
+                )
+                return {"released_bytes": released, "prefix_cache_hot_bytes": target_bytes}
+
+            async def runtime_status(self) -> dict[str, object]:
+                assert self.instance is not None
+                return {"prefix_cache_hot_bytes": self.instance.kv_bytes or 0}
+
+        _model(tmp_path / "older.mfq")
+        _model(tmp_path / "newer.mfq")
+        catalog = ModelCatalog([tmp_path], cache_seconds=0)
+        older_backend = TrimBackend()
+        newer_backend = TrimBackend()
+        older = _ManagedRuntime(
+            id=uuid4(),
+            artifact=await catalog.resolve("older"),
+            process=SimpleNamespace(returncode=None),
+            backend=older_backend,
+            port=0,
+            context_size=4096,
+            state=RuntimeInstanceState.READY,
+            resident_bytes=70,
+            kv_bytes=30,
+            last_used_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        )
+        newer = _ManagedRuntime(
+            id=uuid4(),
+            artifact=await catalog.resolve("newer"),
+            process=SimpleNamespace(returncode=None),
+            backend=newer_backend,
+            port=0,
+            context_size=4096,
+            state=RuntimeInstanceState.READY,
+            resident_bytes=70,
+            kv_bytes=30,
+            last_used_at=datetime(2026, 1, 2, tzinfo=timezone.utc),
+        )
+        older_backend.instance = older
+        newer_backend.instance = newer
+        pool = ManagedRuntimePool(
+            catalog,
+            tmp_path / "runtime",
+            max_instances=2,
+            max_runtime_memory_bytes=100,
+        )
+        pool._instances = {older.id: older, newer.id: newer}
+
+        await pool._trim_idle_prefix_caches_for_budget()
+        async with pool._lock:
+            victims = pool._detach_over_budget_locked()
+
+        assert older_backend.targets == [0]
+        assert newer_backend.targets == [20]
+        assert older.resident_bytes == 40
+        assert newer.resident_bytes == 60
+        assert victims == []
+        assert set(pool._instances) == {older.id, newer.id}
+
+        older.resident_bytes = 70
+        older.kv_bytes = 30
+        older_backend.targets.clear()
+        pool._instances = {older.id: older}
+        await pool._trim_idle_prefix_caches_for_budget(
+            additional_bytes=40,
+            prospective_model="third",
+        )
+        assert older_backend.targets == [20]
+        assert older.resident_bytes == 60
+
+        older_backend.targets.clear()
+        await pool._trim_idle_prefix_caches_for_budget(
+            additional_bytes=70,
+            prospective_model="older",
+        )
+        assert older_backend.targets == []
+
+    asyncio.run(run())
+
+
 def test_runtime_controls_target_the_requested_model_instance(tmp_path: Path) -> None:
     async def run() -> None:
         class ControlBackend:
@@ -1056,6 +1151,7 @@ def test_runtime_controls_target_the_requested_model_instance(tmp_path: Path) ->
                 self.name = name
                 self.reloads: list[int] = []
                 self.cache_clears = 0
+                self.cache_trims: list[int] = []
 
             async def reload_runtime(self, context_size: int) -> dict[str, object]:
                 self.reloads.append(context_size)
@@ -1064,6 +1160,10 @@ def test_runtime_controls_target_the_requested_model_instance(tmp_path: Path) ->
             async def clear_runtime_cache(self) -> dict[str, object]:
                 self.cache_clears += 1
                 return {"model": self.name, "released_snapshots": 1}
+
+            async def trim_runtime_cache(self, target_bytes: int = 0) -> dict[str, object]:
+                self.cache_trims.append(target_bytes)
+                return {"model": self.name, "released_bytes": 2}
 
             async def capabilities(self) -> RuntimeCapabilitiesResource:
                 return RuntimeCapabilitiesResource(
@@ -1112,6 +1212,7 @@ def test_runtime_controls_target_the_requested_model_instance(tmp_path: Path) ->
 
         reloaded = await pool.reload_runtime(8192, second.id)
         cleared = await pool.clear_runtime_cache(second.id)
+        trimmed = await pool.trim_runtime_cache(4096, second.id)
         capabilities = await service.runtime_capabilities(second.id)
         status = await service.runtime_status(second.id)
         transport = httpx.ASGITransport(app=create_app(service))
@@ -1131,6 +1232,7 @@ def test_runtime_controls_target_the_requested_model_instance(tmp_path: Path) ->
 
         assert reloaded["model"] == "second"
         assert cleared["model"] == "second"
+        assert trimmed["model"] == "second"
         assert capabilities.model == "second"
         assert status["model"] == "second"
         assert status["instance_id"] == str(second.id)
@@ -1140,8 +1242,10 @@ def test_runtime_controls_target_the_requested_model_instance(tmp_path: Path) ->
         assert missing_status.json()["error"]["code"] == "runtime_instance_not_found"
         assert first_backend.reloads == []
         assert first_backend.cache_clears == 0
+        assert first_backend.cache_trims == []
         assert second_backend.reloads == [8192]
         assert second_backend.cache_clears == 1
+        assert second_backend.cache_trims == [4096]
         assert second.context_size == 8192
         with pytest.raises(BackendError) as missing:
             await pool.clear_runtime_cache(uuid4())

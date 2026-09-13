@@ -77,6 +77,7 @@ from mfq.server.models import (
     ResponseResource,
     RewindSessionRequest,
     RuntimeCacheClearRequest,
+    RuntimeCacheTrimRequest,
     RuntimeCapabilitiesResource,
     RuntimeInstanceList,
     RuntimeInstanceResource,
@@ -1226,6 +1227,20 @@ def create_app(
         body: RuntimeCacheClearRequest | None = None,
     ) -> dict[str, Any]:
         return await require_service().clear_runtime_cache(
+            instance_id=body.instance_id if body is not None else None,
+        )
+
+    @app.post(
+        "/api/v1/runtime/cache/trim",
+        response_model=dict[str, Any],
+        responses=ERROR_RESPONSES,
+        tags=["runtime"],
+    )
+    async def trim_runtime_cache(
+        body: RuntimeCacheTrimRequest | None = None,
+    ) -> dict[str, Any]:
+        return await require_service().trim_runtime_cache(
+            body.target_bytes if body is not None else 0,
             instance_id=body.instance_id if body is not None else None,
         )
 

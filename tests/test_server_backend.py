@@ -531,6 +531,8 @@ def test_backend_proxies_runtime_console_resources() -> None:
         assert (await backend.runtime_models())["data"][0]["id"] == "model-a"
         assert (await backend.realtime_capabilities())["available"] is True
         assert (await backend.reload_runtime(16384))["model"] == "model-a"
+        assert (await backend.clear_runtime_cache())["model"] == "model-a"
+        assert (await backend.trim_runtime_cache(4096))["model"] == "model-a"
         await client.aclose()
 
     asyncio.run(run())
@@ -539,6 +541,8 @@ def test_backend_proxies_runtime_console_resources() -> None:
         ("GET", "/v1/models", None),
         ("GET", "/realtime/capabilities", None),
         ("POST", "/api/reload", {"context_size": 16384}),
+        ("POST", "/api/runtime/cache/clear", None),
+        ("POST", "/api/runtime/cache/trim", {"target_bytes": 4096}),
     ]
 
 

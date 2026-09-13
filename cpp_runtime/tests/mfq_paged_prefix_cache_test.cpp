@@ -389,11 +389,51 @@ int main() try {
         const auto loaded = cache.load(hot);
         require(loaded && *loaded == std::vector<std::uint8_t>({5, 6, 7, 8}),
                 "RAM-only prefix block could not be loaded");
+        cache.pin({hot});
+        require(cache.trim_hot() == 0,
+                "trim discarded a pinned RAM-only prefix block");
+        cache.unpin({hot});
+        require(cache.trim_hot() == 4,
+                "trim did not reclaim an unpinned RAM-only prefix block");
+        require(!cache.load(hot),
+                "trimmed RAM-only prefix block remained readable");
         require(std::none_of(
                     std::filesystem::recursive_directory_iterator(hot_only_root),
                     std::filesystem::recursive_directory_iterator(),
                     [](const auto& entry) { return entry.is_regular_file(); }),
                 "RAM-only prefix cache created a disk payload");
+    }
+
+    {
+        const auto trim_root = root / "hot-trim-test";
+        PagedPrefixCache cache(PagedPrefixCacheConfig{
+            trim_root,
+            "hot-trim",
+            4,
+            4096,
+            4096,
+            2,
+        });
+        BlockHash parent{};
+        const auto block = cache.store(
+            parent, tokens.data(), 4, payload({12, 13, 14, 15}));
+        const auto second = cache.store(
+            block, tokens.data(), 4, payload({16, 17, 18, 19}));
+        cache.flush();
+        require(cache.metrics().hot_bytes == 8,
+                "durable block was not promoted into the hot tier");
+        require(cache.trim_hot(4) == 4,
+                "hot trim did not report released durable payload bytes");
+        const auto trimmed = cache.metrics();
+        require(trimmed.hot_bytes == 4 && trimmed.disk_blocks == 2,
+                "hot trim deleted or retained the wrong cache tier");
+        const auto restored = cache.load_prefix({block, second});
+        require(restored.size() == 2 &&
+                    *restored[0] == std::vector<std::uint8_t>({12, 13, 14, 15}) &&
+                    *restored[1] == std::vector<std::uint8_t>({16, 17, 18, 19}),
+                "trimmed hot chain could not be restored from SSD");
+        require(cache.metrics().disk_hits == 1,
+                "cold restore after hot trim was not recorded");
     }
 
     {

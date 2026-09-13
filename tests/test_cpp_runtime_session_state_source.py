@@ -150,6 +150,15 @@ def test_persistent_prefix_cache_is_content_addressed_and_restart_safe() -> None
     assert "read_header(input, header)" in PAGED_SOURCE
 
 
+def test_tiered_prefix_cache_can_release_only_its_hot_payloads() -> None:
+    assert "std::uint64_t trim_hot(" in PAGED_HEADER
+    assert "pins_.count(iterator->first) != 0" in PAGED_SOURCE
+    assert 'server.Post("/api/runtime/cache/trim"' in SERVER
+    assert "session_control.trim_hot" in SERVER
+    assert "session_control.trim_hot" in METAL_DECODE
+    assert "text_session_cache.trim_hot(target_bytes)" in DECODE
+
+
 def test_metal_paged_codec_preserves_raw_kv_tensor_storage() -> None:
     assert "encode_state(" in METAL_PAGED_CODEC
     assert "encode_block(" in METAL_PAGED_CODEC

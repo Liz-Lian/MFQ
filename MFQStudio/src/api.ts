@@ -1206,6 +1206,16 @@ export const api = {
       body: JSON.stringify({ instance_id: instanceId }),
     });
   },
+
+  trimRuntimeCache(
+    targetBytes = 0,
+    instanceId?: string,
+  ): Promise<RuntimeStatus & { released_bytes: number; target_bytes: number }> {
+    return request("/api/v1/runtime/cache/trim", {
+      method: "POST",
+      body: JSON.stringify({ target_bytes: targetBytes, instance_id: instanceId }),
+    });
+  },
 };
 
 export interface StreamRequest {

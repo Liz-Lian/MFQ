@@ -22687,6 +22687,10 @@ public:
         return clear_live_sessions();
     }
 
+    uint64_t trim_hot(uint64_t target_bytes) {
+        return paged_cache_ ? paged_cache_->trim_hot(target_bytes) : 0;
+    }
+
 private:
     size_t restore_paged(
             Model & model,
@@ -30144,6 +30148,9 @@ int main(int argc, char ** argv) {
                 [&] {
                     std::lock_guard<std::mutex> lock(model_mutex);
                     return text_session_cache.clear();
+                },
+                [&](uint64_t target_bytes) {
+                    return text_session_cache.trim_hot(target_bytes);
                 },
             }, multimodal_generate,
             [&server_components, &continuous_batcher] {

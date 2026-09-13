@@ -866,6 +866,15 @@ public:
         return clear_live_sessions();
     }
 
+    std::uint64_t trim_hot(std::uint64_t target_bytes) {
+        if constexpr (Codec::available) {
+            if (paged_cache_) {
+                return paged_cache_->trim_hot(target_bytes);
+            }
+        }
+        return 0;
+    }
+
     void replace_paged_cache(
         std::shared_ptr<mfq::cache::PagedPrefixCache> cache,
         std::uint64_t disk_budget,
@@ -1607,6 +1616,9 @@ int serve_loaded_runtime(
         mlx::core::synchronize(runtime_stream);
         release_model_load_staging_memory();
         return released;
+    };
+    session_control.trim_hot = [session_cache](std::uint64_t target_bytes) {
+        return session_cache->trim_hot(target_bytes);
     };
     return run_mfq_server(
         server, generate, reload, duplex, session_control,

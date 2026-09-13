@@ -1351,6 +1351,20 @@ class ServerService:
             return await self._runtime_request("clear_runtime_cache")
         return await self._runtime_request("clear_runtime_cache", instance_id)
 
+    async def trim_runtime_cache(
+        self,
+        target_bytes: int = 0,
+        *,
+        instance_id: UUID | None = None,
+    ) -> dict[str, Any]:
+        if instance_id is None:
+            return await self._runtime_request("trim_runtime_cache", target_bytes)
+        return await self._runtime_request(
+            "trim_runtime_cache",
+            target_bytes,
+            instance_id,
+        )
+
     def realtime_connect(self, *, mode: str = "audio") -> Any:
         connector = getattr(self.backend, "realtime_connect", None)
         if connector is None:
@@ -2019,7 +2033,7 @@ class ServerService:
             return await operation(*args)
         except BackendError as error:
             raise ServiceError(
-                503,
+                error.status_code or 503,
                 error.code,
                 str(error),
                 retryable=error.retryable,

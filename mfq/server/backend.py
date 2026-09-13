@@ -110,6 +110,8 @@ class ChatBackend(Protocol):
 
     async def clear_runtime_cache(self) -> dict[str, Any]: ...
 
+    async def trim_runtime_cache(self, target_bytes: int = 0) -> dict[str, Any]: ...
+
     def realtime_connect(self, *, mode: str = "audio") -> Any: ...
 
     async def aclose(self) -> None: ...
@@ -634,6 +636,15 @@ class OpenAIChatBackend:
 
     async def clear_runtime_cache(self) -> dict[str, Any]:
         return await self._json_request("POST", "/api/runtime/cache/clear")
+
+    async def trim_runtime_cache(self, target_bytes: int = 0) -> dict[str, Any]:
+        if target_bytes < 0:
+            raise ValueError("target_bytes must be non-negative")
+        return await self._json_request(
+            "POST",
+            "/api/runtime/cache/trim",
+            json_body={"target_bytes": target_bytes},
+        )
 
     def realtime_connect(self, *, mode: str = "audio") -> Any:
         import websockets

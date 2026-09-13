@@ -995,6 +995,15 @@ class ClusterBackend:
             return await self.local.clear_runtime_cache()
         return await self.local.clear_runtime_cache(instance_id)
 
+    async def trim_runtime_cache(
+        self,
+        target_bytes: int = 0,
+        instance_id: UUID | None = None,
+    ) -> dict[str, Any]:
+        if instance_id is None:
+            return await self.local.trim_runtime_cache(target_bytes)
+        return await self.local.trim_runtime_cache(target_bytes, instance_id)
+
     def realtime_connect(self, *, mode: str = "audio") -> Any:
         return self.local.realtime_connect(mode=mode)
 

@@ -121,6 +121,14 @@ class FakeBackend:
             "prefix_cache_bytes": 0,
         }
 
+    async def trim_runtime_cache(self, target_bytes: int = 0) -> dict[str, object]:
+        return {
+            "status": "ok",
+            "released_bytes": 1024,
+            "target_bytes": target_bytes,
+            "prefix_cache_hot_bytes": target_bytes,
+        }
+
 
 def make_service(path: Path, backend: FakeBackend) -> ServerService:
     return ServerService(SessionStore(path / "mfq.server.sqlite3"), backend)
@@ -707,6 +715,13 @@ def test_executable_api_persists_nonstream_text_responses(tmp_path: Path) -> Non
             assert cleared.status_code == 200
             assert cleared.json()["released_snapshots"] == 3
             assert backend.cache_clears == 1
+            trimmed = await client.post(
+                "/api/v1/runtime/cache/trim",
+                json={"target_bytes": 4096},
+            )
+            assert trimmed.status_code == 200
+            assert trimmed.json()["released_bytes"] == 1024
+            assert trimmed.json()["target_bytes"] == 4096
             invalid = await client.post("/api/v1/sessions", json={"model": ""})
             assert invalid.status_code == 422
             assert invalid.json()["error"]["code"] == "invalid_request"

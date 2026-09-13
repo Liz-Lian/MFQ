@@ -101,6 +101,9 @@ public:
 
     void pin(const std::vector<BlockHash>& blocks);
     void unpin(const std::vector<BlockHash>& blocks);
+    // Reclaim the RAM tier without deleting durable SSD blocks or breaking
+    // live RAM-only bindings. Returns the number of payload bytes released.
+    std::uint64_t trim_hot(std::uint64_t target_bytes = 0);
     void flush();
     std::size_t clear();
     PagedPrefixCacheMetrics metrics() const;

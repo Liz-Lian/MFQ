@@ -3717,6 +3717,7 @@ int run_mfq_server(
                 "/v1/chat/completions", "/v1/completions", "/v1/models",
                 "/health", "/api/status", "/api/reload", "/backend",
                 "/api/runtime/cache/clear",
+                "/api/runtime/cache/trim",
                 "/api/runtime/sessions/fork",
                 "/api/runtime/sessions/{id}",
                 "/api/runtime/sessions/{id}/cancel",
@@ -3867,6 +3868,49 @@ int run_mfq_server(
             set_json(res, result);
         } catch (const std::exception & error) {
             reloading.store(false);
+            set_json(res, error_body(error.what(), "server_error"), 500);
+        }
+    });
+
+    server.Post("/api/runtime/cache/trim", [&] (
+            const httplib::Request & req, httplib::Response & res) {
+        if (!authorized(req, res, config.api_key)) return;
+        if (!session_control.trim_hot) {
+            set_json(res, error_body(
+                "this runtime does not expose a tiered prefix cache",
+                "unsupported_operation"), 501);
+            return;
+        }
+        try {
+            const json body = parse_body(req);
+            if (!body.is_object()) {
+                throw ApiError(
+                    400, "invalid_request_error",
+                    "request body must be a JSON object");
+            }
+            std::uint64_t target_bytes = 0;
+            if (body.contains("target_bytes")) {
+                if (!body["target_bytes"].is_number_unsigned() &&
+                    !(body["target_bytes"].is_number_integer() &&
+                      body["target_bytes"].get<std::int64_t>() >= 0)) {
+                    throw ApiError(
+                        400, "invalid_request_error",
+                        "target_bytes must be a non-negative integer",
+                        "target_bytes");
+                }
+                target_bytes = body["target_bytes"].get<std::uint64_t>();
+            }
+            const auto released = session_control.trim_hot(target_bytes);
+            json result = {
+                {"status", "ok"},
+                {"released_bytes", released},
+                {"target_bytes", target_bytes},
+            };
+            add_session_metrics(result);
+            set_json(res, result);
+        } catch (const ApiError & error) {
+            handle_api_error(res, error);
+        } catch (const std::exception & error) {
             set_json(res, error_body(error.what(), "server_error"), 500);
         }
     });

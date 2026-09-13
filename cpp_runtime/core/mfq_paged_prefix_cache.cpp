@@ -706,6 +706,13 @@ public:
         enforce_disk_budget_locked();
     }
 
+    std::uint64_t trim_hot(std::uint64_t target_bytes) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const auto released = trim_hot_locked(target_bytes);
+        sync_metrics_locked();
+        return released;
+    }
+
     void flush() {
         std::unique_lock<std::mutex> lock(mutex_);
         writes_finished_.wait(lock, [this] {
@@ -1063,7 +1070,13 @@ private:
         }
         hot_[hash] = HotEntry{std::move(payload), ++clock_};
         hot_bytes_ += hot_[hash].payload->size();
-        while (hot_bytes_ > config_.max_hot_bytes && !hot_.empty()) {
+        trim_hot_locked(config_.max_hot_bytes);
+        sync_metrics_locked();
+    }
+
+    std::uint64_t trim_hot_locked(std::uint64_t target_bytes) {
+        const auto before = hot_bytes_;
+        while (hot_bytes_ > target_bytes && !hot_.empty()) {
             auto victim = hot_.end();
             for (auto iterator = hot_.begin(); iterator != hot_.end();
                  ++iterator) {
@@ -1083,7 +1096,7 @@ private:
             hot_bytes_ -= victim->second.payload->size();
             hot_.erase(victim);
         }
-        sync_metrics_locked();
+        return before - hot_bytes_;
     }
 
     void erase_corrupt_locked(const BlockHash& hash) {
@@ -1241,6 +1254,10 @@ void PagedPrefixCache::pin(const std::vector<BlockHash>& blocks) {
 
 void PagedPrefixCache::unpin(const std::vector<BlockHash>& blocks) {
     implementation_->unpin(blocks);
+}
+
+std::uint64_t PagedPrefixCache::trim_hot(std::uint64_t target_bytes) {
+    return implementation_->trim_hot(target_bytes);
 }
 
 void PagedPrefixCache::flush() {

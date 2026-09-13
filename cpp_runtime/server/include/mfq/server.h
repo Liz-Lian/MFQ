@@ -255,6 +255,7 @@ struct MfqSessionControl {
     std::function<size_t(const std::string & session_id)> close;
     std::function<std::vector<std::pair<std::string, double>>()> metrics;
     std::function<size_t()> clear;
+    std::function<uint64_t(uint64_t target_bytes)> trim_hot;
 };
 
 int run_mfq_server(

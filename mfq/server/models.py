@@ -1049,6 +1049,11 @@ class RuntimeCacheClearRequest(ProtocolModel):
     instance_id: UUID | None = None
 
 
+class RuntimeCacheTrimRequest(ProtocolModel):
+    target_bytes: int = Field(default=0, ge=0)
+    instance_id: UUID | None = None
+
+
 class ErrorResponse(ProtocolModel):
     error: ErrorDetail
 

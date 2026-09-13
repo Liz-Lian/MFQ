@@ -169,6 +169,30 @@ def test_fork_shares_prefix_then_diverges(tmp_path) -> None:
     ]
 
 
+def test_fork_can_switch_models_without_copying_message_payloads(tmp_path) -> None:
+    store = make_store(tmp_path)
+    store.create_session(CreateSessionRequest(model="model-a"), session_id=SESSION_ID, now=NOW)
+    store.append_message(
+        SESSION_ID,
+        0,
+        MessageRole.USER,
+        [{"type": "text", "text": "question"}],
+        message_id=FIRST_MESSAGE_ID,
+        now=NOW,
+    )
+
+    fork = store.fork_session(
+        SESSION_ID,
+        ForkSessionRequest(model="model-b"),
+        target_session_id=FORK_ID,
+        now=NOW,
+    )
+
+    assert fork.model == "model-b"
+    assert fork.runtime_instance_id is None
+    assert [message.id for message in store.list_messages(FORK_ID)] == [FIRST_MESSAGE_ID]
+
+
 def test_fork_rejects_message_from_another_branch(tmp_path) -> None:
     store = make_store(tmp_path)
     store.create_session(CreateSessionRequest(model="model-a"), session_id=SESSION_ID, now=NOW)

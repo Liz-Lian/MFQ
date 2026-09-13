@@ -90,9 +90,9 @@ class HubCatalog:
     @staticmethod
     async def _search_modelscope(query: str, limit: int) -> HubModelSearchResult:
         try:
-            async with httpx.AsyncClient(timeout=30) as client:
+            async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
                 response = await client.put(
-                    "https://modelscope.cn/api/v1/models/",
+                    "https://modelscope.cn/api/v1/models",
                     json={"PageSize": limit, "Name": query},
                 )
                 response.raise_for_status()

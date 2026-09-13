@@ -856,6 +856,7 @@ class ServerService:
         session_id: UUID,
         request: ForkSessionRequest,
     ) -> SessionResource:
+        source = await self.get_session(session_id)
         try:
             forked = await asyncio.to_thread(self.store.fork_session, session_id, request)
         except SessionNotFoundError as error:
@@ -864,7 +865,7 @@ class ServerService:
             raise ServiceError(404, "message_not_found", str(error)) from error
         except StorageError as error:
             raise ServiceError(409, "session_state_conflict", str(error)) from error
-        if request.at_message_id is None:
+        if request.at_message_id is None and forked.model == source.model:
             await self.backend.fork_session(session_id, forked.id)
         return forked
 

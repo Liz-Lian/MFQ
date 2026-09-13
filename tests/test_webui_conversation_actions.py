@@ -46,11 +46,10 @@ def test_stop_generation_cancels_the_server_before_aborting_the_stream() -> None
     assert 'tr("正在停止生成", "Stopping generation")' in APP
 
 
-def test_generation_keeps_the_latest_user_language_consistent() -> None:
-    assert "LANGUAGE_CONSISTENCY_PROMPT" in APP
-    assert "use that language exclusively for every sentence and heading" in APP
-    assert "Never insert Chinese words into an English answer" in APP
-    assert ".join(\"\\n\\n\")" in APP
+def test_generation_does_not_inject_a_hidden_system_prompt() -> None:
+    assert "LANGUAGE_CONSISTENCY_PROMPT" not in APP
+    assert "Before answering, identify the language" not in APP
+    assert "const effectiveSystemPrompt = effectiveSettings.systemPrompt.trim()" in APP
 
 
 def test_media_attachments_are_previewed_uploaded_and_sent_as_typed_parts() -> None:

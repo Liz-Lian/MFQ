@@ -773,6 +773,7 @@ export const api = {
     atMessageId: string | null,
     includeMessage = true,
     title?: string | null,
+    model?: string,
   ): Promise<Session> {
     return request(`/api/v1/sessions/${id}/fork`, {
       method: "POST",
@@ -780,6 +781,7 @@ export const api = {
         at_message_id: atMessageId,
         include_message: includeMessage,
         title,
+        model,
       }),
     });
   },

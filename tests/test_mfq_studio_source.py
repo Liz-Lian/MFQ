@@ -114,6 +114,42 @@ def test_studio_handles_a_running_server_without_a_loaded_model():
     assert "Promise.allSettled([" in APP
 
 
+def test_studio_exposes_every_loaded_model_and_switches_chat_sessions_safely():
+    assert "function runtimeModelNames(" in APP
+    assert 'tr("已加载模型", "Loaded models")' in APP
+    assert "instances.map((instance) =>" in APP
+    assert "artifacts.slice(0, 8)" not in APP
+    assert "availableModelNames.map((name) =>" in APP
+    assert "api.forkSession(active.id, null, true, active.title, model)" in APP
+    assert "active.model === model" in APP
+    assert "!conversationReady" in APP
+    assert "model?: string" in API
+
+
+def test_model_lifecycle_actions_stay_on_the_models_page():
+    load_body = APP[
+        APP.index("async function loadArtifact("):
+        APP.index("async function finishModelRegistration(")
+    ]
+    unload_body = APP[
+        APP.index("async function unloadInstance("):
+        APP.index("const last = runtime?.last_request")
+    ]
+    assert 'setDashboardPage("models")' in load_body
+    assert 'setView("dashboard")' in load_body
+    assert 'setView("lab")' not in load_body
+    assert 'setDashboardPage("models")' in unload_body
+    assert 'setView("dashboard")' in unload_body
+    assert 'setView("lab")' not in unload_body
+
+
+def test_model_hub_accepts_repository_links_and_downloads_into_the_model_catalog():
+    assert "function parseHubReference(" in APP
+    assert 'host === "huggingface.co"' in APP
+    assert 'host === "modelscope.cn"' in APP
+    assert 'destination: `models/${hubModel.provider}/${repositoryPath || name}`' in APP
+
+
 def test_studio_can_select_and_load_an_external_mfq_directory_in_local_mode():
     assert "rfd::AsyncFileDialog::new()" in RUST
     assert ".pick_folder()" in RUST
@@ -215,10 +251,12 @@ def test_studio_resolves_model_and_global_inference_settings_without_roles():
     assert "api.createSession(selectedModel, mode)" in APP
     assert "sampling: samplingParams()" in APP
     assert "max_tokens: effectiveSettings.maxTokens" in APP
-    assert "const effectiveSystemPrompt = useMemo" in APP
+    assert "const effectiveSystemPrompt = effectiveSettings.systemPrompt.trim()" in APP
+    assert "systemPrompt: current.systemPrompt" in APP
     assert "system_prompt: effectiveSystemPrompt" in APP
     assert "systemPrompt: effectiveSystemPrompt" in APP
-    assert "Never insert Chinese words into an English answer" in APP
+    assert "LANGUAGE_CONSISTENCY_PROMPT" not in APP
+    assert "Before answering, identify the language" not in APP
     assert "setSettings((current) => ({ ...current, ...rolePreset.settings" not in APP
 
 

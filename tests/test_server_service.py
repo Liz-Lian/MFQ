@@ -503,6 +503,15 @@ def test_executable_api_persists_nonstream_text_responses(tmp_path: Path) -> Non
             assert forked.status_code == 201
             forked_session = forked.json()
             assert backend.forks == [(UUID(session["id"]), UUID(forked_session["id"]))]
+            switched = await client.post(
+                f"/api/v1/sessions/{session['id']}/fork",
+                json={"model": "model-b"},
+            )
+            assert switched.status_code == 201
+            switched_session = switched.json()
+            assert switched_session["model"] == "model-b"
+            assert switched_session["revision"] == 2
+            assert backend.forks == [(UUID(session["id"]), UUID(forked_session["id"]))]
             rewound = await client.post(
                 f"/api/v1/sessions/{session['id']}/rewind",
                 json={
@@ -526,9 +535,14 @@ def test_executable_api_persists_nonstream_text_responses(tmp_path: Path) -> Non
             assert backend.closed_sessions == [UUID(session["id"])]
             deleted_fork = await client.delete(f"/api/v1/sessions/{forked_session['id']}")
             assert deleted_fork.status_code == 204
+            deleted_switched = await client.delete(
+                f"/api/v1/sessions/{switched_session['id']}"
+            )
+            assert deleted_switched.status_code == 204
             assert backend.closed_sessions == [
                 UUID(session["id"]),
                 UUID(forked_session["id"]),
+                UUID(switched_session["id"]),
             ]
             deleted_edited = await client.delete(f"/api/v1/sessions/{edited_branch.json()['id']}")
             assert deleted_edited.status_code == 204

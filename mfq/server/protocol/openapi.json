@@ -1366,6 +1366,19 @@
             "title": "Include Message",
             "type": "boolean"
           },
+          "model": {
+            "anyOf": [
+              {
+                "maxLength": 255,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
+          },
           "title": {
             "anyOf": [
               {

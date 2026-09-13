@@ -172,6 +172,80 @@ interface PendingAttachment {
   kind: "image" | "video" | "audio" | "document";
 }
 
+interface HubReference {
+  provider: HubModelSummary["provider"];
+  repoId: string;
+  revision?: string;
+}
+
+function parseHubReference(
+  value: string,
+  fallbackProvider: HubModelSummary["provider"],
+): HubReference | null {
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  if (/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(trimmed)) {
+    return { provider: fallbackProvider, repoId: trimmed };
+  }
+  let parsed: URL;
+  try {
+    parsed = new URL(trimmed);
+  } catch {
+    return null;
+  }
+  const host = parsed.hostname.toLowerCase();
+  const provider = host === "huggingface.co" || host === "www.huggingface.co"
+    ? "huggingface"
+    : host === "modelscope.cn" || host === "www.modelscope.cn"
+      ? "modelscope"
+      : null;
+  if (!provider) return null;
+  let parts: string[];
+  try {
+    parts = parsed.pathname.split("/").filter(Boolean).map(decodeURIComponent);
+  } catch {
+    return null;
+  }
+  if (provider === "modelscope" && parts[0] === "models") parts.shift();
+  if (parts.length < 2) return null;
+  const marker = parts.findIndex((part) => part === "tree");
+  const repoId = parts.slice(0, 2).join("/");
+  const revision = marker >= 0 && parts.length > marker + 1
+    ? parts.slice(marker + 1).join("/")
+    : undefined;
+  return { provider, repoId, revision };
+}
+
+function runtimeModelNames(
+  advertised: RuntimeModel[],
+  instances: RuntimeInstance[],
+): string[] {
+  return Array.from(new Set([
+    ...advertised.map((item) => item.id),
+    ...instances
+      .filter((item) => item.state === "ready" || item.state === "busy")
+      .map((item) => item.model),
+  ].filter(Boolean)));
+}
+
+function runtimeSelectionNames(
+  advertised: RuntimeModel[],
+  instances: RuntimeInstance[],
+  jobs: JobResource[] = [],
+): string[] {
+  return Array.from(new Set([
+    ...runtimeModelNames(advertised, instances),
+    ...instances
+      .filter((item) => item.state !== "failed" && item.state !== "unloading")
+      .map((item) => item.model),
+    ...jobs
+      .filter((item) => item.kind === "model.load"
+        && ["queued", "running", "cancelling"].includes(item.status))
+      .map((item) => item.payload.model)
+      .filter((item): item is string => typeof item === "string" && Boolean(item)),
+  ]));
+}
+
 const SETTINGS_KEY = "mfq.studio.generation.v1";
 const STORED_PRESETS_KEY = "mfq.studio.presets.v1";
 const VOICE_HISTORY_KEY = "mfq.studio.voice-history.v1";
@@ -209,8 +283,6 @@ const DOCUMENT_ACCEPT = [
   ".docx",
 ].join(",");
 const MAX_DOCUMENT_BYTES = 64 * 1024 * 1024;
-const LANGUAGE_CONSISTENCY_PROMPT =
-  "Before answering, identify the language of the user's latest message. Follow any explicit language request; otherwise use that language exclusively for every sentence and heading. Never insert Chinese words into an English answer or English prose into a Chinese answer. Keep only unavoidable proper nouns, code, quoted text, and technical identifiers in their original language.";
 const MODE_LABELS: Record<SessionMode, [string, string]> = {
   text: ["文本", "Text"],
   voice: ["语音", "Voice"],
@@ -260,7 +332,7 @@ function modeTemplateSettings(
   };
   return {
     ...current,
-    systemPrompt: voice ? String(defaults.system_prompt ?? "") : "",
+    systemPrompt: current.systemPrompt,
     maxTokens: voice ? current.maxTokens : value("max_tokens", current.maxTokens),
     temperature: value("temperature", current.temperature),
     topP: value("top_p", current.topP),
@@ -1579,6 +1651,7 @@ export default function App() {
   const voiceRef = useRef<RealtimeAudioController | null>(null);
   const voiceClipWrites = useRef(new Map<string, Promise<void>>());
   const appliedModeTemplate = useRef("");
+  const sessionSwitchRef = useRef("");
 
   const english =
     settings.language === "en" ||
@@ -1594,6 +1667,22 @@ export default function App() {
     () => sessions.find((session) => session.id === activeId) ?? null,
     [activeId, sessions],
   );
+  const availableModelNames = useMemo(
+    () => runtimeModelNames(models, instances),
+    [instances, models],
+  );
+  const selectedModelAvailable = Boolean(model && availableModelNames.includes(model));
+  const conversationReady = Boolean(
+    active && selectedModelAvailable && active.model === model,
+  );
+  const selectedRuntimeInstance = instances.find(
+    (instance) => instance.model === model && instance.state !== "failed",
+  );
+  const selectedModelLoading = selectedRuntimeInstance?.state === "loading" || jobs.some(
+    (job) => job.kind === "model.load"
+      && job.payload.model === model
+      && ["queued", "running", "cancelling"].includes(job.status),
+  );
   const currentVoiceMessages = useMemo(
     () => voiceMessages.filter((message) => message.sessionId === activeId),
     [activeId, voiceMessages],
@@ -1605,12 +1694,7 @@ export default function App() {
     [active?.mode, mode, realtime, runtime, settings],
   );
   const effectiveSettings = resolvedGlobalSettings;
-  const effectiveSystemPrompt = useMemo(
-    () => [effectiveSettings.systemPrompt.trim(), LANGUAGE_CONSISTENCY_PROMPT]
-      .filter(Boolean)
-      .join("\n\n"),
-    [effectiveSettings.systemPrompt],
-  );
+  const effectiveSystemPrompt = effectiveSettings.systemPrompt.trim();
   const reasoningValues = useMemo(() => {
     const values = runtime?.chat_template_capabilities?.reasoning_effort?.values;
     return Array.isArray(values) ? values : [];
@@ -1682,18 +1766,29 @@ export default function App() {
       const [metricHistory, nextArtifacts, nextInstances, nextProfiles, nextJobs, nextLogs, nextKinds, nextLineage, nextDatasets, nextEvaluations, nextNodes] = management;
       if (capabilityResult.status === "fulfilled") {
         setCapabilities(capabilityResult.value);
-        setModel(capabilityResult.value.model);
       } else {
         setCapabilities(null);
       }
       if (modelResult.status === "fulfilled") {
         setModels(modelResult.value);
-        if (capabilityResult.status !== "fulfilled") {
-          setModel((current) => current || modelResult.value[0]?.id || "");
-        }
       }
       const status = statusResult.status === "fulfilled" ? statusResult.value : null;
       setRuntime(status);
+      const nextModelNames = runtimeModelNames(
+        modelResult.status === "fulfilled" ? modelResult.value : [],
+        nextInstances,
+      );
+      const nextSelectionNames = runtimeSelectionNames(
+        modelResult.status === "fulfilled" ? modelResult.value : [],
+        nextInstances,
+        nextJobs,
+      );
+      const statusModel = typeof status?.model === "string" ? status.model : "";
+      setModel((current) => {
+        if (current && nextSelectionNames.includes(current)) return current;
+        if (statusModel && nextModelNames.includes(statusModel)) return statusModel;
+        return nextModelNames[0] ?? "";
+      });
       if (realtimeResult.status === "fulfilled") {
         setRealtime(realtimeResult.value);
         setRealtimeAvailable(realtimeResult.value.available === true);
@@ -1928,18 +2023,27 @@ export default function App() {
         if (!current) return;
         if (results[0].status === "fulfilled") {
           setCapabilities(results[0].value);
-          setModel(results[0].value.model);
         }
         if (results[1].status === "fulfilled") {
           const nextModels = results[1].value;
           setModels(nextModels);
-          if (results[0].status !== "fulfilled") {
-            setModel((current) => current || nextModels[0]?.id || "");
-          }
         }
         if (results[2].status === "fulfilled") setRuntime(results[2].value);
         if (results[5].status === "fulfilled") setArtifacts(results[5].value);
         if (results[6].status === "fulfilled") setInstances(results[6].value);
+        const initialInstances = results[6].status === "fulfilled" ? results[6].value : [];
+        const initialModels = results[1].status === "fulfilled" ? results[1].value : [];
+        const initialJobs = results[7].status === "fulfilled" ? results[7].value : [];
+        const initialNames = runtimeSelectionNames(initialModels, initialInstances, initialJobs);
+        const initialStatusModel = results[2].status === "fulfilled"
+          && typeof results[2].value.model === "string"
+          ? results[2].value.model
+          : "";
+        setModel(
+          initialStatusModel && initialNames.includes(initialStatusModel)
+            ? initialStatusModel
+            : initialNames[0] ?? "",
+        );
         if (results[7].status === "fulfilled") setJobs(results[7].value);
         if (results[8].status === "fulfilled") {
           const history = results[8].value
@@ -2020,6 +2124,30 @@ export default function App() {
       if (voiceRef.current?.active) void voiceRef.current.stop();
     };
   }, [activeId]);
+
+  useEffect(() => {
+    if (!active || !selectedModelAvailable || active.model === model || busy) return;
+    const switchKey = `${active.id}:${model}`;
+    if (sessionSwitchRef.current === switchKey) return;
+    sessionSwitchRef.current = switchKey;
+    let current = true;
+    void api.forkSession(active.id, null, true, active.title, model)
+      .then((replacement) => {
+        if (!current) return;
+        setSessions((existing) => [replacement, ...existing]);
+        setActiveId(replacement.id);
+        setResponses({});
+      })
+      .catch((cause) => {
+        if (current) setError(errorMessage(cause));
+      })
+      .finally(() => {
+        if (sessionSwitchRef.current === switchKey) sessionSwitchRef.current = "";
+      });
+    return () => {
+      current = false;
+    };
+  }, [active, busy, model, selectedModelAvailable]);
 
   useEffect(() => {
     setAttachments((current) => {
@@ -2108,7 +2236,7 @@ export default function App() {
   }
 
   async function clearActiveConversation() {
-    if (!active || busy || !await studioConfirm(tr("清空当前对话？", "Clear this conversation?"))) return;
+    if (!active || !conversationReady || busy || !await studioConfirm(tr("清空当前对话？", "Clear this conversation?"))) return;
     setBusy(true);
     setError(null);
     try {
@@ -2271,7 +2399,7 @@ export default function App() {
   async function send(event: FormEvent) {
     event.preventDefault();
     const text = draft.trim();
-    if (!active || (!text && !attachments.length) || busy) return;
+    if (!active || !conversationReady || (!text && !attachments.length) || busy) return;
     if (
       active.mode !== "text" &&
       realtimeAvailable &&
@@ -2401,7 +2529,7 @@ export default function App() {
   }
 
   async function saveEdit(message: Message) {
-    if (!active || !editDraft || busy) return;
+    if (!active || !conversationReady || !editDraft || busy) return;
     const messageIndex = messages.findIndex((item) => item.id === message.id);
     if (messageIndex < 0) return;
     const text = editDraft.text.trim();
@@ -2455,7 +2583,7 @@ export default function App() {
   }
 
   async function regenerate(message: Message) {
-    if (!active || busy || message.role !== "assistant") return;
+    if (!active || !conversationReady || busy || message.role !== "assistant") return;
     const index = messages.findIndex((item) => item.id === message.id);
     let user: Message | undefined;
     let userIndex = -1;
@@ -2510,7 +2638,7 @@ export default function App() {
   }
 
   async function executeToolCalls(message: Message) {
-    if (!active || busy) return;
+    if (!active || !conversationReady || busy) return;
     const calls = message.parts.filter(
       (part): part is Extract<ContentPart, { type: "tool_call" }> => part.type === "tool_call",
     );
@@ -3066,6 +3194,18 @@ export default function App() {
     if (!query || busy) return;
     setBusy(true);
     try {
+      const reference = parseHubReference(query, hubProvider);
+      if (reference) {
+        const info = await api.hubModelInfo(
+          reference.provider,
+          reference.repoId,
+          reference.revision,
+        );
+        setHubProvider(reference.provider);
+        setHubResults([info]);
+        setHubModel(info);
+        return;
+      }
       const results = await api.searchHubModels(hubProvider, query);
       setHubResults(results);
       setHubModel(null);
@@ -3091,13 +3231,17 @@ export default function App() {
   async function downloadHubModel() {
     if (!hubModel || busy) return;
     const name = hubModel.repo_id.split("/").pop()?.replace(/[^A-Za-z0-9_.-]/g, "-") || "model";
+    const repositoryPath = hubModel.repo_id
+      .split("/")
+      .map((part) => part.replace(/[^A-Za-z0-9_.-]+/g, "-") || "model")
+      .join("/");
     setBusy(true);
     try {
       const created = await api.createJob(
         `download.${hubModel.provider}`,
         {
           repo_id: hubModel.repo_id,
-          destination: `downloads/${name}`,
+          destination: `models/${hubModel.provider}/${repositoryPath || name}`,
           revision: hubModel.revision,
           expected_bytes: hubModel.total_bytes || null,
         },
@@ -3231,8 +3375,10 @@ export default function App() {
         idle_ttl_seconds: loadIdleTtl,
       });
       setSelectedJobId(accepted.operation_id);
-      setView("lab");
+      setDashboardPage("models");
+      setView("dashboard");
       await refreshRuntime(false);
+      setModel(name);
     } catch (cause) {
       setError(errorMessage(cause));
     } finally {
@@ -3266,6 +3412,7 @@ export default function App() {
     setDashboardPage("models");
     setView("dashboard");
     await refreshRuntime(false);
+    if (registered.length === 1) setModel(registered[0].name);
   }
 
   async function openModelDirectory(directoryId?: string | null, path?: string | null) {
@@ -3370,7 +3517,10 @@ export default function App() {
     try {
       const accepted = await api.loadRuntimeProfile(profile.id, profile.drifted);
       setSelectedJobId(accepted.operation_id);
-      setView("lab");
+      setDashboardPage("models");
+      setView("dashboard");
+      await refreshRuntime(false);
+      setModel(profile.load.model);
     } catch (cause) {
       setError(errorMessage(cause));
     } finally {
@@ -3397,7 +3547,8 @@ export default function App() {
     try {
       const accepted = await api.unloadModel(id);
       setSelectedJobId(accepted.operation_id);
-      setView("lab");
+      setDashboardPage("models");
+      setView("dashboard");
       await refreshRuntime(false);
     } catch (cause) {
       setError(errorMessage(cause));
@@ -3573,7 +3724,7 @@ export default function App() {
           <SettingRow
             title={tr("模型 ID", "Model ID")}
             detail={tr("由 /v1/models 公布，并用于对话补全请求。", "Advertised by /v1/models and accepted by chat completions.")}
-            trailing={<div className="server-row-actions server-model-control"><strong title={runtime?.model || active?.model || model}>{runtime?.model || active?.model || model || tr("尚未加载", "Not loaded")}</strong><button onClick={() => openStudioPage("dashboard", "models")} type="button">{tr("选择…", "Choose…")}</button></div>}
+            trailing={<div className="server-row-actions server-model-control">{availableModelNames.length > 1 ? <select aria-label={tr("当前模型", "Current model")} disabled={busy} onChange={(event) => setModel(event.target.value)} value={model}>{availableModelNames.map((name) => <option key={name} value={name}>{name}</option>)}</select> : <strong title={model}>{model || tr("尚未加载", "Not loaded")}</strong>}<button onClick={() => openStudioPage("dashboard", "models")} type="button">{tr("选择…", "Choose…")}</button></div>}
           />
           <SettingRow
             title={tr("绑定地址", "Bind address")}
@@ -3889,10 +4040,10 @@ export default function App() {
           </nav>
         </div>
         <button className="sidebar-runtime-card" onClick={() => openStudioPage("dashboard", "overview")} type="button">
-          <span className={`runtime-dot ${Number(runtime?.active_requests || 0) > 0 ? "busy" : runtime?.model ? "ready" : "idle"}`} />
+          <span className={`runtime-dot ${Number(runtime?.active_requests || 0) > 0 ? "busy" : selectedModelAvailable ? "ready" : selectedModelLoading ? "busy" : "idle"}`} />
           <span>
-            <strong>{runtime?.model || tr("服务空闲", "Server idle")}</strong>
-            <small>{runtime?.model ? `${formatNumber(runtime?.active_requests || 0)} ${tr("个活动请求", "active requests")}` : tr("选择模型以开始", "Choose a model to begin")}</small>
+            <strong>{model || tr("服务空闲", "Server idle")}</strong>
+            <small>{availableModelNames.length > 1 ? tr(`${availableModelNames.length} 个模型已加载`, `${availableModelNames.length} models loaded`) : selectedModelAvailable ? `${formatNumber(runtime?.active_requests || 0)} ${tr("个活动请求", "active requests")}` : selectedModelLoading ? tr("模型加载中", "Model loading") : tr("选择模型以开始", "Choose a model to begin")}</small>
           </span>
           <Icon name="activity" size={14} />
         </button>
@@ -3908,16 +4059,16 @@ export default function App() {
               </div>
               <div className="chat-screen-actions">
                 <div className="chat-model-summary">
-                  <strong>{active?.model || model || tr("尚未加载模型", "No model loaded")}</strong>
+                  {availableModelNames.length > 1 ? <select aria-label={tr("对话模型", "Chat model")} disabled={busy} onChange={(event) => setModel(event.target.value)} value={model}>{availableModelNames.map((name) => <option key={name} value={name}>{name}</option>)}</select> : <strong>{model || tr("尚未加载模型", "No model loaded")}</strong>}
                   <small>{tr(`最多 ${formatNumber(effectiveSettings.maxTokens)} tokens`, `${formatNumber(effectiveSettings.maxTokens)} max tokens`)} · {tr("温度", "temperature")} {formatNumber(effectiveSettings.temperature, 2)} · {tr("流式", "streaming")}</small>
                 </div>
-                <span className={`runtime-status-pill ${runtime?.model ? "running" : "stopped"}`}><i />{runtime?.model ? tr("就绪", "Ready") : tr("空闲", "Idle")}</span>
-                <button aria-label={tr("清空对话", "Clear conversation")} className="chat-icon-button" disabled={!active || busy || (!messages.length && !currentVoiceMessages.length)} onClick={() => void clearActiveConversation()} title={tr("清空对话", "Clear conversation")} type="button"><Icon name="trash" size={14} /></button>
+                <span className={`runtime-status-pill ${conversationReady ? "running" : "stopped"}`}><i />{conversationReady ? tr("就绪", "Ready") : selectedModelLoading ? tr("加载中", "Loading") : tr("空闲", "Idle")}</span>
+                <button aria-label={tr("清空对话", "Clear conversation")} className="chat-icon-button" disabled={!conversationReady || busy || (!messages.length && !currentVoiceMessages.length)} onClick={() => void clearActiveConversation()} title={tr("清空对话", "Clear conversation")} type="button"><Icon name="trash" size={14} /></button>
               </div>
             </header>
             <div className="message-scroller" onScroll={handleMessageScroll} ref={messageScrollerRef}>
               <div className="message-list" aria-live="polite">
-                {!messages.length && !currentVoiceMessages.length && !live && <div className="welcome"><Icon name="chat" size={34} />{!model ? <><h1>{tr("尚未加载模型", "No model loaded")}</h1><p>{tr("选择本地检查点后即可开始对话。", "Choose a local checkpoint to use the inference playground.")}</p><button className="open-model-primary" disabled={busy} onClick={() => void chooseModelDirectory()} type="button"><Icon name="folder" />{tr("选择模型", "Choose model")}</button></> : !active ? <><h1>{tr("本机私密对话", "A private conversation on your Mac")}</h1><p>{tr("请求直接发送到本机 MFQ 服务，不经过云端中转。", "Requests go directly to the local MFQ Runtime with no cloud relay.")}</p><button className="open-model-primary" disabled={busy} onClick={() => void createSession()} type="button">{tr("开始对话", "Start chat")}</button></> : <><h1>{tr("本机私密对话", "A private conversation on your Mac")}</h1><p>{tr("请求直接发送到本机 MFQ 服务，不经过云端中转。", "Requests go directly to the local MFQ Runtime with no cloud relay.")}</p></>}</div>}
+                {!messages.length && !currentVoiceMessages.length && !live && <div className="welcome"><Icon name="chat" size={34} />{!selectedModelAvailable ? <><h1>{selectedModelLoading ? tr("模型加载中", "Model loading") : tr("尚未加载模型", "No model loaded")}</h1><p>{selectedModelLoading ? tr("加载完成后即可开始对话。", "Chat becomes available as soon as loading completes.") : tr("选择本地检查点后即可开始对话。", "Choose a local checkpoint to use the inference playground.")}</p>{!selectedModelLoading && <button className="open-model-primary" disabled={busy} onClick={() => void chooseModelDirectory()} type="button"><Icon name="folder" />{tr("选择模型", "Choose model")}</button>}</> : !active ? <><h1>{tr("本机私密对话", "A private conversation on your Mac")}</h1><p>{tr("请求直接发送到本机 MFQ 服务，不经过云端中转。", "Requests go directly to the local MFQ Runtime with no cloud relay.")}</p><button className="open-model-primary" disabled={busy} onClick={() => void createSession()} type="button">{tr("开始对话", "Start chat")}</button></> : <><h1>{tr("本机私密对话", "A private conversation on your Mac")}</h1><p>{tr("请求直接发送到本机 MFQ 服务，不经过云端中转。", "Requests go directly to the local MFQ Runtime with no cloud relay.")}</p></>}</div>}
                 {messages.map((message) => {
                   const parts = textParts(message);
                   const editing = editDraft?.messageId === message.id;
@@ -3949,19 +4100,19 @@ export default function App() {
               {needsVoiceOutputComponent && voiceComponent && <div className="voice-component-banner"><div><strong>{voiceComponent.ready ? tr("语音组件已下载", "Voice component downloaded") : tr("此模型还缺少语音输出组件", "This model needs the voice output component")}</strong><span>{voiceComponentJob ? tr(`正在下载并校验 · ${formatNumber(voiceComponentJob.progress * 100)}%`, `Downloading and verifying · ${formatNumber(voiceComponentJob.progress * 100)}%`) : voiceComponent.error ? voiceComponent.error : tr("Token2Wav 独立安装，不会重复占用每个模型的空间。", "Token2Wav is installed once and shared by all compatible models.")}</span></div>{voiceComponentJob && <progress max={1} value={voiceComponentJob.progress} />}<button disabled={voiceComponentBusy || Boolean(voiceComponentJob)} onClick={() => void installOrEnableVoiceOutput()} type="button">{voiceComponentJob ? tr("正在下载…", "Downloading…") : voiceComponent.ready ? tr("启用语音输出", "Enable voice output") : tr(`下载组件 · ${formatNumber(voiceComponent.total_bytes / 1e9, 2)} GB`, `Download · ${formatNumber(voiceComponent.total_bytes / 1e9, 2)} GB`)}</button></div>}
               <form className="composer" onSubmit={send}>
                 {attachments.length > 0 && <div className="attachment-tray">{attachments.map((attachment) => <div className="attachment-chip" key={attachment.id}>{attachment.kind === "image" ? <img alt="" src={attachment.previewUrl} /> : attachment.kind === "video" ? <VideoWithFirstFrame muted src={attachment.previewUrl} /> : <span>{attachment.kind === "document" ? "TXT" : "♫"}</span>}<div><strong>{attachment.file.name}</strong><small>{attachment.kind} · {formatNumber(attachment.file.size)} B</small></div><button aria-label={tr("移除附件", "Remove attachment")} onClick={() => removeAttachment(attachment.id)} type="button">×</button></div>)}</div>}
-                <textarea aria-label={tr("消息", "Message")} disabled={!active || busy} maxLength={32768} onChange={(event) => setDraft(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); } }} placeholder={active ? tr("向模型发送消息", "Message MFQ") : tr("请先创建会话", "Create a session first")} rows={1} value={draft} />
+                <textarea aria-label={tr("消息", "Message")} disabled={!conversationReady || busy} maxLength={32768} onChange={(event) => setDraft(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); } }} placeholder={conversationReady ? tr("向模型发送消息", "Message MFQ") : selectedModelAvailable ? tr("正在切换对话模型", "Switching chat model") : tr("请先加载模型", "Load a model first")} rows={1} value={draft} />
                 <div className="composer-toolbar">
                   <input accept={attachmentAccept} hidden multiple onChange={(event) => selectAttachments(event.target.files)} ref={attachmentInputRef} type="file" />
-                  <button aria-label={tr("添加附件", "Add attachment")} disabled={!active || busy} onClick={() => attachmentInputRef.current?.click()} title={tr("添加文档或媒体", "Add document or media")} type="button"><Icon name="paperclip" /></button>
-                  {capabilities && (capabilities.model_capabilities.features.audio_input || capabilities.model_capabilities.features.full_duplex) && <select aria-label={tr("交互模式", "Interaction mode")} disabled={!active || busy || voiceState !== "idle"} onChange={(event) => void selectInteractionMode(event.target.value as SessionMode)} value={active?.mode ?? mode}>{(["text", "voice", "full_duplex"] as SessionMode[]).map((item) => { const feature = capabilities.model_capabilities.features; const disabled = item === "voice" ? !feature.audio_input : item === "full_duplex" ? !feature.full_duplex : false; return <option disabled={disabled} key={item} value={item}>{MODE_LABELS[item][english ? 1 : 0]}</option>; })}</select>}
-                  {realtimeAvailable && <button aria-label={tr("语音输入", "Voice input")} aria-pressed={voiceState !== "idle" && voiceState !== "error"} className="voice-button" disabled={!active || active.mode === "text" || busy} onClick={() => void toggleVoice()} style={{ "--voice-level": voiceLevel } as React.CSSProperties} title={active?.mode === "text" ? tr("请先选择语音或全双工模式", "Select voice or full duplex mode first") : voiceState === "processing" ? tr("语音处理中", "Processing voice") : tr("语音输入", "Voice input")} type="button"><span /></button>}
+                  <button aria-label={tr("添加附件", "Add attachment")} disabled={!conversationReady || busy} onClick={() => attachmentInputRef.current?.click()} title={tr("添加文档或媒体", "Add document or media")} type="button"><Icon name="paperclip" /></button>
+                  {capabilities && (capabilities.model_capabilities.features.audio_input || capabilities.model_capabilities.features.full_duplex) && <select aria-label={tr("交互模式", "Interaction mode")} disabled={!conversationReady || busy || voiceState !== "idle"} onChange={(event) => void selectInteractionMode(event.target.value as SessionMode)} value={active?.mode ?? mode}>{(["text", "voice", "full_duplex"] as SessionMode[]).map((item) => { const feature = capabilities.model_capabilities.features; const disabled = item === "voice" ? !feature.audio_input : item === "full_duplex" ? !feature.full_duplex : false; return <option disabled={disabled} key={item} value={item}>{MODE_LABELS[item][english ? 1 : 0]}</option>; })}</select>}
+                  {realtimeAvailable && <button aria-label={tr("语音输入", "Voice input")} aria-pressed={voiceState !== "idle" && voiceState !== "error"} className="voice-button" disabled={!conversationReady || active?.mode === "text" || busy} onClick={() => void toggleVoice()} style={{ "--voice-level": voiceLevel } as React.CSSProperties} title={active?.mode === "text" ? tr("请先选择语音或全双工模式", "Select voice or full duplex mode first") : voiceState === "processing" ? tr("语音处理中", "Processing voice") : tr("语音输入", "Voice input")} type="button"><span /></button>}
                   {realtimeAvailable && active?.mode !== "text" && <button aria-label={tr("语音播放", "Voice playback")} aria-pressed={settings.playbackEnabled} onClick={() => setSettings((current) => ({ ...current, playbackEnabled: !current.playbackEnabled }))} title={tr("语音播放", "Voice playback")} type="button"><Icon name={settings.playbackEnabled ? "volume" : "volume-off"} /></button>}
                   {active?.mode === "text" && visionSupported && <button aria-label={tr("视觉输入", "Vision input")} aria-pressed={visionAvailable && effectiveSettings.enableVision} disabled={!visionAvailable} onClick={() => updateGlobalInference({ enableVision: !effectiveSettings.enableVision })} title={visionAvailable ? tr("视觉输入", "Vision input") : tr("当前模型文件没有视觉权重", "The current model artifact has no vision weights")} type="button"><Icon name="image" />{tr("视觉", "Vision")}</button>}
                   {active?.mode === "text" && mtpSupported && <button aria-label="MTP" aria-pressed={mtpAvailable && effectiveSettings.enableMtp} disabled={!mtpAvailable} onClick={() => updateGlobalInference({ enableMtp: !effectiveSettings.enableMtp })} title={mtpAvailable ? "MTP" : tr("当前模型文件没有完整 MTP 权重", "The current model artifact has no complete MTP head")} type="button"><Icon name="text-forward" />MTP</button>}
                   {active?.mode === "text" && <button aria-pressed={thinkingSupported && effectiveSettings.enableThinking} disabled={!thinkingSupported} onClick={() => updateGlobalInference({ enableThinking: !effectiveSettings.enableThinking })} type="button"><Icon name="lightbulb" />{tr("思考", "Thinking")}</button>}
                   {active?.mode === "text" && thinkingSupported && effectiveSettings.enableThinking && reasoningValues.length > 0 && <select aria-label={tr("思考档位", "Reasoning effort")} onChange={(event) => updateGlobalInference({ reasoningEffort: event.target.value })} value={effectiveSettings.reasoningEffort}><option value="">{tr("标准", "Standard")}</option>{reasoningValues.map((value) => <option key={value} value={value}>{value}</option>)}</select>}
                   <span className="composer-hint">{voiceState !== "idle" ? voiceState : tr("Enter 发送 · Shift+Enter 换行", "Enter to send · Shift+Enter for newline")}</span>
-                  {busy ? <button aria-label={stopping ? tr("正在停止生成", "Stopping generation") : tr("停止生成", "Stop generation")} className="send-button stop" disabled={stopping} onClick={() => void stopGeneration()} type="button"><Icon name="stop" size={14} /></button> : <button aria-label={tr("发送", "Send")} className="send-button" disabled={!active || (!draft.trim() && !attachments.length)} type="submit"><Icon name="send" size={15} /></button>}
+                  {busy ? <button aria-label={stopping ? tr("正在停止生成", "Stopping generation") : tr("停止生成", "Stop generation")} className="send-button stop" disabled={stopping} onClick={() => void stopGeneration()} type="button"><Icon name="stop" size={14} /></button> : <button aria-label={tr("发送", "Send")} className="send-button" disabled={!conversationReady || (!draft.trim() && !attachments.length)} type="submit"><Icon name="send" size={15} /></button>}
                 </div>
               </form>
               <p>{tr("模型输出可能存在错误，请核对重要信息。", "Model output may be inaccurate. Verify important information.")}</p>
@@ -4081,7 +4232,13 @@ export default function App() {
               {toolsRoutingPanel}
             </>}
             {dashboardPage === "models" && <>
-              <SectionLabel title={tr("模型库", "Model library")} subtitle={`${artifacts.length} ${tr("个本地模型", "local models")}`} />
+              <SectionLabel title={tr("已加载模型", "Loaded models")} subtitle={tr(`${availableModelNames.length} 个可用于推理`, `${availableModelNames.length} available for inference`)} />
+              {instances.length > 0 ? <TMPanel className="model-catalog-panel loaded-model-panel"><div className="model-list">{instances.map((instance) => {
+                const ready = instance.state === "ready" || instance.state === "busy";
+                const selected = instance.model === model;
+                const stateLabel = instance.state === "loading" ? tr("加载中", "Loading") : instance.state === "unloading" ? tr("卸载中", "Unloading") : instance.state === "failed" ? tr("失败", "Failed") : instance.state === "busy" ? tr("使用中", "Busy") : tr("就绪", "Ready");
+                return <div className="model-row" key={instance.id}><span className={instance.state === "failed" ? "model-state failed" : ready ? "model-state active" : "model-state"} /><div><strong>{instance.model}</strong><small>{stateLabel} · {formatNumber(instance.context_size)} ctx{instance.pinned ? ` · ${tr("固定", "Pinned")}` : instance.idle_ttl_seconds != null ? ` · TTL ${instance.idle_ttl_seconds}s` : ""}</small></div><div className="model-row-actions">{ready && <button className={selected ? "selected" : ""} disabled={busy || selected} onClick={() => setModel(instance.model)} type="button">{selected ? tr("当前", "Current") : tr("用于对话", "Use in chat")}</button>}<button disabled={busy || !ready || instance.state === "busy"} onClick={() => void unloadInstance(instance.id)} type="button">{tr("卸载", "Unload")}</button></div></div>;
+              })}</div></TMPanel> : <div className="inline-empty model-runtime-empty">{tr("当前没有已加载模型。", "No models are currently loaded.")}</div>}
               <TMPanel className="model-catalog-panel">
                 <div className="panel-heading"><div><h2>{tr("加载策略", "Load policy")}</h2><p>{tr("控制模型的驻留与自动卸载。", "Control model residency and automatic unloading.")}</p></div></div>
                 <div className="setting-list model-policy-panel">
@@ -4089,8 +4246,8 @@ export default function App() {
                   <SettingRow title={tr("空闲卸载", "Idle unload")} detail={loadPinned ? tr("固定模型不使用 TTL", "Ignored while pinned") : tr("每次使用后重新计时", "Resets after each use")} trailing={<select disabled={loadPinned} onChange={(event) => setLoadIdleTtl(event.target.value ? Number(event.target.value) : null)} value={loadIdleTtl ?? ""}><option value="">{tr("永不", "Never")}</option><option value="300">5 min</option><option value="900">15 min</option><option value="3600">1 h</option></select>} />
                 </div>
               </TMPanel>
-              <SectionLabel title={tr("本地检查点", "Local checkpoints")} />
-              {artifacts.length > 0 ? <TMPanel className="model-catalog-panel model-library-panel"><div className="model-list">{artifacts.slice(0, 8).map((item) => {
+              <SectionLabel title={tr("本地检查点", "Local checkpoints")} subtitle={`${artifacts.length} ${tr("个本地模型", "local models")}`} />
+              {artifacts.length > 0 ? <TMPanel className="model-catalog-panel model-library-panel"><div className="model-list">{artifacts.map((item) => {
                   const instance = instances.find((candidate) => candidate.model === item.name && candidate.state !== "failed");
                   const loaded = Boolean(instance) || item.name === runtime?.model;
                   const policy = instance?.pinned ? tr("固定", "Pinned") : instance?.idle_ttl_seconds != null ? `TTL ${instance.idle_ttl_seconds}s` : null;
@@ -4117,7 +4274,7 @@ export default function App() {
         ) : (
           <section aria-label="Lab" className="lab-view">
             <div className="page-heading"><div><h1>{labPage === "models" ? tr("模型仓库", "Model hubs") : labPage === "evaluations" ? tr("评测与数据集", "Evaluations") : tr("量化工作台", "Quantization workspace")}</h1><p>{labPage === "models" ? tr("浏览模型来源并登记本地资产。", "Browse model sources and register local assets.") : labPage === "evaluations" ? tr("组织数据集、评测结果与可复现实验。", "Organize datasets, evaluations, and reproducible experiments.") : tr("配置并运行 MFQ 量化流程。", "Configure and run MFQ quantization workflows.")}</p></div></div>
-            {labPage === "models" && <PanelDeck labels={panelLabels} page="lab-models" resetVersion={labLayoutReset}><div key="hubs"><section className="dashboard-panel hub-panel"><div className="panel-heading"><div><h2>{tr("模型仓库", "Model hubs")}</h2><p>{tr("搜索、检查大小并启动可续传下载", "Search, inspect size, and start resumable downloads")}</p></div></div><form className="hub-search" onSubmit={searchHub}><select onChange={(event) => setHubProvider(event.target.value as HubModelSummary["provider"])} value={hubProvider}><option value="modelscope">ModelScope</option><option value="huggingface">Hugging Face</option></select><input onChange={(event) => setHubQuery(event.target.value)} placeholder={tr("模型名称或仓库", "Model or repository")} value={hubQuery} /><button disabled={busy || !hubQuery.trim()} type="submit">{tr("搜索", "Search")}</button></form>{hubResults.length > 0 && <div className="hub-results">{hubResults.map((item) => <button className={hubModel?.repo_id === item.repo_id ? "active" : ""} key={`${item.provider}:${item.repo_id}`} onClick={() => void inspectHubModel(item)} type="button"><div><strong>{item.repo_id}</strong><small>{formatNumber(item.downloads)} downloads · {formatNumber(item.likes)} likes</small></div><span>{item.total_bytes ? `${formatNumber(item.total_bytes / 2 **30, 1)} GB` : "--"}</span></button>)}</div>}{hubModel && <div className="hub-detail"><div><strong>{hubModel.repo_id}</strong><small>{hubModel.revision} · {hubModel.files.length} files · {formatNumber(hubModel.total_bytes / 2 ** 30, 2)} GB</small></div><button disabled={busy || !jobKinds.some((item) => item.kind === `download.${hubModel.provider}`)} onClick={() => void downloadHubModel()} type="button"><Icon name="download" size={14} />{tr("下载", "Download")}</button></div>}</section></div></PanelDeck>}
+            {labPage === "models" && <PanelDeck labels={panelLabels} page="lab-models" resetVersion={labLayoutReset}><div key="hubs"><section className="dashboard-panel hub-panel"><div className="panel-heading"><div><h2>{tr("模型仓库", "Model hubs")}</h2><p>{tr("搜索、粘贴仓库链接并启动可续传下载", "Search or paste a repository link to start a resumable download")}</p></div></div><form className="hub-search" onSubmit={searchHub}><select onChange={(event) => setHubProvider(event.target.value as HubModelSummary["provider"])} value={hubProvider}><option value="modelscope">ModelScope</option><option value="huggingface">Hugging Face</option></select><input onChange={(event) => setHubQuery(event.target.value)} placeholder={tr("模型名称、仓库或链接", "Model, repository, or URL")} value={hubQuery} /><button disabled={busy || !hubQuery.trim()} type="submit">{tr("查找", "Find")}</button></form>{hubResults.length > 0 && <div className="hub-results">{hubResults.map((item) => <button className={hubModel?.repo_id === item.repo_id ? "active" : ""} key={`${item.provider}:${item.repo_id}`} onClick={() => void inspectHubModel(item)} type="button"><div><strong>{item.repo_id}</strong><small>{formatNumber(item.downloads)} downloads · {formatNumber(item.likes)} likes</small></div><span>{item.total_bytes ? `${formatNumber(item.total_bytes / 2 **30, 1)} GB` : "--"}</span></button>)}</div>}{hubModel && <div className="hub-detail"><div><strong>{hubModel.repo_id}</strong><small>{hubModel.revision} · {hubModel.files.length} files · {formatNumber(hubModel.total_bytes / 2 ** 30, 2)} GB</small></div><button disabled={busy || !jobKinds.some((item) => item.kind === `download.${hubModel.provider}`)} onClick={() => void downloadHubModel()} type="button"><Icon name="download" size={14} />{tr("下载", "Download")}</button></div>}</section></div></PanelDeck>}
             {labPage === "evaluations" && <PanelDeck labels={panelLabels} page="lab-evaluations" resetVersion={labLayoutReset}>
               <section className="dashboard-panel evaluation-panel" key="results">
                 <div className="panel-heading"><div><h2>{tr("评测结果", "Evaluation results")}</h2><p>{tr("只允许数据集与运行参数一致的结果对比", "Comparison requires matching datasets and execution parameters")}</p></div><b>{evaluations.length}</b></div>

@@ -22,6 +22,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from mfq.server.catalog import ModelArtifactNotFoundError, ModelCatalog
 from mfq.server.jobs import JobContext, JobExecutionError, TypedJobHandler
 from mfq.server.models import ErrorDetail
+from mfq.server.network import system_proxy_environment
 from mfq.server.storage import StorageError
 
 
@@ -1101,7 +1102,7 @@ class ToolJobHandlers:
 
     @staticmethod
     def _environment(*, direct: bool = False) -> dict[str, str]:
-        env = dict(os.environ)
+        env = system_proxy_environment()
         if direct:
             for name in (
                 "http_proxy",

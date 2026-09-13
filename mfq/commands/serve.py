@@ -13,6 +13,7 @@ import sys
 from pathlib import Path
 
 from mfq.commands.build import BuildError, build_runtime, detect_backend, load_managed_build
+from mfq.server.network import install_system_proxy_environment
 
 
 def _positive_int(value: str) -> int:
@@ -212,6 +213,7 @@ def _avfoundation_video_library(executable: Path) -> Path | None:
 
 
 def _run(args: argparse.Namespace) -> int:
+    install_system_proxy_environment()
     try:
         import uvicorn
     except ModuleNotFoundError as error:
@@ -224,7 +226,7 @@ def _run(args: argparse.Namespace) -> int:
     from mfq.server.cluster import ClusterBackend
     from mfq.server.components import VoiceOutputComponent
     from mfq.server.jobs import JobManager
-    from mfq.server.native import NativeRuntime, resolve_runtime_route
+    from mfq.server.native import NativeRuntime
     from mfq.server.runtime_pool import ManagedRuntimePool
     from mfq.server.service import ServerService
     from mfq.server.storage import SessionStore
@@ -283,10 +285,6 @@ def _run(args: argparse.Namespace) -> int:
         )
         if model is not None:
             initial_artifact = asyncio.run(catalog.resolve_path(model))
-            runtime_route = resolve_runtime_route(
-                initial_artifact.resource.architecture,
-                initial_artifact.path,
-            )
             runtime = NativeRuntime(
                 executable=executable,
                 model=model,

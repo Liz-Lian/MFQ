@@ -1568,7 +1568,7 @@ class SessionStore:
                 """,
                 (
                     str(identifier),
-                    source["model"],
+                    request.model or source["model"],
                     source["mode"],
                     SessionState.IDLE.value,
                     limit,

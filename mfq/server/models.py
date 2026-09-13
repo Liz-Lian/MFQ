@@ -271,6 +271,7 @@ class ForkSessionRequest(ProtocolModel):
     at_message_id: UUID | None = None
     include_message: bool = True
     title: str | None = Field(default=None, max_length=512)
+    model: str | None = Field(default=None, min_length=1, max_length=255)
 
 
 class RewindSessionRequest(ProtocolModel):

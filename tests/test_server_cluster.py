@@ -11,7 +11,7 @@ import httpx
 import pytest
 
 from mfq.server.api import create_app
-from mfq.server.backend import BackendError
+from mfq.server.backend import BackendDelta, BackendError
 from mfq.server.cluster import ClusterBackend
 from mfq.server.models import CreateRemoteNodeRequest, UpdateRemoteNodeRequest
 from mfq.server.service import ServerService
@@ -575,6 +575,137 @@ def test_cluster_close_serializes_with_refresh_and_is_idempotent(
             await cluster.nodes()
         assert closed.value.code == "backend_closed"
         assert closed.value.status_code == 503
+        await client.aclose()
+
+    asyncio.run(run())
+
+
+def test_cluster_fails_over_before_the_first_remote_delta(tmp_path: Path) -> None:
+    async def run() -> None:
+        requested_hosts: list[str] = []
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            host = request.url.host
+            path = request.url.path
+            requested_hosts.append(f"{host}{path}")
+            if path == "/health":
+                return httpx.Response(200)
+            if path == "/v1/models":
+                return httpx.Response(200, json={"data": [{"id": "remote-model"}]})
+            if path == "/api/v1/runtime/status":
+                return httpx.Response(200, json={})
+            if path == "/api/v1/sessions" and host == "a-broken":
+                raise httpx.ConnectError("worker disappeared", request=request)
+            if path == "/api/v1/sessions":
+                return httpx.Response(
+                    201,
+                    json={
+                        "id": "11111111-1111-4111-8111-111111111111",
+                        "revision": 0,
+                    },
+                )
+            if path.endswith("/responses"):
+                frames = [
+                    {"payload": {"type": "response.text.delta", "delta": "backup"}},
+                    {
+                        "payload": {
+                            "type": "response.completed",
+                            "finish_reason": "stop",
+                        }
+                    },
+                    {"payload": {"type": "session.state", "revision": 2}},
+                ]
+                return httpx.Response(
+                    200,
+                    text="".join(f"data: {json.dumps(frame)}\n\n" for frame in frames),
+                )
+            if request.method == "DELETE":
+                return httpx.Response(204)
+            return httpx.Response(404)
+
+        store = SessionStore(tmp_path / "mfq.server.sqlite3")
+        broken = store.create_remote_node(
+            CreateRemoteNodeRequest(name="a-broken", url="http://a-broken:8090")
+        )
+        backup = store.create_remote_node(
+            CreateRemoteNodeRequest(name="b-backup", url="http://b-backup:8090")
+        )
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        cluster = ClusterBackend(FakeBackend(), store, client=client)
+
+        chunks = [
+            delta
+            async for delta in cluster.stream(
+                model="remote-model",
+                messages=[{"role": "user", "content": "hello"}],
+                sampling=__import__(
+                    "mfq.server.models", fromlist=["SamplingParams"]
+                ).SamplingParams(),
+                session_id=UUID("33333333-3333-4333-8333-333333333333"),
+            )
+        ]
+
+        assert "".join(item.content_delta for item in chunks) == "backup"
+        assert chunks[-1].finish_reason == "stop"
+        assert "a-broken/api/v1/sessions" in requested_hosts
+        assert "b-backup/api/v1/sessions" in requested_hosts
+        assert cluster._states[broken.id].healthy is False
+        assert cluster._states[broken.id].models == []
+        assert cluster._states[backup.id].healthy is True
+        assert cluster._states[broken.id].active_requests == 0
+        assert cluster._states[backup.id].active_requests == 0
+        await cluster.aclose()
+        await client.aclose()
+
+    asyncio.run(run())
+
+
+def test_cluster_never_replays_after_a_remote_delta(tmp_path: Path) -> None:
+    async def run() -> None:
+        async def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/health":
+                return httpx.Response(200)
+            if request.url.path == "/v1/models":
+                return httpx.Response(200, json={"data": [{"id": "remote-model"}]})
+            if request.url.path == "/api/v1/runtime/status":
+                return httpx.Response(200, json={})
+            return httpx.Response(404)
+
+        store = SessionStore(tmp_path / "mfq.server.sqlite3")
+        store.create_remote_node(
+            CreateRemoteNodeRequest(name="worker-a", url="http://worker-a:8090")
+        )
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        local = FakeBackend(
+            (BackendDelta(content_delta="must-not-run", finish_reason="stop"),)
+        )
+        cluster = ClusterBackend(local, store, client=client)
+
+        async def interrupted_remote(*_args: object, **_options: object):
+            yield BackendDelta(content_delta="partial")
+            raise BackendError(
+                "remote_node_unavailable",
+                "connection dropped",
+                retryable=True,
+                status_code=502,
+            )
+
+        cluster._remote_stream = interrupted_remote  # type: ignore[method-assign]
+        received: list[BackendDelta] = []
+        with pytest.raises(BackendError) as interrupted:
+            async for delta in cluster.stream(
+                model="remote-model",
+                messages=[{"role": "user", "content": "hello"}],
+                sampling=__import__(
+                    "mfq.server.models", fromlist=["SamplingParams"]
+                ).SamplingParams(),
+            ):
+                received.append(delta)
+
+        assert interrupted.value.code == "remote_node_unavailable"
+        assert [item.content_delta for item in received] == ["partial"]
+        assert local.calls == []
+        await cluster.aclose()
         await client.aclose()
 
     asyncio.run(run())

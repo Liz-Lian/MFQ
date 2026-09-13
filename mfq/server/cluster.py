@@ -235,13 +235,22 @@ class ClusterBackend:
             }
         )
 
-    async def _select(self, model: str) -> _NodeState | None:
+    async def _select(
+        self,
+        model: str,
+        *,
+        exclude: set[UUID] | None = None,
+    ) -> _NodeState | None:
         await self.refresh()
+        excluded = exclude or set()
         async with self._lock:
             matches = [
                 state
                 for state in self._states.values()
-                if state.resource.enabled and state.healthy and model in state.models
+                if state.resource.id not in excluded
+                and state.resource.enabled
+                and state.healthy
+                and model in state.models
             ]
         return (
             min(matches, key=lambda item: (item.active_requests, item.resource.name))
@@ -260,8 +269,14 @@ class ClusterBackend:
         tool_choice: ToolChoice = "auto",
         response_format: ResponseFormat | None = None,
     ) -> AsyncIterator[BackendDelta]:
-        node = await self._select(model)
-        if node is not None:
+        attempted: set[UUID] = set()
+        last_remote_failure: BackendError | None = None
+        while True:
+            node = await self._select(model, exclude=attempted)
+            if node is None:
+                break
+            node_id = node.resource.id
+            claimed = False
             async with self._lock:
                 if (
                     self._states.get(node.resource.id) is not node
@@ -269,10 +284,55 @@ class ClusterBackend:
                     or not node.healthy
                     or model not in node.models
                 ):
-                    node = None
+                    attempted.add(node_id)
                 else:
                     node.active_requests += 1
-        if node is None:
+                    claimed = True
+            if not claimed:
+                continue
+
+            emitted = False
+            retryable_failure: BackendError | None = None
+            try:
+                async with closing_backend_stream(
+                    self._remote_stream(
+                        node.resource,
+                        model=model,
+                        messages=messages,
+                        sampling=sampling,
+                        session_id=session_id,
+                        tools=tools,
+                        tool_choice=tool_choice,
+                        response_format=response_format,
+                    )
+                ) as remote_stream:
+                    async for delta in remote_stream:
+                        emitted = True
+                        yield delta
+                return
+            except BackendError as error:
+                if emitted or not error.retryable:
+                    raise
+                retryable_failure = error
+            finally:
+                async with self._lock:
+                    node.active_requests = max(0, node.active_requests - 1)
+                    retired = (
+                        node.active_requests == 0
+                        and self._states.get(node.resource.id) is not node
+                    )
+                if retired:
+                    await self._release_node_sessions(node.resource)
+
+            assert retryable_failure is not None
+            last_remote_failure = retryable_failure
+            attempted.add(node_id)
+            await self._record_node_failure(node, retryable_failure)
+            if session_id is not None:
+                await self._discard_remote_route(node.resource, session_id)
+
+        local_emitted = False
+        try:
             async with closing_backend_stream(
                 self.local.stream(
                     model=model,
@@ -285,32 +345,46 @@ class ClusterBackend:
                 )
             ) as local_stream:
                 async for delta in local_stream:
+                    local_emitted = True
                     yield delta
+        except BackendError as error:
+            if (
+                not local_emitted
+                and last_remote_failure is not None
+                and error.code in {"model_not_loaded", "model_artifact_not_found"}
+            ):
+                raise last_remote_failure from error
+            raise
+
+    async def _record_node_failure(
+        self,
+        node: _NodeState,
+        error: BackendError,
+    ) -> None:
+        async with self._lock:
+            if self._states.get(node.resource.id) is not node:
+                return
+            node.healthy = False
+            node.models = []
+            node.status = {}
+            node.checked_at = time.monotonic()
+            node.checked_at_wall = datetime.now(timezone.utc)
+            node.error = f"{error.code}: {error}"[:512]
+
+    async def _discard_remote_route(
+        self,
+        node: RemoteNodeResource,
+        session_id: UUID,
+    ) -> None:
+        async with self._lock:
+            remote = self._sessions.pop((node.id, session_id), None)
+        if remote is None:
             return
         try:
-            async with closing_backend_stream(
-                self._remote_stream(
-                    node.resource,
-                    model=model,
-                    messages=messages,
-                    sampling=sampling,
-                    session_id=session_id,
-                    tools=tools,
-                    tool_choice=tool_choice,
-                    response_format=response_format,
-                )
-            ) as remote_stream:
-                async for delta in remote_stream:
-                    yield delta
-        finally:
-            async with self._lock:
-                node.active_requests = max(0, node.active_requests - 1)
-                retired = (
-                    node.active_requests == 0
-                    and self._states.get(node.resource.id) is not node
-                )
-            if retired:
-                await self._release_node_sessions(node.resource)
+            headers = self._headers(node)
+        except BackendError:
+            return
+        await self._discard_remote_session(node, remote, headers)
 
     async def _remote_stream(
         self,

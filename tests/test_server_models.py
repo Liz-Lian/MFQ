@@ -6,6 +6,7 @@ import stat
 import subprocess
 import sys
 import textwrap
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from uuid import uuid4
@@ -848,6 +849,61 @@ def test_runtime_memory_accounting_uses_backend_device_metrics() -> None:
     assert observed == 200
     assert ManagedRuntimePool._observed_runtime_bytes(100, {}) == 100
     assert ManagedRuntimePool._observed_runtime_bytes(None, {}) is None
+
+
+def test_runtime_memory_enforcement_evicts_only_idle_unpinned_instances(
+    tmp_path: Path,
+) -> None:
+    async def run() -> None:
+        _model(tmp_path / "older.mfq")
+        _model(tmp_path / "newer.mfq")
+        catalog = ModelCatalog([tmp_path], cache_seconds=0)
+        older_artifact = await catalog.resolve("older")
+        newer_artifact = await catalog.resolve("newer")
+        older = _ManagedRuntime(
+            id=uuid4(),
+            artifact=older_artifact,
+            process=SimpleNamespace(returncode=None),
+            backend=IdleBackend(),
+            port=0,
+            context_size=4096,
+            state=RuntimeInstanceState.READY,
+            resident_bytes=70,
+            last_used_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        )
+        newer = _ManagedRuntime(
+            id=uuid4(),
+            artifact=newer_artifact,
+            process=SimpleNamespace(returncode=None),
+            backend=IdleBackend(),
+            port=0,
+            context_size=4096,
+            state=RuntimeInstanceState.READY,
+            resident_bytes=70,
+            last_used_at=datetime(2026, 1, 2, tzinfo=timezone.utc),
+        )
+        pool = ManagedRuntimePool(
+            catalog,
+            tmp_path / "runtime",
+            max_instances=2,
+            max_runtime_memory_bytes=100,
+        )
+        pool._instances = {older.id: older, newer.id: newer}
+
+        async with pool._lock:
+            victims = pool._detach_over_budget_locked()
+
+        assert victims == [older]
+        assert list(pool._instances) == [newer.id]
+        assert older.state == RuntimeInstanceState.UNLOADING
+
+        newer.resident_bytes = 101
+        newer.pinned = True
+        async with pool._lock:
+            assert pool._detach_over_budget_locked() == []
+        assert list(pool._instances) == [newer.id]
+
+    asyncio.run(run())
 
 
 def test_runtime_controls_target_the_requested_model_instance(tmp_path: Path) -> None:

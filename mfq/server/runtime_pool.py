@@ -1339,6 +1339,26 @@ class ManagedRuntimePool:
         self._detach_instance_locked(victim)
         return victim
 
+    def _detach_over_budget_locked(self) -> list[_ManagedRuntime]:
+        if self.max_runtime_memory_bytes is None:
+            return []
+        committed = sum(
+            self._committed_runtime_bytes(item)
+            for item in self._instances.values()
+            if item.state != RuntimeInstanceState.FAILED
+        )
+        victims = []
+        while committed > self.max_runtime_memory_bytes:
+            victim = self._detach_lru_instance_locked()
+            if victim is None:
+                break
+            victims.append(victim)
+            committed = max(
+                0,
+                committed - self._committed_runtime_bytes(victim),
+            )
+        return victims
+
     def _finish_model_load_locked(
         self,
         model: str,
@@ -1457,7 +1477,28 @@ class ManagedRuntimePool:
                     timeout=self.metric_interval_seconds,
                 )
             self._idle_reaper_wakeup.clear()
-            victims: list[_ManagedRuntime] = []
+            async with self._lock:
+                if self._closed:
+                    return
+                now_monotonic = asyncio.get_running_loop().time()
+                refresh = [
+                    item
+                    for item in self._instances.values()
+                    if item.state in {
+                        RuntimeInstanceState.READY,
+                        RuntimeInstanceState.BUSY,
+                    }
+                    and now_monotonic - item.usage_refreshed_at
+                    >= self.metric_interval_seconds
+                ]
+                for item in refresh:
+                    item.usage_refreshed_at = now_monotonic
+            if refresh:
+                await asyncio.gather(
+                    *(self._refresh_instance_usage(item) for item in refresh)
+                )
+
+            victims: list[tuple[_ManagedRuntime, str]] = []
             now = datetime.now(timezone.utc)
             async with self._lock:
                 if self._closed:
@@ -1477,29 +1518,36 @@ class ManagedRuntimePool:
                         continue
                     instance.state = RuntimeInstanceState.UNLOADING
                     self._detach_instance_locked(instance)
-                    victims.append(instance)
-            for instance in victims:
+                    victims.append((instance, "idle_ttl"))
+                victims.extend(
+                    (instance, "memory_budget")
+                    for instance in self._detach_over_budget_locked()
+                )
+            for instance, reason in victims:
                 try:
                     await self._stop_process(instance)
                     if self.store is not None:
+                        message = (
+                            f"runtime unloaded after {instance.idle_ttl_seconds}s "
+                            "of inactivity"
+                            if reason == "idle_ttl"
+                            else "runtime unloaded to enforce the aggregate memory budget"
+                        )
                         await asyncio.to_thread(
                             self.store.append_runtime_log,
                             RuntimeLogLevel.INFO,
-                            (
-                                f"runtime unloaded after {instance.idle_ttl_seconds}s "
-                                "of inactivity"
-                            ),
+                            message,
                             instance_id=instance.id,
-                            fields={"source": "runtime.lifecycle", "reason": "idle_ttl"},
+                            fields={"source": "runtime.lifecycle", "reason": reason},
                         )
                 except Exception as error:
                     if self.store is not None:
                         await asyncio.to_thread(
                             self.store.append_runtime_log,
                             RuntimeLogLevel.ERROR,
-                            f"idle runtime unload failed: {error}",
+                            f"runtime unload failed: {error}",
                             instance_id=instance.id,
-                            fields={"source": "runtime.lifecycle", "reason": "idle_ttl"},
+                            fields={"source": "runtime.lifecycle", "reason": reason},
                         )
 
     @staticmethod

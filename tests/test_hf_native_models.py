@@ -122,6 +122,22 @@ def test_catalog_discovers_native_hf_checkpoint(tmp_path: Path) -> None:
     assert artifacts.data[0].loadable
 
 
+def test_catalog_tracks_native_hf_routed_expert_bytes(tmp_path: Path) -> None:
+    model = tmp_path / "Qwen-MoE"
+    _hf_fixture(
+        model,
+        model_type="qwen4_exp",
+        tensor_name=(
+            "model.language_model.layers.0.mlp.experts.0.gate_proj.weight"
+        ),
+    )
+
+    artifact = asyncio.run(
+        ModelCatalog([tmp_path], cache_seconds=0).resolve_path(model)
+    )
+    assert artifact.routed_expert_bytes == 2
+
+
 @pytest.mark.parametrize("model_type", ["qwen4_exp", "glm5_next"])
 def test_catalog_uses_registered_schema_for_native_hf(
     tmp_path: Path,

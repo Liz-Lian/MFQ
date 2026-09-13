@@ -611,7 +611,11 @@ class ModelLoadRequest(ProtocolModel):
     pin: bool = False
     context_size: int = Field(default=32768, ge=512)
     prefill_chunk_size: int = Field(default=2048, ge=1)
-    moe_gpu_cache_gb: float | None = Field(default=None, ge=0.0)
+    moe_gpu_cache_gb: float | None = Field(
+        default=None,
+        ge=0.0,
+        allow_inf_nan=False,
+    )
     prefix_cache_max_sessions: int | None = Field(default=None, ge=0)
     prefix_cache_max_snapshots_per_session: int | None = Field(default=None, ge=0)
     prefix_cache_max_bytes: int | None = Field(default=None, ge=0)

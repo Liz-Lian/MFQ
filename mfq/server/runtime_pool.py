@@ -85,6 +85,7 @@ class _ManagedRuntime:
     monitor_task: asyncio.Task[None] | None = None
     realtime_gateway: Any | None = None
     realtime_error: str | None = None
+    reserved_bytes: int | None = None
     resident_bytes: int | None = None
     kv_bytes: int | None = None
     usage_refreshed_at: float = 0.0
@@ -351,15 +352,16 @@ class ManagedRuntimePool:
             active_count = len(resident_names) + sum(
                 name not in resident_names for name in self._loading_model_names
             )
-            incoming_bytes = artifact.resource.total_bytes
+            incoming_bytes = self._estimated_load_bytes(artifact, request)
             if (
                 self.max_runtime_memory_bytes is not None
                 and incoming_bytes > self.max_runtime_memory_bytes
             ):
                 raise _job_error(
                     "runtime_model_too_large",
-                    f"model requires {incoming_bytes} bytes but the runtime memory "
-                    f"budget is {self.max_runtime_memory_bytes} bytes",
+                    f"model has an estimated resident set of {incoming_bytes} bytes "
+                    f"but the runtime memory budget is "
+                    f"{self.max_runtime_memory_bytes} bytes",
                 )
             committed_bytes = sum(
                 self._committed_runtime_bytes(item)
@@ -491,6 +493,7 @@ class ManagedRuntimePool:
             ),
             pinned=request.pin,
             request_slots=asyncio.Semaphore(self.max_requests_per_instance),
+            reserved_bytes=incoming_bytes,
         )
         try:
             async with self._lock:
@@ -1511,7 +1514,25 @@ class ManagedRuntimePool:
 
     @staticmethod
     def _committed_runtime_bytes(instance: _ManagedRuntime) -> int:
-        return instance.resident_bytes or instance.artifact.resource.total_bytes
+        return (
+            instance.resident_bytes
+            or instance.reserved_bytes
+            or instance.artifact.resource.total_bytes
+        )
+
+    @staticmethod
+    def _estimated_load_bytes(
+        artifact: DiscoveredModel,
+        request: ModelLoadRequest,
+    ) -> int:
+        total_bytes = artifact.resource.total_bytes
+        cache_gb = request.moe_gpu_cache_gb
+        streamed_bytes = artifact.routed_expert_bytes
+        if cache_gb is None or cache_gb <= 0 or streamed_bytes <= 0:
+            return total_bytes
+        cache_bytes = int(cache_gb * (1 << 30))
+        resident_expert_bytes = min(streamed_bytes, cache_bytes)
+        return total_bytes - streamed_bytes + resident_expert_bytes
 
     @staticmethod
     def _observed_runtime_bytes(

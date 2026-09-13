@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import json
 import os
+import re
 import struct
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -14,6 +15,7 @@ from time import monotonic
 
 from mfq.architectures.tensor_schema import (
     graph_spec_for_source_names,
+    map_source_tensor_name,
 )
 from mfq.formats.assets import is_asset_record
 from mfq.formats.io import open_mmap
@@ -26,6 +28,11 @@ from mfq.server.models import (
 )
 
 MODEL_FILE_INDEX = ".mfq-files.json"
+_ROUTED_EXPERT_RE = re.compile(
+    r"\.mlp\.experts\.(?:\d+\.)?"
+    r"(?:gate|up|down|gate_up)(?:_proj)?\."
+    r"(?:weight|weight_scale)$"
+)
 
 
 class ModelArtifactNotFoundError(LookupError):
@@ -48,6 +55,21 @@ class ModelRegistrationError(RuntimeError):
 class DiscoveredModel:
     resource: ModelArtifactResource
     path: Path
+    routed_expert_bytes: int = 0
+
+
+def _is_routed_expert_tensor(name: str) -> bool:
+    """Identify the canonical expert bank that SSD streaming can replace."""
+
+    return bool(_ROUTED_EXPERT_RE.search(name)) or any(
+        marker in name
+        for marker in (
+            ".ffn_gate_exps.",
+            ".ffn_up_exps.",
+            ".ffn_gate_up_exps.",
+            ".ffn_down_exps.",
+        )
+    )
 
 
 class ModelCatalog:
@@ -533,6 +555,12 @@ class ModelCatalog:
                 tensor_count = sum(
                     not is_asset_record(record.name) for record in store.records.values()
                 )
+                routed_expert_bytes = sum(
+                    int(record.nbytes)
+                    for record in store.records.values()
+                    if not is_asset_record(record.name)
+                    and _is_routed_expert_tensor(record.name)
+                )
                 fingerprint = "\0".join(
                     [
                         store.header.model_arch,
@@ -575,7 +603,13 @@ class ModelCatalog:
                 modified_at=datetime.fromtimestamp(stat.st_mtime, timezone.utc),
                 error=str(error).replace(str(root), "<model-root>"),
             )
-        return DiscoveredModel(resource=resource, path=path)
+        return DiscoveredModel(
+            resource=resource,
+            path=path,
+            routed_expert_bytes=(
+                routed_expert_bytes if resource.complete else 0
+            ),
+        )
 
     @staticmethod
     def _is_hf_model_directory(path: Path) -> bool:
@@ -631,6 +665,7 @@ class ModelCatalog:
             if not shard_paths or any(not item.is_file() for item in shard_paths):
                 raise ValueError("HF checkpoint is missing Safetensors shards")
             tensors: set[str] = set()
+            tensor_sizes: dict[str, int] = {}
             dtypes: set[str] = set()
             for shard in shard_paths:
                 for tensor_name, entry in ModelCatalog._safetensors_header(shard).items():
@@ -640,7 +675,19 @@ class ModelCatalog:
                         raise ValueError(f"invalid Safetensors tensor: {tensor_name}")
                     if tensor_name in tensors:
                         raise ValueError(f"duplicate Safetensors tensor: {tensor_name}")
+                    offsets = entry.get("data_offsets")
+                    if (
+                        not isinstance(offsets, list)
+                        or len(offsets) != 2
+                        or not all(isinstance(value, int) for value in offsets)
+                        or offsets[0] < 0
+                        or offsets[1] < offsets[0]
+                    ):
+                        raise ValueError(
+                            f"invalid Safetensors offsets: {tensor_name}"
+                        )
                     tensors.add(tensor_name)
+                    tensor_sizes[tensor_name] = offsets[1] - offsets[0]
                     dtypes.add(entry["dtype"])
             if indexed_names is not None and not indexed_names.issubset(tensors):
                 raise ValueError("Safetensors index references missing tensors")
@@ -657,6 +704,14 @@ class ModelCatalog:
             )
             identifier = hashlib.sha256(fingerprint.encode("utf-8")).hexdigest()[:32]
             loadable = graph_spec_for_source_names(config, sorted(tensors)) is not None
+            routed_expert_bytes = 0
+            for tensor_name, tensor_bytes in tensor_sizes.items():
+                mapped = map_source_tensor_name(tensor_name, config)
+                canonical_name = (
+                    mapped.canonical_name if mapped is not None else tensor_name
+                )
+                if _is_routed_expert_tensor(canonical_name):
+                    routed_expert_bytes += tensor_bytes
             resource = ModelArtifactResource(
                 id=identifier,
                 name=name,
@@ -697,4 +752,10 @@ class ModelCatalog:
                 modified_at=datetime.fromtimestamp(stat.st_mtime, timezone.utc),
                 error=str(error).replace(str(root), "<model-root>"),
             )
-        return DiscoveredModel(resource=resource, path=path)
+        return DiscoveredModel(
+            resource=resource,
+            path=path,
+            routed_expert_bytes=(
+                routed_expert_bytes if resource.complete else 0
+            ),
+        )

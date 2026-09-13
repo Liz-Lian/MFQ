@@ -16,7 +16,7 @@ import numpy as np
 import pytest
 
 from mfq.formats.header import FileHeader
-from mfq.formats.io import save
+from mfq.formats.io import open_mmap, save
 from mfq.server.api import create_app
 from mfq.server.backend import BackendDelta, BackendError
 from mfq.server.capabilities import capabilities_for_architecture
@@ -188,6 +188,51 @@ def test_catalog_validates_complete_and_incomplete_shards(tmp_path: Path) -> Non
         assert not incomplete.data[0].loadable
         assert "missing MFQ shard" in (incomplete.data[0].error or "")
         assert str(model_dir) not in incomplete.model_dump_json()
+
+    asyncio.run(run())
+
+
+def test_catalog_tracks_streamable_routed_expert_bytes(tmp_path: Path) -> None:
+    async def run() -> None:
+        dense = np.arange(16, dtype=np.float16).reshape(4, 4)
+        experts = np.arange(128, dtype=np.float16).reshape(2, 8, 8)
+        path = tmp_path / "moe.mfq"
+        save(
+            path,
+            FileHeader(version=2, model_arch="qwen4_exp"),
+            {
+                "model.token_embedding.weight": dense,
+                "model.block.0.mlp.experts.gate_up.weight": experts,
+            },
+        )
+
+        artifact = await ModelCatalog([tmp_path], cache_seconds=0).resolve_path(path)
+        with open_mmap(path) as store:
+            expert_blob_bytes = store.records[
+                "model.block.0.mlp.experts.gate_up.weight"
+            ].nbytes
+        assert artifact.routed_expert_bytes == expert_blob_bytes
+        assert expert_blob_bytes > experts.nbytes
+        assert artifact.resource.total_bytes > artifact.routed_expert_bytes
+
+        request = ModelLoadRequest(
+            model=artifact.resource.name,
+            moe_gpu_cache_gb=1 / (1 << 30),
+        )
+        estimated = ManagedRuntimePool._estimated_load_bytes(artifact, request)
+        assert estimated == (
+            artifact.resource.total_bytes - artifact.routed_expert_bytes + 1
+        )
+        runtime = _ManagedRuntime(
+            id=uuid4(),
+            artifact=artifact,
+            process=SimpleNamespace(returncode=None),
+            backend=IdleBackend(),
+            port=0,
+            context_size=4096,
+            reserved_bytes=estimated,
+        )
+        assert ManagedRuntimePool._committed_runtime_bytes(runtime) == estimated
 
     asyncio.run(run())
 

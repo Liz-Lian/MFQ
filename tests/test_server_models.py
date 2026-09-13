@@ -772,6 +772,68 @@ def test_runtime_memory_accounting_uses_backend_device_metrics() -> None:
     assert ManagedRuntimePool._observed_runtime_bytes(None, {}) is None
 
 
+def test_runtime_controls_target_the_requested_model_instance(tmp_path: Path) -> None:
+    async def run() -> None:
+        class ControlBackend:
+            def __init__(self, name: str) -> None:
+                self.name = name
+                self.reloads: list[int] = []
+                self.cache_clears = 0
+
+            async def reload_runtime(self, context_size: int) -> dict[str, object]:
+                self.reloads.append(context_size)
+                return {"model": self.name, "max_context": context_size}
+
+            async def clear_runtime_cache(self) -> dict[str, object]:
+                self.cache_clears += 1
+                return {"model": self.name, "released_snapshots": 1}
+
+        _model(tmp_path / "first.mfq")
+        _model(tmp_path / "second.mfq")
+        catalog = ModelCatalog([tmp_path], cache_seconds=0)
+        first_artifact = await catalog.resolve("first")
+        second_artifact = await catalog.resolve("second")
+        first_backend = ControlBackend("first")
+        second_backend = ControlBackend("second")
+        first = _ManagedRuntime(
+            id=uuid4(),
+            artifact=first_artifact,
+            process=SimpleNamespace(returncode=None),
+            backend=first_backend,  # type: ignore[arg-type]
+            port=0,
+            context_size=4096,
+            state=RuntimeInstanceState.READY,
+        )
+        second = _ManagedRuntime(
+            id=uuid4(),
+            artifact=second_artifact,
+            process=SimpleNamespace(returncode=None),
+            backend=second_backend,  # type: ignore[arg-type]
+            port=0,
+            context_size=4096,
+            state=RuntimeInstanceState.READY,
+        )
+        pool = ManagedRuntimePool(catalog, tmp_path / "runtime", max_instances=2)
+        pool._instances = {first.id: first, second.id: second}
+        pool._last_instance_id = first.id
+
+        reloaded = await pool.reload_runtime(8192, second.id)
+        cleared = await pool.clear_runtime_cache(second.id)
+
+        assert reloaded["model"] == "second"
+        assert cleared["model"] == "second"
+        assert first_backend.reloads == []
+        assert first_backend.cache_clears == 0
+        assert second_backend.reloads == [8192]
+        assert second_backend.cache_clears == 1
+        assert second.context_size == 8192
+        with pytest.raises(BackendError) as missing:
+            await pool.clear_runtime_cache(uuid4())
+        assert missing.value.code == "runtime_instance_not_found"
+
+    asyncio.run(run())
+
+
 def test_request_driven_load_waiters_receive_the_same_startup_error(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

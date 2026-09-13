@@ -1191,15 +1191,18 @@ export const api = {
     return request("/api/v1/components/voice-output/activate", { method: "POST" });
   },
 
-  reloadRuntime(contextSize: number): Promise<RuntimeStatus> {
+  reloadRuntime(contextSize: number, instanceId?: string): Promise<RuntimeStatus> {
     return request("/api/v1/runtime/reload", {
       method: "POST",
-      body: JSON.stringify({ context_size: contextSize }),
+      body: JSON.stringify({ context_size: contextSize, instance_id: instanceId }),
     });
   },
 
-  clearRuntimeCache(): Promise<RuntimeStatus & { released_snapshots: number }> {
-    return request("/api/v1/runtime/cache/clear", { method: "POST" });
+  clearRuntimeCache(instanceId?: string): Promise<RuntimeStatus & { released_snapshots: number }> {
+    return request("/api/v1/runtime/cache/clear", {
+      method: "POST",
+      body: JSON.stringify({ instance_id: instanceId }),
+    });
   },
 };
 

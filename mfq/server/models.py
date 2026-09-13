@@ -1025,6 +1025,11 @@ class JobEventList(ProtocolModel):
 
 class RuntimeReloadRequest(ProtocolModel):
     context_size: int = Field(ge=512)
+    instance_id: UUID | None = None
+
+
+class RuntimeCacheClearRequest(ProtocolModel):
+    instance_id: UUID | None = None
 
 
 class ErrorResponse(ProtocolModel):

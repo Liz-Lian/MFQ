@@ -3011,7 +3011,7 @@ export default function App() {
     if (!await studioConfirm(tr(`以 ${formatNumber(contextSize)} token 上下文重载模型？`, `Reload the model with a ${formatNumber(contextSize)} token context?`))) return;
     setBusy(true);
     try {
-      const status = await api.reloadRuntime(contextSize);
+      const status = await api.reloadRuntime(contextSize, runtime?.instance_id);
       setRuntime(status);
     } catch (cause) {
       setError(errorMessage(cause));
@@ -3036,7 +3036,7 @@ export default function App() {
     if (!await studioConfirm(confirmation)) return;
     setBusy(true);
     try {
-      const status = await api.clearRuntimeCache();
+      const status = await api.clearRuntimeCache(runtime?.instance_id);
       setRuntime((current) => current ? { ...current, ...status } : status);
       await refreshRuntime(false);
     } catch (cause) {

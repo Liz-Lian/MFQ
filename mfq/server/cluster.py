@@ -625,11 +625,22 @@ class ClusterBackend:
     async def realtime_serve(self, client: Any, *, mode: str = "audio") -> bool:
         return await self.local.realtime_serve(client, mode=mode)
 
-    async def reload_runtime(self, context_size: int) -> dict[str, Any]:
-        return await self.local.reload_runtime(context_size)
+    async def reload_runtime(
+        self,
+        context_size: int,
+        instance_id: UUID | None = None,
+    ) -> dict[str, Any]:
+        if instance_id is None:
+            return await self.local.reload_runtime(context_size)
+        return await self.local.reload_runtime(context_size, instance_id)
 
-    async def clear_runtime_cache(self) -> dict[str, Any]:
-        return await self.local.clear_runtime_cache()
+    async def clear_runtime_cache(
+        self,
+        instance_id: UUID | None = None,
+    ) -> dict[str, Any]:
+        if instance_id is None:
+            return await self.local.clear_runtime_cache()
+        return await self.local.clear_runtime_cache(instance_id)
 
     def realtime_connect(self, *, mode: str = "audio") -> Any:
         return self.local.realtime_connect(mode=mode)

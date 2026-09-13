@@ -985,18 +985,26 @@ class ManagedRuntimePool:
         await gateway.serve(client)
         return True
 
-    async def reload_runtime(self, context_size: int) -> dict[str, Any]:
-        backend = await self._current_backend()
+    async def reload_runtime(
+        self,
+        context_size: int,
+        instance_id: UUID | None = None,
+    ) -> dict[str, Any]:
+        instance, backend = await self._runtime_control_target(instance_id)
         if backend is None:
             raise BackendError("model_not_loaded", "no runtime is available")
         result = await backend.reload_runtime(context_size)
-        async with self._lock:
-            if self._last_instance_id in self._instances:
-                self._instances[self._last_instance_id].context_size = context_size
+        if instance is not None:
+            async with self._lock:
+                if self._instances.get(instance.id) is instance:
+                    instance.context_size = context_size
         return result
 
-    async def clear_runtime_cache(self) -> dict[str, Any]:
-        backend = await self._current_backend()
+    async def clear_runtime_cache(
+        self,
+        instance_id: UUID | None = None,
+    ) -> dict[str, Any]:
+        _instance, backend = await self._runtime_control_target(instance_id)
         if backend is None:
             raise BackendError("model_not_loaded", "no runtime is available")
         return await backend.clear_runtime_cache()
@@ -1211,6 +1219,34 @@ class ManagedRuntimePool:
         async with self._lock:
             instance = self._current_instance_locked()
         return instance.backend if instance is not None else self.fallback
+
+    async def _runtime_control_target(
+        self,
+        instance_id: UUID | None,
+    ) -> tuple[_ManagedRuntime | None, ChatBackend | None]:
+        async with self._lock:
+            if instance_id is None:
+                instance = self._current_instance_locked()
+            else:
+                instance = self._instances.get(instance_id)
+                if instance is None:
+                    raise BackendError(
+                        "runtime_instance_not_found",
+                        f"runtime instance was not found: {instance_id}",
+                        status_code=404,
+                    )
+                if instance.state not in {
+                    RuntimeInstanceState.READY,
+                    RuntimeInstanceState.BUSY,
+                }:
+                    raise BackendError(
+                        "model_not_ready",
+                        f"model runtime is {instance.state.value}",
+                        retryable=True,
+                        status_code=409,
+                    )
+            backend = instance.backend if instance is not None else self.fallback
+        return instance, backend
 
     def _current_instance_locked(self) -> _ManagedRuntime | None:
         instance = (

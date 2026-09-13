@@ -4283,6 +4283,25 @@
         "title": "RewindSessionRequest",
         "type": "object"
       },
+      "RuntimeCacheClearRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "instance_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Instance Id"
+          }
+        },
+        "title": "RuntimeCacheClearRequest",
+        "type": "object"
+      },
       "RuntimeCapabilitiesResource": {
         "additionalProperties": false,
         "properties": {
@@ -4862,6 +4881,18 @@
             "minimum": 512.0,
             "title": "Context Size",
             "type": "integer"
+          },
+          "instance_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Instance Id"
           }
         },
         "required": [
@@ -12737,6 +12768,23 @@
     "/api/v1/runtime/cache/clear": {
       "post": {
         "operationId": "clear_runtime_cache_api_v1_runtime_cache_clear_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/RuntimeCacheClearRequest"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Body"
+              }
+            }
+          }
+        },
         "responses": {
           "200": {
             "content": {

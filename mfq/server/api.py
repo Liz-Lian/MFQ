@@ -76,6 +76,7 @@ from mfq.server.models import (
     ResponseList,
     ResponseResource,
     RewindSessionRequest,
+    RuntimeCacheClearRequest,
     RuntimeCapabilitiesResource,
     RuntimeInstanceList,
     RuntimeLogLevel,
@@ -1194,7 +1195,10 @@ def create_app(
         tags=["runtime"],
     )
     async def reload_runtime(body: RuntimeReloadRequest) -> dict[str, Any]:
-        return await require_service().reload_runtime(body.context_size)
+        return await require_service().reload_runtime(
+            body.context_size,
+            instance_id=body.instance_id,
+        )
 
     @app.post(
         "/api/v1/runtime/cache/clear",
@@ -1202,8 +1206,12 @@ def create_app(
         responses=ERROR_RESPONSES,
         tags=["runtime"],
     )
-    async def clear_runtime_cache() -> dict[str, Any]:
-        return await require_service().clear_runtime_cache()
+    async def clear_runtime_cache(
+        body: RuntimeCacheClearRequest | None = None,
+    ) -> dict[str, Any]:
+        return await require_service().clear_runtime_cache(
+            instance_id=body.instance_id if body is not None else None,
+        )
 
     @app.get(
         "/api/v1/components/voice-output",

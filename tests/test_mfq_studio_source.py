@@ -309,6 +309,15 @@ def test_studio_runtime_monogram_tracks_the_real_model_lifecycle():
     assert ".model-monogram.failed { color: var(--danger); }" in STYLES
 
 
+def test_studio_overview_lists_every_loaded_model():
+    assert 'className="overview-models-panel"' in APP
+    assert 'availableModelNames.map((name) =>' in APP
+    assert 'candidate.model === name && candidate.state !== "failed"' in APP
+    assert 'onClick={() => setModel(name)}' in APP
+    assert ".overview-model-grid {" in STYLES
+    assert ".overview-model-card.selected {" in STYLES
+
+
 def test_studio_adapts_prefix_cache_panel_to_flash_next_hot_cache():
     assert 'prefix_cache_mode?: string;' in API
     assert 'prefix_cache_pending_bytes?: number;' in API

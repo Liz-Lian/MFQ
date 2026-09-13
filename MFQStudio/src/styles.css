@@ -711,6 +711,29 @@ button.primary:hover { border-color: var(--accent-hover); color: var(--on-accent
 .runtime-hero-actions button.primary { border-color: var(--accent); color: var(--on-accent); background: var(--accent); font-weight: 700; }
 .runtime-hero-actions button.primary:hover { border-color: var(--accent-hover); background: var(--accent-hover); }
 
+.overview-models-panel { padding: 11px; }
+.overview-model-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 8px; }
+.overview-model-card {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: 42px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 11px;
+  border: 1px solid var(--line-soft);
+  border-radius: 10px;
+  padding: 10px;
+  color: var(--ink-soft);
+  background: var(--panel-control);
+  text-align: left;
+}
+.overview-model-card:hover { border-color: var(--line-strong); background: var(--surface-hover); }
+.overview-model-card.selected { border-color: var(--accent-border); background: var(--accent-soft); }
+.overview-model-card:disabled { cursor: default; opacity: 1; }
+.overview-model-card > .model-monogram { width: 42px; height: 42px; border-radius: 11px; font-size: 20px; }
+.overview-model-copy { display: grid; min-width: 0; gap: 3px; }
+.overview-model-card strong { overflow: hidden; color: var(--ink-strong); font-size: 12px; font-weight: 640; text-overflow: ellipsis; white-space: nowrap; }
+.overview-model-card small { overflow: hidden; color: var(--muted); font-size: 10.5px; text-overflow: ellipsis; white-space: nowrap; }
+
 .overview-memory-panel { padding: 19px; }
 .overview-memory-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 24px; }
 .overview-memory-heading h2,

@@ -4138,6 +4138,26 @@ export default function App() {
               </div>
             </TMPanel>}
             {dashboardPage === "overview" && <>
+              {availableModelNames.length > 1 && <>
+                <SectionLabel title={tr("已加载模型", "Loaded models")} subtitle={tr(`${availableModelNames.length} 个可用于推理`, `${availableModelNames.length} available for inference`)} />
+                <TMPanel className="overview-models-panel">
+                  <div className="overview-model-grid">{availableModelNames.map((name) => {
+                    const instance = instances.find((candidate) => candidate.model === name && candidate.state !== "failed");
+                    const selected = name === model;
+                    const stateLabel = instance?.state === "busy" ? tr("使用中", "Busy") : tr("就绪", "Ready");
+                    const details = [
+                      instance?.devices.join(" + "),
+                      instance?.context_size ? `${formatNumber(instance.context_size)} ctx` : null,
+                      instance ? tr(`${instance.active_sessions} 个会话`, `${instance.active_sessions} sessions`) : null,
+                    ].filter(Boolean).join(" · ");
+                    return <button aria-pressed={selected} className={`overview-model-card${selected ? " selected" : ""}`} disabled={busy || selected} key={name} onClick={() => setModel(name)} type="button">
+                      <ModelMonogram name={name} state="ready" />
+                      <span className="overview-model-copy"><strong title={name}>{name}</strong><small>{details || stateLabel}</small></span>
+                      <span className="runtime-status-pill ready"><i />{selected ? tr("当前", "Current") : stateLabel}</span>
+                    </button>;
+                  })}</div>
+                </TMPanel>
+              </>}
               <SectionLabel title={tr("实时性能", "Live performance")} subtitle={tr("最近请求吞吐与累计缓存复用", "Latest request throughput · cumulative cache reuse")} />
               <div className="metric-grid">
                 <MetricTile label={tr("预填充", "Prefill")} value={`${formatNumber(lastPrefill.tokensPerSecond, 1)} tok/s`} detail={`${formatNumber(lastPrefill.milliseconds, 1)} ms · ${tr("输入处理", "Prompt processing")}`} icon="text-forward" />

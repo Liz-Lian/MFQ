@@ -824,10 +824,10 @@ MlxDeepseekV4DSpark::draft_impl(
     const int requested = width == 0 ? block_size() : width;
     const int available_width = std::min(
         block_size(), impl_->maximum_context - state.position_);
-    // DSpark's block predictor evaluates only the width selected by the
-    // common controller. This preserves the trained non-causal block while
-    // avoiding unused attention, MoE and output rows after early rejection.
-    const int physical_width = std::min(requested, available_width);
+    // DSpark attention is non-causal inside the trained draft block. Adaptive
+    // verification may consume only a prefix, but the predictor must still
+    // evaluate the complete physical block so that prefix logits are stable.
+    const int physical_width = available_width;
     const int vocab = checked_int(impl_->config.vocab, "vocabulary size");
     const int hidden_size = checked_int(impl_->config.hidden, "hidden size");
     if (anchors.ndim() != 2 || anchors.shape(0) != state.batch() ||

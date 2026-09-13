@@ -684,9 +684,10 @@ MlxDeepseekV41DSpark::draft_impl(
     const int requested = width == 0 ? block_size() : width;
     const int available_width = std::min(
         block_size(), impl_->maximum_context - state.position_);
-    // V4.1 DSpark supports variable physical proposal width. Do not evaluate
-    // unused attention, MoE, or LM-head rows after adaptive depth shrinks.
-    const int physical_width = std::min(requested, available_width);
+    // DSpark attention is non-causal inside the trained draft block. Adaptive
+    // verification may consume only a prefix, but the predictor must still
+    // evaluate the complete physical block so that prefix logits are stable.
+    const int physical_width = available_width;
     const int hidden_size = checked_int(
         impl_->config.hidden, "hidden size");
     if (anchors.ndim() != 2 || anchors.shape(0) != state.batch() ||

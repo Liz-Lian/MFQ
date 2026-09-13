@@ -99,6 +99,20 @@ array zeros(int output, int input) {
         Shape{output, input}, mlx::core::float32);
 }
 
+array patterned(int output, int input, float scale, int phase = 0) {
+    std::vector<float> values(
+        static_cast<std::size_t>(output) * input);
+    for (int row = 0; row < output; ++row) {
+        for (int column = 0; column < input; ++column) {
+            values[static_cast<std::size_t>(row) * input + column] =
+                scale * std::sin(
+                    static_cast<float>(
+                        (row + 1) * (column + 3) + phase));
+        }
+    }
+    return array(values.begin(), Shape{output, input});
+}
+
 DeepseekV4Config config() {
     DeepseekV4Config value;
     value.n_layers = 1;
@@ -148,14 +162,23 @@ MlxDeepseekV4Moe make_moe(const DeepseekV4Config& cfg) {
 }
 
 MlxDeepseekV4DSparkStageComponents make_stage(
-    const DeepseekV4Config& cfg) {
+    const DeepseekV4Config& cfg,
+    bool nonzero_attention = false) {
+    const auto linear = [nonzero_attention](
+                            int output,
+                            int input,
+                            int phase) {
+        return MlxLinear(nonzero_attention
+            ? patterned(output, input, 0.08f, phase)
+            : zeros(output, input));
+    };
     return {
         MlxDeepseekV4DSparkAttentionComponents{
-            MlxLinear(zeros(8, kHidden)),
-            MlxLinear(zeros(16, 8)),
-            MlxLinear(zeros(8, kHidden)),
-            MlxLinear(zeros(8, 8)),
-            MlxLinear(zeros(kHidden, 8)),
+            linear(8, kHidden, 1),
+            linear(16, 8, 2),
+            linear(8, kHidden, 3),
+            linear(8, 8, 4),
+            linear(kHidden, 8, 5),
             mlx::core::ones(Shape{8}, mlx::core::float32),
             mlx::core::ones(Shape{8}, mlx::core::float32),
             mlx::core::zeros(Shape{2}, mlx::core::float32),
@@ -172,7 +195,7 @@ MlxDeepseekV4DSparkStageComponents make_stage(
     };
 }
 
-MlxDeepseekV4DSpark make_dspark() {
+MlxDeepseekV4DSpark make_dspark(bool nonzero_attention = false) {
     const auto cfg = config();
     std::vector<float> markov_embedding(
         kVocab * cfg.dspark_markov_rank, 0.0f);
@@ -184,12 +207,16 @@ MlxDeepseekV4DSpark make_dspark() {
         kVocab * cfg.dspark_markov_rank, 0.0f);
     markov_output[3 * cfg.dspark_markov_rank] = 2.0f;
     std::vector<MlxDeepseekV4DSparkStageComponents> stages;
-    stages.push_back(make_stage(cfg));
-    stages.push_back(make_stage(cfg));
+    stages.push_back(make_stage(cfg, nonzero_attention));
+    stages.push_back(make_stage(cfg, nonzero_attention));
     return MlxDeepseekV4DSpark(
         cfg,
-        MlxEmbedding(zeros(kVocab, kHidden)),
-        MlxLinear(zeros(kVocab, kHidden)),
+        MlxEmbedding(nonzero_attention
+            ? patterned(kVocab, kHidden, 0.25f, 6)
+            : zeros(kVocab, kHidden)),
+        MlxLinear(nonzero_attention
+            ? patterned(kVocab, kHidden, 0.12f, 7)
+            : zeros(kVocab, kHidden)),
         MlxLinear(zeros(kHidden, kHidden)),
         mlx::core::ones(Shape{kHidden}, mlx::core::float32),
         std::move(stages),
@@ -270,12 +297,46 @@ void test_context_and_parallel_draft() {
     require(state.position() == 5, "DSpark snapshot did not roll back");
 }
 
+void test_adaptive_width_preserves_fixed_block_geometry() {
+    auto dspark = make_dspark(true);
+    auto state = dspark.make_state();
+    dspark.append_context(
+        mlx::core::reshape(
+            patterned(5, kHidden, 0.15f, 8),
+            Shape{1, 5, kHidden}),
+        state,
+        0);
+
+    const array anchor({1}, Shape{1, 1}, mlx::core::int32);
+    const auto select_fixed = [](const array& logits) {
+        return mlx::core::zeros(
+            Shape{logits.shape(0), 1}, mlx::core::int32);
+    };
+    auto narrow = dspark.draft(anchor, state, select_fixed, 1);
+    auto full = dspark.draft(
+        anchor, state, select_fixed, dspark.block_size());
+    mlx::core::eval({narrow.logits, full.logits});
+
+    require(
+        narrow.logits.shape() == Shape{1, 1, kVocab} &&
+            full.logits.shape() == Shape{1, 3, kVocab},
+        "DSpark adaptive draft geometry mismatch");
+    const auto* narrow_values = narrow.logits.data<float>();
+    const auto* full_values = full.logits.data<float>();
+    for (int token = 0; token < kVocab; ++token) {
+        require(
+            std::fabs(narrow_values[token] - full_values[token]) < 1.0e-5f,
+            "DSpark adaptive depth changed fixed-block prefix logits");
+    }
+}
+
 } // namespace
 
 int main() {
     try {
         mlx::core::set_default_device(mlx::core::Device::gpu);
         test_context_and_parallel_draft();
+        test_adaptive_width_preserves_fixed_block_geometry();
         std::cout << "MFQ DeepSeek-V4 DSpark MoE MTP tests passed\n";
         return 0;
     } catch (const std::exception& error) {

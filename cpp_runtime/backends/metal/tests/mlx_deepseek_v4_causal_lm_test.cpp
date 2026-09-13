@@ -25,14 +25,18 @@ using json = nlohmann::json;
 using mfq::metal::DeepseekV4Config;
 using mfq::metal::MlxDeepseekV4Attention;
 using mfq::metal::MlxDeepseekV4AttentionComponents;
+using mfq::metal::MlxDeepseekV4Affine;
 using mfq::metal::MlxDeepseekV4CausalLm;
 using mfq::metal::MlxDeepseekV4DSpark;
 using mfq::metal::MlxDeepseekV4DSparkAttentionComponents;
 using mfq::metal::MlxDeepseekV4DSparkHeadComponents;
 using mfq::metal::MlxDeepseekV4DSparkStageComponents;
+using mfq::metal::MlxDeepseekV4ImageInput;
 using mfq::metal::MlxDeepseekV4Layer;
 using mfq::metal::MlxDeepseekV4LayerComponents;
 using mfq::metal::MlxDeepseekV4Moe;
+using mfq::metal::MlxDeepseekV4Vision;
+using mfq::metal::MlxDeepseekV4VisionBlock;
 using mfq::metal::MlxEmbedding;
 using mfq::metal::MlxLinear;
 using mfq::metal::MlxRmsNorm;
@@ -738,6 +742,10 @@ MlxDeepseekV4Moe make_moe(
         mlx::core::ones(
             Shape{kExperts},
             mlx::core::bool_);
+    const auto visual_router_bias = config.has_vision()
+        ? std::optional<array>(mlx::core::zeros(
+              Shape{kExperts}, mlx::core::float32))
+        : std::nullopt;
     return MlxDeepseekV4Moe(
         config,
         MlxLinear(
@@ -768,7 +776,8 @@ MlxDeepseekV4Moe make_moe(
             Shape{kExperts},
             mlx::core::float32),
         std::nullopt,
-        available);
+        available,
+        visual_router_bias);
 }
 
 MlxDeepseekV4Layer make_layer(
@@ -895,7 +904,41 @@ MlxDeepseekV4DSpark make_dspark(
             static_cast<float>(config.rope_theta)));
 }
 
-MlxDeepseekV4CausalLm make_dspark_model(bool attach_dspark = true) {
+MlxDeepseekV4Vision make_vision(const DeepseekV4Config& config) {
+    MlxDeepseekV4VisionBlock block{
+        MlxRmsNorm(ones_vector(4)),
+        MlxDeepseekV4Affine(
+            MlxLinear(zeros_matrix(12, 4)),
+            mlx::core::zeros(Shape{12}, mlx::core::float32)),
+        MlxDeepseekV4Affine(
+            MlxLinear(zeros_matrix(4, 4)),
+            mlx::core::zeros(Shape{4}, mlx::core::float32)),
+        MlxRmsNorm(ones_vector(4)),
+        MlxLinear(zeros_matrix(8, 4)),
+        MlxLinear(zeros_matrix(4, 4)),
+    };
+    return MlxDeepseekV4Vision(
+        config,
+        MlxDeepseekV4Affine(
+            MlxLinear(zeros_matrix(4, 12)),
+            mlx::core::zeros(Shape{4}, mlx::core::float32)),
+        {std::move(block)},
+        ones_vector(4),
+        MlxDeepseekV4Affine(
+            MlxLinear(zeros_matrix(kHidden, kHidden)),
+            mlx::core::zeros(Shape{kHidden}, mlx::core::float32)),
+        MlxDeepseekV4Affine(
+            MlxLinear(zeros_matrix(kHidden, kHidden)),
+            mlx::core::zeros(Shape{kHidden}, mlx::core::float32)),
+        mlx::core::full(Shape{kHidden}, 10.0f, mlx::core::float32),
+        mlx::core::full(Shape{kHidden}, 20.0f, mlx::core::float32),
+        mlx::core::full(Shape{kHidden}, 30.0f, mlx::core::float32),
+        mlx::core::full(Shape{kHidden}, 40.0f, mlx::core::float32));
+}
+
+MlxDeepseekV4CausalLm make_dspark_model(
+    bool attach_dspark = true,
+    bool attach_vision = false) {
     auto config = test_config(false, {0, 0, 0});
     config.n_mtp_layers = 1;
     config.dspark_block_size = 2;
@@ -903,6 +946,14 @@ MlxDeepseekV4CausalLm make_dspark_model(bool attach_dspark = true) {
     config.dspark_target_layer_ids = {2};
     config.dspark_markov_rank = 4;
     config.mtp_compress_ratios = {0};
+    if (attach_vision) {
+        config.vision_n_layers = 1;
+        config.vision_dim = 4;
+        config.vision_n_heads = 1;
+        config.vision_inter_dim = 4;
+        config.vision_patch_size = 2;
+        config.vision_downsample_ratio = 2;
+    }
     config.validate();
     std::vector<MlxDeepseekV4Layer> layers;
     for (int layer = 0; layer < kLayers; ++layer) {
@@ -913,6 +964,10 @@ MlxDeepseekV4CausalLm make_dspark_model(bool attach_dspark = true) {
     std::optional<MlxDeepseekV4DSpark> dspark;
     if (attach_dspark) {
         dspark.emplace(make_dspark(config, embedding, output));
+    }
+    std::optional<MlxDeepseekV4Vision> vision;
+    if (attach_vision) {
+        vision.emplace(make_vision(config));
     }
     return MlxDeepseekV4CausalLm(
         config,
@@ -927,7 +982,7 @@ MlxDeepseekV4CausalLm make_dspark_model(bool attach_dspark = true) {
         mlx::core::float32,
         nullptr,
         nullptr,
-        std::nullopt,
+        std::move(vision),
         std::move(dspark));
 }
 
@@ -1588,6 +1643,47 @@ void test_dspark_generation_uses_common_mtp_engine() {
         "DeepSeek-V4 reused predictor prefix changed MTP generation");
 }
 
+void test_vision_generation_uses_common_mtp_engine() {
+    auto model = make_dspark_model(true, true);
+    require(
+        model.supports_multimodal() && model.supports_mtp(),
+        "DeepSeek-V4 Vision/DSpark components were not attached together");
+
+    mfq::metal::MlxSamplingParams sampling;
+    sampling.temperature = 0.0;
+    sampling.mtp_max_draft_tokens = 1;
+    const std::vector<std::int64_t> prompt{
+        1, kVocab, kVocab + 1, kVocab + 2,
+        kVocab + 3, kVocab + 4, 6};
+    std::vector<MlxDeepseekV4ImageInput> images{
+        {
+            mlx::core::zeros(Shape{4, 12}, mlx::core::float32),
+            2,
+            2,
+            1,
+            6,
+            {0, 2, 3, 1, 4},
+            {0},
+        },
+    };
+    std::vector<std::int64_t> emitted;
+    const auto count = model.generate_multimodal(
+        prompt,
+        images,
+        sampling,
+        4,
+        [&](std::int64_t token) {
+            emitted.push_back(token);
+            return true;
+        },
+        std::vector<std::int64_t>{});
+    const auto& stats = model.last_mtp_stats();
+    require(
+        count == 4 && emitted.size() == 4 && stats.available && stats.used &&
+            stats.cycles > 0 && stats.drafted_tokens > 0,
+        "DeepSeek-V4 Vision request bypassed the common MTP engine");
+}
+
 void test_generation_stable_prefix_cache() {
     mfq::metal::MlxSamplingParams sampling;
     sampling.temperature = 0.0;
@@ -2118,6 +2214,7 @@ int main() {
         test_prefill_decode_and_chunking();
         test_generation_eos_and_callback();
         test_dspark_generation_uses_common_mtp_engine();
+        test_vision_generation_uses_common_mtp_engine();
         test_generation_stable_prefix_cache();
         test_text_session_snapshot_restore();
         test_mfq_container_load();

@@ -144,6 +144,8 @@ mfq_pyinstaller_args=(
   --collect-all fastapi
   --collect-all uvicorn
   --collect-all pydantic
+  --collect-all huggingface_hub
+  --collect-all modelscope_hub
   --collect-all torch
   --collect-all transformers
   --collect-all tokenizers
@@ -158,6 +160,8 @@ mfq_pyinstaller_args=(
   --collect-all stepaudio2
   --collect-all torchaudio
   --copy-metadata requests
+  --copy-metadata huggingface-hub
+  --copy-metadata modelscope-hub
   --hidden-import mfq.runtime.minicpmo45_realtime
   --hidden-import mfq.runtime.flash_next_worker
   --hidden-import mfq.runtime.mlx_qwen4_exp

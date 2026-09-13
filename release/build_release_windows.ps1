@@ -406,12 +406,12 @@ function Build-PythonCli {
     )
     foreach ($package in @(
             "av", "fastapi", "httpx", "PIL", "pydantic", "pypdf",
-            "uvicorn", "websockets")) {
+            "huggingface_hub", "modelscope_hub", "uvicorn", "websockets")) {
         $arguments += @("--collect-all", $package)
     }
     foreach ($module in @(
             "torch", "transformers", "tokenizers", "safetensors",
-            "scipy", "pyarrow", "huggingface_hub", "tiktoken",
+            "scipy", "pyarrow", "tiktoken",
             "mfq.calibration", "mfq.quantize", "mfq.runtime", "mfq.tools",
             "mfq._vendor.tpq",
             "mfq.runtime.minicpmo45", "mfq.runtime.minicpmo45_realtime",
@@ -419,6 +419,10 @@ function Build-PythonCli {
             "s3tokenizer", "hyperpyyaml", "librosa")) {
         $arguments += @("--exclude-module", $module)
     }
+    $arguments += @(
+        "--copy-metadata", "huggingface-hub",
+        "--copy-metadata", "modelscope-hub"
+    )
     $arguments += @(
         "--distpath", $Context.ResourceDirectory,
         "--workpath", $Context.PyInstallerBuildDirectory,

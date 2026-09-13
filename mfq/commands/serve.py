@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import importlib.util
 import math
 import os
 import platform
@@ -327,6 +328,8 @@ def _run(args: argparse.Namespace) -> int:
                 runtime=executable,
                 perplexity=perplexity if perplexity.is_file() else None,
                 standalone_cli=bool(getattr(sys, "frozen", False)),
+                internal_modelscope=importlib.util.find_spec("modelscope_hub") is not None,
+                internal_huggingface=importlib.util.find_spec("huggingface_hub") is not None,
             ),
             voice_component=voice_component,
             activate_voice_output=runtime_manager.enable_realtime,

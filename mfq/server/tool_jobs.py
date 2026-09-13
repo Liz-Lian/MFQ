@@ -214,6 +214,8 @@ class ToolJobPaths:
     runtime: Path | None
     perplexity: Path | None
     standalone_cli: bool = False
+    internal_modelscope: bool = False
+    internal_huggingface: bool = False
 
 
 class ToolJobHandlers:
@@ -249,11 +251,11 @@ class ToolJobHandlers:
             result["component.voice_output.install"] = TypedJobHandler(
                 self.install_voice_output, VoiceOutputInstallPayload
             )
-        if self.paths.modelscope is not None:
+        if self.paths.modelscope is not None or self.paths.internal_modelscope:
             result["download.modelscope"] = TypedJobHandler(
                 self.download_modelscope, ModelScopeDownloadPayload
             )
-        if self.paths.huggingface is not None:
+        if self.paths.huggingface is not None or self.paths.internal_huggingface:
             result["download.huggingface"] = TypedJobHandler(
                 self.download_huggingface, HuggingFaceDownloadPayload
             )
@@ -471,11 +473,18 @@ class ToolJobHandlers:
         request = ModelScopeDownloadPayload.model_validate(payload)
         destination = self._output(request.destination, directory=True)
         self._preflight_download(destination, request.expected_bytes)
-        executable = self._required_executable(self.paths.modelscope, "ModelScope")
-        argv = [
-            str(executable),
-            "download",
-            request.repo_id,
+        if self.paths.internal_modelscope:
+            argv = self._mfq_command(
+                "_hub-download",
+                "--provider",
+                "modelscope",
+                "--repo-id",
+                request.repo_id,
+            )
+        else:
+            executable = self._required_executable(self.paths.modelscope, "ModelScope")
+            argv = [str(executable), "download", request.repo_id]
+        argv.extend([
             "--repo-type",
             request.repo_type,
             "--revision",
@@ -484,11 +493,19 @@ class ToolJobHandlers:
             str(destination),
             "--max-workers",
             str(request.max_workers),
-        ]
+        ])
         if request.include:
-            argv.extend(["--include", *request.include])
+            if self.paths.internal_modelscope:
+                for pattern in request.include:
+                    argv.extend(["--include", pattern])
+            else:
+                argv.extend(["--include", *request.include])
         if request.exclude:
-            argv.extend(["--exclude", *request.exclude])
+            if self.paths.internal_modelscope:
+                for pattern in request.exclude:
+                    argv.extend(["--exclude", pattern])
+            else:
+                argv.extend(["--exclude", *request.exclude])
         env = self._environment(direct=request.direct)
         await context.progress(0.01, message="Starting ModelScope download")
         await self._run(context, argv, env=env)
@@ -507,11 +524,18 @@ class ToolJobHandlers:
         request = HuggingFaceDownloadPayload.model_validate(payload)
         destination = self._output(request.destination, directory=True)
         self._preflight_download(destination, request.expected_bytes)
-        executable = self._required_executable(self.paths.huggingface, "Hugging Face")
-        argv = [
-            str(executable),
-            "download",
-            request.repo_id,
+        if self.paths.internal_huggingface:
+            argv = self._mfq_command(
+                "_hub-download",
+                "--provider",
+                "huggingface",
+                "--repo-id",
+                request.repo_id,
+            )
+        else:
+            executable = self._required_executable(self.paths.huggingface, "Hugging Face")
+            argv = [str(executable), "download", request.repo_id]
+        argv.extend([
             "--repo-type",
             request.repo_type,
             "--revision",
@@ -520,7 +544,7 @@ class ToolJobHandlers:
             str(destination),
             "--max-workers",
             str(request.max_workers),
-        ]
+        ])
         for pattern in request.include:
             argv.extend(["--include", pattern])
         for pattern in request.exclude:

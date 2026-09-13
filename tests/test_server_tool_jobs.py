@@ -373,6 +373,51 @@ def test_download_argv_does_not_execute_shell_metacharacters(tmp_path: Path) -> 
     asyncio.run(run())
 
 
+def test_packaged_download_reinvokes_the_unified_cli(tmp_path: Path) -> None:
+    async def run() -> None:
+        cli = _executable(
+            tmp_path / "mfq-cli",
+            """\
+            #!/usr/bin/env python3
+            import pathlib, sys
+            assert sys.argv[1:6] == [
+                '_hub-download', '--provider', 'modelscope', '--repo-id', 'owner/model'
+            ]
+            root = pathlib.Path(sys.argv[sys.argv.index('--local-dir') + 1])
+            root.mkdir(parents=True, exist_ok=True)
+            (root / 'config.json').write_text('{}')
+            """,
+        )
+        handlers = ToolJobHandlers(
+            ModelCatalog([]),
+            ToolJobPaths(
+                work_root=tmp_path,
+                python=cli,
+                modelscope=None,
+                huggingface=None,
+                runtime=None,
+                perplexity=None,
+                standalone_cli=True,
+                internal_modelscope=True,
+            ),
+        )
+        store = SessionStore(tmp_path / "jobs.sqlite3")
+        manager = JobManager(store, handlers.handlers())
+        assert "download.modelscope" in {item.kind for item in manager.kinds().data}
+        submitted = await manager.submit(
+            CreateJobRequest(
+                kind="download.modelscope",
+                payload={"repo_id": "owner/model", "destination": "models/owner/model"},
+            )
+        )
+        result = await _wait(store, submitted.id)
+        assert result.status == JobStatus.SUCCEEDED
+        assert result.result["files"] == 1
+        await manager.close()
+
+    asyncio.run(run())
+
+
 def test_perplexity_job_parses_result_and_publishes_logits(tmp_path: Path) -> None:
     async def run() -> None:
         model_dir = tmp_path / "models"

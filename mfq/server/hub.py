@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import os
-from datetime import datetime
 from typing import Literal
 
 import httpx
@@ -121,28 +120,29 @@ class HubCatalog:
     @staticmethod
     def _info_modelscope(repo_id: str, revision: str | None) -> HubModelInfo:
         try:
-            from modelscope.hub.api import HubApi
+            from modelscope_hub import HubApi
 
             api = HubApi()
-            model = api.get_model(repo_id, revision=revision)
+            model = api.get_repo(repo_id, "model", revision=revision)
             files = [
                 HubModelFile(
-                    name=item.get("Name") or item.get("Path") or "file",
-                    byte_size=int(item.get("Size") or 0),
+                    name=item.path,
+                    byte_size=int(item.size or 0),
                 )
-                for item in api.get_model_files(repo_id, revision=revision) or []
+                for item in api.list_repo_files(
+                    repo_id, "model", revision=revision, recursive=True
+                )
             ]
-            updated = model.get("LastUpdatedTime") if isinstance(model, dict) else None
             return HubModelInfo(
                 provider="modelscope",
-                repo_id=repo_id,
+                repo_id=model.id,
                 revision=revision or "master",
-                downloads=int(model.get("Downloads") or 0) if isinstance(model, dict) else 0,
-                likes=int(model.get("Likes") or 0) if isinstance(model, dict) else 0,
+                downloads=int(model.downloads or 0),
+                likes=int(model.likes or 0),
                 total_bytes=sum(item.byte_size for item in files),
-                updated_at=datetime.fromisoformat(updated) if updated else None,
+                updated_at=model.last_modified,
                 files=files,
-                tags=list(model.get("Tags") or []) if isinstance(model, dict) else [],
+                tags=list(model.tags or []),
             )
         except Exception as error:
             raise HubError(str(error)) from error

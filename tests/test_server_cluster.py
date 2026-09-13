@@ -532,3 +532,49 @@ def test_cluster_bounds_control_and_media_requests(tmp_path: Path) -> None:
         await client.aclose()
 
     asyncio.run(run())
+
+
+def test_cluster_close_serializes_with_refresh_and_is_idempotent(
+    tmp_path: Path,
+) -> None:
+    async def run() -> None:
+        probe_started = asyncio.Event()
+        release_probe = asyncio.Event()
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/health":
+                probe_started.set()
+                await release_probe.wait()
+                return httpx.Response(200)
+            if request.url.path == "/v1/models":
+                return httpx.Response(200, json={"data": [{"id": "remote-model"}]})
+            if request.url.path == "/api/v1/runtime/status":
+                return httpx.Response(200, json={})
+            return httpx.Response(404)
+
+        store = SessionStore(tmp_path / "mfq.server.sqlite3")
+        store.create_remote_node(
+            CreateRemoteNodeRequest(name="worker-a", url="http://worker-a:8090")
+        )
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        local = FakeBackend()
+        cluster = ClusterBackend(local, store, client=client)
+
+        refresh = asyncio.create_task(cluster.nodes(force=True))
+        await probe_started.wait()
+        close = asyncio.create_task(cluster.aclose())
+        await asyncio.sleep(0)
+        assert not close.done()
+        release_probe.set()
+        [node] = await refresh
+        assert node.models == ["remote-model"]
+        await close
+        await cluster.aclose()
+
+        with pytest.raises(BackendError) as closed:
+            await cluster.nodes()
+        assert closed.value.code == "backend_closed"
+        assert closed.value.status_code == 503
+        await client.aclose()
+
+    asyncio.run(run())

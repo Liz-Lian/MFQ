@@ -88,6 +88,7 @@ class ClusterBackend:
         self._sessions: dict[tuple[UUID, UUID], _RemoteSession] = {}
         self._lock = asyncio.Lock()
         self._refresh_lock = asyncio.Lock()
+        self._closed = False
 
     @staticmethod
     def _headers(node: RemoteNodeResource) -> dict[str, str]:
@@ -103,6 +104,13 @@ class ClusterBackend:
 
     async def refresh(self, *, force: bool = False) -> list[RemoteNodeResource]:
         async with self._refresh_lock:
+            async with self._lock:
+                if self._closed:
+                    raise BackendError(
+                        "backend_closed",
+                        "cluster backend is closed",
+                        status_code=503,
+                    )
             resources = await asyncio.to_thread(self.store.list_remote_nodes)
             configured = {item.id for item in resources}
             retired: list[RemoteNodeResource] = []
@@ -917,13 +925,17 @@ class ClusterBackend:
         return self.local.realtime_connect(mode=mode)
 
     async def aclose(self) -> None:
-        async with self._lock:
-            nodes = [state.resource for state in self._states.values()]
-        await asyncio.gather(
-            *(self._release_node_sessions(node) for node in nodes)
-        )
-        async with self._lock:
-            self._sessions.clear()
-        await self.local.aclose()
-        if self._owns_client:
-            await self._client.aclose()
+        async with self._refresh_lock:
+            async with self._lock:
+                if self._closed:
+                    return
+                self._closed = True
+                nodes = [state.resource for state in self._states.values()]
+            await asyncio.gather(
+                *(self._release_node_sessions(node) for node in nodes)
+            )
+            async with self._lock:
+                self._sessions.clear()
+            await self.local.aclose()
+            if self._owns_client:
+                await self._client.aclose()

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import socket
+import struct
 import subprocess
 import time
 import urllib.error
@@ -13,6 +14,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
+from mfq.architectures.tensor_schema import graph_spec_for_source_names
 from mfq.compat.legacy_model_graph import legacy_model_graph
 from mfq.formats.assets import (
     HF_TOKENIZER_CONFIG_ASSET,
@@ -40,7 +42,6 @@ class RuntimeRoute:
     architecture_family: str
     backbone: str = ""
     python_mlx_worker: bool = False
-    requires_mfq: bool = False
     vision_available: bool = False
 
 
@@ -48,7 +49,6 @@ class RuntimeRoute:
 class _RuntimeImplementationRegistration:
     backbone: str
     python_mlx_worker: bool = False
-    python_mlx_requires_mfq: bool = False
 
 
 _RUNTIME_IMPLEMENTATION_REGISTRY = (
@@ -61,7 +61,6 @@ _RUNTIME_IMPLEMENTATION_REGISTRY = (
     _RuntimeImplementationRegistration(
         backbone="glm5_next",
         python_mlx_worker=True,
-        python_mlx_requires_mfq=True,
     ),
 )
 
@@ -85,6 +84,37 @@ def _runtime_implementation(
 
 def _runtime_graph(architecture: str, model: str | Path) -> dict[str, object] | None:
     model_path = Path(model).expanduser().resolve()
+    if model_path.is_dir():
+        try:
+            config = json.loads((model_path / "config.json").read_text(encoding="utf-8"))
+            if not isinstance(config, dict):
+                return None
+            index_path = model_path / "model.safetensors.index.json"
+            if index_path.is_file():
+                index = json.loads(index_path.read_text(encoding="utf-8"))
+                weight_map = index.get("weight_map") if isinstance(index, dict) else None
+                if not isinstance(weight_map, dict) or not weight_map:
+                    return None
+                source_names = tuple(str(name) for name in weight_map)
+            else:
+                names: list[str] = []
+                for shard in sorted(model_path.glob("*.safetensors")):
+                    with shard.open("rb") as stream:
+                        raw_size = stream.read(8)
+                        if len(raw_size) != 8:
+                            return None
+                        size = struct.unpack("<Q", raw_size)[0]
+                        header = json.loads(stream.read(size))
+                    if not isinstance(header, dict):
+                        return None
+                    names.extend(
+                        str(name) for name in header if name != "__metadata__"
+                    )
+                source_names = tuple(names)
+            spec = graph_spec_for_source_names(config, source_names)
+            return None if spec is None else spec.as_dict()
+        except (OSError, TypeError, ValueError, KeyError, json.JSONDecodeError):
+            return None
     if not model_path.is_file():
         return None
     try:
@@ -132,10 +162,6 @@ def resolve_runtime_route(architecture: str, model: str | Path) -> RuntimeRoute:
         architecture_family=family,
         backbone=backbone,
         python_mlx_worker=registration.python_mlx_worker,
-        requires_mfq=(
-            registration.python_mlx_worker
-            and registration.python_mlx_requires_mfq
-        ),
         vision_available="vision" in component_kinds,
     )
 
@@ -155,7 +181,7 @@ def python_mlx_runtime_command(
     return [
         *(str(value) for value in controller_command),
         "_flash-next-worker",
-        "--mfq",
+        "--model",
         str(model),
         "--host",
         host,
@@ -190,9 +216,11 @@ def native_runtime_environment(
     base: Mapping[str, str] | None = None,
     model: str | Path | None = None,
 ) -> dict[str, str]:
-    """Return a worker environment with relocatable Metal resources resolved."""
+    """Return source assets plus any backend-specific runtime resources."""
 
     environment = dict(os.environ if base is None else base)
+    if model is not None:
+        environment.update(native_hf_asset_environment(model))
     if backend != "metal":
         return environment
     if not environment.get("MFQ_MLX_METALLIB"):
@@ -206,8 +234,6 @@ def native_runtime_environment(
         )
         if video_library is not None:
             environment["MFQ_AVFOUNDATION_VIDEO_LIBRARY"] = str(video_library)
-    if model is not None:
-        environment.update(native_hf_asset_environment(model))
     return environment
 
 

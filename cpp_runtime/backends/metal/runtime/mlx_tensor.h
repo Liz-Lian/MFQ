@@ -3,6 +3,7 @@
 #include "mfq_container.h"
 #include "mlx_tpq.h"
 #include "mlx_grouped_linear.h"
+#include "mlx_fp8_sq.h"
 #include "mlx_mx.h"
 #include "mlx_mxfp4_sq.h"
 #include "mlx_nint.h"
@@ -41,6 +42,7 @@ public:
     explicit MlxLinear(MlxVqWeight weight);
     explicit MlxLinear(MlxTpqInt4Weight weight);
     explicit MlxLinear(MlxTpqPqWeight weight);
+    explicit MlxLinear(MlxFp8SqWeight weight);
     explicit MlxLinear(MlxMxWeight weight);
     explicit MlxLinear(MlxMxfp4SqWeight weight);
     explicit MlxLinear(mlx::core::array weight);
@@ -52,7 +54,7 @@ public:
     std::optional<mlx::core::array> greedy_argmax(
         const mlx::core::array& input) const;
 
-    // DeepSeek-V4 O-LoRA layout:
+    // Diagonal grouped-projection layout:
     // input [...,groups,K] -> [...,groups,OUT/groups].
     // TPQ-I4G64 uses its dedicated Metal kernel; every other supported
     // linear format takes the exact packed/dense fallback without changing
@@ -86,6 +88,7 @@ private:
         MlxVqWeight,
         MlxTpqInt4Weight,
         MlxTpqPqWeight,
+        MlxFp8SqWeight,
         MlxMxWeight,
         MlxMxfp4SqWeight,
         mlx::core::array> weight_;

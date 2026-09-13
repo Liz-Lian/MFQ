@@ -1,6 +1,7 @@
 #include "mlx_ssd_expert_cache.h"
 
 #include "mfe_expert_store.h"
+#include "mlx_eval_timing.h"
 
 #include <algorithm>
 #include <array>
@@ -26,6 +27,23 @@ namespace {
 std::uint64_t expert_key(std::size_t layer, std::int32_t expert) {
     return (static_cast<std::uint64_t>(layer) << 32u) |
         static_cast<std::uint32_t>(expert);
+}
+
+std::size_t prefill_slot_count(
+    bool requested,
+    std::size_t cache_bytes,
+    std::size_t slot_bytes,
+    std::size_t maximum_experts) noexcept {
+    if (!requested || slot_bytes == 0 ||
+        maximum_experts >
+            (std::numeric_limits<std::size_t>::max() - 6) / 2) {
+        return 0;
+    }
+    const auto prefill_slots = 2 * maximum_experts;
+    const auto minimum_slots = prefill_slots + 6;
+    return cache_bytes / slot_bytes >= minimum_slots
+        ? prefill_slots
+        : 0;
 }
 
 } // namespace
@@ -124,7 +142,11 @@ struct MlxMoeSsdExpertCache::Impl {
               hidden_size,
               intermediate_size),
           slot_bytes(store.slot_bytes()),
-          prefill_slots(overlap ? 2 * store.max_num_experts() : 0),
+          prefill_slots(prefill_slot_count(
+              overlap,
+              bytes,
+              slot_bytes,
+              store.max_num_experts())),
           total_slots(bytes / slot_bytes),
           slot_count(total_slots > prefill_slots
               ? total_slots - prefill_slots
@@ -1050,6 +1072,30 @@ MlxSsdPreparedExperts::slot_for_expert() const noexcept {
     return slot_for_expert_;
 }
 
+MlxSsdPreparedRoutes::MlxSsdPreparedRoutes(
+    MlxSsdPreparedExperts experts,
+    mlx::core::array expert_ids)
+    : experts_(std::move(experts)),
+      expert_ids_(std::move(expert_ids)) {}
+
+MlxSsdPreparedRoutes::MlxSsdPreparedRoutes(
+    MlxSsdPreparedRoutes&&) noexcept = default;
+
+MlxSsdPreparedRoutes& MlxSsdPreparedRoutes::operator=(
+    MlxSsdPreparedRoutes&&) noexcept = default;
+
+MlxSsdPreparedRoutes::~MlxSsdPreparedRoutes() = default;
+
+const MlxSsdExpertWeights&
+MlxSsdPreparedRoutes::weights() const noexcept {
+    return experts_.weights();
+}
+
+const mlx::core::array&
+MlxSsdPreparedRoutes::expert_ids() const noexcept {
+    return expert_ids_;
+}
+
 MlxSsdExpertPageTableSnapshot::MlxSsdExpertPageTableSnapshot(
     std::unique_ptr<Impl> impl)
     : impl_(std::move(impl)) {}
@@ -1299,6 +1345,47 @@ MlxSsdPreparedExperts MlxMoeSsdExpertCache::prepare(
         impl_->release(acquisitions);
         throw;
     }
+}
+
+MlxSsdPreparedRoutes MlxMoeSsdExpertCache::prepare_routes(
+    std::size_t layer,
+    const mlx::core::array& expert_ids) {
+    if (expert_ids.size() == 0) {
+        throw std::invalid_argument(
+            "SSD expert route batch cannot be empty");
+    }
+    auto host_ids = mlx::core::contiguous(
+        expert_ids.dtype() == mlx::core::int32
+            ? expert_ids
+            : mlx::core::astype(expert_ids, mlx::core::int32));
+    detail::eval_with_timing(host_ids);
+    std::vector<std::int32_t> active(
+        host_ids.data<std::int32_t>(),
+        host_ids.data<std::int32_t>() + host_ids.size());
+    active.erase(
+        std::remove_if(
+            active.begin(),
+            active.end(),
+            [](std::int32_t expert) { return expert < 0; }),
+        active.end());
+    std::sort(active.begin(), active.end());
+    active.erase(std::unique(active.begin(), active.end()), active.end());
+    auto prepared = prepare(layer, active);
+    const auto slots = prepared.slot_for_expert();
+    std::vector<std::int32_t> resident_ids(host_ids.size(), -1);
+    for (std::size_t index = 0; index < resident_ids.size(); ++index) {
+        const auto expert = host_ids.data<std::int32_t>()[index];
+        if (expert >= 0) {
+            if (static_cast<std::size_t>(expert) >= slots.size()) {
+                throw std::out_of_range(
+                    "SSD expert route ID is out of range");
+            }
+            resident_ids[index] = slots[static_cast<std::size_t>(expert)];
+        }
+    }
+    return MlxSsdPreparedRoutes(
+        std::move(prepared),
+        mlx::core::array(resident_ids.begin(), expert_ids.shape()));
 }
 
 MlxSsdExpertPageTableSnapshot

@@ -17,6 +17,7 @@ from pathlib import Path
 
 import numpy as np
 
+from mfq.formats.compat import NINT_DTYPE, canonical_dtype
 from mfq.formats.header import FileHeader, MFQ_MAGIC
 from mfq.formats.io import (
     _MFE_HDR,
@@ -573,7 +574,7 @@ def _write_upgraded_routed_stream(
         handle.write(runtime)
         handle.write(payload)
         del payload, tensor
-    dtype_bytes = selected_family.encode("ascii")
+    dtype_bytes = NINT_DTYPE.encode("ascii")
     handle.write(
         _MFE_POOL_HDR.pack(
             len(selected_ids),
@@ -625,7 +626,7 @@ def _write_header(handle, header: FileHeader, records: list[tuple[str, str, int]
     handle.write(_u32(len(records)))
     for name, dtype, nbytes in records:
         nb = name.encode("utf-8")
-        db = dtype.encode("utf-8")
+        db = canonical_dtype(dtype).encode("utf-8")
         handle.write(_u32(len(nb)))
         handle.write(nb)
         handle.write(_u32(len(db)))

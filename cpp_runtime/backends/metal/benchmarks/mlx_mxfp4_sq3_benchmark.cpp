@@ -1,5 +1,5 @@
 #include "mlx_mx.h"
-#include "mlx_mxfp4_sq3.h"
+#include "mlx_mxfp4_sq.h"
 
 #include <algorithm>
 #include <chrono>
@@ -19,7 +19,7 @@
 namespace {
 
 using Clock = std::chrono::steady_clock;
-using mfq::metal::MlxMxfp4Sq3Weight;
+using mfq::metal::MlxMxfp4SqWeight;
 using mfq::metal::MlxMxWeight;
 using mlx::core::array;
 using mlx::core::Shape;
@@ -207,7 +207,7 @@ Measurement measure(Operation &&operation, int warmup, int repetitions) {
   return {elapsed, checksum, maximum};
 }
 
-void verify_exact_weights(const MlxMxfp4Sq3Weight &sq3,
+void verify_exact_weights(const MlxMxfp4SqWeight &sq3,
                           const MlxMxWeight &native) {
   auto sq3_dense = mlx::core::contiguous(
       mlx::core::astype(sq3.dequantize(), mlx::core::float32));
@@ -221,7 +221,7 @@ void verify_exact_weights(const MlxMxfp4Sq3Weight &sq3,
   }
 }
 
-void verify_matmul(const MlxMxfp4Sq3Weight &sq3, const MlxMxWeight &native,
+void verify_matmul(const MlxMxfp4SqWeight &sq3, const MlxMxWeight &native,
                    const array &input, int rows) {
   auto sq3_output = mlx::core::contiguous(
       mlx::core::astype(sq3.matmul(input), mlx::core::float32));
@@ -277,7 +277,7 @@ int main(int argc, char **argv) {
     constexpr int rows = 4096;
     constexpr int columns = 4096;
     auto encoded = make_pair(rows, columns);
-    const auto sq3 = MlxMxfp4Sq3Weight::from_blob(encoded.sq3_blob);
+    const auto sq3 = MlxMxfp4SqWeight::from_blob(encoded.sq3_blob);
     const auto native = MlxMxWeight::from_blob("MXFP4", encoded.mxfp4_blob);
     const auto input = make_input(columns);
 

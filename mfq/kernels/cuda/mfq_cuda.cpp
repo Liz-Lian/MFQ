@@ -7,6 +7,7 @@
 #include <torch/extension.h>
 #include <vector>
 #include <optional>
+#include "fp8_sq.h"
 #include "mxfp4_sq.h"
 #include "flash_next.h"
 
@@ -90,8 +91,12 @@ torch::Tensor mfe_nint_matmul_ws_cuda(
     torch::Tensor neuron_min, torch::Tensor x, torch::Tensor ids,
     torch::Tensor expert_local, int64_t n_experts,
     int64_t n_local_experts, int64_t out_per_expert, int64_t gs,
-    bool input_quantized, torch::Tensor out, torch::Tensor qx,
-    torch::Tensor xscale);
+    int64_t epilogue_mode, bool route_map_ready, bool input_quantized,
+    torch::Tensor out, torch::Tensor qx, torch::Tensor xscale,
+    torch::Tensor ids_dst,
+    torch::Tensor expert_bounds, torch::Tensor tile_bounds,
+    torch::Tensor tile_experts, int64_t route_tile_m,
+    int64_t pool_phase);
 torch::Tensor nint8_zero_moe_grouped_matmul_pool_ws_cuda(
     torch::Tensor q, torch::Tensor scale, torch::Tensor x,
     torch::Tensor ids, torch::Tensor expert_local, int64_t n_experts,
@@ -100,7 +105,7 @@ torch::Tensor nint8_zero_moe_grouped_matmul_pool_ws_cuda(
     torch::Tensor qx, torch::Tensor xscale, torch::Tensor counts,
     torch::Tensor cursors, torch::Tensor ids_dst,
     torch::Tensor expert_bounds, torch::Tensor tile_bounds,
-    torch::Tensor tile_experts);
+    torch::Tensor tile_experts, int64_t route_tile_m);
 torch::Tensor moe_weighted_reduce_cuda(torch::Tensor pair_output, torch::Tensor weights);
 torch::Tensor moe_swiglu_split_cuda(torch::Tensor gate_up);
 torch::Tensor moe_geglu_split_cuda(torch::Tensor gate_up);
@@ -141,12 +146,25 @@ torch::Tensor nint_matmul_ws_cuda(
     torch::Tensor sub_min, torch::Tensor neuron_scale,
     torch::Tensor neuron_min, torch::Tensor x, int64_t gs,
     torch::Tensor qx, torch::Tensor xscale);
+torch::Tensor nint_matmul_input_mul_ws_cuda(
+    torch::Tensor q_packed, torch::Tensor row_q_bits,
+    torch::Tensor row_q_bit_offsets, torch::Tensor sub_scale,
+    torch::Tensor sub_min, torch::Tensor neuron_scale,
+    torch::Tensor neuron_min, torch::Tensor x, torch::Tensor gate,
+    int64_t activation_mode, int64_t gs,
+    torch::Tensor qx, torch::Tensor xscale);
 torch::Tensor nint_cublas_gemm_nt_f16acc_cuda(torch::Tensor x, torch::Tensor w);
 torch::Tensor nint_decode_cuda(
     torch::Tensor q_packed, torch::Tensor row_q_bits,
     torch::Tensor row_q_bit_offsets, torch::Tensor sub_scale,
     torch::Tensor sub_min, torch::Tensor neuron_scale,
     torch::Tensor neuron_min, int64_t neuron_len, int64_t gs);
+torch::Tensor nint_backward_input_cuda(
+    torch::Tensor q_packed, torch::Tensor row_q_bits,
+    torch::Tensor row_q_bit_offsets, torch::Tensor sub_scale,
+    torch::Tensor sub_min, torch::Tensor neuron_scale,
+    torch::Tensor neuron_min, torch::Tensor output_gradient,
+    int64_t neuron_len, int64_t gs);
 torch::Tensor nint8_zero_mmq_f16_packed_cuda(
     torch::Tensor q, torch::Tensor scale, torch::Tensor x,
     int64_t neuron_len);
@@ -493,10 +511,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("nint_matmul_ws_cuda",
           &nint_matmul_ws_cuda,
           "Canonical NINT matmul with caller workspace (CUDA)");
+    m.def("nint_matmul_input_mul_ws_cuda",
+          &nint_matmul_input_mul_ws_cuda,
+          "Canonical NINT matmul with fused input gate quantization (CUDA)");
     m.def("nint_cublas_gemm_nt_f16acc_cuda", &nint_cublas_gemm_nt_f16acc_cuda, "llama.cpp-style cuBLAS fp16-accumulate GEMM y=x*w.T (CUDA)");
     m.def("nint_decode_cuda",
           &nint_decode_cuda,
           "Canonical NINT full row decode (CUDA)");
+    m.def("nint_backward_input_cuda",
+          &nint_backward_input_cuda,
+          "Canonical metadata-driven NINT packed input backward (CUDA)");
     m.def("nint8_zero_mmq_f16_packed_cuda",
           &nint8_zero_mmq_f16_packed_cuda,
           "Common packed NINT8-0 FP16 Tensor-Core MMQ with FP32 accumulation (CUDA)");
@@ -525,11 +549,29 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("mxfp4_dequant_cuda", &mxfp4_dequant_cuda,
           "MXFP4 full dequantization (CUDA)");
     m.def("mxfp4_sq_dequant_cuda", &mxfp4_sq_dequant_cuda,
-          "Frozen SQ2/SQ3 packed dequantization (CUDA)");
+          "Per-neuron SQ1/SQ2/SQ3/SQ4 packed dequantization (CUDA)");
     m.def("mxfp4_sq_matmul_cuda", &mxfp4_sq_matmul_cuda,
-          "Frozen SQ2/SQ3 packed matmul (CUDA)");
+          "Per-neuron SQ1/SQ2/SQ3/SQ4 packed matmul (CUDA)");
     m.def("mxfp4_sq_backward_input_cuda", &mxfp4_sq_backward_input_cuda,
-          "Frozen SQ2/SQ3 packed input backward (CUDA)");
+          "Per-neuron SQ1/SQ2/SQ3/SQ4 packed input backward (CUDA)");
+    m.def("mxfp4_sq_moe_matmul_cuda", &mxfp4_sq_moe_matmul_cuda,
+          "Per-neuron SQ1/SQ2/SQ3/SQ4 routed cohort matmul (CUDA)");
+    m.def("mxfp8_sq_dequant_cuda", &mxfp8_sq_dequant_cuda,
+          "MXFP8-SQ packed dequantization (CUDA)");
+    m.def("fp8_128_sq_dequant_cuda", &fp8_128_sq_dequant_cuda,
+          "FP8-128SQ packed dequantization (CUDA)");
+    m.def("mxfp8_sq_matmul_cuda", &mxfp8_sq_matmul_cuda,
+          "MXFP8-SQ packed matmul (CUDA)");
+    m.def("fp8_128_sq_matmul_cuda", &fp8_128_sq_matmul_cuda,
+          "FP8-128SQ packed matmul (CUDA)");
+    m.def("mxfp8_sq_backward_input_cuda", &mxfp8_sq_backward_input_cuda,
+          "MXFP8-SQ packed linear input backward (CUDA)");
+    m.def("fp8_128_sq_backward_input_cuda", &fp8_128_sq_backward_input_cuda,
+          "FP8-128SQ packed linear input backward (CUDA)");
+    m.def("mxfp8_sq_moe_matmul_cuda", &mxfp8_sq_moe_matmul_cuda,
+          "MXFP8-SQ routed cohort matmul (CUDA)");
+    m.def("fp8_128_sq_moe_matmul_cuda", &fp8_128_sq_moe_matmul_cuda,
+          "FP8-128SQ routed cohort matmul (CUDA)");
     m.def("mxfp4_embedding_lookup_cuda", &mxfp4_embedding_lookup_cuda,
           "MXFP4 selected-row embedding decode (CUDA)");
     m.def("mxfp4_matmul_f16_cuda", &mxfp4_matmul_f16_cuda,

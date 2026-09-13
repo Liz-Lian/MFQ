@@ -62,9 +62,9 @@ from mfq.runtime.torch_linear import TorchNintLinear
 from mfq.formats.io import unpack_mfe
 from mfq.quantize.expert_nint import dequantize_expertwise
 from mfq.tools.quantize_hf_to_mfq import (
-    _nint_moe_blob_nbytes,
+    _mfe_nint_blob_nbytes,
     _plan,
-    _write_nint_moe_axis0_blob,
+    _write_mfe_nint_axis0_blob,
 )
 
 
@@ -813,7 +813,7 @@ def test_expertwise_scheme_roundtrip_plan_and_stream_writer(tmp_path: Path) -> N
     assert plan[0].expert_specs == specs
 
     blob_path = tmp_path / "expert.blob"
-    nbytes = _write_nint_moe_axis0_blob(
+    nbytes = _write_mfe_nint_axis0_blob(
         weight,
         shape,
         shape,
@@ -824,9 +824,18 @@ def test_expertwise_scheme_roundtrip_plan_and_stream_writer(tmp_path: Path) -> N
         device="cpu",
     )
     tensor = unpack_mfe(blob_path.read_bytes())
-    assert nbytes == _nint_moe_blob_nbytes(shape, specs)
+    assert nbytes == _mfe_nint_blob_nbytes(shape, specs)
     assert tensor.expert_profiles == ("NINT",) * len(specs)
-    assert tuple(pool.tensor.spec for pool in tensor.pools) == tuple(dict.fromkeys(specs))
+    assert len(tensor.pools) == 1
+    np.testing.assert_array_equal(tensor.pools[0].expert_ids, [0, 1, 2, 3])
+    np.testing.assert_array_equal(
+        tensor.pools[0].tensor.row_q_bits.reshape(4, 3)[:, 0],
+        [4, 6, 4, 6],
+    )
+    np.testing.assert_array_equal(
+        tensor.pools[0].tensor.row_sub_bits.reshape(4, 3)[:, 0],
+        [6, 7, 6, 7],
+    )
     assert dequantize_expertwise(tensor).shape == shape
 
 

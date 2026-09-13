@@ -24,6 +24,7 @@ from mfq.quantize.expert_nint import (
     quantize_flat_cohort,
 )
 from mfq.quantize.nint_quant import quantize as quantize_nint
+from mfq.quantize.mxfp4_sq import write_mxfp4_sq_blob
 from mfq.quantize.npq0_l import Npq0LTables
 from mfq.quantize.npq0_s import Npq0STables
 from mfq.quantize.nvq_jsc import NvqJscTables
@@ -283,11 +284,84 @@ def test_mixed_moe_preserves_native_mxfp4_bytes(tmp_path):
     np.testing.assert_array_equal(pool.scales, scales.reshape(-1, 1))
 
 
-def test_synthetic_mixed_moe_writer_covers_all_runtime_families(tmp_path):
-    shape = (9, 2, 96)
-    precisions = _parse_expert_mix_profiles(
-        "NINT2,NINT3,NINT4,NINT5,NINT6,NINT8,NVQ2J,NVQ3J,MXFP4"
+def test_mixed_moe_writer_supports_nint8_zero_pool(tmp_path):
+    rng = np.random.default_rng(20260912)
+    shape = (2, 3, 96)
+    weight = rng.normal(0, 0.04, shape).astype(np.float32)
+    precisions = (
+        ExpertPrecision("NINT4", nint_spec=NintSpec(4, 24, 6)),
+        ExpertPrecision("NINT8-0"),
     )
+    path = tmp_path / "mixed-nint8-zero.blob"
+
+    nbytes = _write_mixed_moe_axis0_blob(
+        weight,
+        shape,
+        shape,
+        precisions,
+        path,
+        row_chunk=8,
+        quant_backend="cpu",
+        device="cpu",
+        artifact_root=tmp_path,
+    )
+
+    assert nbytes == _mixed_moe_blob_nbytes(shape, precisions, tmp_path)
+    restored = io.unpack_mfe(path.read_bytes())
+    assert restored.expert_profiles == ("NINT", "NINT8-0")
+    assert np.isfinite(dequantize_expertwise(restored)).all()
+    assert io.pack_mfe(restored) == path.read_bytes()
+
+
+@pytest.mark.parametrize("q", (1, 2, 3, 4))
+def test_mixed_moe_quantizes_native_mxfp4_with_uniform_q(tmp_path, q):
+    shape = (2, 3, 64)
+    rng = np.random.default_rng(20260911 + q)
+    values = rng.integers(0, 256, size=(2, 3, 32), dtype=np.uint8)
+    scales = rng.integers(119, 123, size=(2, 3, 2), dtype=np.uint8)
+
+    class ExactMxSource:
+        def write_mxfp4_sq_expert_pool(self, expert, path, *, q):
+            return write_mxfp4_sq_blob(
+                path,
+                values[int(expert)],
+                scales[int(expert)],
+                row_q_bits=q,
+            )
+
+    precision = ExpertPrecision("MXFP4-SQ", options=(("q", q),))
+    precisions = (precision,) * shape[0]
+    path = tmp_path / f"mixed-mxfp4-sq{q}.blob"
+    nbytes = _write_mixed_moe_axis0_blob(
+        ExactMxSource(),
+        shape,
+        shape,
+        precisions,
+        path,
+        row_chunk=3,
+        quant_backend="cpu",
+        device="cpu",
+        artifact_root=None,
+    )
+
+    assert nbytes == _mixed_moe_blob_nbytes(shape, precisions, None)
+    restored = io.unpack_mfe(path.read_bytes())
+    assert restored.expert_profiles == ("MXFP4-SQ", "MXFP4-SQ")
+    assert len(restored.pools) == 2
+    for expert, pool in enumerate(restored.pools):
+        assert pool.expert_ids.tolist() == [expert]
+        assert pool.tensor.row_q_bits == (q,) * shape[1]
+        if q == 4:
+            # The standalone quantizer tests verify the exact native rows;
+            # this path checks that MFE retains the same lossless endpoint.
+            assert pool.tensor.format_version == 2
+
+
+def test_synthetic_mixed_moe_writer_covers_all_runtime_families(tmp_path):
+    precisions = _parse_expert_mix_profiles(
+        "NINT2,NINT3,NINT4,NINT5,NINT6,NINT8,NINT8-0,NVQ2J,NVQ3J,MXFP4"
+    )
+    shape = (len(precisions), 2, 96)
 
     class NoReadSource:
         def read_rows(self, *_args, **_kwargs):
@@ -316,6 +390,7 @@ def test_synthetic_mixed_moe_writer_covers_all_runtime_families(tmp_path):
         "NINT",
         "NINT",
         "NINT",
+        "NINT8-0",
         "NVQ2J",
         "NVQ3J",
         "MXFP4",
@@ -381,6 +456,7 @@ def test_streaming_writer_builds_all_precision_families(
         )
     restored = io.unpack_mfe(path.read_bytes())
     assert nbytes == path.stat().st_size
+    assert len(restored.pools) == len(expert_precisions) - 1
     assert restored.expert_profiles == (
         "NINT",
         "NINT",

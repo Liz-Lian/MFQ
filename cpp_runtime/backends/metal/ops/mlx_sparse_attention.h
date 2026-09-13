@@ -6,6 +6,15 @@
 
 namespace mfq::metal {
 
+// Exact FP32 top-512 selection adapted from DeepSelect. The operator and its
+// device/shape policy are model-neutral; architecture adapters only provide
+// score tensors and valid-key counts.
+mlx::core::array mlx_deepselect_topk512(
+    const mlx::core::array& scores,
+    const std::optional<mlx::core::array>& valid_keys = std::nullopt);
+
+bool mlx_deepselect_topk512_preferred(int width, int rows) noexcept;
+
 // Common selected-block sparse-attention seam for Metal runtimes. Model
 // adapters own index construction and cache semantics; this operator owns the
 // direct indexed GQA execution. Blocks identify fixed-width, chronological

@@ -18,6 +18,7 @@ import numpy as np
 import torch
 from safetensors import safe_open
 
+from mfq.formats.compat import canonical_dtype
 from mfq.formats.tpq import (
     TpqPqSpec,
     tpq_int4_payload_nbytes,
@@ -1147,7 +1148,7 @@ def _write_mfq(
         output.write(_u32(len(records)))
         for record in records:
             encoded_name = record.name.encode("utf-8")
-            encoded_dtype = record.dtype.encode("ascii")
+            encoded_dtype = canonical_dtype(record.dtype).encode("ascii")
             output.write(_u32(len(encoded_name)))
             output.write(encoded_name)
             output.write(_u32(len(encoded_dtype)))

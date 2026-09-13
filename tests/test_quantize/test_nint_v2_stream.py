@@ -16,6 +16,7 @@ from mfq.quantize.nint import (
     profile_variable_bits,
 )
 from mfq.tools.quantize_hf_to_mfq import _write_nint_axis0_blob
+from mfq.tools.quantize_hf_to_mfq import _uniform_nint_pool_plans
 
 
 def test_stream_writer_packs_mixed_neuron_metadata_across_chunk_boundaries(tmp_path):
@@ -111,3 +112,22 @@ def test_data_free_stream_writer_matches_uniform_encoded_bit_budget(tmp_path):
     # The q/k selectors are format metadata, not part of the encoded-weight
     # bitrate constraint.  They may make the physical blob a few bytes larger.
     assert mixed_size <= uniform_size + 32
+
+
+def test_uniform_mfe_pool_planner_only_coalesces_runtime_compatible_nint():
+    plans = _uniform_nint_pool_plans(
+        (
+            NintSpec(4, 24, 5),
+            NintSpec(6, 24, 8),
+            NintSpec(3, 28, 5),
+            NintSpec(5, 24, 1),
+        ),
+        rows_per_expert=3,
+    )
+
+    assert tuple(plan.expert_ids for plan in plans) == ((0, 1), (2,), (3,))
+    np.testing.assert_array_equal(plans[0].row_q_bits, [4, 4, 4, 6, 6, 6])
+    np.testing.assert_array_equal(plans[0].row_sub_bits, [5, 5, 5, 8, 8, 8])
+    assert plans[0].spec.groupsize == 24
+    assert plans[1].spec.groupsize == 28
+    assert plans[2].spec.groupsize == 24

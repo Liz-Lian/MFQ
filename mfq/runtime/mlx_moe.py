@@ -15,7 +15,7 @@ except ModuleNotFoundError as exc:  # pragma: no cover - optional dependency
     ) from exc
 
 from mfq.formats.mfe import MfeTensor
-from mfq.formats.mx import MXFP4_DTYPE, MxTensor
+from mfq.formats.mx import MX_DTYPES, MxTensor
 from mfq.formats.nepq import NepqTensor
 from mfq.formats.nint import NintTensor
 from mfq.formats.nint8_zero import Nint8ZeroTensor
@@ -165,7 +165,7 @@ class MlxRoutedLinear:
             if all_tpq:
                 self.grouped_weight = MetalTpqMoeWeight.from_tensor(tensor)
             elif not has_tpq:
-                with suppress(UnsupportedGroupedMoeError):
+                with suppress(UnsupportedGroupedMoeError, TypeError):
                     self.grouped_weight = MetalMoeWeight.from_tensor(tensor)
         if self.grouped_weight is not None:
             self.pools = ()
@@ -185,11 +185,11 @@ class MlxRoutedLinear:
                 weight = MetalVqWeight.from_tensor(source)
             elif isinstance(source, TpqPqTensor):
                 weight = MetalTpqPqWeight.from_tensor(source)
-            elif isinstance(source, MxTensor) and source.dtype == MXFP4_DTYPE:
+            elif isinstance(source, MxTensor) and source.dtype in MX_DTYPES:
                 weight = MetalMxWeight.from_tensor(source)
             else:
                 raise TypeError(
-                    "Metal MFE supports NINT/NVQ/NPQ/NEPQ/TPQ/MXFP4 cohorts; "
+                    "Metal MFE supports NINT/NVQ/NPQ/NEPQ/TPQ/MX cohorts; "
                     f"received {type(source).__name__}"
                 )
             expert_ids = np.ascontiguousarray(pool.expert_ids, dtype=np.int32)

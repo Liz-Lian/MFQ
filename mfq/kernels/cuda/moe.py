@@ -39,7 +39,7 @@ class NintExpertPool:
 
 @dataclass
 class CompactExpertPool:
-    """One native NINT, NVQ/NPQ, or NEPQ execution cohort."""
+    """One native compact-format execution cohort."""
 
     family: str
     weight: dict
@@ -160,7 +160,17 @@ class ExpertWiseMixedWeight:
             raise ValueError("expert-wise mixed weight must contain at least one pool")
         owners = [-1] * self.n_experts
         for pool_index, pool in enumerate(self.pools):
-            if pool.family not in {"nint", "nint8_zero", "nvq", "nepq", "mxfp4", "tpq"}:
+            if pool.family not in {
+                "nint",
+                "nint8_zero",
+                "nvq",
+                "nepq",
+                "mxfp4",
+                "mxfp4_sq",
+                "mxfp8_sq",
+                "fp8_128_sq",
+                "tpq",
+            }:
                 raise ValueError(f"unsupported expert cohort family: {pool.family}")
             if not pool.expert_ids:
                 raise ValueError("expert-wise mixed pool cannot be empty")
@@ -253,18 +263,33 @@ class MoeRoutePlan:
             raise ValueError("ids must have [tokens, routes] shape")
         ids = ids.contiguous().to(device=ids.device, dtype=torch.int32)
         if int(ids.shape[0]) > 8:
-            use_coarse_mma = ids.numel() >= 8192
-            mapped = (
-                ext().moe_build_expert_maps_cuda(ids, int(n_experts), 8, 64, 128)
-                if use_coarse_mma
-                else ext().moe_build_expert_map_cuda(ids, int(n_experts), 8)
+            rows_per_expert = max(
+                1, (ids.numel() + int(n_experts) - 1) // int(n_experts)
             )
+            use_coarse_mma = rows_per_expert >= 4
+            mma_tile_m = (
+                16 if rows_per_expert <= 16 else 32 if rows_per_expert <= 32 else 64
+            )
+            if not use_coarse_mma:
+                mapped = ext().moe_build_expert_map_cuda(ids, int(n_experts), 8)
+            elif rows_per_expert > 64:
+                mapped = ext().moe_build_expert_maps_cuda(
+                    ids, int(n_experts), 8, mma_tile_m, 128
+                )
+            else:
+                mapped = ext().moe_build_expert_maps_cuda(
+                    ids, int(n_experts), 8, mma_tile_m
+                )
             ids_dst, expert_bounds, tile_bounds, tile_experts, counts = mapped[:5]
             if use_coarse_mma:
                 mma_tile_bounds, mma_tile_experts = mapped[5:7]
-                mma_tile_m = 64
-                wide_tile_bounds, wide_tile_experts = mapped[7:9]
-                wide_tile_m = 128
+                if rows_per_expert > 64:
+                    wide_tile_bounds, wide_tile_experts = mapped[7:9]
+                    wide_tile_m = 128
+                else:
+                    wide_tile_bounds = mma_tile_bounds
+                    wide_tile_experts = mma_tile_experts
+                    wide_tile_m = mma_tile_m
             else:
                 mma_tile_bounds = tile_bounds
                 mma_tile_experts = tile_experts
@@ -303,6 +328,20 @@ class MoeRoutePlan:
             counts=counts,
             cursors=cursors,
         )
+
+
+def _nint_prefill_route_tiles(
+    route: MoeRoutePlan,
+) -> tuple[torch.Tensor, torch.Tensor, int]:
+    pairs = route.tokens * route.routes
+    rows_per_expert = max(1, (pairs + route.n_experts - 1) // route.n_experts)
+    if rows_per_expert < 4:
+        return route.tile_bounds, route.tile_experts, 8
+    if rows_per_expert > 64 and route.wide_tile_m == 128:
+        return route.wide_tile_bounds, route.wide_tile_experts, 128
+    if route.mma_tile_m in (16, 32, 64):
+        return route.mma_tile_bounds, route.mma_tile_experts, route.mma_tile_m
+    return route.tile_bounds, route.tile_experts, 8
 
 
 def topk(
@@ -405,9 +444,71 @@ def _grouped_matmul_mixed(
     input_rows = route.tokens * route.routes if x.ndim == 3 else route.tokens
     prepared_inputs: dict[tuple, torch.Tensor] = {("identity",): x}
     quantized: set[tuple] = set()
+    nint_pool_phase = 0
     for pool in weight.pools:
         g = pool.weight
         expert_local = pool.local_map(weight.n_experts, x.device)
+        if pool.family == "mxfp4_sq":
+            ext().mxfp4_sq_moe_matmul_cuda(
+                g["blob"],
+                g["row_q"],
+                g["row_symbol_byte_offsets"],
+                g["row_auxiliary"],
+                x,
+                route.ids,
+                expert_local,
+                int(g["bits"]),
+                weight.n_experts,
+                len(pool.expert_ids),
+                weight.out_per_expert,
+                weight.neuron_len,
+                int(g["matrix_scale_base"]),
+                int(g["q_sum"]),
+                int(g["sq4_rows"]),
+                out,
+            )
+            continue
+        if pool.family == "mxfp8_sq":
+            ext().mxfp8_sq_moe_matmul_cuda(
+                g["blob"],
+                g["row_q"],
+                g["row_symbol_byte_offsets"],
+                x,
+                route.ids,
+                expert_local,
+                weight.n_experts,
+                len(pool.expert_ids),
+                weight.out_per_expert,
+                weight.neuron_len,
+                int(g["block_rows"]),
+                int(g["block_columns"]),
+                int(g["scale_rows"]),
+                int(g["scale_columns"]),
+                int(g["palettes_offset"]),
+                int(g["symbols_offset"]),
+                int(g["scales_offset"]),
+                out,
+            )
+            continue
+        if pool.family == "fp8_128_sq":
+            ext().fp8_128_sq_moe_matmul_cuda(
+                g["blob"],
+                g["row_q"],
+                g["row_symbol_byte_offsets"],
+                x,
+                route.ids,
+                expert_local,
+                weight.n_experts,
+                len(pool.expert_ids),
+                weight.out_per_expert,
+                weight.neuron_len,
+                int(g["scale_kind"]),
+                int(g["palettes_offset"]),
+                int(g["symbols_offset"]),
+                int(g["scales_offset"]),
+                out,
+            )
+            continue
         if pool.family == "mxfp4":
             ext().mxfp4_moe_grouped_matmul_pool_f16_cuda(
                 g["values"],
@@ -470,7 +571,11 @@ def _grouped_matmul_mixed(
             transform_key=transform_key,
         )
         input_quantized = activation_key in quantized
+        activation_quantized_after_call = True
         if pool.family == "nint":
+            nint_tile_bounds, nint_tile_experts, nint_tile_m = (
+                _nint_prefill_route_tiles(route)
+            )
             ext().mfe_nint_matmul_ws_cuda(
                 g["q_packed"],
                 g["row_q_bits"],
@@ -486,11 +591,21 @@ def _grouped_matmul_mixed(
                 len(pool.expert_ids),
                 weight.out_per_expert,
                 gs,
+                0,
+                route.map_ready,
                 input_quantized,
                 out,
                 qx,
                 xscale,
+                route.ids_dst,
+                route.expert_bounds,
+                nint_tile_bounds,
+                nint_tile_experts,
+                nint_tile_m,
+                nint_pool_phase,
             )
+            nint_pool_phase += 1
+            activation_quantized_after_call = input_quantized or nint_tile_m == 8
         elif pool.family == "nint8_zero":
             ext().nint8_zero_moe_grouped_matmul_pool_ws_cuda(
                 g["q"],
@@ -513,6 +628,7 @@ def _grouped_matmul_mixed(
                 route.expert_bounds,
                 route.tile_bounds,
                 route.tile_experts,
+                8,
             )
         elif pool.family == "nvq":
             nvq_grouped_matmul_pool(
@@ -539,7 +655,8 @@ def _grouped_matmul_mixed(
                 input_quantized=input_quantized,
                 input_prepared=True,
             )
-        quantized.add(activation_key)
+        if activation_quantized_after_call:
+            quantized.add(activation_key)
     return out
 
 
@@ -578,6 +695,10 @@ def grouped_matmul(
 
     input_rows = route.tokens * route.routes if x.ndim == 3 else route.tokens
     quantized_groups: set[tuple[int, int]] = set()
+    nint_tile_bounds, nint_tile_experts, nint_tile_m = (
+        _nint_prefill_route_tiles(route)
+    )
+    nint_pool_phase = 0
     for pool in weight.pools:
         g = pool.weight
         gs = int(g["gs"])
@@ -599,12 +720,22 @@ def grouped_matmul(
             len(pool.expert_ids),
             weight.out_per_expert,
             gs,
+            0,
+            route.map_ready,
             key in quantized_groups,
             out,
             qx,
             xscale,
+            route.ids_dst,
+            route.expert_bounds,
+            nint_tile_bounds,
+            nint_tile_experts,
+            nint_tile_m,
+            nint_pool_phase,
         )
-        quantized_groups.add(key)
+        nint_pool_phase += 1
+        if key in quantized_groups or nint_tile_m == 8:
+            quantized_groups.add(key)
     return out
 
 
@@ -706,13 +837,85 @@ def pools_from_groups(groups: Iterable[tuple[dict, Iterable[int]]]) -> tuple[Nin
     return tuple(NintExpertPool(weight, tuple(int(v) for v in ids)) for weight, ids in groups)
 
 
+def _payload_tensor(payload: bytes, device: str | torch.device) -> torch.Tensor:
+    return torch.frombuffer(bytearray(payload), dtype=torch.uint8).to(
+        device=device,
+        non_blocking=True,
+    ).contiguous()
+
+
+def _to_gpu_mxfp4_sq(tensor, device: str | torch.device) -> dict:
+    from mfq.formats.mxfp4_sq import pack_mxfp4_sq, unpack_mxfp4_sq
+
+    payload = pack_mxfp4_sq(tensor)
+    parsed = unpack_mxfp4_sq(payload)
+    row_q = tuple(int(value) for value in parsed.row_q_bits)
+    symbol_offsets: list[int] = []
+    auxiliary_rows: list[int] = []
+    symbol_offset = 0
+    sq_row = 0
+    native_row = 0
+    for q in row_q:
+        symbol_offsets.append(symbol_offset)
+        symbol_offset += int(parsed.input_size) * q // 8
+        if q == 4:
+            auxiliary_rows.append(native_row)
+            native_row += 1
+        else:
+            auxiliary_rows.append(sq_row)
+            sq_row += 1
+    return {
+        "blob": _payload_tensor(payload, device),
+        "row_q": torch.tensor(row_q, dtype=torch.uint8, device=device),
+        "row_symbol_byte_offsets": torch.tensor(
+            symbol_offsets, dtype=torch.int32, device=device
+        ),
+        "row_auxiliary": torch.tensor(
+            auxiliary_rows, dtype=torch.int32, device=device
+        ),
+        "bits": int(parsed.bits),
+        "out": int(parsed.output_size),
+        "neuron_len": int(parsed.input_size),
+        "matrix_scale_base": int(parsed.matrix_scale_base),
+        "q_sum": sum(row_q),
+        "sq4_rows": native_row,
+    }
+
+
+def _to_gpu_fp8_sq(tensor, device: str | torch.device) -> dict:
+    from mfq.formats.fp8_sq import parse_fp8_sq_layout
+
+    layout = parse_fp8_sq_layout(tensor.dtype, tensor.payload)
+    return {
+        "blob": _payload_tensor(tensor.payload, device),
+        "row_q": torch.tensor(layout.row_q_bits, dtype=torch.uint8, device=device),
+        "row_symbol_byte_offsets": torch.tensor(
+            layout.row_symbol_byte_offsets, dtype=torch.int32, device=device
+        ),
+        "out": int(layout.shape[0]),
+        "neuron_len": int(layout.shape[1]),
+        "block_rows": int(layout.block_shape[0]),
+        "block_columns": int(layout.block_shape[1]),
+        "scale_rows": int(layout.scale_shape[0]),
+        "scale_columns": int(layout.scale_shape[1]),
+        "scale_kind": {"F8_E8M0": 1, "BF16": 2, "F16": 3, "F32": 4}[
+            layout.scale_dtype
+        ],
+        "palettes_offset": int(layout.palettes_offset),
+        "symbols_offset": int(layout.symbols_offset),
+        "scales_offset": int(layout.scales_offset),
+    }
+
+
 def to_gpu(
     tensor, device: str | torch.device = "cuda"
 ) -> ExpertWiseNintWeight | ExpertWiseMixedWeight:
     """Upload an :class:`MfeTensor` as native execution cohorts."""
 
     from mfq.formats.mfe import MfeTensor
+    from mfq.formats.fp8_sq import Fp8_128SqTensor, Mxfp8SqTensor
     from mfq.formats.mx import MxTensor
+    from mfq.formats.mxfp4_sq import Mxfp4SqTensor
     from mfq.formats.nepq import NepqTensor
     from mfq.formats.nint import NintTensor
     from mfq.formats.nint8_zero import Nint8ZeroTensor
@@ -758,6 +961,15 @@ def to_gpu(
                 raise ValueError("MFE CUDA execution supports MXFP4 expert pools")
             family = "mxfp4"
             packed = to_gpu_mx(pool.tensor, device=device)
+        elif isinstance(pool.tensor, Mxfp4SqTensor):
+            family = "mxfp4_sq"
+            packed = _to_gpu_mxfp4_sq(pool.tensor, device)
+        elif isinstance(pool.tensor, Mxfp8SqTensor):
+            family = "mxfp8_sq"
+            packed = _to_gpu_fp8_sq(pool.tensor, device)
+        elif isinstance(pool.tensor, Fp8_128SqTensor):
+            family = "fp8_128_sq"
+            packed = _to_gpu_fp8_sq(pool.tensor, device)
         elif isinstance(pool.tensor, TpqPqTensor):
             family = "tpq"
             packed = to_gpu_tpq(pool.tensor, device=device)

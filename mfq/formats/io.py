@@ -55,8 +55,10 @@ import numpy as np
 
 from mfq.formats.assets import ASSET_DTYPE
 from mfq.formats.compat import (
+    FP8_128SQ_DTYPE,
     MFE_DTYPE,
     MXFP4_SQ_DTYPE,
+    MXFP8_SQ_DTYPE,
     NEPQ_DTYPE,
     NINT_DTYPE,
     NPQ_DTYPE,
@@ -64,8 +66,14 @@ from mfq.formats.compat import (
     canonical_dtype,
     is_nint_dtype,
 )
+from mfq.formats.fp8_sq import (
+    Fp8_128SqTensor,
+    Mxfp8SqTensor,
+    pack_fp8_sq,
+    unpack_fp8_sq,
+)
 from mfq.formats.header import MFQ_MAGIC, FileHeader
-from mfq.formats.mfe import MfePool, MfeTensor
+from mfq.formats.mfe import MfePool, MfeTensor, merge_mxfp4_sq_pools
 from mfq.formats.mx import MX_DTYPES, MxTensor, pack_mx, unpack_mx
 from mfq.formats.mxfp4_sq import (
     Mxfp4SqTensor,
@@ -119,6 +127,8 @@ MfqTensor: TypeAlias = (
     | TpqInt4Tensor
     | MxTensor
     | Mxfp4SqTensor
+    | Mxfp8SqTensor
+    | Fp8_128SqTensor
     | np.ndarray
     | bytes
 )
@@ -723,19 +733,24 @@ def _validate_mfe_runtime(tensor: MfqTensor, payload: bytes) -> None:
 
 
 def pack_mfe(tensor: MfeTensor) -> bytes:
-    """Pack heterogeneous expert cohorts without changing local row order."""
+    """Pack heterogeneous experts, coalescing compatible adaptive cohorts."""
 
     n_experts, out_per_expert, neuron_len = tensor.shape
+    pools = merge_mxfp4_sq_pools(
+        tensor.pools,
+        out_per_expert=out_per_expert,
+        neuron_len=neuron_len,
+    )
     parts = [
         _MFE_HDR.pack(
             _MFE_MAGIC,
             int(n_experts),
             int(out_per_expert),
             int(neuron_len),
-            len(tensor.pools),
+            len(pools),
         )
     ]
-    for pool in tensor.pools:
+    for pool in pools:
         expert_ids = np.ascontiguousarray(pool.expert_ids, dtype=np.int32).reshape(-1)
         dtype, payload = _pack_tensor(pool.tensor, allow_moe=False)
         runtime_payload = _pack_mfe_runtime(pool.tensor)
@@ -949,6 +964,8 @@ def _unpack_tensor(dtype: str, blob: bytes | memoryview) -> MfqTensor:
         return unpack_nepq(blob)
     if dtype == MXFP4_SQ_DTYPE:
         return unpack_mxfp4_sq(blob)
+    if dtype in {MXFP8_SQ_DTYPE, FP8_128SQ_DTYPE}:
+        return unpack_fp8_sq(dtype, blob)
     if dtype == NINT_DTYPE:
         return unpack_nint(blob)
     magic = bytes(memoryview(blob)[:4])
@@ -990,6 +1007,8 @@ def _pack_tensor(tensor: MfqTensor, *, allow_moe: bool = True) -> tuple[str, byt
         return tensor.dtype, pack_mx(tensor)
     if isinstance(tensor, Mxfp4SqTensor):
         return MXFP4_SQ_DTYPE, pack_mxfp4_sq(tensor)
+    if isinstance(tensor, (Mxfp8SqTensor, Fp8_128SqTensor)):
+        return tensor.dtype, pack_fp8_sq(tensor)
     if isinstance(tensor, Nint8ZeroTensor):
         return "NINT8-0", pack_nint8_zero(tensor)
     if isinstance(tensor, TpqInt4Tensor):

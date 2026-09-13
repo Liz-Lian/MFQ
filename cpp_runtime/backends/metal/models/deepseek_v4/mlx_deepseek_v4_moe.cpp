@@ -2,17 +2,12 @@
 
 #include "mlx_eval_timing.h"
 #include "mlx_moe_ops.h"
-#include "mlx_deepseek_v4_hf_ssd_expert_arena.h"
-
-#include <mlx/memory.h>
 
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
-#include <future>
-#include <iostream>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -26,55 +21,6 @@ namespace {
 
 using mlx::core::Shape;
 using mlx::core::array;
-
-MlxDeepseekV4SsdExpertWeights load_resident_hf_experts(
-    const MlxHfTensorStore& model,
-    const DeepseekV4Config& config,
-    const std::string& prefix) {
-    const auto count = static_cast<std::size_t>(config.n_experts);
-    MlxNativeMxfp4ExpertStore store(
-        model.shared_checkpoint(),
-        std::vector<std::string>{prefix},
-        count,
-        static_cast<std::size_t>(config.hidden),
-        static_cast<std::size_t>(config.moe_inter),
-        [&model](std::string_view canonical) {
-            return model.stored_name(canonical);
-        });
-    MlxDeepseekV4SsdExpertArena arena(
-        count,
-        static_cast<std::size_t>(config.hidden),
-        static_cast<std::size_t>(config.moe_inter));
-    std::vector<MlxNativeMxfp4ExpertDestination> destinations;
-    destinations.reserve(count);
-    for (std::size_t expert = 0; expert < count; ++expert) {
-        destinations.push_back(arena.destination(expert));
-    }
-    const auto workers = std::min<std::size_t>(8, count);
-    std::vector<std::future<void>> reads;
-    reads.reserve(workers);
-    for (std::size_t worker = 0; worker < workers; ++worker) {
-        reads.push_back(std::async(std::launch::async, [&, worker] {
-            for (std::size_t expert = worker;
-                 expert < count;
-                 expert += workers) {
-                store.load_scatter(0, expert, destinations[expert]);
-            }
-        }));
-    }
-    for (auto& read : reads) {
-        read.get();
-    }
-    std::cout
-        << "Resident HF experts: " << prefix
-        << " experts=" << count
-        << " bytes=" << arena.nbytes()
-        << " mlx_active_bytes=" << mlx::core::get_active_memory()
-        << " mlx_cache_bytes=" << mlx::core::get_cache_memory()
-        << std::endl;
-    // The returned MLX arrays retain the four arena bank allocations.
-    return arena.slot_weights();
-}
 
 double current_thread_cpu_seconds() noexcept {
     timespec value{};
@@ -264,7 +210,9 @@ MlxDeepseekV4Moe MlxDeepseekV4Moe::load(
     std::size_t layer,
     const std::optional<array>& available,
     std::shared_ptr<MlxMfeOffloadCache>
-        offload) {
+        offload,
+    std::shared_ptr<MlxMoeSsdExpertCache>
+        ssd_expert_cache) {
     config.validate();
     if (layer >=
         static_cast<std::size_t>(config.n_layers)) {
@@ -318,6 +266,33 @@ MlxDeepseekV4Moe MlxDeepseekV4Moe::load(
             std::to_string(layer));
     }
     const bool split_gate_up = has_split_gate;
+    if (ssd_expert_cache) {
+        if (!split_gate_up) {
+            throw std::runtime_error(
+                "SSD MXFP4 experts require canonical split Gate/Up records");
+        }
+        return MlxDeepseekV4Moe(
+            config,
+            MlxLinear::load(model, name("mlp.router.weight")),
+            MlxLinear::load(model, name("mlp.shared_expert.gate.weight")),
+            MlxLinear::load(model, name("mlp.shared_expert.up.weight")),
+            MlxLinear::load(model, name("mlp.shared_expert.down.weight")),
+            std::nullopt,
+            std::nullopt,
+            std::nullopt,
+            std::nullopt,
+            nullptr,
+            std::move(ssd_expert_cache),
+            layer,
+            {},
+            {},
+            {},
+            {},
+            std::move(router_bias),
+            std::move(token_experts),
+            available,
+            std::move(visual_router_bias));
+    }
     std::vector<std::string> routed_names =
         split_gate_up
         ? std::vector<std::string>{
@@ -527,7 +502,8 @@ MlxDeepseekV4Moe MlxDeepseekV4Moe::load_named(
     const std::string& prefix,
     const std::optional<array>& available,
     std::shared_ptr<MlxMfeOffloadCache> offload,
-    std::size_t expert_cache_layer) {
+    std::size_t expert_cache_layer,
+    std::shared_ptr<MlxMoeSsdExpertCache> ssd_expert_cache) {
     config.validate();
     if (prefix.empty()) {
         throw std::invalid_argument(
@@ -544,6 +520,39 @@ MlxDeepseekV4Moe MlxDeepseekV4Moe::load_named(
     if (split != model.contains(up_name)) {
         throw std::runtime_error(
             "DeepSeek-V4 named MoE has an incomplete split Gate/Up pair");
+    }
+    if (ssd_expert_cache) {
+        if (!split) {
+            throw std::runtime_error(
+                "SSD MXFP4 experts require canonical split Gate/Up records");
+        }
+        std::optional<array> visual_bias;
+        if (config.has_vision() &&
+            model.contains(name("mlp.router.vision_bias"))) {
+            visual_bias = load_dense(
+                model, name("mlp.router.vision_bias"), mlx::core::float32);
+        }
+        return MlxDeepseekV4Moe(
+            config,
+            MlxLinear::load(model, name("mlp.router.weight")),
+            MlxLinear::load(model, name("mlp.shared_expert.gate.weight")),
+            MlxLinear::load(model, name("mlp.shared_expert.up.weight")),
+            MlxLinear::load(model, name("mlp.shared_expert.down.weight")),
+            std::nullopt,
+            std::nullopt,
+            std::nullopt,
+            std::nullopt,
+            nullptr,
+            std::move(ssd_expert_cache),
+            expert_cache_layer,
+            {},
+            {},
+            {},
+            {},
+            load_dense(model, name("mlp.router.bias"), mlx::core::float32),
+            std::nullopt,
+            available,
+            std::move(visual_bias));
     }
     const std::vector<std::string> routed_names = split
         ? std::vector<std::string>{gate_name, up_name, down_name}
@@ -649,115 +658,6 @@ MlxDeepseekV4Moe MlxDeepseekV4Moe::load_named(
         std::move(visual_bias));
 }
 
-MlxDeepseekV4Moe MlxDeepseekV4Moe::load_named(
-    const MlxHfTensorStore& model,
-    const DeepseekV4Config& config,
-    const std::string& prefix,
-    std::shared_ptr<MlxDeepseekV4SsdExpertCache> expert_cache,
-    std::size_t expert_cache_layer,
-    const std::optional<array>& available) {
-    config.validate();
-    if (prefix.empty()) {
-        throw std::invalid_argument(
-            "DeepSeek-V4 named HF MoE requires a prefix");
-    }
-    const auto name = [&prefix](std::string_view suffix) {
-        return prefix + "." + std::string(suffix);
-    };
-    std::optional<array> visual_bias;
-    const auto visual_name = name("mlp.router.vision_bias");
-    if (config.has_vision()) {
-        visual_bias = model.load_dense(visual_name);
-    }
-    std::optional<MlxRoutedLinear> resident_gate_up;
-    std::optional<MlxRoutedLinear> resident_down;
-    if (!expert_cache) {
-        auto weights = load_resident_hf_experts(model, config, prefix);
-        resident_gate_up.emplace(std::move(weights.gate_up));
-        resident_down.emplace(std::move(weights.down));
-    }
-    return MlxDeepseekV4Moe(
-        config,
-        model.load_linear(name("mlp.router.weight")),
-        model.load_linear(name("mlp.shared_expert.gate.weight")),
-        model.load_linear(name("mlp.shared_expert.up.weight")),
-        model.load_linear(name("mlp.shared_expert.down.weight")),
-        std::move(resident_gate_up),
-        std::nullopt,
-        std::nullopt,
-        std::move(resident_down),
-        nullptr,
-        std::move(expert_cache),
-        expert_cache_layer,
-        {},
-        {},
-        {},
-        {},
-        model.load_dense(name("mlp.router.bias")),
-        std::nullopt,
-        available,
-        std::move(visual_bias));
-}
-
-MlxDeepseekV4Moe MlxDeepseekV4Moe::load(
-    const MlxHfTensorStore& model,
-    const DeepseekV4Config& config,
-    std::size_t layer,
-    std::shared_ptr<MlxDeepseekV4SsdExpertCache>
-        expert_cache,
-    const std::optional<array>& available) {
-    config.validate();
-    if (layer >= static_cast<std::size_t>(config.n_layers)) {
-        throw std::out_of_range(
-            "DeepSeek-V4 HF MoE layer index is out of range");
-    }
-    const auto name = [layer](std::string_view suffix) {
-        return DeepseekV4TensorNames::layer(layer, suffix);
-    };
-    std::optional<array> router_bias;
-    std::optional<array> token_experts;
-    std::optional<array> visual_router_bias;
-    if (layer < static_cast<std::size_t>(config.n_hash_layers)) {
-        token_experts = model.load_dense(name("mlp.router.token_to_expert"));
-    } else {
-        router_bias = model.load_dense(name("mlp.router.bias"));
-    }
-    if (config.has_vision()) {
-        visual_router_bias = model.load_dense(name("mlp.router.vision_bias"));
-    }
-    std::optional<MlxRoutedLinear> resident_gate_up;
-    std::optional<MlxRoutedLinear> resident_down;
-    if (!expert_cache) {
-        auto weights = load_resident_hf_experts(
-            model,
-            config,
-            "model.block." + std::to_string(layer));
-        resident_gate_up.emplace(std::move(weights.gate_up));
-        resident_down.emplace(std::move(weights.down));
-    }
-    return MlxDeepseekV4Moe(
-        config,
-        model.load_linear(name("mlp.router.weight")),
-        model.load_linear(name("mlp.shared_expert.gate.weight")),
-        model.load_linear(name("mlp.shared_expert.up.weight")),
-        model.load_linear(name("mlp.shared_expert.down.weight")),
-        std::move(resident_gate_up),
-        std::nullopt,
-        std::nullopt,
-        std::move(resident_down),
-        nullptr,
-        std::move(expert_cache),
-        layer,
-        {},
-        {},
-        {},
-        {},
-        std::move(router_bias),
-        std::move(token_experts),
-        available,
-        std::move(visual_router_bias));
-}
-
 MlxDeepseekV4Moe::MlxDeepseekV4Moe(
     DeepseekV4Config config,
     MlxLinear router,
@@ -810,7 +710,7 @@ MlxDeepseekV4Moe::MlxDeepseekV4Moe(
         routed_down,
     std::shared_ptr<MlxMfeOffloadCache>
         expert_offload,
-    std::shared_ptr<MlxDeepseekV4SsdExpertCache>
+    std::shared_ptr<MlxMoeSsdExpertCache>
         ssd_expert_cache,
     std::size_t layer,
     std::string streamed_gate_up_name,
@@ -893,13 +793,13 @@ MlxDeepseekV4Moe::MlxDeepseekV4Moe(
     const bool full_resident =
         routed_down_.has_value()
         && (combined_resident != split_resident);
-    const bool legacy_streamed =
+    const bool mfe_streamed =
         static_cast<bool>(expert_offload_);
     const bool ssd_streamed =
         static_cast<bool>(ssd_expert_cache_);
     const int residency_modes =
         static_cast<int>(full_resident)
-        + static_cast<int>(legacy_streamed)
+        + static_cast<int>(mfe_streamed)
         + static_cast<int>(ssd_streamed);
     if (
         routed_down_.has_value()
@@ -948,7 +848,7 @@ MlxDeepseekV4Moe::MlxDeepseekV4Moe(
                 "DeepSeek-V4 MoE routed component "
                 "dimensions mismatch");
         }
-    } else if (legacy_streamed) {
+    } else if (mfe_streamed) {
         const bool split_streamed =
             !streamed_gate_name_.empty()
             || !streamed_up_name_.empty();
@@ -1002,17 +902,26 @@ MlxDeepseekV4Moe::MlxDeepseekV4Moe(
                 "DeepSeek-V4 streamed routed component "
                 "dimensions mismatch");
         }
+        legacy_tpq_stream_ =
+            expert_offload_->is_legacy_tpq(streamed_down_name_);
+        const auto same_stream_family = [&](const std::string& name) {
+            return expert_offload_->is_legacy_tpq(name)
+                == legacy_tpq_stream_;
+        };
+        const bool stream_family_matches = split_streamed
+            ? same_stream_family(streamed_gate_name_)
+                && same_stream_family(streamed_up_name_)
+            : same_stream_family(streamed_gate_up_name_);
+        if (!stream_family_matches) {
+            throw std::invalid_argument(
+                "DeepSeek-V4 cannot mix legacy TPQ and native MFE "
+                "within one routed projection set");
+        }
     } else {
-        // The SSD store and arena are parameterized by the checkpoint's
-        // geometry. Keep the alignment and layer-bound checks here without
-        // pinning the path to the legacy V4F 4096/2048/256 dimensions.
-        if (config_.hidden <= 0 || config_.hidden % 32 != 0 ||
-            config_.moe_inter <= 0 || config_.moe_inter % 32 != 0 ||
-            config_.n_experts <= 0 ||
-            layer_ >= static_cast<std::size_t>(
+        if (layer_ >= static_cast<std::size_t>(
                 config_.n_layers + config_.n_mtp_layers)) {
             throw std::invalid_argument(
-                "DeepSeek-V4 SSD expert geometry is incompatible");
+                "SSD expert cache layer index is out of range");
         }
     }
     const auto router_scale =
@@ -1116,6 +1025,34 @@ MlxDeepseekV4Moe::MlxDeepseekV4Moe(
     }
 }
 
+int MlxDeepseekV4Moe::recommended_prefill_chunk_size() const noexcept {
+    if (expert_offload_ || ssd_expert_cache_ || !routed_down_) {
+        return 0;
+    }
+    int recommendation =
+        routed_down_->recommended_mxfp4_nax_prefill_tokens(
+            config_.top_k);
+    const auto include = [&](const auto& projection) {
+        if (!projection || recommendation <= 0) {
+            recommendation = 0;
+            return;
+        }
+        const int candidate =
+            projection->recommended_mxfp4_nax_prefill_tokens(
+                config_.top_k);
+        recommendation = candidate > 0
+            ? std::min(recommendation, candidate)
+            : 0;
+    };
+    if (routed_gate_up_) {
+        include(routed_gate_up_);
+    } else {
+        include(routed_gate_);
+        include(routed_up_);
+    }
+    return recommendation;
+}
+
 std::vector<array>
 MlxDeepseekV4Moe::project_shared(
     const array& input,
@@ -1194,7 +1131,7 @@ MlxDeepseekV4Moe::forward_branches(
     return forward_branches(input, token_ids, nullptr);
 }
 
-std::optional<MlxDeepseekV4SsdPrefetchedLayer>
+std::optional<MlxSsdPrefetchedExpertLayer>
 MlxDeepseekV4Moe::prefetch_routed(std::size_t rows) const {
     constexpr std::size_t kFullLayerPrefetchRows = 512;
     if (ssd_expert_cache_ && rows >= kFullLayerPrefetchRows &&
@@ -1208,7 +1145,7 @@ MlxDeepseekV4MoeBranches
 MlxDeepseekV4Moe::forward_branches(
     const array& input,
     const array& token_ids,
-    MlxDeepseekV4SsdPrefetchedLayer* prefetched) const {
+    MlxSsdPrefetchedExpertLayer* prefetched) const {
     const int hidden = checked_int(
         static_cast<std::size_t>(config_.hidden),
         "hidden width");
@@ -1259,23 +1196,18 @@ MlxDeepseekV4Moe::forward_branches(
         && !token_experts_.has_value()
         && !visual_router_bias_.has_value()
         && dense_router != nullptr
+        && config_.n_experts == 256
         && config_.top_k == 6
         && config_.norm_topk_prob
         && moe_dense_router_topk_supported(
             source,
             *dense_router);
-    std::optional<MlxDeepseekV4SsdPageTableSnapshot>
+    std::optional<MlxSsdExpertPageTableSnapshot>
         device_route_snapshot;
     const bool route_transaction =
         ssd_expert_cache_ &&
         ssd_expert_cache_->route_transaction_active();
-    // Packed device-route IDs currently reserve eight low bits for the
-    // global expert ID. V4.1 has 384 experts, so keep its fused router on the
-    // unpacked path until that wire format is widened.
-    const bool packed_device_route_supported =
-        config_.n_experts <= 256;
     if (ssd_expert_cache_ && prefetched == nullptr && rows == 1 &&
-        packed_device_route_supported &&
         (route_transaction || ssd_device_route_enabled()) &&
         (use_fused_dense_router || route_transaction)) {
         device_route_snapshot.emplace(
@@ -1944,7 +1876,7 @@ MlxDeepseekV4Moe::forward_branches(
                     rows,
                     this
                 ](
-                    const MlxDeepseekV4SsdExpertWeights& weights,
+                    const MlxSsdExpertWeights& weights,
                     std::span<const std::int32_t> ready_experts,
                     std::span<const std::int32_t> slot_for_expert) {
                     std::vector<array> overlap_values;
@@ -2011,7 +1943,7 @@ MlxDeepseekV4Moe::forward_branches(
                     rows,
                     this
                 ](
-                    const MlxDeepseekV4SsdExpertWeights& weights,
+                    const MlxSsdExpertWeights& weights,
                     std::span<const std::int32_t>,
                     std::span<const std::int32_t> slot_for_expert) {
                     if (rows != 1 || pending_positions.empty()) {
@@ -2193,45 +2125,84 @@ MlxDeepseekV4Moe::forward_branches(
                     expert_weights,
                     Shape{start, 0},
                     Shape{end, routes});
-            auto routed_hidden = [&]() {
-                if (!streamed_gate_name_.empty()) {
-                    auto gate_weight =
-                        expert_offload_->grouped(
-                            streamed_gate_name_,
-                            selected);
-                    auto up_weight =
-                        expert_offload_->grouped(
-                            streamed_up_name_,
-                            selected);
-                    return limited_swiglu_pair(
-                        gate_weight.routed_matmul(
-                            chunk_source,
-                            chunk_ids),
-                        up_weight.routed_matmul(
-                            chunk_source,
-                            chunk_ids),
-                        static_cast<float>(
-                            config_.swiglu_limit));
+            auto routed_pair = [&]() -> std::pair<array, array> {
+                if (legacy_tpq_stream_) {
+                    array routed_hidden = [&]() {
+                        if (!streamed_gate_name_.empty()) {
+                            auto gate_weight = expert_offload_->grouped(
+                                streamed_gate_name_, selected);
+                            auto up_weight = expert_offload_->grouped(
+                                streamed_up_name_, selected);
+                            return limited_swiglu_pair(
+                                gate_weight.routed_matmul(
+                                    chunk_source, chunk_ids),
+                                up_weight.routed_matmul(
+                                    chunk_source, chunk_ids),
+                                static_cast<float>(config_.swiglu_limit));
+                        }
+                        auto gate_weight = expert_offload_->grouped(
+                            streamed_gate_up_name_, selected);
+                        return moe_limited_swiglu_split(
+                            gate_weight.routed_matmul(
+                                chunk_source, chunk_ids),
+                            static_cast<float>(config_.swiglu_limit));
+                    }();
+                    auto down_weight = expert_offload_->grouped(
+                        streamed_down_name_, selected);
+                    auto down = down_weight.routed_matmul(
+                        routed_hidden, chunk_ids);
+                    return {
+                        std::move(routed_hidden),
+                        std::move(down),
+                    };
                 }
-                auto gate_weight =
-                    expert_offload_->grouped(
-                        streamed_gate_up_name_,
-                        selected);
-                return moe_limited_swiglu_split(
-                    gate_weight.routed_matmul(
+
+                std::vector<std::int32_t> global_to_local(
+                    static_cast<std::size_t>(config_.n_experts) + 1,
+                    -1);
+                for (std::size_t local = 0;
+                     local < selected.size();
+                     ++local) {
+                    global_to_local[
+                        static_cast<std::size_t>(selected[local]) + 1] =
+                            static_cast<std::int32_t>(local);
+                }
+                auto local_ids = mlx::core::take(
+                    array(
+                        global_to_local.begin(),
+                        Shape{static_cast<int>(global_to_local.size())}),
+                    chunk_ids + array(1, mlx::core::int32));
+                array routed_hidden = [&]() {
+                    if (!streamed_gate_name_.empty()) {
+                        auto gate_weight = expert_offload_->grouped_mfe(
+                            streamed_gate_name_, selected);
+                        auto up_weight = expert_offload_->grouped_mfe(
+                            streamed_up_name_, selected);
+                        return MlxMfeWeight::concatenate_projections({
+                            std::move(gate_weight),
+                            std::move(up_weight),
+                        }).routed_swiglu(
+                            chunk_source,
+                            local_ids,
+                            static_cast<float>(config_.swiglu_limit));
+                    }
+                    auto gate_weight = expert_offload_->grouped_mfe(
+                        streamed_gate_up_name_, selected);
+                    return gate_weight.routed_swiglu(
                         chunk_source,
-                        chunk_ids),
-                    static_cast<float>(
-                        config_.swiglu_limit));
+                        local_ids,
+                        static_cast<float>(config_.swiglu_limit));
+                }();
+                auto down_weight = expert_offload_->grouped_mfe(
+                    streamed_down_name_, selected);
+                auto down = down_weight.routed_matmul(
+                    routed_hidden, local_ids);
+                return {
+                    std::move(routed_hidden),
+                    std::move(down),
+                };
             }();
-            auto down_weight =
-                expert_offload_->grouped(
-                    streamed_down_name_,
-                    selected);
-            auto down =
-                down_weight.routed_matmul(
-                    routed_hidden,
-                    chunk_ids);
+            auto& down = routed_pair.second;
             auto chunk_output =
                 moe_weighted_reduce(
                     down,

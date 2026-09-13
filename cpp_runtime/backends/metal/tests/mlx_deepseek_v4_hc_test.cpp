@@ -1,4 +1,5 @@
 #include "mlx_deepseek_v4_hc.h"
+#include "mlx_deepseek_v41_mhc.h"
 #include "mlx_transformer.h"
 
 #include <algorithm>
@@ -625,34 +626,36 @@ void test_v41_hidden_width() {
     auto scale = mlx::core::ones({3}, mlx::core::float32);
     auto base = mlx::core::zeros({kMixWidth}, mlx::core::float32);
     auto norm = mlx::core::ones({hidden}, mlx::core::float32);
-    auto pre = mfq::metal::deepseek_v4_hc_pre_norm(
-        residual,
+    auto metadata = mfq::metal::deepseek_v41_hc_metadata_exact(
         mixes,
         scale,
         base,
-        norm,
         20,
-        kEps,
+        kEps);
+    auto reduced = mfq::metal::deepseek_v41_hc_collapse_norm(
+        residual,
+        metadata.pre,
+        norm,
         kEps);
     require(
-        pre.reduced.shape() == mlx::core::Shape{1, 1, hidden},
+        reduced.shape() == mlx::core::Shape{1, 1, hidden},
         "V4.1-width HC pre returned the wrong shape");
     require(
-        pre.reduced.dtype() == mlx::core::bfloat16 &&
-            pre.packed_metadata.has_value() && pre.pre.has_value(),
-        "V4.1-width HC pre lost BF16 packed output");
+        reduced.dtype() == mlx::core::bfloat16,
+        "V4.1-width HC collapse changed dtype");
     require_close(
-        evaluated_float(*pre.pre),
+        evaluated_float(metadata.pre),
         std::vector<float>(kConnections, 0.5f + kEps),
         2e-4f,
         "V4.1-width carried HC pre");
     auto branch = mlx::core::ones(
         {1, 1, hidden},
         mlx::core::bfloat16);
-    auto post = mfq::metal::deepseek_v4_hc_post_packed(
+    auto post = mfq::metal::deepseek_v41_hc_post(
         branch,
         residual,
-        *pre.packed_metadata);
+        metadata.post,
+        metadata.combination);
     require_close(
         evaluated_float(std::move(post)),
         std::vector<float>(
@@ -712,7 +715,7 @@ void test_v41_post_matches_generic_graph() {
     };
 
     require_close(
-        evaluated_float(mfq::metal::deepseek_v4_hc_post(
+        evaluated_float(mfq::metal::deepseek_v41_hc_post(
             branch_values,
             residual_values,
             post,
@@ -721,7 +724,7 @@ void test_v41_post_matches_generic_graph() {
         0.0f,
         "V4.1 HC post generic equivalence");
     require_close(
-        evaluated_float(mfq::metal::deepseek_v4_hc_post_sum(
+        evaluated_float(mfq::metal::deepseek_v41_hc_post_sum(
             branch_values,
             shared_values,
             residual_values,
@@ -790,7 +793,7 @@ void test_v41_post_matches_generic_graph() {
                 mlx::core::bfloat16);
         };
         require_close(
-            evaluated_float(mfq::metal::deepseek_v4_hc_post(
+            evaluated_float(mfq::metal::deepseek_v41_hc_post(
                 branch_case,
                 residual_case,
                 post_case,
@@ -799,7 +802,7 @@ void test_v41_post_matches_generic_graph() {
             0.0f,
             "V4.1 HC post randomized generic equivalence");
         require_close(
-            evaluated_float(mfq::metal::deepseek_v4_hc_post_sum(
+            evaluated_float(mfq::metal::deepseek_v41_hc_post_sum(
                 branch_case,
                 shared_case,
                 residual_case,
@@ -838,7 +841,7 @@ void test_v41_post_matches_generic_graph() {
             << benchmark([&] { return generic(branch_values); })
             << " fused="
             << benchmark([&] {
-                   return mfq::metal::deepseek_v4_hc_post(
+                   return mfq::metal::deepseek_v41_hc_post(
                        branch_values,
                        residual_values,
                        post,
@@ -850,7 +853,7 @@ void test_v41_post_matches_generic_graph() {
                })
             << " fused_sum="
             << benchmark([&] {
-                   return mfq::metal::deepseek_v4_hc_post_sum(
+                   return mfq::metal::deepseek_v41_hc_post_sum(
                        branch_values,
                        shared_values,
                        residual_values,
@@ -1054,6 +1057,41 @@ void test_v41_collapse_norm_matches_generic_graph() {
                     std::to_string(actual_bits[index]) +
                     " expected_bits=" +
                     std::to_string(expected_bits[index]));
+            }
+        }
+
+        auto residual_f16 = astype(
+            array(
+                residual_values.begin(),
+                Shape{rows, 1, kConnections, hidden}),
+            float16);
+        const auto generic_f16 = [&] {
+            auto reduced = sum(
+                expand_dims(pre, -1) * astype(residual_f16, float32),
+                2);
+            reduced = astype(reduced, float16);
+            return normalizer(reduced);
+        };
+        auto expected_f16 = contiguous(generic_f16());
+        auto actual_f16 = contiguous(
+            mfq::metal::deepseek_v41_hc_collapse_norm(
+                residual_f16,
+                pre,
+                norm,
+                kEps));
+        eval(expected_f16, actual_f16);
+        const auto* expected_f16_bits =
+            expected_f16.data<std::uint16_t>();
+        const auto* actual_f16_bits = actual_f16.data<std::uint16_t>();
+        for (std::size_t index = 0; index < actual_f16.size(); ++index) {
+            if (actual_f16_bits[index] != expected_f16_bits[index]) {
+                throw std::runtime_error(
+                    "V4.1 F16 HC collapse/RMSNorm mismatch in case " +
+                    std::to_string(test_case) + " at " +
+                    std::to_string(index) + ": actual_bits=" +
+                    std::to_string(actual_f16_bits[index]) +
+                    " expected_bits=" +
+                    std::to_string(expected_f16_bits[index]));
             }
         }
 

@@ -1,4 +1,5 @@
 #include "mlx_deepseek_v4_causal_lm.h"
+#include "mlx_transformer.h"
 
 #include "nlohmann/json.hpp"
 
@@ -699,20 +700,26 @@ MlxDeepseekV4Attention make_attention(
     int layer,
     int ratio) {
     auto rope_base =
-        mfq::metal::deepseek_v4_yarn_tables(
+        mfq::metal::mlx_yarn_tables(
             static_cast<int>(
                 config.qk_rope_head_dim),
             kContext,
             static_cast<float>(
                 config.rope_theta));
     auto rope_compressed =
-        mfq::metal::deepseek_v4_yarn_tables(
+        mfq::metal::mlx_yarn_tables(
             static_cast<int>(
                 config.qk_rope_head_dim),
             kContext,
             static_cast<float>(
                 config.compress_rope_theta),
-            config.rope_scaling);
+            mfq::metal::MlxYarnScaling{
+                config.rope_scaling.enabled,
+                config.rope_scaling.factor,
+                config.rope_scaling.beta_fast,
+                config.rope_scaling.beta_slow,
+                config.rope_scaling.original_max_position_embeddings,
+            });
     return MlxDeepseekV4Attention(
         config,
         layer,
@@ -882,7 +889,7 @@ MlxDeepseekV4DSpark make_dspark(
                 kHidden + static_cast<int>(config.dspark_markov_rank))),
         },
         kContext,
-        mfq::metal::deepseek_v4_yarn_tables(
+        mfq::metal::mlx_yarn_tables(
             static_cast<int>(config.qk_rope_head_dim),
             kContext,
             static_cast<float>(config.rope_theta)));
@@ -895,8 +902,6 @@ MlxDeepseekV4CausalLm make_dspark_model(bool attach_dspark = true) {
     config.dspark_noise_token_id = kVocab - 1;
     config.dspark_target_layer_ids = {2};
     config.dspark_markov_rank = 4;
-    config.dspark_n_experts = kExperts;
-    config.dspark_top_k = 1;
     config.mtp_compress_ratios = {0};
     config.validate();
     std::vector<MlxDeepseekV4Layer> layers;
@@ -1529,6 +1534,58 @@ void test_dspark_generation_uses_common_mtp_engine() {
             sampled_first.last_mtp_stats().used &&
             sampled_second.last_mtp_stats().used,
         "DeepSeek-V4 DSpark stochastic MTP is not deterministic");
+
+    auto cached = make_dspark_model();
+    (void)cached.generate(
+        {1, 2, 3},
+        sampling,
+        4,
+        {},
+        std::vector<std::int64_t>{},
+        512,
+        {},
+        2);
+    require(
+        cached.cache_position() == 2 && cached.last_mtp_stats().used,
+        "DeepSeek-V4 MTP did not retain its stable predictor prefix");
+    const auto stable_snapshot =
+        cached.capture_text_session_state({1, 2});
+    require(
+        stable_snapshot.dspark.has_value() &&
+            stable_snapshot.dspark->position() == 2,
+        "DeepSeek-V4 session omitted the stable predictor state");
+
+    std::size_t reused_prefill_tokens = 0;
+    std::vector<std::int64_t> reused_output;
+    (void)cached.generate(
+        {1, 2, 4},
+        sampling,
+        4,
+        [&](std::int64_t token) {
+            reused_output.push_back(token);
+            return true;
+        },
+        std::vector<std::int64_t>{},
+        512,
+        [&](std::size_t tokens, double) {
+            reused_prefill_tokens = tokens;
+        },
+        2);
+    auto fresh = make_dspark_model();
+    std::vector<std::int64_t> fresh_output;
+    (void)fresh.generate(
+        {1, 2, 4},
+        sampling,
+        4,
+        [&](std::int64_t token) {
+            fresh_output.push_back(token);
+            return true;
+        },
+        std::vector<std::int64_t>{});
+    require(
+        reused_prefill_tokens == 1 && reused_output == fresh_output &&
+            cached.last_mtp_stats().used,
+        "DeepSeek-V4 reused predictor prefix changed MTP generation");
 }
 
 void test_generation_stable_prefix_cache() {
@@ -1896,7 +1953,7 @@ void test_mfq_container_load() {
                 runtime.max_context() == 16 &&
                 runtime.expert_cache_limit_bytes() ==
                     12'345 &&
-                !runtime.uses_streamed_experts(),
+                runtime.uses_streamed_experts(),
             "container-loaded DeepSeek-V4 runtime metadata "
             "mismatch");
         auto logits = runtime.prefill(

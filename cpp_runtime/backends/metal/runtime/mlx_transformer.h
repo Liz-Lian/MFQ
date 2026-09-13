@@ -10,6 +10,35 @@
 
 namespace mfq::metal {
 
+struct MlxYarnScaling {
+    bool enabled = false;
+    double factor = 1.0;
+    double beta_fast = 32.0;
+    double beta_slow = 1.0;
+    std::int64_t original_max_position_embeddings = 0;
+};
+
+// Model-neutral adjacent-pair RoPE primitives. Architecture adapters provide
+// the configured YaRN parameters but do not own the table builder or kernel.
+std::pair<mlx::core::array, mlx::core::array> mlx_yarn_tables(
+    int dimension,
+    int length,
+    float theta,
+    const MlxYarnScaling& scaling = {});
+
+mlx::core::array mlx_rope_adjacent(
+    const mlx::core::array& value,
+    int rotary_dimension,
+    const mlx::core::array& cosine,
+    const mlx::core::array& sine,
+    bool inverse = false);
+
+mlx::core::array mlx_rope_adjacent(
+    const mlx::core::array& value,
+    const mlx::core::array& cosine,
+    const mlx::core::array& sine,
+    bool inverse = false);
+
 struct MlxKvCacheSnapshot {
     int batch = 0;
     int heads = 0;

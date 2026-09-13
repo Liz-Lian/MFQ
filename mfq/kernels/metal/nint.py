@@ -24,12 +24,53 @@ from mfq.formats.nint import (
     NINT_ADAPTIVE_FLAG,
     NINT_K_SELECTOR_BITS,
     NINT_Q_SELECTOR_BITS,
+    NintDescriptor,
     NintTensor,
+    describe_nint_allocation,
 )
 
 _NINT_HEADER = struct.Struct("<BBiii")
 
 _NINT_HEADER_SOURCE = r"""
+inline uint mfq_nint_load_u32(
+    device const uchar* stream,
+    uint byte_index
+) {
+    const packed_uchar4 bytes =
+        *reinterpret_cast<device const packed_uchar4*>(stream + byte_index);
+    return as_type<uint>(bytes);
+}
+
+inline uint mfq_nint_load_u32(
+    constant const uchar* stream,
+    uint byte_index
+) {
+    return uint(stream[byte_index])
+        | (uint(stream[byte_index + 1u]) << 8u)
+        | (uint(stream[byte_index + 2u]) << 16u)
+        | (uint(stream[byte_index + 3u]) << 24u);
+}
+
+template <typename T>
+inline vec<T, 4> mfq_nint_load_vec4(
+    device const T* stream,
+    uint index
+) {
+    return *reinterpret_cast<device const vec<T, 4>*>(stream + index);
+}
+
+template <typename T>
+inline vec<T, 4> mfq_nint_load_vec4(
+    constant const T* stream,
+    uint index
+) {
+    return vec<T, 4>(
+        stream[index],
+        stream[index + 1u],
+        stream[index + 2u],
+        stream[index + 3u]);
+}
+
 template <typename Stream>
 inline uint mfq_nint_read_row_value(
     Stream stream,
@@ -41,17 +82,6 @@ inline uint mfq_nint_read_row_value(
     uint row_relative_bits = row_bit_shift + value_index * bits;
     uint byte_index = row_byte_offset + (row_relative_bits >> 3u);
     uint shift = row_relative_bits & 7u;
-    if (bits == 8u && shift == 0u) {
-        return uint(stream[byte_index]);
-    }
-    if (bits == 4u && row_bit_shift == 0u) {
-        uint packed = uint(stream[row_byte_offset + (value_index >> 1u)]);
-        return (packed >> ((value_index & 1u) * 4u)) & 15u;
-    }
-    if (bits == 2u && row_bit_shift == 0u) {
-        uint packed = uint(stream[row_byte_offset + (value_index >> 2u)]);
-        return (packed >> ((value_index & 3u) * 2u)) & 3u;
-    }
     uint packed = uint(stream[byte_index]);
     if (shift + bits > 8u) {
         packed |= uint(stream[byte_index + 1ul]) << 8u;
@@ -70,39 +100,8 @@ inline uint4 mfq_nint_read_row_value4(
     uint row_relative_bits = row_bit_shift + value_index * bits;
     uint byte_index = row_byte_offset + (row_relative_bits >> 3u);
     uint shift = row_relative_bits & 7u;
-    if (shift == 0u) {
-        if (bits == 8u) {
-            return uint4(
-                uint(stream[byte_index]),
-                uint(stream[byte_index + 1u]),
-                uint(stream[byte_index + 2u]),
-                uint(stream[byte_index + 3u]));
-        }
-        if (bits == 4u) {
-            uint lo = uint(stream[byte_index]);
-            uint hi = uint(stream[byte_index + 1u]);
-            return uint4(lo & 15u, lo >> 4u, hi & 15u, hi >> 4u);
-        }
-        if (bits == 2u) {
-            uint packed = uint(stream[byte_index]);
-            return uint4(
-                packed & 3u,
-                (packed >> 2u) & 3u,
-                (packed >> 4u) & 3u,
-                packed >> 6u);
-        }
-    }
     uint required_bits = shift + 4u * bits;
-    uint packed = uint(stream[byte_index]);
-    if (required_bits > 8u) {
-        packed |= uint(stream[byte_index + 1u]) << 8u;
-    }
-    if (required_bits > 16u) {
-        packed |= uint(stream[byte_index + 2u]) << 16u;
-    }
-    if (required_bits > 24u) {
-        packed |= uint(stream[byte_index + 3u]) << 24u;
-    }
+    uint packed = mfq_nint_load_u32(stream, byte_index);
     if (shift != 0u) {
         packed = (packed >> shift)
             | (required_bits > 32u
@@ -115,6 +114,22 @@ inline uint4 mfq_nint_read_row_value4(
         (packed >> bits) & mask,
         (packed >> (2u * bits)) & mask,
         (packed >> (3u * bits)) & mask);
+}
+
+template <typename Stream>
+inline uint mfq_nint_read_bits32(
+    Stream stream,
+    uint row_byte_offset,
+    uint row_bit_index
+) {
+    const uint byte_index = row_byte_offset + (row_bit_index >> 3u);
+    const uint shift = row_bit_index & 7u;
+    uint packed = mfq_nint_load_u32(stream, byte_index);
+    if (shift != 0u) {
+        packed = (packed >> shift)
+            | (uint(stream[byte_index + 4u]) << (32u - shift));
+    }
+    return packed;
 }
 """
 
@@ -180,104 +195,94 @@ _NINT_MATMUL_SOURCE = r"""
     }
 
     constexpr uint CHUNKS = (uint(GS) + 3u) / 4u;
-    constexpr uint Q4_WORDS = (uint(GS) + 7u) / 8u;
     if (route_valid) {
     for (uint group = lane; group < uint(NG); group += 32u) {
-        uint q4_words[OUTPUTS_PER_SIMD][Q4_WORDS];
-#pragma unroll
-        for (uint output_row = 0u;
-             output_row < OUTPUTS_PER_SIMD;
-             ++output_row) {
-            if (q_widths[output_row] == 4u &&
-                q_row_bit_shifts[output_row] == 0u &&
-                (uint(GS) & 7u) == 0u) {
-                uint byte_offset = q_row_byte_offsets[output_row]
-                    + group * (uint(GS) >> 1u);
-#pragma unroll
-                for (uint word = 0u; word < Q4_WORDS; ++word) {
-                    uint base = byte_offset + word * 4u;
-                    q4_words[output_row][word] =
-                        uint(q_packed[base])
-                        | (uint(q_packed[base + 1u]) << 8u)
-                        | (uint(q_packed[base + 2u]) << 16u)
-                        | (uint(q_packed[base + 3u]) << 24u);
-                }
-            }
-        }
         float activation_sums[TILE_M];
-        float quantized_dots[OUTPUTS_PER_SIMD][TILE_M];
+        float quantized_dots0[TILE_M];
+        float quantized_dots1[TILE_M];
 #pragma unroll
         for (uint local_row = 0u; local_row < uint(TILE_M); ++local_row) {
             activation_sums[local_row] = 0.0f;
-#pragma unroll
-            for (uint output_row = 0u;
-                 output_row < OUTPUTS_PER_SIMD;
-                 ++output_row) {
-                quantized_dots[output_row][local_row] = 0.0f;
-            }
+            quantized_dots0[local_row] = 0.0f;
+            quantized_dots1[local_row] = 0.0f;
         }
+
+        const uint bits0 = q_widths[0];
+        const uint bits1 = q_widths[1];
+        const uint mask0 = (1u << bits0) - 1u;
+        const uint mask1 = (1u << bits1) - 1u;
+        const uint chunk_bits0 = 4u * bits0;
+        const uint chunk_bits1 = 4u * bits1;
+        const uint group_bits0 = uint(GS) * bits0;
+        const uint group_bits1 = uint(GS) * bits1;
+        const uint group_bit_offset0 = q_row_bit_shifts[0]
+            + group * group_bits0;
+        const uint group_bit_offset1 = q_row_bit_shifts[1]
+            + group * group_bits1;
+        uint current_bit0 = 0u;
+        uint current_bit1 = 0u;
+        uint cursor0 = 0u;
+        uint cursor1 = 0u;
+        uint current0 = mfq_nint_read_bits32(
+            q_packed,
+            q_row_byte_offsets[0],
+            group_bit_offset0);
+        uint current1 = mfq_nint_read_bits32(
+            q_packed,
+            q_row_byte_offsets[1],
+            group_bit_offset1);
+        uint next0 = group_bits0 > 32u
+            ? mfq_nint_read_bits32(
+                q_packed,
+                q_row_byte_offsets[0],
+                group_bit_offset0 + 32u)
+            : 0u;
+        uint next1 = group_bits1 > 32u
+            ? mfq_nint_read_bits32(
+                q_packed,
+                q_row_byte_offsets[1],
+                group_bit_offset1 + 32u)
+            : 0u;
 
 #pragma unroll
         for (uint chunk = 0u; chunk < CHUNKS; ++chunk) {
-            uint group_element = chunk * 4u;
-            uint column = group * uint(GS) + group_element;
-            uint4 codes[OUTPUTS_PER_SIMD];
-#pragma unroll
-            for (uint output_row = 0u;
-                 output_row < OUTPUTS_PER_SIMD;
-                 ++output_row) {
-                if (q_widths[output_row] == 4u &&
-                    q_row_bit_shifts[output_row] == 0u &&
-                    (uint(GS) & 7u) == 0u) {
-                    uint packed = q4_words[output_row][chunk >> 1u]
-                        >> ((chunk & 1u) * 16u);
-                    codes[output_row] = uint4(
-                        packed & 15u,
-                        (packed >> 4u) & 15u,
-                        (packed >> 8u) & 15u,
-                        (packed >> 12u) & 15u);
-                } else if (group_element + 3u < uint(GS)) {
-                    codes[output_row] = mfq_nint_read_row_value4(
-                        q_packed,
-                        q_row_byte_offsets[output_row],
-                        q_row_bit_shifts[output_row],
-                        column,
-                        q_widths[output_row]);
-                } else {
-                    codes[output_row] = uint4(0u);
-#pragma unroll
-                    for (uint element = 0u; element < 4u; ++element) {
-                        if (group_element + element < uint(GS)) {
-                            codes[output_row][element] =
-                                mfq_nint_read_row_value(
-                                    q_packed,
-                                    q_row_byte_offsets[output_row],
-                                    q_row_bit_shifts[output_row],
-                                    column + element,
-                                    q_widths[output_row]);
-                        }
-                    }
-                }
+            const uint group_element = chunk * 4u;
+            const uint column = group * uint(GS) + group_element;
+            uint packed0 = current0 >> cursor0;
+            if (cursor0 != 0u && cursor0 + chunk_bits0 > 32u) {
+                packed0 |= next0 << (32u - cursor0);
             }
+            uint packed1 = current1 >> cursor1;
+            if (cursor1 != 0u && cursor1 + chunk_bits1 > 32u) {
+                packed1 |= next1 << (32u - cursor1);
+            }
+            const uint4 codes0 = uint4(
+                packed0 & mask0,
+                (packed0 >> bits0) & mask0,
+                (packed0 >> (2u * bits0)) & mask0,
+                (packed0 >> (3u * bits0)) & mask0);
+            const uint4 codes1 = uint4(
+                packed1 & mask1,
+                (packed1 >> bits1) & mask1,
+                (packed1 >> (2u * bits1)) & mask1,
+                (packed1 >> (3u * bits1)) & mask1);
 #pragma unroll
             for (uint local_row = 0u;
                  local_row < uint(TILE_M);
                  ++local_row) {
-                uint row = first_row + local_row;
-                uint input_row = uint(ROUTED) != 0u
+                const uint row = first_row + local_row;
+                const uint input_row = uint(ROUTED) != 0u
                     && uint(SHARED_INPUT) != 0u
                     ? row / uint(ROUTES)
                     : row;
                 float4 activation = float4(0.0f);
                 if (row < uint(M)) {
-                    uint input_base = input_row * uint(K) + column;
+                    const uint input_base = input_row * uint(K) + column;
                     if (group_element + 3u < uint(GS) &&
                         column + 3u < uint(K)) {
-                        activation = float4(
-                            x[input_base],
-                            x[input_base + 1u],
-                            x[input_base + 2u],
-                            x[input_base + 3u]);
+                        const vec<T, 4> packed_activation =
+                            mfq_nint_load_vec4(x, input_base);
+                        activation = float4(packed_activation);
                     } else {
                         activation.x = column < uint(K)
                             ? float(x[input_base]) : 0.0f;
@@ -293,36 +298,66 @@ _NINT_MATMUL_SOURCE = r"""
                     }
                 }
                 activation_sums[local_row] +=
-                    activation.x + activation.y + activation.z + activation.w;
-#pragma unroll
-                for (uint output_row = 0u;
-                     output_row < OUTPUTS_PER_SIMD;
-                     ++output_row) {
-                    quantized_dots[output_row][local_row] +=
-                        dot(activation, float4(codes[output_row]));
-                }
+                    activation.x + activation.y
+                    + activation.z + activation.w;
+                quantized_dots0[local_row] +=
+                    dot(activation, float4(codes0));
+                quantized_dots1[local_row] +=
+                    dot(activation, float4(codes1));
+            }
+
+            cursor0 += chunk_bits0;
+            if (cursor0 >= 32u) {
+                cursor0 -= 32u;
+                current_bit0 += 32u;
+                current0 = next0;
+                next0 = current_bit0 + 32u < group_bits0
+                    ? mfq_nint_read_bits32(
+                        q_packed,
+                        q_row_byte_offsets[0],
+                        group_bit_offset0 + current_bit0 + 32u)
+                    : 0u;
+            }
+            cursor1 += chunk_bits1;
+            if (cursor1 >= 32u) {
+                cursor1 -= 32u;
+                current_bit1 += 32u;
+                current1 = next1;
+                next1 = current_bit1 + 32u < group_bits1
+                    ? mfq_nint_read_bits32(
+                        q_packed,
+                        q_row_byte_offsets[1],
+                        group_bit_offset1 + current_bit1 + 32u)
+                    : 0u;
             }
         }
 
+        const uint metadata_index0 = metadata_bases[0] + group;
+        const uint metadata_index1 = metadata_bases[1] + group;
+        const float scale0 = neuron_scales[0]
+            * float(sub_scale[metadata_index0]);
+        const float minimum0 = neuron_minimums[0]
+            * float(sub_min[metadata_index0]);
+        const float scale1 = neuron_scales[1]
+            * float(sub_scale[metadata_index1]);
+        const float minimum1 = neuron_minimums[1]
+            * float(sub_min[metadata_index1]);
 #pragma unroll
-        for (uint output_row = 0u;
-             output_row < OUTPUTS_PER_SIMD;
-             ++output_row) {
-            uint metadata_index = metadata_bases[output_row] + group;
-            float scale =
-                neuron_scales[output_row] * float(sub_scale[metadata_index]);
-            float minimum =
-                neuron_minimums[output_row] * float(sub_min[metadata_index]);
-#pragma unroll
-            for (uint local_row = 0u; local_row < uint(TILE_M); ++local_row) {
-                accumulators[output_row][local_row] = fma(
-                    scale,
-                    quantized_dots[output_row][local_row],
-                    fma(
-                        -minimum,
-                        activation_sums[local_row],
-                        accumulators[output_row][local_row]));
-            }
+        for (uint local_row = 0u; local_row < uint(TILE_M); ++local_row) {
+            accumulators[0][local_row] = fma(
+                scale0,
+                quantized_dots0[local_row],
+                fma(
+                    -minimum0,
+                    activation_sums[local_row],
+                    accumulators[0][local_row]));
+            accumulators[1][local_row] = fma(
+                scale1,
+                quantized_dots1[local_row],
+                fma(
+                    -minimum1,
+                    activation_sums[local_row],
+                    accumulators[1][local_row]));
         }
     }
     }
@@ -340,6 +375,185 @@ _NINT_MATMUL_SOURCE = r"""
                 y[row * uint(LOGICAL_OUT) + output] =
                     T(route_valid ? total : 0.0f);
             }
+        }
+    }
+"""
+
+_NINT_SWIGLU_SOURCE = r"""
+    constexpr uint SIMD_GROUPS = 8u;
+    constexpr uint OUTPUTS_PER_SIMD = 2u;
+    constexpr uint OUTPUTS_PER_TG = SIMD_GROUPS * OUTPUTS_PER_SIMD;
+
+    uint lane = thread_index_in_simdgroup;
+    uint simd_group = simdgroup_index_in_threadgroup;
+    uint output_base =
+        threadgroup_position_in_grid.x * OUTPUTS_PER_TG
+        + simd_group * OUTPUTS_PER_SIMD;
+    if (output_base >= uint(OUT)) {
+        return;
+    }
+
+    uint metadata_bases[OUTPUTS_PER_SIMD];
+    uint gate_widths[OUTPUTS_PER_SIMD];
+    uint gate_byte_offsets[OUTPUTS_PER_SIMD];
+    uint gate_bit_shifts[OUTPUTS_PER_SIMD];
+    uint up_widths[OUTPUTS_PER_SIMD];
+    uint up_byte_offsets[OUTPUTS_PER_SIMD];
+    uint up_bit_shifts[OUTPUTS_PER_SIMD];
+    float gate_neuron_scales[OUTPUTS_PER_SIMD];
+    float gate_neuron_minimums[OUTPUTS_PER_SIMD];
+    float up_neuron_scales[OUTPUTS_PER_SIMD];
+    float up_neuron_minimums[OUTPUTS_PER_SIMD];
+    float gate_accumulators[OUTPUTS_PER_SIMD] = {0.0f};
+    float up_accumulators[OUTPUTS_PER_SIMD] = {0.0f};
+
+#pragma unroll
+    for (uint output_row = 0u;
+         output_row < OUTPUTS_PER_SIMD;
+         ++output_row) {
+        uint output = min(output_base + output_row, uint(OUT) - 1u);
+        metadata_bases[output_row] = output * uint(NG);
+
+        uint gate_layout = uint(gate_row_q_layout[output]);
+        gate_widths[output_row] = gate_layout & 15u;
+        gate_byte_offsets[output_row] = gate_row_q_byte_offsets[output];
+        gate_bit_shifts[output_row] = gate_layout >> 4u;
+        gate_neuron_scales[output_row] = gate_neuron_scale[output];
+        gate_neuron_minimums[output_row] = gate_neuron_min[output];
+
+        uint up_layout = uint(up_row_q_layout[output]);
+        up_widths[output_row] = up_layout & 15u;
+        up_byte_offsets[output_row] = up_row_q_byte_offsets[output];
+        up_bit_shifts[output_row] = up_layout >> 4u;
+        up_neuron_scales[output_row] = up_neuron_scale[output];
+        up_neuron_minimums[output_row] = up_neuron_min[output];
+    }
+
+    constexpr uint CHUNKS = (uint(GS) + 3u) / 4u;
+    for (uint group = lane; group < uint(NG); group += 32u) {
+        float activation_sum = 0.0f;
+        float gate_quantized_dots[OUTPUTS_PER_SIMD] = {0.0f};
+        float up_quantized_dots[OUTPUTS_PER_SIMD] = {0.0f};
+
+#pragma unroll
+        for (uint chunk = 0u; chunk < CHUNKS; ++chunk) {
+            uint group_element = chunk * 4u;
+            uint column = group * uint(GS) + group_element;
+            uint4 gate_codes[OUTPUTS_PER_SIMD];
+            uint4 up_codes[OUTPUTS_PER_SIMD];
+
+#pragma unroll
+            for (uint output_row = 0u;
+                 output_row < OUTPUTS_PER_SIMD;
+                 ++output_row) {
+                if (group_element + 3u < uint(GS)) {
+                    gate_codes[output_row] = mfq_nint_read_row_value4(
+                        gate_q,
+                        gate_byte_offsets[output_row],
+                        gate_bit_shifts[output_row],
+                        column,
+                        gate_widths[output_row]);
+                    up_codes[output_row] = mfq_nint_read_row_value4(
+                        up_q,
+                        up_byte_offsets[output_row],
+                        up_bit_shifts[output_row],
+                        column,
+                        up_widths[output_row]);
+                } else {
+                    gate_codes[output_row] = uint4(0u);
+                    up_codes[output_row] = uint4(0u);
+#pragma unroll
+                    for (uint element = 0u; element < 4u; ++element) {
+                        if (group_element + element < uint(GS)) {
+                            gate_codes[output_row][element] =
+                                mfq_nint_read_row_value(
+                                    gate_q,
+                                    gate_byte_offsets[output_row],
+                                    gate_bit_shifts[output_row],
+                                    column + element,
+                                    gate_widths[output_row]);
+                            up_codes[output_row][element] =
+                                mfq_nint_read_row_value(
+                                    up_q,
+                                    up_byte_offsets[output_row],
+                                    up_bit_shifts[output_row],
+                                    column + element,
+                                    up_widths[output_row]);
+                        }
+                    }
+                }
+            }
+
+            float4 activation = float4(0.0f);
+            if (group_element + 3u < uint(GS) && column + 3u < uint(K)) {
+                const vec<T, 4> packed_activation =
+                    mfq_nint_load_vec4(x, column);
+                activation = float4(packed_activation);
+            } else {
+                activation.x = column < uint(K) ? float(x[column]) : 0.0f;
+                activation.y = group_element + 1u < uint(GS) &&
+                        column + 1u < uint(K)
+                    ? float(x[column + 1u]) : 0.0f;
+                activation.z = group_element + 2u < uint(GS) &&
+                        column + 2u < uint(K)
+                    ? float(x[column + 2u]) : 0.0f;
+                activation.w = group_element + 3u < uint(GS) &&
+                        column + 3u < uint(K)
+                    ? float(x[column + 3u]) : 0.0f;
+            }
+            activation_sum +=
+                activation.x + activation.y + activation.z + activation.w;
+
+#pragma unroll
+            for (uint output_row = 0u;
+                 output_row < OUTPUTS_PER_SIMD;
+                 ++output_row) {
+                gate_quantized_dots[output_row] +=
+                    dot(activation, float4(gate_codes[output_row]));
+                up_quantized_dots[output_row] +=
+                    dot(activation, float4(up_codes[output_row]));
+            }
+        }
+
+#pragma unroll
+        for (uint output_row = 0u;
+             output_row < OUTPUTS_PER_SIMD;
+             ++output_row) {
+            uint metadata_index = metadata_bases[output_row] + group;
+            float gate_scale = gate_neuron_scales[output_row]
+                * float(gate_sub_scale[metadata_index]);
+            float gate_minimum = gate_neuron_minimums[output_row]
+                * float(gate_sub_min[metadata_index]);
+            float up_scale = up_neuron_scales[output_row]
+                * float(up_sub_scale[metadata_index]);
+            float up_minimum = up_neuron_minimums[output_row]
+                * float(up_sub_min[metadata_index]);
+            gate_accumulators[output_row] = fma(
+                gate_scale,
+                gate_quantized_dots[output_row],
+                fma(
+                    -gate_minimum,
+                    activation_sum,
+                    gate_accumulators[output_row]));
+            up_accumulators[output_row] = fma(
+                up_scale,
+                up_quantized_dots[output_row],
+                fma(
+                    -up_minimum,
+                    activation_sum,
+                    up_accumulators[output_row]));
+        }
+    }
+
+#pragma unroll
+    for (uint output_row = 0u;
+         output_row < OUTPUTS_PER_SIMD;
+         ++output_row) {
+        float gate = simd_sum(gate_accumulators[output_row]);
+        float up = simd_sum(up_accumulators[output_row]);
+        uint output = output_base + output_row;
+        if (lane == 0u && output < uint(OUT)) {
+            y[output] = T((gate / (1.0f + exp(-gate))) * up);
         }
     }
 """
@@ -364,6 +578,102 @@ _NINT_ROW_DECODE_SOURCE = r"""
     float scale = neuron_scale[output] * float(sub_scale[metadata_index]);
     float minimum = neuron_min[output] * float(sub_min[metadata_index]);
     y[output_index] = T(scale * float(quantized) - minimum);
+"""
+
+_NINT_BACKWARD_SOURCE = r"""
+    constexpr uint SIMD_GROUPS = 8u;
+    constexpr uint COLUMNS_PER_SIMD = 4u;
+    constexpr uint CHUNKS_PER_GROUP = (uint(GS) + 3u) / 4u;
+
+    const uint lane = thread_index_in_simdgroup;
+    const uint simd_group = simdgroup_index_in_threadgroup;
+    const uint chunk_index =
+        threadgroup_position_in_grid.x * SIMD_GROUPS + simd_group;
+    const uint group = chunk_index / CHUNKS_PER_GROUP;
+    const uint group_element =
+        (chunk_index - group * CHUNKS_PER_GROUP) * COLUMNS_PER_SIMD;
+    const uint column_base = group * uint(GS) + group_element;
+    const uint first_row = threadgroup_position_in_grid.y * uint(TILE_M);
+    if (group >= uint(NG) || column_base >= uint(K) ||
+        first_row >= uint(M)) {
+        return;
+    }
+
+    float accumulators[TILE_M][COLUMNS_PER_SIMD] = {{0.0f}};
+    for (uint output = lane; output < uint(OUT); output += 32u) {
+        const uint metadata_index = output * uint(NG) + group;
+        const uint row_layout = uint(row_q_layout[output]);
+        uint4 codes = uint4(0u);
+        if (group_element + 3u < uint(GS)) {
+            codes = mfq_nint_read_row_value4(
+                q_packed,
+                row_q_byte_offsets[output],
+                row_layout >> 4u,
+                column_base,
+                row_layout & 15u);
+        } else {
+#pragma unroll
+            for (uint component = 0u;
+                 component < COLUMNS_PER_SIMD;
+                 ++component) {
+                if (group_element + component < uint(GS) &&
+                    column_base + component < uint(K)) {
+                    codes[component] = mfq_nint_read_row_value(
+                        q_packed,
+                        row_q_byte_offsets[output],
+                        row_layout >> 4u,
+                        column_base + component,
+                        row_layout & 15u);
+                }
+            }
+        }
+        const float scale = neuron_scale[output]
+            * float(sub_scale[metadata_index]);
+        const float minimum = neuron_min[output]
+            * float(sub_min[metadata_index]);
+        const float4 weights = fma(
+            float4(codes),
+            float4(scale),
+            float4(-minimum));
+#pragma unroll
+        for (uint local_row = 0u;
+             local_row < uint(TILE_M);
+             ++local_row) {
+            const uint row = first_row + local_row;
+            const float gradient = row < uint(M)
+                ? float(output_gradient[row * uint(OUT) + output])
+                : 0.0f;
+#pragma unroll
+            for (uint component = 0u;
+                 component < COLUMNS_PER_SIMD;
+                 ++component) {
+                accumulators[local_row][component] = fma(
+                    gradient,
+                    weights[component],
+                    accumulators[local_row][component]);
+            }
+        }
+    }
+
+#pragma unroll
+    for (uint local_row = 0u;
+         local_row < uint(TILE_M);
+         ++local_row) {
+        const uint row = first_row + local_row;
+#pragma unroll
+        for (uint component = 0u;
+             component < COLUMNS_PER_SIMD;
+             ++component) {
+            const float total = simd_sum(
+                accumulators[local_row][component]);
+            const uint column = column_base + component;
+            if (lane == 0u && row < uint(M) &&
+                group_element + component < uint(GS) &&
+                column < uint(K)) {
+                y[row * uint(K) + column] = T(total);
+            }
+        }
+    }
 """
 
 
@@ -395,6 +705,28 @@ _NINT_MATMUL_KERNEL = _make_kernel(
     _NINT_MATMUL_SOURCE,
 )
 
+_NINT_SWIGLU_KERNEL = _make_kernel(
+    "mfq_nint_metadata_swiglu",
+    [
+        "gate_q",
+        "gate_row_q_layout",
+        "gate_row_q_byte_offsets",
+        "gate_sub_scale",
+        "gate_sub_min",
+        "gate_neuron_scale",
+        "gate_neuron_min",
+        "up_q",
+        "up_row_q_layout",
+        "up_row_q_byte_offsets",
+        "up_sub_scale",
+        "up_sub_min",
+        "up_neuron_scale",
+        "up_neuron_min",
+        "x",
+    ],
+    _NINT_SWIGLU_SOURCE,
+)
+
 _NINT_UNROUTED_SENTINEL = mx.zeros((1,), dtype=mx.int32)
 
 _NINT_ROW_DECODE_KERNEL = _make_kernel(
@@ -410,6 +742,21 @@ _NINT_ROW_DECODE_KERNEL = _make_kernel(
         "row_ids",
     ],
     _NINT_ROW_DECODE_SOURCE,
+)
+
+_NINT_BACKWARD_KERNEL = _make_kernel(
+    "mfq_nint_backward_input",
+    [
+        "q_packed",
+        "row_q_layout",
+        "row_q_byte_offsets",
+        "sub_scale",
+        "sub_min",
+        "neuron_scale",
+        "neuron_min",
+        "output_gradient",
+    ],
+    _NINT_BACKWARD_SOURCE,
 )
 
 
@@ -599,6 +946,7 @@ class MetalNintWeight:
     out: int
     groups: int
     neuron_len: int
+    descriptor: NintDescriptor
 
     @classmethod
     def from_tensor(cls, tensor: NintTensor) -> MetalNintWeight:
@@ -635,6 +983,7 @@ class MetalNintWeight:
             out=out,
             groups=groups,
             neuron_len=int(tensor.neuron_len),
+            descriptor=tensor.descriptor,
         )
 
     @classmethod
@@ -814,6 +1163,7 @@ class MetalNintWeight:
             sub_scale = scales.reshape(out, groups)
             sub_min = minima.reshape(out, groups)
             row_q_bits = np.full(out, bits, dtype=np.uint8)
+            row_sub_bits = np.full(out, sub_bits, dtype=np.uint8)
             row_bit_offsets = (
                 np.arange(out, dtype=np.uint64) * values_per_row * bits
             )
@@ -850,6 +1200,13 @@ class MetalNintWeight:
             out=int(out),
             groups=int(groups),
             neuron_len=int(neuron_len),
+            descriptor=describe_nint_allocation(
+                groupsize=int(groupsize),
+                groups=int(groups),
+                neuron_len=int(neuron_len),
+                row_q_bits=row_q_bits,
+                row_sub_bits=row_sub_bits,
+            ),
         )
 
     @property
@@ -903,7 +1260,8 @@ def _packed_matmul(
         return mx.zeros((*prefix, weight.out), dtype=source.dtype)
     tile_rows = 1 if rows == 1 else (rows if rows <= 16 else 8)
     row_tiles = (rows + tile_rows - 1) // tile_rows
-    outputs_per_threadgroup = 16
+    outputs_per_simd = 2
+    outputs_per_threadgroup = 8 * outputs_per_simd
     threads_per_threadgroup = 256
     output_threadgroups = (
         weight.out + outputs_per_threadgroup - 1
@@ -1121,14 +1479,48 @@ def nint_backward_input(
     weight: MetalNintWeight,
     output_gradient: mx.array | np.ndarray,
 ) -> mx.array:
+    """Compute ``dX = dY @ W`` directly from the canonical packed rows."""
+
     gradient = _floating_input(output_gradient)
     if gradient.ndim < 1 or int(gradient.shape[-1]) != weight.out:
         raise ValueError("NINT output-gradient width does not match packed weight")
     prefix = tuple(int(value) for value in gradient.shape[:-1])
     rows = int(gradient.size) // weight.out
+    if rows == 0:
+        return mx.zeros((*prefix, weight.neuron_len), dtype=gradient.dtype)
     gradient = mx.contiguous(gradient.reshape(rows, weight.out))
-    dense = nint_dequantize(weight, dtype=gradient.dtype)
-    return (gradient @ dense).reshape((*prefix, weight.neuron_len))
+    if rows > 16:
+        dense = nint_dequantize(weight, dtype=gradient.dtype)
+        return (gradient @ dense).reshape((*prefix, weight.neuron_len))
+    tile_rows = min(rows, 4)
+    chunks_per_group = (weight.groupsize + 3) // 4
+    threadgroups = (weight.groups * chunks_per_group + 7) // 8
+    result = _NINT_BACKWARD_KERNEL(
+        inputs=[
+            weight.q_packed,
+            weight.row_q_layout,
+            weight.row_q_byte_offsets,
+            weight.sub_scale,
+            weight.sub_min,
+            weight.neuron_scale,
+            weight.neuron_min,
+            gradient,
+        ],
+        template=[
+            ("T", gradient.dtype),
+            ("GS", weight.groupsize),
+            ("NG", weight.groups),
+            ("K", weight.neuron_len),
+            ("OUT", weight.out),
+            ("M", rows),
+            ("TILE_M", tile_rows),
+        ],
+        grid=(threadgroups * 256, (rows + tile_rows - 1) // tile_rows, 1),
+        threadgroup=(256, 1, 1),
+        output_shapes=[(rows, weight.neuron_len)],
+        output_dtypes=[gradient.dtype],
+    )[0]
+    return result.reshape((*prefix, weight.neuron_len))
 
 
 def _nint_matmul_with_vjp(
@@ -1173,10 +1565,56 @@ def nint_swiglu(
     up: MetalNintWeight,
     x: mx.array | np.ndarray,
 ) -> mx.array:
+    if (
+        gate.groupsize != up.groupsize
+        or gate.groups != up.groups
+        or gate.neuron_len != up.neuron_len
+        or gate.out != up.out
+    ):
+        raise ValueError("NINT SwiGLU gate/up projections must have matching geometry")
+    source, prefix, rows = _prepare_matmul_input(gate, x)
+    if rows == 1:
+        threads_per_threadgroup = 256
+        outputs_per_threadgroup = 16
+        output_threadgroups = (
+            gate.out + outputs_per_threadgroup - 1
+        ) // outputs_per_threadgroup
+        grid_x = output_threadgroups * threads_per_threadgroup
+        if grid_x > (1 << 31) - 1:
+            raise OverflowError("NINT SwiGLU Metal launch grid exceeds MLX limits")
+        result = _NINT_SWIGLU_KERNEL(
+            inputs=[
+                gate.q_packed,
+                gate.row_q_layout,
+                gate.row_q_byte_offsets,
+                gate.sub_scale,
+                gate.sub_min,
+                gate.neuron_scale,
+                gate.neuron_min,
+                up.q_packed,
+                up.row_q_layout,
+                up.row_q_byte_offsets,
+                up.sub_scale,
+                up.sub_min,
+                up.neuron_scale,
+                up.neuron_min,
+                source,
+            ],
+            template=[
+                ("T", source.dtype),
+                ("GS", gate.groupsize),
+                ("NG", gate.groups),
+                ("K", gate.neuron_len),
+                ("OUT", gate.out),
+            ],
+            grid=(grid_x, 1, 1),
+            threadgroup=(threads_per_threadgroup, 1, 1),
+            output_shapes=[(1, gate.out)],
+            output_dtypes=[source.dtype],
+        )[0]
+        return result.reshape((*prefix, gate.out))
     gate_value = nint_matmul(gate, x)
     up_value = nint_matmul(up, x)
-    if gate_value.shape != up_value.shape:
-        raise ValueError("NINT SwiGLU gate/up projections must have matching shapes")
     return mx.sigmoid(gate_value) * gate_value * up_value
 
 

@@ -30,15 +30,6 @@ constexpr int kDescriptorSize = 12;
 constexpr int kFamily = 0;
 constexpr int kOutput = 1;
 
-constexpr int kFamilyNint = 0;
-constexpr int kNintBits = 2;
-constexpr int kNintGroupSize = 3;
-constexpr int kNintGroups = 4;
-constexpr int kNintQOffset = 5;
-constexpr int kNintSubOffset = 6;
-constexpr int kNintAnchorOffset = 7;
-constexpr int kNintQ5Execution = 8;
-
 constexpr int kFamilyNint8Zero = 1;
 constexpr int kQ8Groups = 2;
 constexpr int kQ8QOffset = 3;
@@ -50,12 +41,11 @@ constexpr int kFamilyTpqPq = 4;
 constexpr int kFamilyMx = 5;
 
 struct DirectProjectionLayout {
-    int family = kFamilyNint;
+    int family = kFamilyNint8Zero;
     int output_size = 0;
     int bits = 0;
     int group_size = 0;
     int groups = 0;
-    bool q5_execution = false;
     int vector_size = 0;
     int vectors = 0;
     int index_bits = 0;
@@ -100,58 +90,38 @@ RetainedProjection retain_projection(
         value);
 }
 
-constexpr const char* kGroupedHeader = R"METAL(
+constexpr const char* kNintProjectionHeader = R"METAL(
 template <typename Stream>
-inline uint mfq_grouped_nint_read_bits(
+inline uint4 mfq_grouped_nint_read_row_value4(
     Stream stream,
+    uint row_byte_offset,
+    uint row_bit_shift,
     uint value_index,
     uint bits
 ) {
-    // Avoid overflowing the intermediate bit offset for large packed
-    // projections whose byte offset still fits in uint.
-    uint residual_bits = (value_index & 7u) * bits;
-    uint byte_index =
-        (value_index >> 3) * bits + (residual_bits >> 3);
-    uint shift = residual_bits & 7u;
-    uint packed = uint(stream[byte_index]);
-    if (shift + bits > 8u) {
-        packed |= uint(stream[byte_index + 1u]) << 8;
+    uint row_relative_bits = row_bit_shift + value_index * bits;
+    uint byte_index = row_byte_offset + (row_relative_bits >> 3u);
+    uint shift = row_relative_bits & 7u;
+    uint required_bits = shift + 4u * bits;
+    const packed_uchar4 bytes =
+        *reinterpret_cast<device const packed_uchar4*>(stream + byte_index);
+    uint packed = as_type<uint>(bytes);
+    if (shift != 0u) {
+        packed = (packed >> shift)
+            | (required_bits > 32u
+                ? uint(stream[byte_index + 4u]) << (32u - shift)
+                : 0u);
     }
-    return (packed >> shift) & ((1u << bits) - 1u);
+    uint mask = (1u << bits) - 1u;
+    return uint4(
+        packed & mask,
+        (packed >> bits) & mask,
+        (packed >> (2u * bits)) & mask,
+        (packed >> (3u * bits)) & mask);
 }
+)METAL";
 
-template <typename Stream>
-inline uint mfq_grouped_nint_read_value(
-    Stream stream,
-    uint value_index,
-    uint bits,
-    uint group_size,
-    uint q5_execution
-) {
-    if (q5_execution != 0u && bits == 5u) {
-        uint metadata_index = value_index / group_size;
-        uint element = value_index - metadata_index * group_size;
-        uint low_bytes = (group_size + 1u) >> 1;
-        uint high_bytes = (group_size + 7u) >> 3;
-        uint group_offset =
-            metadata_index * (low_bytes + high_bytes);
-        uint low_packed =
-            uint(stream[group_offset + (element >> 1)]);
-        uint low =
-            (low_packed >> ((element & 1u) * 4u)) & 15u;
-        uint high = (
-            uint(stream[
-                group_offset + low_bytes + (element >> 3)])
-            >> (element & 7u)
-        ) & 1u;
-        return low | (high << 4u);
-    }
-    return mfq_grouped_nint_read_bits(
-        stream,
-        value_index,
-        bits);
-}
-
+constexpr const char* kGroupedHeader = R"METAL(
 template <typename Stream>
 inline uint mfq_grouped_vq_read_bits(
     Stream stream,
@@ -467,8 +437,6 @@ constexpr const char* kGroupedSource = R"METAL(
         + simd_group * ROWS_PER_SIMD;
     uint output_offset =
         uint(projection_output_offsets[projection]);
-    uint family = uint(descriptors[descriptor_base]);
-
     float accumulators[ROWS_PER_SIMD] = {0.0f};
     for (uint column = lane; column < uint(K); column += 32u) {
         float activation =
@@ -483,55 +451,16 @@ constexpr const char* kGroupedSource = R"METAL(
                 continue;
             }
 
-            float weight;
-            if (family == 0u) {
-                uint bits =
-                    uint(descriptors[descriptor_base + 2u]);
-                uint group_size =
-                    uint(descriptors[descriptor_base + 3u]);
-                uint groups =
-                    uint(descriptors[descriptor_base + 4u]);
-                uint group = column / group_size;
-                uint element = column - group * group_size;
-                uint metadata_index = output * groups + group;
-                uint quantized_index =
-                    metadata_index * group_size + element;
-                uint quantized = mfq_grouped_nint_read_value(
-                    nint_q
-                        + uint(descriptors[
-                            descriptor_base + 5u]),
-                    quantized_index,
-                    bits,
-                    group_size,
-                    uint(descriptors[descriptor_base + 8u]));
-                uint sub_index =
-                    uint(descriptors[descriptor_base + 6u])
-                    + metadata_index;
-                uint anchor_index =
-                    uint(descriptors[descriptor_base + 7u])
-                    + output;
-                float scale =
-                    nint_anchor_scale[anchor_index]
-                    * float(nint_sub_scale[sub_index]);
-                float minimum =
-                    nint_anchor_min[anchor_index]
-                    * float(nint_sub_min[sub_index]);
-                weight =
-                    scale * float(quantized) - minimum;
-            } else {
-                uint groups =
-                    uint(descriptors[descriptor_base + 2u]);
-                uint group = column >> 5;
-                weight =
-                    float(q8_scales[
-                        uint(descriptors[
-                            descriptor_base + 4u])
-                        + output * groups + group])
-                    * float(q8_q[
-                        uint(descriptors[
-                            descriptor_base + 3u])
-                        + output * uint(K) + column]);
-            }
+            uint groups =
+                uint(descriptors[descriptor_base + 2u]);
+            uint group = column >> 5;
+            float weight =
+                float(q8_scales[
+                    uint(descriptors[descriptor_base + 4u])
+                    + output * groups + group])
+                * float(q8_q[
+                    uint(descriptors[descriptor_base + 3u])
+                    + output * uint(K) + column]);
             accumulators[local_row] = fma(
                 activation,
                 weight,
@@ -632,11 +561,6 @@ mlx::core::fast::CustomKernelFunction make_grouped_kernel() {
             "descriptors",
             "projection_tile_offsets",
             "projection_output_offsets",
-            "nint_q",
-            "nint_sub_scale",
-            "nint_sub_min",
-            "nint_anchor_scale",
-            "nint_anchor_min",
             "q8_q",
             "q8_scales",
             "x",
@@ -651,6 +575,349 @@ mlx::core::fast::CustomKernelFunction make_grouped_kernel() {
 
 const mlx::core::fast::CustomKernelFunction& grouped_kernel() {
     static const auto kernel = make_grouped_kernel();
+    return kernel;
+}
+
+std::vector<std::string> nint_projection_group_input_names(
+    std::size_t projections) {
+    std::vector<std::string> names;
+    names.reserve(projections * 7 + 1);
+    for (std::size_t projection = 0;
+         projection < projections;
+         ++projection) {
+        const auto suffix = std::to_string(projection);
+        names.push_back("q_packed_" + suffix);
+        names.push_back("row_q_layout_" + suffix);
+        names.push_back("row_q_byte_offsets_" + suffix);
+        names.push_back("sub_scale_" + suffix);
+        names.push_back("sub_min_" + suffix);
+        names.push_back("neuron_scale_" + suffix);
+        names.push_back("neuron_min_" + suffix);
+    }
+    names.emplace_back("x");
+    names.emplace_back("params");
+    return names;
+}
+
+std::string make_nint_projection_group_source(
+    std::size_t projections) {
+    std::string source = R"METAL(
+    constexpr uint SIMD_GROUPS = 8u;
+    constexpr uint OUTPUTS_PER_SIMD = 2u;
+    constexpr uint OUTPUTS_PER_TG = SIMD_GROUPS * OUTPUTS_PER_SIMD;
+    constexpr uint CHUNKS = (uint(GS) + 3u) / 4u;
+
+    uint lane = thread_index_in_simdgroup;
+    uint simd_group = simdgroup_index_in_threadgroup;
+    uint output_base =
+        threadgroup_position_in_grid.x * OUTPUTS_PER_TG
+        + simd_group * OUTPUTS_PER_SIMD;
+    uint first_row = threadgroup_position_in_grid.y * uint(TILE_M);
+    if (output_base >= uint(MAX_OUT) || first_row >= uint(M)) {
+        return;
+    }
+)METAL";
+
+    for (std::size_t projection = 0;
+         projection < projections;
+         ++projection) {
+        const auto suffix = std::to_string(projection);
+        source +=
+            "    bool active_" + suffix
+            + " = output_base < uint(P" + suffix + "_OUT);\n"
+            "    uint outputs_" + suffix
+            + "[OUTPUTS_PER_SIMD];\n"
+            "    uint metadata_bases_" + suffix
+            + "[OUTPUTS_PER_SIMD];\n"
+            "    uint q_widths_" + suffix
+            + "[OUTPUTS_PER_SIMD];\n"
+            "    uint q_byte_offsets_" + suffix
+            + "[OUTPUTS_PER_SIMD];\n"
+            "    uint q_bit_shifts_" + suffix
+            + "[OUTPUTS_PER_SIMD];\n"
+            "    float neuron_scales_" + suffix
+            + "[OUTPUTS_PER_SIMD];\n"
+            "    float neuron_minimums_" + suffix
+            + "[OUTPUTS_PER_SIMD];\n"
+            "    float accumulators_" + suffix
+            + "[OUTPUTS_PER_SIMD][TILE_M];\n"
+            "    for (uint output_row = 0u;\n"
+            "         output_row < OUTPUTS_PER_SIMD;\n"
+            "         ++output_row) {\n"
+            "        uint output = min(\n"
+            "            output_base + output_row,\n"
+            "            uint(P" + suffix + "_OUT) - 1u);\n"
+            "        outputs_" + suffix + "[output_row] = output;\n"
+            "        metadata_bases_" + suffix
+            + "[output_row] = output * uint(NG);\n"
+            "        uint row_layout = uint(row_q_layout_" + suffix
+            + "[output]);\n"
+            "        q_widths_" + suffix
+            + "[output_row] = row_layout & 15u;\n"
+            "        q_byte_offsets_" + suffix
+            + "[output_row] = row_q_byte_offsets_" + suffix
+            + "[output];\n"
+            "        q_bit_shifts_" + suffix
+            + "[output_row] = row_layout >> 4u;\n"
+            "        neuron_scales_" + suffix
+            + "[output_row] = neuron_scale_" + suffix
+            + "[output];\n"
+            "        neuron_minimums_" + suffix
+            + "[output_row] = neuron_min_" + suffix
+            + "[output];\n"
+            "        for (uint local_row = 0u;\n"
+            "             local_row < uint(TILE_M);\n"
+            "             ++local_row) {\n"
+            "            accumulators_" + suffix
+            + "[output_row][local_row] = 0.0f;\n"
+            "        }\n"
+            "    }\n";
+    }
+
+    source += R"METAL(
+    for (uint group = lane; group < uint(NG); group += 32u) {
+        float activation_sums[TILE_M];
+        for (uint local_row = 0u;
+             local_row < uint(TILE_M);
+             ++local_row) {
+            activation_sums[local_row] = 0.0f;
+        }
+)METAL";
+
+    for (std::size_t projection = 0;
+         projection < projections;
+         ++projection) {
+        const auto suffix = std::to_string(projection);
+        source +=
+            "        float quantized_dots_" + suffix
+            + "[OUTPUTS_PER_SIMD][TILE_M];\n"
+            "        for (uint output_row = 0u;\n"
+            "             output_row < OUTPUTS_PER_SIMD;\n"
+            "             ++output_row) {\n"
+            "            for (uint local_row = 0u;\n"
+            "                 local_row < uint(TILE_M);\n"
+            "                 ++local_row) {\n"
+            "                quantized_dots_" + suffix
+            + "[output_row][local_row] = 0.0f;\n"
+            "            }\n"
+            "        }\n";
+    }
+
+    source += R"METAL(
+        for (uint chunk = 0u; chunk < CHUNKS; ++chunk) {
+            uint group_element = chunk * 4u;
+            uint column = group * uint(GS) + group_element;
+)METAL";
+
+    for (std::size_t projection = 0;
+         projection < projections;
+         ++projection) {
+        const auto suffix = std::to_string(projection);
+        source +=
+            "            uint4 codes_" + suffix
+            + "[OUTPUTS_PER_SIMD];\n"
+            "            if (active_" + suffix + ") {\n"
+            "                for (uint output_row = 0u;\n"
+            "                     output_row < OUTPUTS_PER_SIMD;\n"
+            "                     ++output_row) {\n"
+            "                    codes_" + suffix
+            + "[output_row] = mfq_grouped_nint_read_row_value4(\n"
+            "                        q_packed_" + suffix + ",\n"
+            "                        q_byte_offsets_" + suffix
+            + "[output_row],\n"
+            "                        q_bit_shifts_" + suffix
+            + "[output_row],\n"
+            "                        column,\n"
+            "                        q_widths_" + suffix
+            + "[output_row]);\n"
+            "                }\n"
+            "            }\n";
+    }
+
+    source += R"METAL(
+            for (uint local_row = 0u;
+                 local_row < uint(TILE_M);
+                 ++local_row) {
+                uint row = first_row + local_row;
+                float4 activation = float4(0.0f);
+                if (row < uint(M)) {
+                    uint input_base = row * uint(K) + column;
+                    if (group_element + 3u < uint(GS) &&
+                        column + 3u < uint(K)) {
+                        const vec<T, 4> packed_activation =
+                            *reinterpret_cast<device const vec<T, 4>*>(
+                                x + input_base);
+                        activation = float4(packed_activation);
+                    } else {
+                        activation.x = column < uint(K)
+                            ? float(x[input_base]) : 0.0f;
+                        activation.y = group_element + 1u < uint(GS) &&
+                                column + 1u < uint(K)
+                            ? float(x[input_base + 1u]) : 0.0f;
+                        activation.z = group_element + 2u < uint(GS) &&
+                                column + 2u < uint(K)
+                            ? float(x[input_base + 2u]) : 0.0f;
+                        activation.w = group_element + 3u < uint(GS) &&
+                                column + 3u < uint(K)
+                            ? float(x[input_base + 3u]) : 0.0f;
+                    }
+                }
+                activation_sums[local_row] +=
+                    activation.x + activation.y
+                    + activation.z + activation.w;
+)METAL";
+
+    for (std::size_t projection = 0;
+         projection < projections;
+         ++projection) {
+        const auto suffix = std::to_string(projection);
+        source +=
+            "                if (active_" + suffix + ") {\n"
+            "                    for (uint output_row = 0u;\n"
+            "                         output_row < OUTPUTS_PER_SIMD;\n"
+            "                         ++output_row) {\n"
+            "                        quantized_dots_" + suffix
+            + "[output_row][local_row] += dot(\n"
+            "                            activation,\n"
+            "                            float4(codes_" + suffix
+            + "[output_row]));\n"
+            "                    }\n"
+            "                }\n";
+    }
+
+    source += R"METAL(
+            }
+        }
+)METAL";
+
+    for (std::size_t projection = 0;
+         projection < projections;
+         ++projection) {
+        const auto suffix = std::to_string(projection);
+        source +=
+            "        if (active_" + suffix + ") {\n"
+            "            for (uint output_row = 0u;\n"
+            "                 output_row < OUTPUTS_PER_SIMD;\n"
+            "                 ++output_row) {\n"
+            "                uint metadata_index = metadata_bases_"
+            + suffix + "[output_row] + group;\n"
+            "                float scale = neuron_scales_" + suffix
+            + "[output_row]\n"
+            "                    * float(sub_scale_" + suffix
+            + "[metadata_index]);\n"
+            "                float minimum = neuron_minimums_" + suffix
+            + "[output_row]\n"
+            "                    * float(sub_min_" + suffix
+            + "[metadata_index]);\n"
+            "                for (uint local_row = 0u;\n"
+            "                     local_row < uint(TILE_M);\n"
+            "                     ++local_row) {\n"
+            "                    accumulators_" + suffix
+            + "[output_row][local_row] = fma(\n"
+            "                        scale,\n"
+            "                        quantized_dots_" + suffix
+            + "[output_row][local_row],\n"
+            "                        fma(\n"
+            "                            -minimum,\n"
+            "                            activation_sums[local_row],\n"
+            "                            accumulators_" + suffix
+            + "[output_row][local_row]));\n"
+            "                }\n"
+            "            }\n"
+            "        }\n";
+    }
+
+    source += "    }\n";
+
+    if (projections == 2) {
+        source += R"METAL(
+    if (uint(SWIGLU) != 0u) {
+        if (active_0 && active_1) {
+            for (uint output_row = 0u;
+                 output_row < OUTPUTS_PER_SIMD;
+                 ++output_row) {
+                uint output = output_base + output_row;
+                for (uint local_row = 0u;
+                     local_row < uint(TILE_M);
+                     ++local_row) {
+                    float gate = float(T(simd_sum(
+                        accumulators_0[output_row][local_row])));
+                    float up = float(T(simd_sum(
+                        accumulators_1[output_row][local_row])));
+                    uint row = first_row + local_row;
+                    if (lane == 0u &&
+                        output < uint(P0_OUT) &&
+                        row < uint(M)) {
+                        if (params[0] > 0.0f) {
+                            gate = min(gate, params[0]);
+                            up = clamp(up, -params[0], params[0]);
+                        }
+                        y[row * uint(P0_OUT) + output] =
+                            T((gate / (1.0f + exp(-gate))) * up);
+                    }
+                }
+            }
+        }
+        return;
+    }
+)METAL";
+    }
+
+    for (std::size_t projection = 0;
+         projection < projections;
+         ++projection) {
+        const auto suffix = std::to_string(projection);
+        source +=
+            "    if (active_" + suffix + ") {\n"
+            "        for (uint output_row = 0u;\n"
+            "             output_row < OUTPUTS_PER_SIMD;\n"
+            "             ++output_row) {\n"
+            "            uint output = output_base + output_row;\n"
+            "            for (uint local_row = 0u;\n"
+            "                 local_row < uint(TILE_M);\n"
+            "                 ++local_row) {\n"
+            "                float total = simd_sum(\n"
+            "                    accumulators_" + suffix
+            + "[output_row][local_row]);\n"
+            "                uint row = first_row + local_row;\n"
+            "                if (lane == 0u &&\n"
+            "                    output < uint(P" + suffix + "_OUT) &&\n"
+            "                    row < uint(M)) {\n"
+            "                    y[row * uint(TOTAL_OUT)\n"
+            "                        + uint(P" + suffix + "_OFFSET)\n"
+            "                        + output] = T(total);\n"
+            "                }\n"
+            "            }\n"
+            "        }\n"
+            "    }\n";
+    }
+    return source;
+}
+
+mlx::core::fast::CustomKernelFunction nint_projection_group_kernel(
+    std::size_t projections) {
+    static std::mutex mutex;
+    static std::unordered_map<
+        std::size_t,
+        mlx::core::fast::CustomKernelFunction> kernels;
+    std::lock_guard<std::mutex> lock(mutex);
+    const auto found = kernels.find(projections);
+    if (found != kernels.end()) {
+        return found->second;
+    }
+    CompileOptions options;
+    options.math_mode = MathMode::Fast;
+    auto kernel = mlx::core::fast::metal_kernel(
+        "mfq_cpp_nint_metadata_grouped_p" +
+            std::to_string(projections),
+        nint_projection_group_input_names(projections),
+        {"y"},
+        make_nint_projection_group_source(projections),
+        kNintProjectionHeader,
+        true,
+        false,
+        options);
+    kernels.emplace(projections, kernel);
     return kernel;
 }
 
@@ -675,10 +942,8 @@ std::string direct_kernel_key(
             key += "cpq";
         } else if (layout.family == kFamilyMx) {
             key += "mx" + std::to_string(layout.bits);
-        } else if (layout.q5_execution) {
-            key += "n5x";
         } else {
-            key += "n";
+            key += "unknown";
         }
     }
     return key;
@@ -723,32 +988,6 @@ bool supports_small_m_group64_output_tile(
     return true;
 }
 
-bool supports_small_m_qkv_output_tile(
-    const std::vector<DirectProjectionLayout>& layouts) noexcept {
-    if (layouts.size() != 3) {
-        return false;
-    }
-    for (std::size_t index = 0; index < 2; ++index) {
-        const auto& layout = layouts[index];
-        if (layout.family != kFamilyVq ||
-            layout.execution_layout != 0 ||
-            layout.group_size != 24 ||
-            layout.vector_size != 4 ||
-            layout.index_bits != 8 ||
-            layout.entries != 256 ||
-            layout.code_bank_mode == 2 ||
-            layout.aux_mode < 1 || layout.aux_mode > 2) {
-            return false;
-        }
-    }
-    const auto& value = layouts[2];
-    return value.family == kFamilyNint &&
-        value.bits == 4 &&
-        !value.q5_execution &&
-        value.group_size > 0 &&
-        (value.group_size % 4) == 0;
-}
-
 std::vector<std::string> direct_input_names(
     const std::vector<DirectProjectionLayout>& layouts) {
     std::vector<std::string> names;
@@ -759,13 +998,7 @@ std::vector<std::string> direct_input_names(
         ++projection
     ) {
         const auto suffix = std::to_string(projection);
-        if (layouts[projection].family == kFamilyNint) {
-            names.push_back("q_packed_" + suffix);
-            names.push_back("sub_scale_" + suffix);
-            names.push_back("sub_min_" + suffix);
-            names.push_back("neuron_scale_" + suffix);
-            names.push_back("neuron_min_" + suffix);
-        } else if (
+        if (
             layouts[projection].family
                 == kFamilyNint8Zero
         ) {
@@ -854,56 +1087,7 @@ std::string make_direct_small_m_source(
             + "_OUT)) { continue; }\n"
             "                float weight = 0.0f;\n";
 
-        if (layouts[projection].family == kFamilyNint) {
-            source +=
-                "                uint group = column / uint(P" + suffix
-                + "_GS);\n"
-                "                uint element = column - group * uint(P"
-                + suffix + "_GS);\n"
-                "                uint metadata_index = output * uint(P"
-                + suffix + "_NG) + group;\n"
-                "                uint quantized_index = metadata_index"
-                " * uint(P" + suffix + "_GS) + element;\n"
-                "                uint quantized = ";
-            if (layouts[projection].bits == 2
-                && !layouts[projection].q5_execution) {
-                source +=
-                    "(uint(q_packed_" + suffix
-                    + "[quantized_index >> 2u])"
-                    " >> ((quantized_index & 3u) * 2u)) & 3u;\n";
-            } else if (layouts[projection].bits == 4
-                && !layouts[projection].q5_execution) {
-                source +=
-                    "(uint(q_packed_" + suffix
-                    + "[quantized_index >> 1u])"
-                    " >> ((quantized_index & 1u) * 4u)) & 15u;\n";
-            } else if (layouts[projection].bits == 8
-                && !layouts[projection].q5_execution) {
-                source +=
-                    "uint(q_packed_" + suffix
-                    + "[quantized_index]);\n";
-            } else {
-                source +=
-                    "mfq_grouped_nint_read_value(\n"
-                    "                    q_packed_" + suffix + ",\n"
-                    "                    quantized_index,\n"
-                    "                    uint(P" + suffix + "_BITS),\n"
-                    "                    uint(P" + suffix + "_GS),\n"
-                    "                    "
-                    + std::string(
-                        layouts[projection].q5_execution ? "1u" : "0u")
-                    + ");\n";
-            }
-            source +=
-                "                float scale = neuron_scale_" + suffix
-                + "[output] * float(sub_scale_" + suffix
-                + "[metadata_index]);\n"
-                "                float minimum = neuron_min_" + suffix
-                + "[output] * float(sub_min_" + suffix
-                + "[metadata_index]);\n"
-                "                weight = scale * float(quantized)"
-                " - minimum;\n";
-        } else if (layouts[projection].family == kFamilyNint8Zero) {
+        if (layouts[projection].family == kFamilyNint8Zero) {
             source +=
                 "                uint group = column >> 5;\n"
                 "                weight = float(q8_scales_" + suffix
@@ -1058,8 +1242,7 @@ std::string make_direct_source(
             layouts.begin(),
             layouts.end(),
             [](const DirectProjectionLayout& layout) {
-                return (layout.family == kFamilyNint
-                    || layout.family == kFamilyNint8Zero
+                return (layout.family == kFamilyNint8Zero
                     || layout.family == kFamilyVq)
                     && layout.execution_layout == 0;
             });
@@ -1200,40 +1383,7 @@ std::string make_direct_source(
             ? "            if ("
             : " else if (";
         source += "projection == " + suffix + "u) {\n";
-        if (layouts[projection].family == kFamilyNint) {
-            source +=
-                "                uint group = column / uint(P"
-                + suffix + "_GS);\n"
-                "                uint element = column"
-                " - group * uint(P" + suffix + "_GS);\n"
-                "                uint metadata_index ="
-                " output * uint(P" + suffix + "_NG) + group;\n"
-                "                uint quantized_index ="
-                " metadata_index * uint(P" + suffix
-                + "_GS) + element;\n"
-                "                uint quantized ="
-                " mfq_grouped_nint_read_value(\n"
-                "                    q_packed_" + suffix + ",\n"
-                "                    quantized_index,\n"
-                "                    uint(P" + suffix + "_BITS),\n"
-                "                    uint(P" + suffix + "_GS),\n"
-                "                    "
-                + std::string(
-                    layouts[projection].q5_execution
-                        ? "1u"
-                        : "0u")
-                + ");\n"
-                "                float scale ="
-                " neuron_scale_" + suffix + "[output]"
-                " * float(sub_scale_" + suffix
-                + "[metadata_index]);\n"
-                "                float minimum ="
-                " neuron_min_" + suffix + "[output]"
-                " * float(sub_min_" + suffix
-                + "[metadata_index]);\n"
-                "                weight ="
-                " scale * float(quantized) - minimum;\n";
-        } else if (
+        if (
             layouts[projection].family
                 == kFamilyNint8Zero
         ) {
@@ -1974,201 +2124,6 @@ std::string make_direct_small_m_blockwise_source(
             source +=
                 "            }\n"
                 "        }\n";
-        } else if (layout.family == kFamilyNint) {
-            source +=
-                "        uint output_metadata_base = output * uint(P" + suffix
-                + "_NG);\n"
-                "        float output_scale = neuron_scale_" + suffix
-                + "[output];\n"
-                "        float output_minimum = neuron_min_" + suffix
-                + "[output];\n"
-                "        for (uint group = k_lane; group < uint(P" + suffix
-                + "_NG); group += K_LANES) {\n"
-                "            uint metadata_index ="
-                " output_metadata_base + group;\n"
-                "            float scale = output_scale"
-                " * float(sub_scale_" + suffix + "[metadata_index]);\n"
-                "            float minimum = output_minimum"
-                " * float(sub_min_" + suffix + "[metadata_index]);\n";
-            const bool vectorized_nint =
-                (layout.group_size % 4) == 0 &&
-                ((!layout.q5_execution &&
-                  (layout.bits == 2 || layout.bits == 3 ||
-                   layout.bits == 4 ||
-                   layout.bits == 8)) ||
-                 (layout.q5_execution && layout.bits == 5));
-            if (vectorized_nint) {
-                source +=
-                    "            for (uint element = 0u; element < uint(P"
-                    + suffix + "_GS); element += 4u) {\n"
-                    "                uint column = group * uint(P" + suffix
-                    + "_GS) + element;\n"
-                    "                if (column >= uint(K)) { break; }\n"
-                    "                uint quantized_index = metadata_index"
-                    " * uint(P" + suffix + "_GS) + element;\n";
-                if (layout.bits == 2) {
-                    source +=
-                        "                uint packed = uint(q_packed_" + suffix
-                        + "[quantized_index >> 2u]);\n"
-                        "                float4 weights = scale * float4(\n"
-                        "                    float(packed & 3u),\n"
-                        "                    float((packed >> 2u) & 3u),\n"
-                        "                    float((packed >> 4u) & 3u),\n"
-                        "                    float((packed >> 6u) & 3u))"
-                        " - float4(minimum);\n";
-                } else if (layout.bits == 3) {
-                    source +=
-                        "                uint residual_bits ="
-                        " (quantized_index & 7u) * 3u;\n"
-                        "                uint byte_index ="
-                        " (quantized_index >> 3u) * 3u"
-                        " + (residual_bits >> 3u);\n"
-                        "                uint shift = residual_bits & 7u;\n"
-                        "                uint packed = uint(q_packed_" + suffix
-                        + "[byte_index]) | (uint(q_packed_" + suffix
-                        + "[byte_index + 1u]) << 8u);\n"
-                        "                float4 weights = scale * float4(\n"
-                        "                    float((packed >> shift) & 7u),\n"
-                        "                    float((packed >> (shift + 3u))"
-                        " & 7u),\n"
-                        "                    float((packed >> (shift + 6u))"
-                        " & 7u),\n"
-                        "                    float((packed >> (shift + 9u))"
-                        " & 7u)) - float4(minimum);\n";
-                } else if (layout.bits == 4) {
-                    source +=
-                        "                uint packed = uint(q_packed_" + suffix
-                        + "[quantized_index >> 1u])"
-                        " | (uint(q_packed_" + suffix
-                        + "[(quantized_index >> 1u) + 1u]) << 8u);\n"
-                        "                float4 weights = scale * float4(\n"
-                        "                    float(packed & 15u),\n"
-                        "                    float((packed >> 4u) & 15u),\n"
-                        "                    float((packed >> 8u) & 15u),\n"
-                        "                    float((packed >> 12u) & 15u))"
-                        " - float4(minimum);\n";
-                } else if (layout.bits == 5) {
-                    const int low_bytes = (layout.group_size + 1) / 2;
-                    const int high_bytes = (layout.group_size + 7) / 8;
-                    source +=
-                        "                constexpr uint LOW_BYTES = " +
-                        std::to_string(low_bytes) + "u;\n"
-                        "                constexpr uint EXEC_BYTES = " +
-                        std::to_string(low_bytes + high_bytes) + "u;\n"
-                        "                uint group_offset = metadata_index"
-                        " * EXEC_BYTES;\n"
-                        "                uint low0 = uint(q_packed_" + suffix
-                        + "[group_offset + (element >> 1u)]);\n"
-                        "                uint low1 = uint(q_packed_" + suffix
-                        + "[group_offset + (element >> 1u) + 1u]);\n"
-                        "                uint high = uint(q_packed_" + suffix
-                        + "[group_offset + LOW_BYTES + (element >> 3u)])"
-                        " >> (element & 7u);\n"
-                        "                float4 weights = scale * float4(\n"
-                        "                    float((low0 & 15u)"
-                        " | ((high & 1u) << 4u)),\n"
-                        "                    float((low0 >> 4u)"
-                        " | (((high >> 1u) & 1u) << 4u)),\n"
-                        "                    float((low1 & 15u)"
-                        " | (((high >> 2u) & 1u) << 4u)),\n"
-                        "                    float((low1 >> 4u)"
-                        " | (((high >> 3u) & 1u) << 4u)))"
-                        " - float4(minimum);\n";
-                } else {
-                    source +=
-                        "                float4 weights = scale * float4(\n"
-                        "                    float(q_packed_" + suffix
-                        + "[quantized_index]),\n"
-                        "                    float(q_packed_" + suffix
-                        + "[quantized_index + 1u]),\n"
-                        "                    float(q_packed_" + suffix
-                        + "[quantized_index + 2u]),\n"
-                        "                    float(q_packed_" + suffix
-                        + "[quantized_index + 3u]))"
-                        " - float4(minimum);\n";
-                }
-                source +=
-                    "                for (uint row = 0u; row < uint(ROWS);"
-                    " ++row) {\n"
-                    "                    uint input_base = row * uint(K)"
-                    " + column;\n";
-                if (vectorized_fp16) {
-                    source +=
-                        "                    float4 activation;\n"
-                        "                    if ((uint(K) & 3u) == 0u &&"
-                        " element + 3u < uint(P" + suffix
-                        + "_GS) && column + 3u < uint(K)) {\n"
-                        "                        activation = float4("
-                        "*(device const half4*)(x + input_base));\n"
-                        "                    } else {\n"
-                        "                        activation = float4(\n"
-                        "                            column < uint(K)"
-                        " ? float(x[input_base]) : 0.0f,\n"
-                        "                            element + 1u < uint(P" + suffix
-                        + "_GS) && column + 1u < uint(K)"
-                        " ? float(x[input_base + 1u]) : 0.0f,\n"
-                        "                            element + 2u < uint(P" + suffix
-                        + "_GS) && column + 2u < uint(K)"
-                        " ? float(x[input_base + 2u]) : 0.0f,\n"
-                        "                            element + 3u < uint(P" + suffix
-                        + "_GS) && column + 3u < uint(K)"
-                        " ? float(x[input_base + 3u]) : 0.0f);\n"
-                        "                    }\n";
-                } else {
-                    source +=
-                        "                    float4 activation = float4(\n"
-                        "                        column < uint(K)"
-                        " ? float(x[input_base]) : 0.0f,\n"
-                        "                        element + 1u < uint(P" + suffix
-                        + "_GS) && column + 1u < uint(K)"
-                        " ? float(x[input_base + 1u]) : 0.0f,\n"
-                        "                        element + 2u < uint(P" + suffix
-                        + "_GS) && column + 2u < uint(K)"
-                        " ? float(x[input_base + 2u]) : 0.0f,\n"
-                        "                        element + 3u < uint(P" + suffix
-                        + "_GS) && column + 3u < uint(K)"
-                        " ? float(x[input_base + 3u]) : 0.0f);\n";
-                }
-                source +=
-                    "                    accumulators[row] +="
-                    " activation.x * weights.x;\n"
-                    "                    if (element + 1u < uint(P" + suffix
-                    + "_GS) && column + 1u < uint(K))"
-                    " accumulators[row] += activation.y * weights.y;\n"
-                    "                    if (element + 2u < uint(P" + suffix
-                    + "_GS) && column + 2u < uint(K))"
-                    " accumulators[row] += activation.z * weights.z;\n"
-                    "                    if (element + 3u < uint(P" + suffix
-                    + "_GS) && column + 3u < uint(K))"
-                    " accumulators[row] += activation.w * weights.w;\n";
-                source +=
-                    "                }\n"
-                    "            }\n";
-            } else {
-                source +=
-                "            for (uint element = 0u; element < uint(P"
-                + suffix + "_GS); ++element) {\n"
-                "                uint column = group * uint(P" + suffix
-                + "_GS) + element;\n"
-                "                if (column >= uint(K)) { break; }\n"
-                "                uint quantized_index = metadata_index"
-                " * uint(P" + suffix + "_GS) + element;\n"
-                "                uint quantized ="
-                " mfq_grouped_nint_read_value(q_packed_" + suffix
-                + ", quantized_index, uint(P" + suffix + "_BITS), uint(P"
-                + suffix + "_GS), "
-                + std::string(layout.q5_execution ? "1u" : "0u")
-                + ");\n"
-                "                float weight = scale * float(quantized)"
-                " - minimum;\n"
-                "                for (uint row = 0u; row < uint(ROWS);"
-                " ++row) {\n"
-                "                    accumulators[row] += float("
-                "x[row * uint(K) + column]) * weight;\n"
-                "                }\n"
-                "            }\n";
-            }
-            source += "        }\n";
         } else if (layout.family == kFamilyMx) {
             const int block = layout.bits == 4 ? 32 : 128;
             const int vectors = block / 4;
@@ -2464,332 +2419,6 @@ std::string make_direct_small_m_group64_output_tile_source(
             "    }\n";
     }
     return source;
-}
-
-std::string make_direct_small_m_qkv_output_tile_source(
-    const std::vector<DirectProjectionLayout>& layouts,
-    int outputs_per_simd,
-    int simd_groups) {
-    std::string source =
-        "    constexpr uint SIMD_GROUPS = "
-        + std::to_string(simd_groups) + "u;\n";
-    source += "    constexpr uint OUTPUTS_PER_SIMD = "
-        + std::to_string(outputs_per_simd) + "u;\n";
-    source += R"METAL(
-    constexpr uint OUTPUTS_PER_TG = SIMD_GROUPS * OUTPUTS_PER_SIMD;
-
-    uint lane = thread_index_in_simdgroup;
-    uint simd_group = simdgroup_index_in_threadgroup;
-    uint global_tile = threadgroup_position_in_grid.x;
-)METAL";
-
-    for (std::size_t projection = 0;
-         projection < layouts.size();
-         ++projection) {
-        const auto& layout = layouts[projection];
-        const auto suffix = std::to_string(projection);
-        source += projection == 0 ? "    if (" : "    else if (";
-        source += "global_tile >= uint(P" + suffix
-            + "_TILE_BEGIN) && global_tile < uint(P" + suffix
-            + "_TILE_END)) {\n";
-        source +=
-            "        uint local_tile = global_tile - uint(P" + suffix
-            + "_TILE_BEGIN);\n"
-            "        uint output_base = local_tile * OUTPUTS_PER_TG"
-            " + simd_group * OUTPUTS_PER_SIMD;\n"
-            "        float accumulators[OUTPUTS_PER_SIMD][ROWS];\n"
-            "        for (uint output_row = 0u;"
-            " output_row < OUTPUTS_PER_SIMD; ++output_row) {\n"
-            "            for (uint row = 0u; row < uint(ROWS); ++row) {\n"
-            "                accumulators[output_row][row] = 0.0f;\n"
-            "            }\n"
-            "        }\n";
-
-        if (layout.family == kFamilyVq) {
-            source +=
-                "        uint output_group_bases[OUTPUTS_PER_SIMD];\n"
-                "        uint output_vector_bases[OUTPUTS_PER_SIMD];\n"
-                "        uint output_sign_bases[OUTPUTS_PER_SIMD];\n"
-                "        uint output_super_bases[OUTPUTS_PER_SIMD];\n"
-                "        float output_anchors[OUTPUTS_PER_SIMD];\n"
-                "        for (uint output_row = 0u;"
-                " output_row < OUTPUTS_PER_SIMD; ++output_row) {\n"
-                "            uint output = min(output_base + output_row,"
-                " uint(P" + suffix + "_OUT) - 1u);\n"
-                "            output_group_bases[output_row] ="
-                " output * uint(P" + suffix + "_NG);\n"
-                "            output_vector_bases[output_row] ="
-                " output * uint(P" + suffix + "_NVEC);\n"
-                "            output_sign_bases[output_row] ="
-                " output * ((uint(K) + 7u) / 8u);\n"
-                "            output_super_bases[output_row] ="
-                " output * uint(P" + suffix + "_NSUPER);\n"
-                "            output_anchors[output_row] ="
-                " vq_anchors_" + suffix + "[output];\n"
-                "        }\n"
-                "        for (uint group = lane; group < uint(P" + suffix
-                + "_NG); group += 32u) {\n"
-                "            float weight_scales[OUTPUTS_PER_SIMD];\n"
-                "            uint table_banks[OUTPUTS_PER_SIMD];\n"
-                "            uint code_banks[OUTPUTS_PER_SIMD];\n"
-                "            uint group_signs[OUTPUTS_PER_SIMD];\n"
-                "            for (uint output_row = 0u;"
-                " output_row < OUTPUTS_PER_SIMD; ++output_row) {\n"
-                "                uint state_index ="
-                " output_group_bases[output_row] + group;\n";
-            append_blockwise_vq_read(
-                source,
-                "state",
-                "vq_state_" + suffix,
-                "state_index",
-                layout.state_bits);
-            source +=
-                "                uint table_bank = 0u;\n";
-            if (layout.table_banks > 1) {
-                source +=
-                    "                table_bank = uint(vq_bank_ids_" + suffix
-                    + "[output_super_bases[output_row]"
-                    " + group / uint(P" + suffix
-                    + "_GROUPS_PER_SUPER)]);\n";
-            }
-            source +=
-                "                uint code_bank = 0u;\n";
-            if (layout.code_bank_mode == 1) {
-                source +=
-                    "                code_bank = uint(vq_state_banks_"
-                    + suffix + "[state]);\n";
-            }
-            source +=
-                "                table_banks[output_row] = table_bank;\n"
-                "                code_banks[output_row] = code_bank;\n"
-                "                weight_scales[output_row] ="
-                " output_anchors[output_row] * vq_scales_" + suffix
-                + "[table_bank * uint(P" + suffix
-                + "_STATES) + state];\n"
-                "                uint sign_bit ="
-                " (output_sign_bases[output_row] + group * 3u) * 7u;\n"
-                "                uint sign_byte = sign_bit >> 3u;\n"
-                "                uint packed_signs ="
-                " uint(vq_aux_" + suffix + "[sign_byte])"
-                " | (uint(vq_aux_" + suffix
-                + "[sign_byte + 1u]) << 8u)"
-                " | (uint(vq_aux_" + suffix
-                + "[sign_byte + 2u]) << 16u)"
-                " | (uint(vq_aux_" + suffix
-                + "[sign_byte + 3u]) << 24u);\n"
-                "                group_signs[output_row] ="
-                " packed_signs >> (sign_bit & 7u);\n"
-                "            }\n"
-                "            #pragma clang loop unroll(full)\n"
-                "            for (uint local_pair = 0u;"
-                " local_pair < 3u; ++local_pair) {\n"
-                "                uint column_base = group * 24u"
-                " + local_pair * 8u;\n"
-                "                if (column_base >= uint(K)) { break; }\n"
-                "                for (uint output_row = 0u;"
-                " output_row < OUTPUTS_PER_SIMD; ++output_row) {\n"
-                "                    uint index_position ="
-                " output_vector_bases[output_row] + group * 6u"
-                " + local_pair * 2u;\n"
-                "                    uchar2 pair_indices ="
-                " *(device const uchar2*)(vq_indices_" + suffix
-                + " + index_position);\n"
-                "                    uint index0 = uint(pair_indices.x);\n"
-                "                    uint index1 = uint(pair_indices.y);\n"
-                "                    uint sign_value ="
-                " (group_signs[output_row] >> (local_pair * 7u))"
-                " & 127u;\n"
-                "                    uint code_base0 = (("
-                "(table_banks[output_row] * uint(P" + suffix
-                + "_CODE_BANKS) + code_banks[output_row])"
-                " * uint(P" + suffix + "_ENTRIES) + index0) * 4u);\n"
-                "                    uint code_base1 = (("
-                "(table_banks[output_row] * uint(P" + suffix
-                + "_CODE_BANKS) + code_banks[output_row])"
-                " * uint(P" + suffix + "_ENTRIES) + index1) * 4u);\n"
-                "                    char4 packed_codes0 ="
-                " *(device const char4*)(vq_codebooks_" + suffix
-                + " + code_base0);\n"
-                "                    char4 packed_codes1 ="
-                " *(device const char4*)(vq_codebooks_" + suffix
-                + " + code_base1);\n"
-                "                    float4 codes0 = float4("
-                "float(packed_codes0.x), float(packed_codes0.y),"
-                " float(packed_codes0.z), float(packed_codes0.w));\n"
-                "                    float4 codes1 = float4("
-                "float(packed_codes1.x), float(packed_codes1.y),"
-                " float(packed_codes1.z), float(packed_codes1.w));\n"
-                "                    for (uint component = 0u;"
-                " component < 4u; ++component) {\n"
-                "                        if (((sign_value >> component)"
-                " & 1u) != 0u) { codes0[component] = -codes0[component]; }\n"
-                "                    }\n"
-                "                    for (uint component = 0u;"
-                " component < 4u; ++component) {\n"
-                "                        uint sign_position ="
-                " component + 4u;\n"
-                "                        uint negative ="
-                " sign_position < 7u"
-                " ? ((sign_value >> sign_position) & 1u)"
-                " : (popcount(sign_value) & 1u);\n";
-            if (layout.aux_mode == 2) {
-                source +=
-                    "                        if (sign_position == 7u)"
-                    " { negative ^= (index1 >> 7u) & 1u; }\n";
-            }
-            source +=
-                "                        if (negative != 0u)"
-                " { codes1[component] = -codes1[component]; }\n"
-                "                    }\n"
-                "                    float scale ="
-                " weight_scales[output_row];\n"
-                "                    float4 weights0 = scale * codes0;\n"
-                "                    float4 weights1 = scale * codes1;\n"
-                "                    for (uint row = 0u;"
-                " row < uint(ROWS); ++row) {\n"
-                "                        uint input_base ="
-                " row * uint(K) + column_base;\n"
-                "                        float4 activation0 = float4("
-                "*(device const half4*)(x + input_base));\n"
-                "                        float4 activation1 = float4("
-                "*(device const half4*)(x + input_base + 4u));\n"
-                "                        accumulators[output_row][row] +="
-                " dot(activation0, weights0);\n"
-                "                        accumulators[output_row][row] +="
-                " dot(activation1, weights1);\n"
-                "                    }\n"
-                "                }\n"
-                "            }\n"
-                "        }\n";
-        } else {
-            source +=
-                "        uint output_group_bases[OUTPUTS_PER_SIMD];\n"
-                "        float output_scales[OUTPUTS_PER_SIMD];\n"
-                "        float output_minimums[OUTPUTS_PER_SIMD];\n"
-                "        for (uint output_row = 0u;"
-                " output_row < OUTPUTS_PER_SIMD; ++output_row) {\n"
-                "            uint output = min(output_base + output_row,"
-                " uint(P" + suffix + "_OUT) - 1u);\n"
-                "            output_group_bases[output_row] ="
-                " output * uint(P" + suffix + "_NG);\n"
-                "            output_scales[output_row] ="
-                " neuron_scale_" + suffix + "[output];\n"
-                "            output_minimums[output_row] ="
-                " neuron_min_" + suffix + "[output];\n"
-                "        }\n"
-                "        for (uint group = lane; group < uint(P" + suffix
-                + "_NG); group += 32u) {\n"
-                "            for (uint element = 0u;"
-                " element < uint(P" + suffix + "_GS); element += 4u) {\n"
-                "                uint column = group * uint(P" + suffix
-                + "_GS) + element;\n"
-                "                if (column >= uint(K)) { break; }\n"
-                "                for (uint output_row = 0u;"
-                " output_row < OUTPUTS_PER_SIMD; ++output_row) {\n"
-                "                    uint metadata_index ="
-                " output_group_bases[output_row] + group;\n"
-                "                    float scale ="
-                " output_scales[output_row]"
-                " * float(sub_scale_" + suffix + "[metadata_index]);\n"
-                "                    float minimum ="
-                " output_minimums[output_row]"
-                " * float(sub_min_" + suffix + "[metadata_index]);\n"
-                "                    uint quantized_index ="
-                " metadata_index * uint(P" + suffix + "_GS) + element;\n"
-                "                    uint packed ="
-                " uint(q_packed_" + suffix
-                + "[quantized_index >> 1u])"
-                " | (uint(q_packed_" + suffix
-                + "[(quantized_index >> 1u) + 1u]) << 8u);\n"
-                "                    float4 weights = scale * float4("
-                "float(packed & 15u),"
-                " float((packed >> 4u) & 15u),"
-                " float((packed >> 8u) & 15u),"
-                " float((packed >> 12u) & 15u)) - float4(minimum);\n"
-                "                    for (uint row = 0u;"
-                " row < uint(ROWS); ++row) {\n"
-                "                        uint input_base ="
-                " row * uint(K) + column;\n"
-                "                        float4 activation = float4("
-                "*(device const half4*)(x + input_base));\n"
-                "                        accumulators[output_row][row] +="
-                " activation.x * weights.x;\n"
-                "                        accumulators[output_row][row] +="
-                " activation.y * weights.y;\n"
-                "                        accumulators[output_row][row] +="
-                " activation.z * weights.z;\n"
-                "                        accumulators[output_row][row] +="
-                " activation.w * weights.w;\n"
-                "                    }\n"
-                "                }\n"
-                "            }\n"
-                "        }\n";
-        }
-
-        source +=
-            "        for (uint output_row = 0u;"
-            " output_row < OUTPUTS_PER_SIMD; ++output_row) {\n"
-            "            uint output = output_base + output_row;\n"
-            "            for (uint row = 0u; row < uint(ROWS); ++row) {\n"
-            "                float total ="
-            " simd_sum(accumulators[output_row][row]);\n"
-            "                if (lane == 0u &&"
-            " output < uint(P" + suffix + "_OUT)) {\n"
-            "                    y[row * uint(TOTAL_OUT) + uint(P" + suffix
-            + "_OUT_OFFSET) + output] = T(total);\n"
-            "                }\n"
-            "            }\n"
-            "        }\n"
-            "    }\n";
-    }
-    return source;
-}
-
-mlx::core::fast::CustomKernelFunction make_direct_small_m_qkv_kernel(
-    const std::vector<DirectProjectionLayout>& layouts,
-    int outputs_per_simd,
-    int simd_groups) {
-    CompileOptions options;
-    options.math_mode = MathMode::Fast;
-    return mlx::core::fast::metal_kernel(
-        "mfq_cpp_zero_copy_grouped_linear_"
-            + direct_kernel_key(layouts)
-            + "_m2_qkv_o" + std::to_string(outputs_per_simd)
-            + "s" + std::to_string(simd_groups),
-        direct_input_names(layouts),
-        {"y"},
-        make_direct_small_m_qkv_output_tile_source(
-            layouts,
-            outputs_per_simd,
-            simd_groups),
-        kGroupedHeader,
-        true,
-        false,
-        options);
-}
-
-mlx::core::fast::CustomKernelFunction direct_small_m_qkv_kernel(
-    const std::vector<DirectProjectionLayout>& layouts,
-    int outputs_per_simd,
-    int simd_groups) {
-    static std::mutex mutex;
-    static std::unordered_map<
-        std::string,
-        mlx::core::fast::CustomKernelFunction> kernels;
-    const auto key = direct_kernel_key(layouts)
-        + "_m2_qkv_o" + std::to_string(outputs_per_simd)
-        + "s" + std::to_string(simd_groups);
-    std::lock_guard<std::mutex> lock(mutex);
-    const auto found = kernels.find(key);
-    if (found != kernels.end()) {
-        return found->second;
-    }
-    auto kernel = make_direct_small_m_qkv_kernel(
-        layouts,
-        outputs_per_simd,
-        simd_groups);
-    kernels.emplace(key, kernel);
-    return kernel;
 }
 
 mlx::core::fast::CustomKernelFunction make_direct_kernel(
@@ -3320,14 +2949,10 @@ struct MlxGroupedLinear::Impl {
     std::optional<array> descriptors;
     std::optional<array> projection_tile_offsets;
     std::optional<array> projection_output_offsets;
-    std::optional<array> nint_q;
-    std::optional<array> nint_sub_scale;
-    std::optional<array> nint_sub_min;
-    std::optional<array> nint_anchor_scale;
-    std::optional<array> nint_anchor_min;
     std::optional<array> q8_q;
     std::optional<array> q8_scales;
     std::vector<RetainedProjection> common_kernel_weights;
+    std::vector<MlxNintWeight> nint_projection_weights;
     std::vector<DirectProjectionLayout> direct_layouts;
     std::vector<array> direct_weight_inputs;
     std::vector<int> output_sizes;
@@ -3351,14 +2976,21 @@ struct MlxGroupedLinear::Impl {
           packed_bytes(bytes) {}
 
     Impl(
+        std::vector<MlxNintWeight> weights,
+        std::vector<int> widths,
+        int width,
+        int total_output,
+        std::size_t bytes)
+        : nint_projection_weights(std::move(weights)),
+          output_sizes(std::move(widths)),
+          input_size(width),
+          total_output_size(total_output),
+          packed_bytes(bytes) {}
+
+    Impl(
         array descriptors_value,
         array tile_offsets_value,
         array output_offsets_value,
-        array nint_q_value,
-        array nint_sub_scale_value,
-        array nint_sub_min_value,
-        array nint_anchor_scale_value,
-        array nint_anchor_min_value,
         array q8_q_value,
         array q8_scales_value,
         std::vector<int> widths,
@@ -3371,11 +3003,6 @@ struct MlxGroupedLinear::Impl {
               std::move(tile_offsets_value)),
           projection_output_offsets(
               std::move(output_offsets_value)),
-          nint_q(std::move(nint_q_value)),
-          nint_sub_scale(std::move(nint_sub_scale_value)),
-          nint_sub_min(std::move(nint_sub_min_value)),
-          nint_anchor_scale(std::move(nint_anchor_scale_value)),
-          nint_anchor_min(std::move(nint_anchor_min_value)),
           q8_q(std::move(q8_q_value)),
           q8_scales(std::move(q8_scales_value)),
           output_sizes(std::move(widths)),
@@ -3412,7 +3039,20 @@ struct MlxGroupedLinear::Impl {
 
     bool uses_zero_copy_storage() const noexcept {
         return !common_kernel_weights.empty()
+            || !nint_projection_weights.empty()
             || !direct_layouts.empty();
+    }
+
+    bool has_nint_projection_group() const noexcept {
+        return !nint_projection_weights.empty();
+    }
+
+    bool has_nint_swiglu_pair() const noexcept {
+        return nint_projection_weights.size() == 2
+            && output_sizes.size() == 2
+            && output_sizes[0] == output_sizes[1]
+            && nint_projection_weights[0].can_fuse_swiglu(
+                nint_projection_weights[1]);
     }
 
     bool has_single_row_mxfp8_fast_path() const noexcept {
@@ -3420,6 +3060,9 @@ struct MlxGroupedLinear::Impl {
     }
 
     bool supports_single_row_swiglu() const noexcept {
+        if (has_nint_swiglu_pair()) {
+            return true;
+        }
         if (direct_layouts.size() != 2
             || output_sizes.size() != 2
             || output_sizes[0] != output_sizes[1]) {
@@ -3458,10 +3101,10 @@ MlxGroupedLinear::MlxGroupedLinear(
             "grouped linear input width must be positive");
     }
 
-    // NINT v2 has one metadata-driven matmul kernel for every q/k profile.
-    // Keep grouped projection orchestration at the graph level instead of
-    // compiling q-specific, projection-fused, or heterogeneous NINT kernels.
-    // This also makes adaptive and uniform rows use exactly the same path.
+    // Two- and three-projection NINT groups use one projection-fused operator
+    // whose decoder consumes the same per-row q/k metadata as the standalone
+    // NINT kernel. Larger or mixed-format groups remain graph compositions;
+    // no uniform-q or precision-specific NINT implementation is retained.
     const bool contains_nint = std::any_of(
         weights.begin(),
         weights.end(),
@@ -3470,6 +3113,13 @@ MlxGroupedLinear::MlxGroupedLinear(
                 const MlxNintWeight*>(weight);
         });
     if (contains_nint) {
+        const bool all_nint = std::all_of(
+            weights.begin(),
+            weights.end(),
+            [](const MlxGroupedLinearWeightRef& weight) {
+                return std::holds_alternative<
+                    const MlxNintWeight*>(weight);
+            });
         std::vector<RetainedProjection> retained;
         std::vector<int> output_sizes;
         retained.reserve(weights.size());
@@ -3508,6 +3158,61 @@ MlxGroupedLinear::MlxGroupedLinear(
             packed_bytes += bytes;
             output_sizes.push_back(output);
             retained.push_back(retain_projection(weight));
+        }
+
+        bool can_fuse_projections = all_nint && weights.size() <= 3;
+        std::vector<MlxNintWeight> nint_weights;
+        if (can_fuse_projections) {
+            nint_weights.reserve(weights.size());
+            const auto* first = std::get<const MlxNintWeight*>(
+                weights.front());
+            for (const auto& weight : weights) {
+                const auto* value = std::get<const MlxNintWeight*>(weight);
+                if (value == nullptr || first == nullptr ||
+                    value->group_size() != first->group_size() ||
+                    value->groups() != first->groups()) {
+                    can_fuse_projections = false;
+                    break;
+                }
+                validate_direct_array(
+                    value->packed_values(),
+                    mlx::core::uint8,
+                    "NINT q");
+                validate_direct_array(
+                    value->row_q_layout(),
+                    mlx::core::uint8,
+                    "NINT row q layout");
+                validate_direct_array(
+                    value->row_q_byte_offsets(),
+                    mlx::core::uint32,
+                    "NINT row q byte offsets");
+                validate_direct_array(
+                    value->sub_scales(),
+                    mlx::core::uint8,
+                    "NINT sub scales");
+                validate_direct_array(
+                    value->sub_mins(),
+                    mlx::core::uint8,
+                    "NINT sub minima");
+                validate_direct_array(
+                    value->neuron_scales(),
+                    mlx::core::float32,
+                    "NINT neuron scales");
+                validate_direct_array(
+                    value->neuron_mins(),
+                    mlx::core::float32,
+                    "NINT neuron minima");
+                nint_weights.push_back(*value);
+            }
+        }
+        if (can_fuse_projections) {
+            impl_ = std::make_shared<Impl>(
+                std::move(nint_weights),
+                std::move(output_sizes),
+                shared_input,
+                total_output,
+                packed_bytes);
+            return;
         }
         impl_ = std::make_shared<Impl>(
             std::move(retained),
@@ -3596,45 +3301,8 @@ MlxGroupedLinear::MlxGroupedLinear(
                     if constexpr (
                         std::is_same_v<Weight, MlxNintWeight>
                     ) {
-                        if (!weight->has_uniform_q_bits()) {
-                            throw MlxGroupedLinearUnsupported(
-                                "grouped linear falls back for adaptive NINT q widths");
-                        }
-                        layout.family = kFamilyNint;
-                        layout.bits = weight->bits();
-                        layout.group_size = weight->group_size();
-                        layout.groups = weight->groups();
-                        layout.q5_execution = false;
-                        validate_direct_array(
-                            weight->packed_values(),
-                            mlx::core::uint8,
-                            "NINT q");
-                        validate_direct_array(
-                            weight->sub_scales(),
-                            mlx::core::uint8,
-                            "NINT sub scales");
-                        validate_direct_array(
-                            weight->sub_mins(),
-                            mlx::core::uint8,
-                            "NINT sub minima");
-                        validate_direct_array(
-                            weight->neuron_scales(),
-                            mlx::core::float32,
-                            "NINT neuron scales");
-                        validate_direct_array(
-                            weight->neuron_mins(),
-                            mlx::core::float32,
-                            "NINT neuron minima");
-                        direct_inputs.push_back(
-                            weight->packed_values());
-                        direct_inputs.push_back(
-                            weight->sub_scales());
-                        direct_inputs.push_back(
-                            weight->sub_mins());
-                        direct_inputs.push_back(
-                            weight->neuron_scales());
-                        direct_inputs.push_back(
-                            weight->neuron_mins());
+                        throw MlxGroupedLinearUnsupported(
+                            "NINT cannot enter the heterogeneous direct kernel");
                     } else if constexpr (
                         std::is_same_v<
                             Weight,
@@ -3874,11 +3542,6 @@ MlxGroupedLinear::MlxGroupedLinear(
     std::vector<int> output_sizes;
     output_sizes.reserve(weights.size());
 
-    std::vector<std::uint8_t> nint_q;
-    std::vector<std::uint8_t> nint_sub_scale;
-    std::vector<std::uint8_t> nint_sub_min;
-    std::vector<std::uint8_t> nint_anchor_scale;
-    std::vector<std::uint8_t> nint_anchor_min;
     std::vector<std::uint8_t> q8_q;
     std::vector<std::uint8_t> q8_scales;
 
@@ -3917,58 +3580,8 @@ MlxGroupedLinear::MlxGroupedLinear(
                 if constexpr (
                     std::is_same_v<Weight, MlxNintWeight>
                 ) {
-                    if (!weight->has_uniform_q_bits()) {
-                        throw MlxGroupedLinearUnsupported(
-                            "grouped linear falls back for adaptive NINT q widths");
-                    }
-                    descriptors[base + kFamily] = kFamilyNint;
-                    descriptors[base + kNintBits] =
-                        weight->bits();
-                    descriptors[base + kNintGroupSize] =
-                        weight->group_size();
-                    descriptors[base + kNintGroups] =
-                        weight->groups();
-                    descriptors[base + kNintQOffset] =
-                        checked_int(nint_q.size(), "NINT q offset");
-                    descriptors[base + kNintSubOffset] =
-                        checked_int(
-                            nint_sub_scale.size(),
-                            "NINT sub offset");
-                    descriptors[base + kNintAnchorOffset] =
-                        checked_int(
-                            nint_anchor_scale.size() /
-                                sizeof(float),
-                            "NINT anchor offset");
-                    descriptors[base + kNintQ5Execution] = 0;
-
-                    append_raw(
-                        nint_q,
-                        weight->packed_values(),
-                        mlx::core::uint8,
-                        "NINT q");
-                    // Two bytes allow a safe cross-byte read at the end
-                    // of every independently packed projection.
-                    nint_q.insert(nint_q.end(), 2, 0);
-                    append_raw(
-                        nint_sub_scale,
-                        weight->sub_scales(),
-                        mlx::core::uint8,
-                        "NINT sub scales");
-                    append_raw(
-                        nint_sub_min,
-                        weight->sub_mins(),
-                        mlx::core::uint8,
-                        "NINT sub minima");
-                    append_raw(
-                        nint_anchor_scale,
-                        weight->neuron_scales(),
-                        mlx::core::float32,
-                        "NINT neuron scales");
-                    append_raw(
-                        nint_anchor_min,
-                        weight->neuron_mins(),
-                        mlx::core::float32,
-                        "NINT neuron minima");
+                    throw MlxGroupedLinearUnsupported(
+                        "NINT cannot enter the heterogeneous pooled kernel");
                 } else if constexpr (
                     std::is_same_v<
                         Weight,
@@ -4010,32 +3623,12 @@ MlxGroupedLinear::MlxGroupedLinear(
     const auto offsets_shape = Shape{
         checked_int(weights.size() + 1, "offset count"),
     };
-    const std::size_t packed_bytes =
-        nint_q.size()
-        + nint_sub_scale.size()
-        + nint_sub_min.size()
-        + nint_anchor_scale.size()
-        + nint_anchor_min.size()
-        + q8_q.size()
-        + q8_scales.size();
+    const std::size_t packed_bytes = q8_q.size() + q8_scales.size();
 
     impl_ = std::make_shared<Impl>(
         make_int32_array(descriptors, descriptor_shape),
         make_int32_array(tile_offsets, offsets_shape),
         make_int32_array(output_offsets, offsets_shape),
-        make_raw_array(std::move(nint_q), mlx::core::uint8),
-        make_raw_array(
-            std::move(nint_sub_scale),
-            mlx::core::uint8),
-        make_raw_array(
-            std::move(nint_sub_min),
-            mlx::core::uint8),
-        make_raw_array(
-            std::move(nint_anchor_scale),
-            mlx::core::float32),
-        make_raw_array(
-            std::move(nint_anchor_min),
-            mlx::core::float32),
         make_raw_array(std::move(q8_q), mlx::core::int8),
         make_raw_array(
             std::move(q8_scales),
@@ -4045,6 +3638,90 @@ MlxGroupedLinear::MlxGroupedLinear(
         output_offsets.back(),
         tile_offsets.back(),
         packed_bytes);
+}
+
+array MlxGroupedLinear::run_nint_projection_group(
+    const array& source,
+    std::size_t rows,
+    bool swiglu,
+    float limit) const {
+    if (!impl_->has_nint_projection_group() || rows < 1 || rows > 6) {
+        throw MlxGroupedLinearUnsupported(
+            "grouped NINT metadata operator supports one through six rows");
+    }
+    if (swiglu && !impl_->has_nint_swiglu_pair()) {
+        throw MlxGroupedLinearUnsupported(
+            "grouped NINT SwiGLU requires two equal-width projections");
+    }
+    const auto projection_count =
+        impl_->nint_projection_weights.size();
+    const int max_output = *std::max_element(
+        impl_->output_sizes.begin(),
+        impl_->output_sizes.end());
+    constexpr std::size_t outputs_per_threadgroup = 16;
+    constexpr std::size_t threads_per_threadgroup = 256;
+    const auto output_threadgroups =
+        (static_cast<std::size_t>(max_output)
+            + outputs_per_threadgroup - 1) /
+        outputs_per_threadgroup;
+    const auto grid_x = output_threadgroups * threads_per_threadgroup;
+    if (grid_x > static_cast<std::size_t>(
+            std::numeric_limits<int>::max())) {
+        throw MlxGroupedLinearUnsupported(
+            "grouped NINT Metal grid exceeds MLX limits");
+    }
+
+    std::vector<array> inputs;
+    inputs.reserve(projection_count * 7 + 2);
+    for (const auto& weight : impl_->nint_projection_weights) {
+        inputs.push_back(weight.packed_values());
+        inputs.push_back(weight.row_q_layout());
+        inputs.push_back(weight.row_q_byte_offsets());
+        inputs.push_back(weight.sub_scales());
+        inputs.push_back(weight.sub_mins());
+        inputs.push_back(weight.neuron_scales());
+        inputs.push_back(weight.neuron_mins());
+    }
+    inputs.push_back(source);
+    inputs.push_back(array({limit}, mlx::core::float32));
+
+    std::vector<
+        std::pair<std::string, mlx::core::fast::TemplateArg>>
+        templates{
+            {"T", source.dtype()},
+            {"GS", impl_->nint_projection_weights.front().group_size()},
+            {"NG", impl_->nint_projection_weights.front().groups()},
+            {"K", impl_->input_size},
+            {"M", static_cast<int>(rows)},
+            {"TILE_M", static_cast<int>(rows)},
+            {"MAX_OUT", max_output},
+            {"TOTAL_OUT", impl_->total_output_size},
+            {"SWIGLU", static_cast<int>(swiglu)},
+        };
+    int output_offset = 0;
+    for (std::size_t projection = 0;
+         projection < projection_count;
+         ++projection) {
+        const auto prefix = "P" + std::to_string(projection) + "_";
+        templates.emplace_back(
+            prefix + "OUT",
+            impl_->output_sizes[projection]);
+        templates.emplace_back(prefix + "OFFSET", output_offset);
+        output_offset += impl_->output_sizes[projection];
+    }
+    const int output_width = swiglu
+        ? impl_->output_sizes[0]
+        : impl_->total_output_size;
+    return nint_projection_group_kernel(projection_count)(
+        std::move(inputs),
+        {Shape{static_cast<std::int32_t>(rows), output_width}},
+        {source.dtype()},
+        {static_cast<int>(grid_x), 1, 1},
+        {static_cast<int>(threads_per_threadgroup), 1, 1},
+        std::move(templates),
+        std::nullopt,
+        false,
+        {}).front();
 }
 
 bool MlxGroupedLinear::supports(
@@ -4076,19 +3753,31 @@ bool MlxGroupedLinear::supports(
 
 bool MlxGroupedLinear::supports_single_row_swiglu(
     const array& input) const noexcept {
+    const bool nint_pair = impl_->has_nint_swiglu_pair();
     return impl_->supports_single_row_swiglu()
         && input.ndim() > 0
         && input.shape(-1) == impl_->input_size
-        && (
-            input.dtype() == mlx::core::float16 ||
-            (input.dtype() == mlx::core::bfloat16 &&
-             impl_->supports_bf16_single_row_swiglu()))
+        && (nint_pair
+            ? (input.dtype() == mlx::core::float16 ||
+               input.dtype() == mlx::core::float32)
+            : (input.dtype() == mlx::core::float16 ||
+               (input.dtype() == mlx::core::bfloat16 &&
+                impl_->supports_bf16_single_row_swiglu())))
         && input.size() == static_cast<std::size_t>(
             impl_->input_size);
 }
 
 bool MlxGroupedLinear::supports_small_m_swiglu(
     const array& input) const noexcept {
+    if (impl_->has_nint_swiglu_pair() &&
+        input.ndim() > 0 &&
+        input.shape(-1) == impl_->input_size &&
+        (input.dtype() == mlx::core::float16 ||
+         input.dtype() == mlx::core::float32)) {
+        const auto rows = input.size() /
+            static_cast<std::size_t>(impl_->input_size);
+        return rows >= 2 && rows <= 6;
+    }
     if (!impl_->has_single_row_mxfp8_fast_path()
         || impl_->direct_layouts.size() != 2
         || impl_->direct_layouts[0].family != kFamilyMx
@@ -4117,6 +3806,23 @@ array MlxGroupedLinear::single_row_swiglu(
     if (!std::isfinite(limit) || limit < 0.0f) {
         throw std::invalid_argument(
             "grouped SwiGLU limit must be finite and non-negative");
+    }
+    if (impl_->has_nint_swiglu_pair()) {
+        if (limit == 0.0f) {
+            return impl_->nint_projection_weights[0].swiglu(
+                impl_->nint_projection_weights[1],
+                input);
+        }
+        Shape output_shape(
+            input.shape().begin(),
+            input.shape().end() - 1);
+        output_shape.push_back(impl_->output_sizes[0]);
+        auto source = mlx::core::contiguous(mlx::core::reshape(
+            input,
+            Shape{1, impl_->input_size}));
+        return mlx::core::reshape(
+            run_nint_projection_group(source, 1, true, limit),
+            std::move(output_shape));
     }
 
     Shape prefix(
@@ -4169,6 +3875,20 @@ array MlxGroupedLinear::small_m_swiglu(
     if (!std::isfinite(limit) || limit < 0.0f) {
         throw std::invalid_argument(
             "grouped SwiGLU limit must be finite and non-negative");
+    }
+    if (impl_->has_nint_swiglu_pair()) {
+        const auto rows = input.size() /
+            static_cast<std::size_t>(impl_->input_size);
+        Shape output_shape(
+            input.shape().begin(),
+            input.shape().end() - 1);
+        output_shape.push_back(impl_->output_sizes[0]);
+        auto source = mlx::core::contiguous(mlx::core::reshape(
+            input,
+            Shape{static_cast<std::int32_t>(rows), impl_->input_size}));
+        return mlx::core::reshape(
+            run_nint_projection_group(source, rows, true, limit),
+            std::move(output_shape));
     }
     const int rows = checked_int(
         input.size() / static_cast<std::size_t>(impl_->input_size),
@@ -4250,6 +3970,14 @@ std::vector<array> MlxGroupedLinear::matmul(
         }
         return outputs;
     }
+    if (impl_->has_nint_projection_group() && rows > 6) {
+        std::vector<array> outputs;
+        outputs.reserve(impl_->nint_projection_weights.size());
+        for (const auto& weight : impl_->nint_projection_weights) {
+            outputs.push_back(weight.matmul(input));
+        }
+        return outputs;
+    }
 
     auto source = mlx::core::contiguous(
         mlx::core::reshape(
@@ -4258,6 +3986,33 @@ std::vector<array> MlxGroupedLinear::matmul(
                 static_cast<std::int32_t>(rows),
                 impl_->input_size,
             }));
+    if (impl_->has_nint_projection_group()) {
+        auto combined = run_nint_projection_group(
+            source,
+            rows,
+            false,
+            0.0f);
+
+        std::vector<array> outputs;
+        outputs.reserve(impl_->output_sizes.size());
+        int offset = 0;
+        for (const int width : impl_->output_sizes) {
+            auto shape = prefix;
+            shape.push_back(width);
+            outputs.push_back(
+                mlx::core::reshape(
+                    mlx::core::slice(
+                        combined,
+                        Shape{0, offset},
+                        Shape{
+                            static_cast<std::int32_t>(rows),
+                            offset + width,
+                        }),
+                    std::move(shape)));
+            offset += width;
+        }
+        return outputs;
+    }
     const bool use_single_row_mxfp8_fast_path =
         rows == 1 &&
         source.dtype() == mlx::core::float16 &&
@@ -4275,8 +4030,7 @@ std::vector<array> MlxGroupedLinear::matmul(
             impl_->direct_layouts.begin(),
             impl_->direct_layouts.end(),
             [](const DirectProjectionLayout& layout) {
-                return layout.family == kFamilyNint
-                    || layout.family == kFamilyNint8Zero
+                return layout.family == kFamilyNint8Zero
                     || layout.family == kFamilyVq
                     || layout.family == kFamilyMx;
             });
@@ -4320,37 +4074,8 @@ std::vector<array> MlxGroupedLinear::matmul(
             }
         }
     }
-    int qkv_outputs_per_simd = 0;
-    int qkv_simd_groups = 4;
-    if (rows == 2 &&
-        use_vectorized_fp16 &&
-        (impl_->input_size % 8) == 0 &&
-        supports_small_m_qkv_output_tile(impl_->direct_layouts)) {
-        qkv_outputs_per_simd = 3;
-        if (const auto* value = std::getenv(
-                "MFQ_METAL_GROUPED_QKV_OUTPUT_TILE")) {
-            qkv_outputs_per_simd = 0;
-            if (value[1] == '\0' && value[0] >= '1' && value[0] <= '8') {
-                qkv_outputs_per_simd = value[0] - '0';
-            }
-        }
-        if (const auto* value = std::getenv(
-                "MFQ_METAL_GROUPED_QKV_SIMD_GROUPS")) {
-            if (std::strcmp(value, "4") == 0) {
-                qkv_simd_groups = 4;
-            } else if (std::strcmp(value, "8") == 0) {
-                qkv_simd_groups = 8;
-            }
-        }
-    }
-    const int specialized_outputs_per_simd =
-        group64_outputs_per_simd > 0
-        ? group64_outputs_per_simd
-        : qkv_outputs_per_simd;
-    const int specialized_simd_groups =
-        group64_outputs_per_simd > 0
-        ? group64_simd_groups
-        : qkv_simd_groups;
+    const int specialized_outputs_per_simd = group64_outputs_per_simd;
+    const int specialized_simd_groups = group64_simd_groups;
     const int small_m_outputs_per_tile =
         specialized_outputs_per_simd > 0
         ? specialized_simd_groups * specialized_outputs_per_simd
@@ -4498,14 +4223,7 @@ std::vector<array> MlxGroupedLinear::matmul(
                 templates.emplace_back(
                     prefix + "NG",
                     layout.groups);
-                if (layout.family == kFamilyNint) {
-                    templates.emplace_back(
-                        prefix + "BITS",
-                        layout.bits);
-                    templates.emplace_back(
-                        prefix + "GS",
-                        layout.group_size);
-                } else if (layout.family == kFamilyVq) {
+                if (layout.family == kFamilyVq) {
                     templates.emplace_back(
                         prefix + "GS",
                         layout.group_size);
@@ -4573,18 +4291,13 @@ std::vector<array> MlxGroupedLinear::matmul(
                         layout.bits);
                 }
             }
-            auto kernel = qkv_outputs_per_simd > 0
-                ? direct_small_m_qkv_kernel(
-                    impl_->direct_layouts,
-                    qkv_outputs_per_simd,
-                    qkv_simd_groups)
-                : direct_kernel(
-                    impl_->direct_layouts,
-                    use_small_m_batched_path,
-                    use_small_m_blockwise,
-                    use_vectorized_fp16,
-                    group64_outputs_per_simd,
-                    group64_simd_groups);
+            auto kernel = direct_kernel(
+                impl_->direct_layouts,
+                use_small_m_batched_path,
+                use_small_m_blockwise,
+                use_vectorized_fp16,
+                group64_outputs_per_simd,
+                group64_simd_groups);
             return kernel(
                 inputs,
                 output_shapes,
@@ -4602,11 +4315,6 @@ std::vector<array> MlxGroupedLinear::matmul(
                 *impl_->descriptors,
                 *impl_->projection_tile_offsets,
                 *impl_->projection_output_offsets,
-                *impl_->nint_q,
-                *impl_->nint_sub_scale,
-                *impl_->nint_sub_min,
-                *impl_->nint_anchor_scale,
-                *impl_->nint_anchor_min,
                 *impl_->q8_q,
                 *impl_->q8_scales,
                 source,
@@ -4682,6 +4390,12 @@ bool MlxGroupedLinear::uses_zero_copy_storage() const noexcept {
 std::size_t
 MlxGroupedLinear::copied_packed_nbytes() const noexcept {
     return impl_->copied_packed_bytes;
+}
+
+bool MlxGroupedLinear::supports_single_row_projection_fusion()
+    const noexcept {
+    return impl_->has_nint_projection_group() ||
+        impl_->has_single_row_mxfp8_fast_path();
 }
 
 bool MlxGroupedLinear::has_single_row_mxfp8_fast_path()

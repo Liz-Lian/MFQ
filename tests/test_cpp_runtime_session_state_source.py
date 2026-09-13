@@ -11,6 +11,10 @@ METAL_QWEN = (
 METAL_DSV4 = (
     ROOT / "cpp_runtime" / "backends" / "metal" / "models/deepseek_v4" / "mlx_deepseek_v4_causal_lm.cpp"
 ).read_text(encoding="utf-8")
+METAL_DSV41 = (
+    ROOT / "cpp_runtime" / "backends" / "metal" / "models/deepseek_v41"
+    / "mlx_deepseek_v41_causal_lm.cpp"
+).read_text(encoding="utf-8")
 METAL_MINICPM = (
     ROOT / "cpp_runtime" / "backends" / "metal" / "models/minicpmo45" / "mlx_minicpmo45.cpp"
 ).read_text(encoding="utf-8")
@@ -108,8 +112,8 @@ def test_metal_server_bounds_and_explicitly_reclaims_allocator_cache() -> None:
     assert "release_model_load_staging_memory();" in METAL_DECODE
 
 
-def test_all_metal_text_graphs_capture_and_restore_prefix_state() -> None:
-    for source in (METAL_QWEN, METAL_DSV4, METAL_MINICPM):
+def test_supported_metal_text_graphs_capture_and_restore_prefix_state() -> None:
+    for source in (METAL_QWEN, METAL_DSV4, METAL_DSV41, METAL_MINICPM):
         assert "capture_text_session_state" in source
         assert "restore_text_session_state" in source
         assert "prompt.size() - reused_tokens" in source

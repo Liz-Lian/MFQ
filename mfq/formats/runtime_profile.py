@@ -78,8 +78,6 @@ _ARCHITECTURE_REGISTRY: dict[str, dict[str, Any]] = {
         chat={
             "temperature": 1.0,
             "top_p": 0.95,
-            "presence_penalty": 0.0,
-            "enable_mtp": False,
             "mtp_max_draft_tokens": 5,
         },
         source="architecture-registry:deepseek_v41",
@@ -172,8 +170,13 @@ def _normalise_identity(value: object) -> str:
 def architecture_profile(*identities: object) -> dict[str, Any] | None:
     names = [_normalise_identity(value) for value in identities if value]
     for name in names:
-        for key, profile in _ARCHITECTURE_REGISTRY.items():
-            compact_name = name.replace("_", "")
+        compact_name = name.replace("_", "")
+        ordered = sorted(
+            _ARCHITECTURE_REGISTRY.items(),
+            key=lambda item: len(item[0].replace("_", "")),
+            reverse=True,
+        )
+        for key, profile in ordered:
             compact_key = key.replace("_", "")
             if (
                 name == key

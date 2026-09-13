@@ -138,6 +138,76 @@ Fixture make_nint_fixture(int bits, int output_size) {
     };
 }
 
+Fixture make_adaptive_nint_fixture(
+    int output_size,
+    int phase) {
+    constexpr int nominal_bits = 4;
+    constexpr int sub_bits = 6;
+    const auto metadata_count =
+        static_cast<std::size_t>(output_size) * kGroups;
+    const auto values_per_row = kGroups * kGroupSize;
+    std::vector<std::uint8_t> row_bits(output_size);
+    std::vector<std::uint8_t> q_selectors(output_size);
+    std::vector<std::uint8_t> quantized(
+        static_cast<std::size_t>(output_size) * values_per_row);
+    for (int row = 0; row < output_size; ++row) {
+        const int bits = 1 + (row + phase) % 8;
+        row_bits[static_cast<std::size_t>(row)] =
+            static_cast<std::uint8_t>(bits);
+        q_selectors[static_cast<std::size_t>(row)] =
+            static_cast<std::uint8_t>(bits - 1);
+        const auto mask = (1u << bits) - 1u;
+        for (int column = 0; column < values_per_row; ++column) {
+            quantized[static_cast<std::size_t>(row) * values_per_row
+                + column] = static_cast<std::uint8_t>(
+                    (row * 11 + column * 5 + phase) & mask);
+        }
+    }
+
+    std::vector<std::uint8_t> blob;
+    append<std::uint8_t>(blob, 0x80u | nominal_bits);
+    append<std::uint8_t>(blob, sub_bits);
+    append<std::int32_t>(blob, kGroupSize);
+    append<std::int32_t>(blob, 0);
+    append<std::int32_t>(blob, kInputSize);
+    append<std::uint32_t>(blob, 2);
+    append<std::int64_t>(blob, output_size);
+    append<std::int64_t>(blob, kInputSize);
+    append<std::uint32_t>(blob, output_size);
+    append<std::uint32_t>(blob, kGroups);
+    for (int row = 0; row < output_size; ++row) {
+        append<std::uint16_t>(blob, 0x3c00);
+    }
+    for (int row = 0; row < output_size; ++row) {
+        append<std::uint16_t>(blob, 0);
+    }
+    const std::vector<std::uint8_t> sub_selectors(output_size, 1);
+    const std::vector<std::uint8_t> sub_scales(metadata_count, 1);
+    const std::vector<std::uint8_t> sub_mins(metadata_count, 0);
+    for (const auto& packed : {
+             pack_values(sub_selectors, 2),
+             pack_values(sub_scales, sub_bits),
+             pack_values(sub_mins, sub_bits),
+             pack_values(q_selectors, 3)}) {
+        blob.insert(blob.end(), packed.begin(), packed.end());
+    }
+    for (int bits = 1; bits <= 8; ++bits) {
+        std::vector<std::uint8_t> cohort;
+        for (int row = 0; row < output_size; ++row) {
+            if (row_bits[static_cast<std::size_t>(row)] != bits) {
+                continue;
+            }
+            const auto begin = quantized.begin()
+                + static_cast<std::ptrdiff_t>(row * values_per_row);
+            cohort.insert(cohort.end(), begin, begin + values_per_row);
+        }
+        const auto packed = pack_values(cohort, bits);
+        blob.insert(blob.end(), packed.begin(), packed.end());
+    }
+    std::vector<float> dense(quantized.begin(), quantized.end());
+    return {std::move(blob), std::move(dense), output_size};
+}
+
 std::vector<std::uint8_t> make_nint4_gs24_blob(
     int input_size,
     int output_size,
@@ -1409,6 +1479,9 @@ int main() {
             direct_gate_up.uses_zero_copy_storage()
                 && direct_gate_up.copied_packed_nbytes() == 0,
             "ordinary NINT gate/up group copied packed streams");
+        require(
+            direct_gate_up.supports_single_row_projection_fusion(),
+            "ordinary NINT gate/up lost single-row projection fusion");
         require_one_row_matches(
             direct_gate_up,
             input,
@@ -1427,6 +1500,9 @@ int main() {
             direct_qkv.uses_zero_copy_storage()
                 && direct_qkv.copied_packed_nbytes() == 0,
             "ordinary NINT QKV group copied packed streams");
+        require(
+            direct_qkv.supports_single_row_projection_fusion(),
+            "ordinary NINT QKV lost single-row projection fusion");
         const auto half_input =
             mlx::core::astype(input, mlx::core::float16);
         require_one_row_matches(
@@ -1453,6 +1529,50 @@ int main() {
             },
             8e-4f,
             "NINT4/5/6 float32 fallback");
+
+        // Adaptive NINT rows must remain in the same grouped dispatch. Each
+        // projection deliberately uses a different q-width sequence.
+        const auto adaptive_q = make_adaptive_nint_fixture(17, 0);
+        const auto adaptive_k = make_adaptive_nint_fixture(9, 3);
+        const auto adaptive_v = make_adaptive_nint_fixture(13, 6);
+        const auto adaptive_q_weight =
+            mfq::metal::MlxNintWeight::from_blob(adaptive_q.blob);
+        const auto adaptive_k_weight =
+            mfq::metal::MlxNintWeight::from_blob(adaptive_k.blob);
+        const auto adaptive_v_weight =
+            mfq::metal::MlxNintWeight::from_blob(adaptive_v.blob);
+        require(
+            !adaptive_q_weight.has_uniform_q_bits() &&
+                !adaptive_k_weight.has_uniform_q_bits() &&
+                !adaptive_v_weight.has_uniform_q_bits(),
+            "adaptive grouped fixture lost per-row q metadata");
+        const mfq::metal::MlxGroupedLinear adaptive_qkv({
+            &adaptive_q_weight,
+            &adaptive_k_weight,
+            &adaptive_v_weight,
+        });
+        constexpr int adaptive_rows = 6;
+        std::vector<float> adaptive_source(
+            adaptive_rows * kInputSize);
+        for (std::size_t index = 0;
+             index < adaptive_source.size();
+             ++index) {
+            adaptive_source[index] = static_cast<float>(
+                static_cast<int>((index * 19 + 7) % 127) - 63) /
+                1024.0f;
+        }
+        const auto adaptive_input = astype(
+            array(
+                adaptive_source.begin(),
+                Shape{adaptive_rows, kInputSize}),
+            float16);
+        require_rows_match(
+            adaptive_qkv,
+            adaptive_input,
+            adaptive_source,
+            adaptive_rows,
+            {&adaptive_q, &adaptive_k, &adaptive_v},
+            0.3f);
 
         // MiniCPM uses K=4096 with GS24, so the final packed group has eight
         // padded weights. Keep non-zero values immediately after the logical
@@ -1587,9 +1707,8 @@ int main() {
             }
         }
 
-        // NINT gate/up uses the same metadata-driven matmul kernel as every
-        // other NINT projection. It must not instantiate a format/profile
-        // specific fused SwiGLU kernel.
+        // NINT gate/up keeps its operator fusion while consuming the same
+        // per-row q/k metadata as every other NINT projection.
         const auto swiglu_gate_fixture =
             make_nint_fixture(5, 9);
         const auto swiglu_up_fixture =
@@ -1605,17 +1724,61 @@ int main() {
             &swiglu_up_weight,
         });
         require(
-            !swiglu_pair.supports_single_row_swiglu(half_input),
-            "NINT5/6 gate/up unexpectedly enabled fused SwiGLU");
+            swiglu_pair.supports_single_row_swiglu(half_input),
+            "NINT5/6 gate/up did not enable metadata SwiGLU");
         require(
-            !swiglu_pair.supports_single_row_swiglu(input),
-            "float32 gate/up unexpectedly accepted fused SwiGLU");
+            swiglu_pair.supports_single_row_swiglu(input),
+            "float32 NINT gate/up rejected metadata SwiGLU");
         require(
             !swiglu_pair.supports_single_row_swiglu(
                 mlx::core::concatenate(
                     {half_input, half_input},
                     0)),
             "multi-row gate/up unexpectedly accepted fused SwiGLU");
+
+        auto swiglu_projected = swiglu_pair(half_input);
+        auto swiglu_reference =
+            swiglu_projected[0]
+            * mlx::core::sigmoid(swiglu_projected[0])
+            * swiglu_projected[1];
+        auto swiglu_actual =
+            swiglu_pair.single_row_swiglu(half_input, 0.0f);
+        auto swiglu_difference = max(abs(
+            astype(swiglu_actual, float32) -
+            astype(swiglu_reference, float32)));
+        swiglu_difference.eval();
+        require(
+            std::isfinite(swiglu_difference.item<float>()) &&
+                swiglu_difference.item<float>() <= 2e-3f,
+            "NINT5/6 metadata SwiGLU mismatch");
+
+        for (int rows = 2; rows <= 6; ++rows) {
+            std::vector<array> repeated(
+                static_cast<std::size_t>(rows),
+                half_input);
+            auto small_input = mlx::core::concatenate(repeated, 0);
+            require(
+                swiglu_pair.supports_small_m_swiglu(small_input),
+                "NINT small-M metadata SwiGLU was rejected");
+            auto projected = swiglu_pair(small_input);
+            constexpr float limit = 1.75f;
+            auto gate = mlx::core::minimum(projected[0], array(limit));
+            auto up = mlx::core::maximum(
+                mlx::core::minimum(projected[1], array(limit)),
+                array(-limit));
+            auto expected = gate * mlx::core::sigmoid(gate) * up;
+            auto actual = swiglu_pair.small_m_swiglu(
+                small_input,
+                limit);
+            auto difference = max(abs(
+                astype(actual, float32) -
+                astype(expected, float32)));
+            difference.eval();
+            require(
+                std::isfinite(difference.item<float>()) &&
+                    difference.item<float>() <= 4e-3f,
+                "NINT small-M fused metadata SwiGLU mismatch");
+        }
 
         require_one_row_matches(
             swiglu_pair,

@@ -43,12 +43,19 @@ int main() {
         controller.observe(0, 0, 29.0);
         controller.observe(0, 0, 31.0);
         require(controller.depth() == 0);
-        for (int cycle = 0; cycle < 15; ++cycle) {
+        // Depth zero is a reversible scheduling choice, not a permanent exit
+        // from the common MTP state machine. Periodic exploration must remain
+        // able to probe speculation again when runtime conditions change.
+        bool probed_speculation = false;
+        for (int cycle = 0; cycle < 240; ++cycle) {
+            const int used_depth = controller.depth();
+            if (used_depth > 0) {
+                probed_speculation = true;
+                break;
+            }
             controller.observe(0, 0, 30.0);
         }
-        require(!controller.should_exit());
-        controller.observe(0, 0, 30.0);
-        require(controller.should_exit());
+        require(probed_speculation);
     }
     {
         const std::array<int32_t, 4> drafts{11, 12, 13, 14};

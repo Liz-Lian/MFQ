@@ -8,6 +8,13 @@
 namespace {
 
 // Exact frozen catalogs; source tests compare every entry to Metal.
+__device__ __constant__ std::uint8_t kSq1Palette[64] = {
+    15, 6, 14, 7, 13, 7, 15, 5, 15, 7, 11, 6, 14, 3, 12, 6,
+    14, 6, 14, 4, 10, 6, 14, 2, 13, 6, 14, 5, 9, 6, 14, 1,
+    15, 2, 11, 7, 10, 7, 15, 3, 9, 7, 15, 1, 14, 0, 13, 5,
+    12, 4, 11, 3, 10, 2, 9, 1, 13, 4, 12, 5, 11, 4, 12, 3,
+};
+
 __device__ __constant__ std::uint8_t kSq2Palette[128] = {
     15, 13, 0,  5,  15, 13, 1,  6,  15, 12, 2,  6,  14, 11, 0,  3,  14, 11, 1,
     5,  14, 11, 2,  6,  14, 10, 1,  4,  14, 10, 1,  5,  14, 10, 3,  6,  14, 10,
@@ -45,12 +52,16 @@ __device__ __forceinline__ unsigned read_bits(
 }
 
 __device__ __forceinline__ unsigned block_tag(
-        const std::uint8_t* symbols, const std::uint8_t* selectors,
-        std::size_t block, int bits) {
+        const std::uint8_t* row_symbols, const std::uint8_t* selectors,
+        std::size_t block, std::size_t selector_index, int bits) {
     const auto* words = reinterpret_cast<const unsigned*>(
-        symbols + block * (bits * 4));
+        row_symbols + block * (bits * 4));
     unsigned low;
-    if (bits == 2) {
+    if (bits == 1) {
+        const unsigned word = words[0];
+        low = (__popc(word & 0x55555555u) & 1u) |
+            ((__popc(word & 0xaaaaaaaau) & 1u) << 1u);
+    } else if (bits == 2) {
         unsigned fold = words[0] ^ words[1];
         fold ^= fold >> 16; fold ^= fold >> 8; fold ^= fold >> 4; fold ^= fold >> 2;
         low = fold & 3;
@@ -61,14 +72,11 @@ __device__ __forceinline__ unsigned block_tag(
         const unsigned hi = __popc(a & m1) + __popc(b & m2) + __popc(c & m0);
         low = (lo & 1) | ((hi & 1) << 1);
     }
-    return low | (((selectors[block >> 3] >> (block & 7)) & 1) << 2);
+    return low | (((selectors[selector_index >> 3] >> (selector_index & 7)) & 1) << 2);
 }
 
-__device__ __forceinline__ float decode_value(
-        unsigned palette, unsigned symbol, unsigned exponent, int bits) {
-    const unsigned nibble = bits == 2
-        ? kSq2Palette[palette * 4 + symbol]
-        : kSq3Palette[palette * 8 + symbol];
+__device__ __forceinline__ float decode_native(
+        unsigned nibble, unsigned exponent) {
     float magnitude = float((0xc8643210u >> ((nibble & 7) * 4)) & 15) * 0.5f;
     if (nibble & 8) magnitude = -magnitude;
     const float scale = __uint_as_float(exponent == 0 ? 0x00400000u : exponent << 23);
@@ -78,30 +86,67 @@ __device__ __forceinline__ float decode_value(
     return result;
 }
 
+__device__ __forceinline__ float decode_value(
+        unsigned palette, unsigned symbol, unsigned exponent, int bits) {
+    const unsigned nibble = bits == 1
+        ? kSq1Palette[palette * 2 + symbol]
+        : bits == 2
+        ? kSq2Palette[palette * 4 + symbol]
+        : kSq3Palette[palette * 8 + symbol];
+    return decode_native(nibble, exponent);
+}
+
 template<typename T> __device__ __forceinline__ float as_float(T x) { return float(x); }
 template<> __device__ __forceinline__ float as_float(__half x) { return __half2float(x); }
 template<typename T> __device__ __forceinline__ T from_float(float x) { return T(x); }
 template<> __device__ __forceinline__ __half from_float(float x) { return __float2half_rn(x); }
 
 template<typename T>
-__global__ void sq_dequant(const std::uint8_t* blob, T* out, mfq::sq::Layout q) {
+__global__ void sq_dequant(
+        const std::uint8_t* blob,
+        const std::uint8_t* row_q,
+        const std::int32_t* row_symbol_byte_offsets,
+        const std::int32_t* row_auxiliary,
+        T* out,
+        mfq::sq::Layout q) {
     const auto* symbols = blob + q.symbols;
     const std::size_t count = std::size_t(q.outputs) * q.width;
     for (std::size_t index = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
          index < count; index += std::size_t(gridDim.x) * blockDim.x) {
-        const auto state = (index / q.width) * 8 +
-            block_tag(symbols, blob + q.selectors, index / 32, q.bits);
-        const auto exponent = q.base + read_bits(blob + q.scales, state, 2);
-        out[index] = from_float<T>(decode_value(
-            read_bits(blob + q.palettes, state, 5),
-            read_bits(symbols, index, q.bits), exponent, q.bits));
+        const auto output = index / q.width;
+        const auto column = index - output * q.width;
+        const int bits = row_q[output];
+        const auto auxiliary = std::size_t(row_auxiliary[output]);
+        const auto* row_symbols =
+            symbols + std::size_t(row_symbol_byte_offsets[output]);
+        const auto block = column / 32;
+        const auto symbol = read_bits(row_symbols, column, bits);
+        if (bits == 4) {
+            const auto exponent = blob[
+                q.native_scales + auxiliary * (q.width / 32) + block];
+            out[index] = from_float<T>(decode_native(symbol, exponent));
+        } else {
+            const auto selector_index =
+                auxiliary * (q.width / 32) + block;
+            const auto state = auxiliary * 8 + block_tag(
+                row_symbols, blob + q.selectors, block, selector_index, bits);
+            const auto exponent = q.base + read_bits(blob + q.scales, state, 2);
+            out[index] = from_float<T>(decode_value(
+                read_bits(blob + q.palettes, state, 5),
+                symbol, exponent, bits));
+        }
     }
 }
 
 // One warp per output, coalesced K loads, decode reuse across TILE_M rows.
 // All batch sizes use packed weights; M=1..6 have exact tile specializations.
 template<int TILE_M, typename T, bool ROUTED = false>
-__global__ void sq_mmq(const std::uint8_t* blob, const T* x, T* y,
+__global__ void sq_mmq(
+                       const std::uint8_t* blob,
+                       const std::uint8_t* row_q,
+                       const std::int32_t* row_symbol_byte_offsets,
+                       const std::int32_t* row_auxiliary,
+                       const T* x, T* y,
                        mfq::sq::Layout q, int rows,
                        const std::int32_t* expert_ids,
                        const std::int32_t* expert_local,
@@ -131,23 +176,38 @@ __global__ void sq_mmq(const std::uint8_t* blob, const T* x, T* y,
         const auto output = ROUTED
             ? std::int64_t(local_expert) * out_per_expert + logical_output
             : logical_output;
+        const int bits = row_q[output];
+        const auto auxiliary = std::size_t(row_auxiliary[output]);
+        const auto* row_symbols =
+            symbols + std::size_t(row_symbol_byte_offsets[output]);
         float accum[TILE_M] = {};
         for (int column = 0; column < q.width; column += 32) {
-            const auto block = std::size_t(output) * (q.width / 32) + column / 32;
+            const auto block = std::size_t(column / 32);
             unsigned state_value = 0;
             if (lane == 0) {
-                const auto state = output * 8 +
-                    block_tag(symbols, blob + q.selectors, block, q.bits);
-                state_value = (read_bits(blob + q.palettes, state, 5) << 8) |
-                              (q.base + read_bits(blob + q.scales, state, 2));
+                if (bits == 4) {
+                    state_value = blob[
+                        q.native_scales + auxiliary * (q.width / 32) + block];
+                } else {
+                    const auto selector_index =
+                        auxiliary * (q.width / 32) + block;
+                    const auto state = auxiliary * 8 + block_tag(
+                        row_symbols, blob + q.selectors,
+                        block, selector_index, bits);
+                    state_value = (read_bits(blob + q.palettes, state, 5) << 8) |
+                                  (q.base + read_bits(blob + q.scales, state, 2));
+                }
             }
             state_value = __shfl_sync(0xffffffffu, state_value, 0);
-            const auto index = std::size_t(output) * q.width + column + lane;
-            const float w = decode_value(
-                state_value >> 8,
-                read_bits(symbols, index, q.bits),
-                state_value & 255,
-                q.bits);
+            const auto symbol = read_bits(
+                row_symbols, std::size_t(column + lane), bits);
+            const float w = bits == 4
+                ? decode_native(symbol, state_value)
+                : decode_value(
+                    state_value >> 8,
+                    symbol,
+                    state_value & 255,
+                    bits);
 #pragma unroll
             for (int m = 0; m < TILE_M; ++m)
                 if (first_row + m < rows)
@@ -173,6 +233,9 @@ __global__ void sq_mmq(const std::uint8_t* blob, const T* x, T* y,
 template<int Rows>
 __global__ void __launch_bounds__(128) sq_backward_matrix(
         const std::uint8_t* blob,
+        const std::uint8_t* row_q,
+        const std::int32_t* row_symbol_byte_offsets,
+        const std::int32_t* row_auxiliary,
         const __half* output_gradient,
         float* partials,
         mfq::sq::Layout q,
@@ -190,23 +253,35 @@ __global__ void __launch_bounds__(128) sq_backward_matrix(
     const int output_end = min(output0 + output_tile, q.outputs);
     float accumulators[Rows] = {};
     for (int output = output0; output < output_end; ++output) {
+        const int bits = row_q[output];
+        const auto auxiliary = std::size_t(row_auxiliary[output]);
+        const auto* row_symbols =
+            symbols + std::size_t(row_symbol_byte_offsets[output]);
         unsigned state_value = 0;
         if (lane == 0) {
-            const auto block_index =
-                std::size_t(output) * (q.width / 32) + block;
-            const auto state = std::size_t(output) * 8 +
-                block_tag(symbols, blob + q.selectors, block_index, q.bits);
-            state_value =
-                (read_bits(blob + q.palettes, state, 5) << 8) |
-                (q.base + read_bits(blob + q.scales, state, 2));
+            if (bits == 4) {
+                state_value = blob[
+                    q.native_scales + auxiliary * (q.width / 32) + block];
+            } else {
+                const auto selector_index =
+                    auxiliary * (q.width / 32) + block;
+                const auto state = auxiliary * 8 + block_tag(
+                    row_symbols, blob + q.selectors,
+                    block, selector_index, bits);
+                state_value =
+                    (read_bits(blob + q.palettes, state, 5) << 8) |
+                    (q.base + read_bits(blob + q.scales, state, 2));
+            }
         }
         state_value = __shfl_sync(0xffffffffu, state_value, 0);
-        const float weight = decode_value(
-            state_value >> 8,
-            read_bits(
-                symbols, std::size_t(output) * q.width + column, q.bits),
-            state_value & 255,
-            q.bits);
+        const auto symbol = read_bits(row_symbols, column, bits);
+        const float weight = bits == 4
+            ? decode_native(symbol, state_value)
+            : decode_value(
+                state_value >> 8,
+                symbol,
+                state_value & 255,
+                bits);
 #pragma unroll
         for (int row = 0; row < Rows; ++row) {
             float gradient = lane == 0 && row < rows
@@ -226,29 +301,64 @@ __global__ void __launch_bounds__(128) sq_backward_matrix(
     }
 }
 
-mfq::sq::Layout validate(const mfq_tensor_backend::Tensor& blob,
-        std::int64_t bits, std::int64_t outputs, std::int64_t width, std::int64_t base) {
-    const auto q = mfq::sq::layout(bits, outputs, width, base);
+mfq::sq::Layout validate(
+        const mfq_tensor_backend::Tensor& blob,
+        const mfq_tensor_backend::Tensor& row_q,
+        const mfq_tensor_backend::Tensor& row_symbol_byte_offsets,
+        const mfq_tensor_backend::Tensor& row_auxiliary,
+        std::int64_t bits,
+        std::int64_t outputs,
+        std::int64_t width,
+        std::int64_t base,
+        std::int64_t q_sum,
+        std::int64_t sq4_rows) {
+    const auto q = bits == 0
+        ? mfq::sq::adaptive_layout(outputs, width, base, q_sum, sq4_rows)
+        : mfq::sq::layout(bits, outputs, width, base);
     MFQ_RUNTIME_CHECK(blob.is_cuda() && blob.scalar_type() == mfq_tensor_backend::kUInt8 &&
         blob.dim() == 1 && blob.is_contiguous() && std::size_t(blob.numel()) == q.bytes,
         "MXFP4-SQ blob requires contiguous rank-1 CUDA uint8 and exact payload length");
+    MFQ_RUNTIME_CHECK(
+        row_q.is_cuda() && row_q.get_device() == blob.get_device() &&
+        row_q.scalar_type() == mfq_tensor_backend::kUInt8 &&
+        row_q.dim() == 1 && row_q.is_contiguous() && row_q.numel() == outputs &&
+        row_symbol_byte_offsets.is_cuda() &&
+        row_symbol_byte_offsets.get_device() == blob.get_device() &&
+        row_symbol_byte_offsets.scalar_type() == mfq_tensor_backend::kInt32 &&
+        row_symbol_byte_offsets.dim() == 1 &&
+        row_symbol_byte_offsets.is_contiguous() &&
+        row_symbol_byte_offsets.numel() == outputs &&
+        row_auxiliary.is_cuda() && row_auxiliary.get_device() == blob.get_device() &&
+        row_auxiliary.scalar_type() == mfq_tensor_backend::kInt32 &&
+        row_auxiliary.dim() == 1 && row_auxiliary.is_contiguous() &&
+        row_auxiliary.numel() == outputs,
+        "MXFP4-SQ row metadata requires matching contiguous CUDA arrays");
     MFQ_RUNTIME_CHECK(reinterpret_cast<std::uintptr_t>(blob.data_ptr<std::uint8_t>()) % 4 == 0,
         "MXFP4-SQ blob must be 4-byte aligned");
     return q;
 }
 
 template<int M, typename T>
-void launch_mmq(const std::uint8_t* blob, const T* x, T* y,
+void launch_mmq(
+                const std::uint8_t* blob,
+                const std::uint8_t* row_q,
+                const std::int32_t* row_symbol_byte_offsets,
+                const std::int32_t* row_auxiliary,
+                const T* x, T* y,
                 mfq::sq::Layout q, int rows, cudaStream_t stream) {
     const auto tasks = ((std::int64_t(q.outputs) + 3) / 4) * ((std::int64_t(rows) + M - 1) / M);
     const int blocks = int(std::min<std::int64_t>(tasks, 65535));
     sq_mmq<M, T><<<blocks, 128, 0, stream>>>(
-        blob, x, y, q, rows,
+        blob, row_q, row_symbol_byte_offsets, row_auxiliary,
+        x, y, q, rows,
         nullptr, nullptr, 0, 0, q.outputs, 1, false);
 }
 
 void launch_routed_mmq(
         const std::uint8_t* blob,
+        const std::uint8_t* row_q,
+        const std::int32_t* row_symbol_byte_offsets,
+        const std::int32_t* row_auxiliary,
         const __half* x,
         __half* y,
         const std::int32_t* expert_ids,
@@ -266,6 +376,9 @@ void launch_routed_mmq(
     const int blocks = int(std::min<std::int64_t>(tasks, 65535));
     sq_mmq<1, __half, true><<<blocks, 128, 0, stream>>>(
         blob,
+        row_q,
+        row_symbol_byte_offsets,
+        row_auxiliary,
         x,
         y,
         q,
@@ -280,13 +393,18 @@ void launch_routed_mmq(
 }
 
 template<typename T>
-void dispatch_mmq(const std::uint8_t* blob, const T* x, T* y,
+void dispatch_mmq(
+                  const std::uint8_t* blob,
+                  const std::uint8_t* row_q,
+                  const std::int32_t* row_symbol_byte_offsets,
+                  const std::int32_t* row_auxiliary,
+                  const T* x, T* y,
                   mfq::sq::Layout q, int rows, cudaStream_t stream) {
-#define MFQ_SQ_M_CASE(M) case M: launch_mmq<M>(blob, x, y, q, rows, stream); break
+#define MFQ_SQ_M_CASE(M) case M: launch_mmq<M>(blob, row_q, row_symbol_byte_offsets, row_auxiliary, x, y, q, rows, stream); break
     switch (rows) {
         MFQ_SQ_M_CASE(1); MFQ_SQ_M_CASE(2); MFQ_SQ_M_CASE(3);
         MFQ_SQ_M_CASE(4); MFQ_SQ_M_CASE(5); MFQ_SQ_M_CASE(6);
-        default: launch_mmq<8>(blob, x, y, q, rows, stream); break;
+        default: launch_mmq<8>(blob, row_q, row_symbol_byte_offsets, row_auxiliary, x, y, q, rows, stream); break;
     }
 #undef MFQ_SQ_M_CASE
 }
@@ -294,6 +412,9 @@ void dispatch_mmq(const std::uint8_t* blob, const T* x, T* y,
 template<int Rows>
 void launch_backward_matrix(
         const std::uint8_t* blob,
+        const std::uint8_t* row_q,
+        const std::int32_t* row_symbol_byte_offsets,
+        const std::int32_t* row_auxiliary,
         const __half* output_gradient,
         float* partials,
         mfq::sq::Layout q,
@@ -305,11 +426,15 @@ void launch_backward_matrix(
         static_cast<unsigned>((q.outputs + output_tile - 1) / output_tile));
     sq_backward_matrix<Rows><<<
         grid, 128, 0, stream>>>(
-        blob, output_gradient, partials, q, rows, output_tile);
+        blob, row_q, row_symbol_byte_offsets, row_auxiliary,
+        output_gradient, partials, q, rows, output_tile);
 }
 
 void dispatch_backward_matrix(
         const std::uint8_t* blob,
+        const std::uint8_t* row_q,
+        const std::int32_t* row_symbol_byte_offsets,
+        const std::int32_t* row_auxiliary,
         const __half* output_gradient,
         float* partials,
         mfq::sq::Layout q,
@@ -318,33 +443,48 @@ void dispatch_backward_matrix(
         cudaStream_t stream) {
     if (rows == 1) {
         launch_backward_matrix<1>(
-            blob, output_gradient, partials, q, rows, output_tile, stream);
+            blob, row_q, row_symbol_byte_offsets, row_auxiliary,
+            output_gradient, partials, q, rows, output_tile, stream);
     } else if (rows <= 2) {
         launch_backward_matrix<2>(
-            blob, output_gradient, partials, q, rows, output_tile, stream);
+            blob, row_q, row_symbol_byte_offsets, row_auxiliary,
+            output_gradient, partials, q, rows, output_tile, stream);
     } else if (rows <= 4) {
         launch_backward_matrix<4>(
-            blob, output_gradient, partials, q, rows, output_tile, stream);
+            blob, row_q, row_symbol_byte_offsets, row_auxiliary,
+            output_gradient, partials, q, rows, output_tile, stream);
     } else {
         launch_backward_matrix<8>(
-            blob, output_gradient, partials, q, rows, output_tile, stream);
+            blob, row_q, row_symbol_byte_offsets, row_auxiliary,
+            output_gradient, partials, q, rows, output_tile, stream);
     }
 }
 
 } // namespace
 
 mfq_tensor_backend::Tensor mxfp4_sq_dequant_cuda(
-        mfq_tensor_backend::Tensor blob, std::int64_t bits, std::int64_t outputs,
-        std::int64_t width, std::int64_t base, bool fp32) {
-    const auto q = validate(blob, bits, outputs, width, base);
+        mfq_tensor_backend::Tensor blob,
+        mfq_tensor_backend::Tensor row_q,
+        mfq_tensor_backend::Tensor row_symbol_byte_offsets,
+        mfq_tensor_backend::Tensor row_auxiliary,
+        std::int64_t bits, std::int64_t outputs,
+        std::int64_t width, std::int64_t base,
+        std::int64_t q_sum, std::int64_t sq4_rows,
+        bool fp32) {
+    const auto q = validate(
+        blob, row_q, row_symbol_byte_offsets, row_auxiliary,
+        bits, outputs, width, base, q_sum, sq4_rows);
     const MfqCudaGuard guard(blob.device());
     auto out = mfq_tensor_backend::empty({outputs, width}, blob.options().dtype(
         fp32 ? mfq_tensor_backend::kFloat32 : mfq_tensor_backend::kFloat16));
     const auto count = outputs * width;
     const int blocks = int(std::min<std::int64_t>((count + 255) / 256, 65535));
     const auto* data = blob.data_ptr<std::uint8_t>();
+    const auto* q_data = row_q.data_ptr<std::uint8_t>();
+    const auto* symbol_offsets = row_symbol_byte_offsets.data_ptr<std::int32_t>();
+    const auto* auxiliary = row_auxiliary.data_ptr<std::int32_t>();
     const auto stream = mfq_current_cuda_stream();
-#define MFQ_SQ_DEQUANT(T, PTR) sq_dequant<T><<<blocks, 256, 0, stream>>>(data, PTR, q)
+#define MFQ_SQ_DEQUANT(T, PTR) sq_dequant<T><<<blocks, 256, 0, stream>>>(data, q_data, symbol_offsets, auxiliary, PTR, q)
     if (fp32) {
         MFQ_SQ_DEQUANT(float, out.data_ptr<float>());
     } else {
@@ -357,9 +497,17 @@ mfq_tensor_backend::Tensor mxfp4_sq_dequant_cuda(
 }
 
 mfq_tensor_backend::Tensor mxfp4_sq_matmul_cuda(
-        mfq_tensor_backend::Tensor blob, mfq_tensor_backend::Tensor input,
-        std::int64_t bits, std::int64_t outputs, std::int64_t width, std::int64_t base) {
-    const auto q = validate(blob, bits, outputs, width, base);
+        mfq_tensor_backend::Tensor blob,
+        mfq_tensor_backend::Tensor row_q,
+        mfq_tensor_backend::Tensor row_symbol_byte_offsets,
+        mfq_tensor_backend::Tensor row_auxiliary,
+        mfq_tensor_backend::Tensor input,
+        std::int64_t bits, std::int64_t outputs,
+        std::int64_t width, std::int64_t base,
+        std::int64_t q_sum, std::int64_t sq4_rows) {
+    const auto q = validate(
+        blob, row_q, row_symbol_byte_offsets, row_auxiliary,
+        bits, outputs, width, base, q_sum, sq4_rows);
     MFQ_RUNTIME_CHECK(input.is_cuda() && input.get_device() == blob.get_device() &&
         input.dim() == 2 && input.is_contiguous() && input.size(1) == width &&
         input.size(0) <= std::numeric_limits<int>::max() &&
@@ -371,13 +519,20 @@ mfq_tensor_backend::Tensor mxfp4_sq_matmul_cuda(
     const int rows = int(input.size(0));
     if (!rows) return out;
     const auto* data = blob.data_ptr<std::uint8_t>();
+    const auto* q_data = row_q.data_ptr<std::uint8_t>();
+    const auto* symbol_offsets = row_symbol_byte_offsets.data_ptr<std::int32_t>();
+    const auto* auxiliary = row_auxiliary.data_ptr<std::int32_t>();
     const auto stream = mfq_current_cuda_stream();
     if (input.scalar_type() == mfq_tensor_backend::kFloat32) {
-        dispatch_mmq(data, input.data_ptr<float>(), out.data_ptr<float>(), q, rows, stream);
+        dispatch_mmq(
+            data, q_data, symbol_offsets, auxiliary,
+            input.data_ptr<float>(), out.data_ptr<float>(), q, rows, stream);
     } else {
         const auto* x = reinterpret_cast<const __half*>(input.data_ptr<mfq_half>());
         auto* y = reinterpret_cast<__half*>(out.data_ptr<mfq_half>());
-        dispatch_mmq(data, x, y, q, rows, stream);
+        dispatch_mmq(
+            data, q_data, symbol_offsets, auxiliary,
+            x, y, q, rows, stream);
     }
     MFQ_CUDA_KERNEL_LAUNCH_CHECK();
     return out;
@@ -385,6 +540,9 @@ mfq_tensor_backend::Tensor mxfp4_sq_matmul_cuda(
 
 void mxfp4_sq_moe_matmul_cuda(
         mfq_tensor_backend::Tensor blob,
+        mfq_tensor_backend::Tensor row_q,
+        mfq_tensor_backend::Tensor row_symbol_byte_offsets,
+        mfq_tensor_backend::Tensor row_auxiliary,
         mfq_tensor_backend::Tensor input,
         mfq_tensor_backend::Tensor expert_ids,
         mfq_tensor_backend::Tensor expert_local,
@@ -394,9 +552,13 @@ void mxfp4_sq_moe_matmul_cuda(
         std::int64_t out_per_expert,
         std::int64_t width,
         std::int64_t base,
+        std::int64_t q_sum,
+        std::int64_t sq4_rows,
         mfq_tensor_backend::Tensor output) {
     const auto q = validate(
-        blob, bits, local_experts * out_per_expert, width, base);
+        blob, row_q, row_symbol_byte_offsets, row_auxiliary,
+        bits, local_experts * out_per_expert, width, base,
+        q_sum, sq4_rows);
     MFQ_RUNTIME_CHECK(
         input.is_cuda() && input.get_device() == blob.get_device() &&
         input.is_contiguous() && input.scalar_type() == mfq_tensor_backend::kFloat16 &&
@@ -434,7 +596,11 @@ void mxfp4_sq_moe_matmul_cuda(
     const int route_count = static_cast<int>(route_count64);
     const int routes = static_cast<int>(expert_ids.size(1));
     launch_routed_mmq(
-        data, x, y, ids, local, q, route_count, routes,
+        data,
+        row_q.data_ptr<std::uint8_t>(),
+        row_symbol_byte_offsets.data_ptr<std::int32_t>(),
+        row_auxiliary.data_ptr<std::int32_t>(),
+        x, y, ids, local, q, route_count, routes,
         static_cast<int>(n_experts), static_cast<int>(local_experts),
         static_cast<int>(out_per_expert), shared_input, stream);
     MFQ_CUDA_KERNEL_LAUNCH_CHECK();
@@ -442,12 +608,19 @@ void mxfp4_sq_moe_matmul_cuda(
 
 mfq_tensor_backend::Tensor mxfp4_sq_backward_input_cuda(
         mfq_tensor_backend::Tensor blob,
+        mfq_tensor_backend::Tensor row_q,
+        mfq_tensor_backend::Tensor row_symbol_byte_offsets,
+        mfq_tensor_backend::Tensor row_auxiliary,
         mfq_tensor_backend::Tensor output_gradient,
         std::int64_t bits,
         std::int64_t outputs,
         std::int64_t width,
-        std::int64_t base) {
-    const auto q = validate(blob, bits, outputs, width, base);
+        std::int64_t base,
+        std::int64_t q_sum,
+        std::int64_t sq4_rows) {
+    const auto q = validate(
+        blob, row_q, row_symbol_byte_offsets, row_auxiliary,
+        bits, outputs, width, base, q_sum, sq4_rows);
     MFQ_RUNTIME_CHECK(
         output_gradient.is_cuda() &&
         output_gradient.get_device() == blob.get_device() &&
@@ -479,7 +652,11 @@ mfq_tensor_backend::Tensor mxfp4_sq_backward_input_cuda(
         auto* destination = reinterpret_cast<__half*>(
             result.data_ptr<mfq_half>());
         dispatch_backward_matrix(
-            data, gradient, partials.data_ptr<float>(), q, rows,
+            data,
+            row_q.data_ptr<std::uint8_t>(),
+            row_symbol_byte_offsets.data_ptr<std::int32_t>(),
+            row_auxiliary.data_ptr<std::int32_t>(),
+            gradient, partials.data_ptr<float>(), q, rows,
             output_tile, stream);
         mfq_packed_backward::launch_split_float_reduce_to_half(
             partials.data_ptr<float>(), destination,
@@ -488,7 +665,8 @@ mfq_tensor_backend::Tensor mxfp4_sq_backward_input_cuda(
         return result;
     }
     auto weight = mxfp4_sq_dequant_cuda(
-        blob, bits, outputs, width, base, false);
+        blob, row_q, row_symbol_byte_offsets, row_auxiliary,
+        bits, outputs, width, base, q_sum, sq4_rows, false);
     mfq_packed_backward::launch_dense_half_weight(
         output_gradient, weight, result,
         rows, int(outputs), int(width), stream);

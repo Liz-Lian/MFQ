@@ -281,6 +281,49 @@ void benchmark_case(
         << maximum << '\t' << std::hex << hash << std::dec << '\n';
 }
 
+void benchmark_swiglu(
+    MlxNintWeight gate_weight,
+    MlxNintWeight up_weight,
+    int warmup,
+    int repetitions) {
+    const auto source = make_input(1, gate_weight.input_size());
+    const auto execute_fused = [&] {
+        auto result = gate_weight.swiglu(up_weight, source);
+        mlx::core::eval(result);
+        return result;
+    };
+    const auto execute_split = [&] {
+        auto gate = gate_weight.matmul(source);
+        auto up = up_weight.matmul(source);
+        auto result = gate * mlx::core::sigmoid(gate) * up;
+        mlx::core::eval(result);
+        return result;
+    };
+    auto fused = execute_fused();
+    auto split = execute_split();
+    for (int index = 0; index < warmup; ++index) {
+        fused = execute_fused();
+        split = execute_split();
+    }
+    mlx::core::synchronize();
+    const auto fused_started = Clock::now();
+    for (int index = 0; index < repetitions; ++index) {
+        fused = execute_fused();
+    }
+    mlx::core::synchronize();
+    const double fused_ms = milliseconds_since(fused_started) / repetitions;
+    const auto split_started = Clock::now();
+    for (int index = 0; index < repetitions; ++index) {
+        split = execute_split();
+    }
+    mlx::core::synchronize();
+    const double split_ms = milliseconds_since(split_started) / repetitions;
+    std::cout << "fused_ms\tsplit_ms\tspeedup\thash\n"
+              << std::fixed << std::setprecision(3) << fused_ms << '\t'
+              << split_ms << '\t' << split_ms / fused_ms << '\t'
+              << std::hex << output_hash(fused) << std::dec << '\n';
+}
+
 void benchmark(
     const MfqContainer& model,
     const std::string& name,
@@ -398,9 +441,53 @@ int main(int argc, char** argv) {
             argc >= 2,
             "usage: mfq-metal-nint-benchmark MODEL.mfq [REPETITIONS] "
             "[--rows ROWS] [TENSOR ...] | --synthetic-q8|"
+            "--model-swiglu MODEL.mfq REPETITIONS GATE UP | "
             "--synthetic-nint5 REPETITIONS ROWS OUTPUT INPUT | "
             "--synthetic-nint BITS GROUP_SIZE REPETITIONS ROWS "
-            "OUTPUT INPUT");
+                   "OUTPUT INPUT");
+        if (std::string_view(argv[1]) == "--model-swiglu") {
+            require(
+                argc == 6,
+                "usage: mfq-metal-nint-benchmark --model-swiglu "
+                "MODEL.mfq REPETITIONS GATE UP");
+            const MfqContainer model(argv[2]);
+            const int repetitions = std::stoi(argv[3]);
+            require(repetitions > 0, "repetitions must be positive");
+            auto gate = load_case(model, argv[4]);
+            auto up = load_case(model, argv[5]);
+            require(
+                std::holds_alternative<MlxNintWeight>(gate.weight) &&
+                    std::holds_alternative<MlxNintWeight>(up.weight),
+                "model SwiGLU benchmark requires two NINT tensors");
+            benchmark_swiglu(
+                std::get<MlxNintWeight>(std::move(gate.weight)),
+                std::get<MlxNintWeight>(std::move(up.weight)),
+                3,
+                repetitions);
+            return 0;
+        }
+        if (std::string_view(argv[1]) == "--synthetic-swiglu") {
+            require(
+                argc == 7,
+                "usage: mfq-metal-nint-benchmark --synthetic-swiglu "
+                "BITS GROUP_SIZE REPETITIONS OUTPUT INPUT");
+            const int bits = std::stoi(argv[2]);
+            const int group_size = std::stoi(argv[3]);
+            const int repetitions = std::stoi(argv[4]);
+            const int output = std::stoi(argv[5]);
+            const int input = std::stoi(argv[6]);
+            require(repetitions > 0, "repetitions must be positive");
+            auto gate_blob = make_synthetic_nint_blob(
+                bits, group_size, output, input);
+            auto up_blob = gate_blob;
+            up_blob.back() ^= 1u;
+            benchmark_swiglu(
+                MlxNintWeight::from_blob(gate_blob),
+                MlxNintWeight::from_blob(up_blob),
+                3,
+                repetitions);
+            return 0;
+        }
         if (std::string_view(argv[1]) == "--synthetic-q8") {
             require(
                 argc == 6,
@@ -503,7 +590,7 @@ int main(int argc, char** argv) {
             first_tensor = 5;
         }
         require(repetitions > 0, "repetitions must be positive");
-        require(rows >= 1 && rows <= 16, "rows must be in [1, 16]");
+        require(rows >= 1 && rows <= 4096, "rows must be in [1, 4096]");
 
         const MfqContainer model(argv[1]);
         std::cout

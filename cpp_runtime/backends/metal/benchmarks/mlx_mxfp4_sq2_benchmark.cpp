@@ -1,5 +1,5 @@
 #include "mlx_mx.h"
-#include "mlx_mxfp4_sq2.h"
+#include "mlx_mxfp4_sq.h"
 
 #include <algorithm>
 #include <chrono>
@@ -23,7 +23,7 @@ using mfq::metal::MlxMxWeight;
 using mlx::core::array;
 using mlx::core::Shape;
 
-using Sq2Weight = mfq::metal::MlxMxfp4Sq2Weight;
+using Sq2Weight = mfq::metal::MlxMxfp4SqWeight;
 constexpr const char *kSq2Format = "MXFP4-SQ2";
 
 template <typename T> void append(std::vector<std::uint8_t> &target, T value) {
@@ -61,6 +61,7 @@ std::vector<std::uint8_t> pack_bits(const std::vector<std::uint8_t> &values,
 
 struct EncodedPair {
   std::vector<std::uint8_t> sq2_blob;
+  std::vector<std::uint8_t> adaptive_blob;
   std::vector<std::uint8_t> mxfp4_blob;
 };
 
@@ -145,6 +146,67 @@ EncodedPair make_pair(int rows, int columns) {
   append_bytes(sq2_blob, pack_bits(state_scales, 2));
   append_bytes(sq2_blob, pack_bits(state_palettes, 5));
 
+  // Alternate exact SQ2 and native SQ4 rows. This stresses the heterogeneous
+  // q launch geometry while preserving one byte-for-byte comparable dense
+  // MXFP4 reference.
+  std::vector<std::uint8_t> row_q(static_cast<std::size_t>(rows));
+  std::vector<std::uint8_t> adaptive_symbols;
+  std::vector<std::uint8_t> adaptive_selectors;
+  std::vector<std::uint8_t> adaptive_state_scales;
+  std::vector<std::uint8_t> adaptive_state_palettes;
+  std::vector<std::uint8_t> adaptive_native_scales;
+  adaptive_symbols.reserve(weights * 3 / 8);
+  for (int row = 0; row < rows; ++row) {
+    const bool native_row = (row & 1) != 0;
+    row_q[static_cast<std::size_t>(row)] = native_row ? 3 : 1;
+    if (native_row) {
+      const auto value_begin = native_values.begin() +
+          static_cast<std::ptrdiff_t>(row) * (columns / 2);
+      adaptive_symbols.insert(
+          adaptive_symbols.end(), value_begin, value_begin + columns / 2);
+      const auto scale_begin = native_scales.begin() +
+          static_cast<std::ptrdiff_t>(row) * blocks_per_row;
+      adaptive_native_scales.insert(
+          adaptive_native_scales.end(), scale_begin,
+          scale_begin + blocks_per_row);
+    } else {
+      const auto symbol_begin = symbols.begin() +
+          static_cast<std::ptrdiff_t>(row) * columns;
+      const std::vector<std::uint8_t> row_symbols(
+          symbol_begin, symbol_begin + columns);
+      append_bytes(adaptive_symbols, pack_bits(row_symbols, 2));
+      const auto selector_begin = selectors.begin() +
+          static_cast<std::ptrdiff_t>(row) * blocks_per_row;
+      adaptive_selectors.insert(
+          adaptive_selectors.end(), selector_begin,
+          selector_begin + blocks_per_row);
+      const auto state_begin = state_scales.begin() +
+          static_cast<std::ptrdiff_t>(row) * states_per_row;
+      adaptive_state_scales.insert(
+          adaptive_state_scales.end(), state_begin,
+          state_begin + states_per_row);
+      const auto palette_begin = state_palettes.begin() +
+          static_cast<std::ptrdiff_t>(row) * states_per_row;
+      adaptive_state_palettes.insert(
+          adaptive_state_palettes.end(), palette_begin,
+          palette_begin + states_per_row);
+    }
+  }
+  std::vector<std::uint8_t> adaptive_blob{'S', 'Q', 'V', '2'};
+  append<std::uint8_t>(adaptive_blob, 2);
+  append<std::uint8_t>(adaptive_blob, matrix_scale_base);
+  append<std::uint16_t>(adaptive_blob, 0);
+  append<std::uint64_t>(adaptive_blob, rows);
+  append<std::uint64_t>(adaptive_blob, columns);
+  auto packed_q = pack_bits(row_q, 2);
+  packed_q.resize((packed_q.size() + 3) & ~std::size_t{3}, 0);
+  append_bytes(adaptive_blob, packed_q);
+  append_bytes(adaptive_blob, adaptive_symbols);
+  append_bytes(adaptive_blob, pack_bits(adaptive_selectors, 1));
+  append_bytes(adaptive_blob, pack_bits(adaptive_state_scales, 2));
+  append_bytes(adaptive_blob, pack_bits(adaptive_state_palettes, 5));
+  append_bytes(adaptive_blob, adaptive_native_scales);
+
   std::vector<std::uint8_t> mxfp4_blob{'M', 'X', 'T', '1'};
   append<std::uint8_t>(mxfp4_blob, 1);
   append<std::uint8_t>(mxfp4_blob, 4);
@@ -157,7 +219,11 @@ EncodedPair make_pair(int rows, int columns) {
   append<std::uint64_t>(mxfp4_blob, columns / 32);
   append_bytes(mxfp4_blob, native_values);
   append_bytes(mxfp4_blob, native_scales);
-  return {std::move(sq2_blob), std::move(mxfp4_blob)};
+  return {
+      std::move(sq2_blob),
+      std::move(adaptive_blob),
+      std::move(mxfp4_blob),
+  };
 }
 
 array make_input(int width, int rows = 1) {
@@ -278,12 +344,13 @@ int main(int argc, char **argv) {
     require(gemv_repetitions > 0 && dequant_repetitions > 0 &&
                 multirow_repetitions > 0 &&
                 (requested_rows == -1 || requested_rows == 0 ||
-                 requested_rows >= 2),
+                 requested_rows >= 1),
             "benchmark repetitions must be positive");
     constexpr int rows = 4096;
     constexpr int columns = 4096;
     auto encoded = make_pair(rows, columns);
     const auto sq2 = Sq2Weight::from_blob(encoded.sq2_blob);
+    const auto adaptive = Sq2Weight::from_blob(encoded.adaptive_blob);
     const auto native = MlxMxWeight::from_blob("MXFP4", encoded.mxfp4_blob);
     const auto input = make_input(columns);
     require(sq2.packed_nbytes() == 4'288'536u,
@@ -292,6 +359,7 @@ int main(int argc, char **argv) {
             "unexpected MXFP4 benchmark payload size");
 
     verify_exact_weights(sq2, native);
+    verify_exact_weights(adaptive, native);
 
     const std::size_t dense_nbytes =
         static_cast<std::size_t>(rows) * columns * sizeof(std::uint16_t);
@@ -301,6 +369,7 @@ int main(int argc, char **argv) {
                  "mean_ms\tpacked_GB_s\ttotal_GB_s\tchecksum\tmax_abs\n";
     if (requested_rows == -1) {
       verify_matmul(sq2, native, input, 1);
+      verify_matmul(adaptive, native, input, 1);
       for (int trial = 0; trial < 3; ++trial) {
         const bool native_first = trial == 1;
         const auto run_dequant = [&](bool run_native) {
@@ -342,11 +411,12 @@ int main(int argc, char **argv) {
     for (const int input_rows : row_counts) {
       const auto multirow_input = make_input(columns, input_rows);
       verify_matmul(sq2, native, multirow_input, input_rows);
+      verify_matmul(adaptive, native, multirow_input, input_rows);
       const auto output_nbytes =
           static_cast<std::size_t>(input_rows) * rows * sizeof(std::uint16_t);
       for (int trial = 0; trial < 3; ++trial) {
-        for (int slot = 0; slot < 3; ++slot) {
-          const int operation = (slot + trial) % 3;
+        for (int slot = 0; slot < 4; ++slot) {
+          const int operation = (slot + trial) % 4;
           if (operation == 0) {
             print_trial(kSq2Format, "bucket_matmul_fp16", trial, input_rows,
                         sq2.packed_nbytes(), output_nbytes, 2,
@@ -357,7 +427,7 @@ int main(int argc, char **argv) {
                         input_rows, native.packed_nbytes(), output_nbytes, 2,
                         multirow_repetitions,
                         [&] { return native.matmul(multirow_input); });
-          } else {
+          } else if (operation == 2) {
             print_trial(
                 "MXFP4-SQ2-DENSE", "dequant_matmul_fp16", trial, input_rows,
                 sq2.packed_nbytes(),
@@ -365,6 +435,12 @@ int main(int argc, char **argv) {
                   return mlx::core::matmul(
                       multirow_input, mlx::core::transpose(sq2.dequantize()));
                 });
+          } else {
+            print_trial(
+                "MXFP4-SQ-MIXED-2/4", "bucket_matmul_fp16", trial,
+                input_rows, adaptive.packed_nbytes(), output_nbytes, 2,
+                multirow_repetitions,
+                [&] { return adaptive.matmul(multirow_input); });
           }
         }
         print_trial(kSq2Format, "backward_input_fp16", trial, input_rows,

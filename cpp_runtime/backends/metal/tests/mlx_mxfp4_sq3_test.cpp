@@ -1,4 +1,4 @@
-#include "mlx_mxfp4_sq3.h"
+#include "mlx_mxfp4_sq.h"
 
 #include <algorithm>
 #include <array>
@@ -164,7 +164,7 @@ Fixture make_fixture(int rows, int columns) {
 void test_dequantize() {
   using namespace mlx::core;
   const auto fixture = make_fixture(7, 160);
-  const auto weight = mfq::metal::MlxMxfp4Sq3Weight::from_blob(fixture.blob);
+  const auto weight = mfq::metal::MlxMxfp4SqWeight::from_blob(fixture.blob);
   require(weight.input_size() == fixture.columns, "SQ3 input size mismatch");
   require(weight.output_size() == fixture.rows, "SQ3 output size mismatch");
   require(weight.matrix_scale_base() == fixture.matrix_scale_base,
@@ -186,7 +186,7 @@ void test_dequantize() {
 void test_fused_gemv() {
   using namespace mlx::core;
   const auto fixture = make_fixture(19, 160);
-  const auto weight = mfq::metal::MlxMxfp4Sq3Weight::from_blob(fixture.blob);
+  const auto weight = mfq::metal::MlxMxfp4SqWeight::from_blob(fixture.blob);
   std::vector<float> input_values(static_cast<std::size_t>(fixture.columns));
   for (int column = 0; column < fixture.columns; ++column) {
     input_values[static_cast<std::size_t>(column)] =
@@ -222,7 +222,7 @@ void test_fused_gemv() {
 void test_multirow_buckets() {
   using namespace mlx::core;
   const auto fixture = make_fixture(19, 96);
-  const auto weight = mfq::metal::MlxMxfp4Sq3Weight::from_blob(fixture.blob);
+  const auto weight = mfq::metal::MlxMxfp4SqWeight::from_blob(fixture.blob);
   constexpr std::array<int, 9> row_counts{2, 6, 7, 16, 17, 32, 33, 64, 65};
   for (const int rows : row_counts) {
     std::vector<float> input_values(static_cast<std::size_t>(rows) *
@@ -275,7 +275,7 @@ void test_multirow_buckets() {
 void test_fp32_multirow_contract() {
   using namespace mlx::core;
   const auto fixture = make_fixture(9, 96);
-  const auto weight = mfq::metal::MlxMxfp4Sq3Weight::from_blob(fixture.blob);
+  const auto weight = mfq::metal::MlxMxfp4SqWeight::from_blob(fixture.blob);
   constexpr int rows = 7;
   std::vector<float> values(static_cast<std::size_t>(rows) * fixture.columns);
   for (std::size_t index = 0; index < values.size(); ++index) {
@@ -297,7 +297,7 @@ void test_fp32_multirow_contract() {
 void test_backward_input() {
   using namespace mlx::core;
   const auto fixture = make_fixture(19, 96);
-  const auto weight = mfq::metal::MlxMxfp4Sq3Weight::from_blob(fixture.blob);
+  const auto weight = mfq::metal::MlxMxfp4SqWeight::from_blob(fixture.blob);
   constexpr int rows = 6;
   std::vector<float> values(static_cast<std::size_t>(rows) * fixture.rows);
   for (std::size_t index = 0; index < values.size(); ++index) {
@@ -332,7 +332,7 @@ void test_blob_validation() {
                                    const std::string &message) {
     bool rejected = false;
     try {
-      (void)mfq::metal::MlxMxfp4Sq3Weight::from_blob(blob);
+      (void)mfq::metal::MlxMxfp4SqWeight::from_blob(blob);
     } catch (const std::runtime_error &) {
       rejected = true;
     }

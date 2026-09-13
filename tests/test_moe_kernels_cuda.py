@@ -180,10 +180,18 @@ def _canonical_grouped(weight, x: torch.Tensor, route: MoeRoutePlan) -> torch.Te
             len(pool.expert_ids),
             weight.out_per_expert,
             gs,
+            0,
+            route.map_ready,
             key in quantized,
             out,
             qx,
             xscale,
+            route.ids_dst,
+            route.expert_bounds,
+            route.tile_bounds,
+            route.tile_experts,
+            8,
+            0,
         )
         quantized.add(key)
     return out
@@ -237,6 +245,38 @@ def test_expertwise_nint_large_routed_tensor_matches_reference():
     expected = _reference(tensor, x, ids)
     relative = ((actual - expected).float().norm() / expected.float().norm()).item()
     assert relative < 0.025, f"relative={relative}"
+
+
+def test_expertwise_nint_wide_prefill_tail_tiles_match_reference():
+    torch.manual_seed(146)
+    tensor, weight = _mixed_weight(
+        146,
+        experts=17,
+        out=17,
+        k=29,
+    )
+    tokens, routes = 1024, 8
+    x = torch.randn(
+        tokens,
+        routes,
+        tensor.neuron_len,
+        device="cuda",
+        dtype=torch.float16,
+    ) * 0.1
+    ids = _ids(tokens, tensor.n_experts, routes)
+    route = MoeRoutePlan.build(ids, tensor.n_experts)
+    assert route.wide_tile_m == 128
+
+    actual = grouped_matmul(weight, x, route)
+    dense = torch.as_tensor(
+        dequantize_expertwise(tensor), device="cuda", dtype=torch.float32
+    )
+    selected = dense.index_select(0, ids.long().reshape(-1)).reshape(
+        tokens, routes, tensor.out_per_expert, tensor.neuron_len
+    )
+    expected = torch.einsum("trk,trok->tro", x.float(), selected).half()
+    relative = ((actual - expected).float().norm() / expected.float().norm()).item()
+    assert relative < 0.015, f"relative={relative}"
 
 
 @pytest.mark.parametrize("tokens", [1, 2])

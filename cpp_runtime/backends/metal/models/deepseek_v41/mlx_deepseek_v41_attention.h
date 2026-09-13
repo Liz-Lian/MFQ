@@ -3,6 +3,7 @@
 #include "deepseek_v41_model.h"
 #include "mlx_tensor.h"
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -36,6 +37,11 @@ struct MlxDeepseekV41AttentionState {
         int batch,
         int max_context,
         mlx::core::Dtype dtype = mlx::core::float16);
+
+    void reset() noexcept;
+    MlxDeepseekV41AttentionState snapshot() const;
+    void restore_snapshot(MlxDeepseekV41AttentionState snapshot);
+    std::size_t nbytes() const noexcept;
 };
 
 struct MlxDeepseekV41SharedAttentionState {
@@ -120,13 +126,5 @@ private:
     MlxDeepseekV41AttentionComponents components_;
     std::pair<mlx::core::array, mlx::core::array> rope_;
 };
-
-// Exact released activation fake-quantization boundaries. Values remain F16
-// after quantize/dequantize because the sparse kernels consume unpacked cache
-// rows; no persistent full-weight dequantization is involved.
-mlx::core::array deepseek_v41_mxfp8_e4m3_sim(
-    const mlx::core::array& input);
-mlx::core::array deepseek_v41_mxfp4_e4m3_scale_sim(
-    const mlx::core::array& input);
 
 } // namespace mfq::metal

@@ -11,10 +11,10 @@ NINTv2 began with a simple question: how can we assign precision to individual
 neurons?
 
 Research into per-neuron precision is not new, but efficient implementations
-remain uncommon. The NINTv1 abstraction can already express this idea with
-reasonable efficiency. Important Neurons (IN) can split neurons of different
-importance into several Sub-FFNs with different NINT precisions, after which a
-heterogeneous dispatcher executes those branches in parallel.
+remain uncommon. MFQ's retired fixed-profile NINT representation could express
+this idea with reasonable efficiency. Important Neurons (IN) can split neurons
+of different importance into several Sub-FFNs with different NINT precisions,
+after which a heterogeneous dispatcher executes those branches in parallel.
 
 That approach is not especially slow, but it is inelegant and its number of
 possible combinations can grow rapidly. Applying the same construction to an
@@ -40,18 +40,20 @@ measurements on a 4096 x 5120 matrix put the adaptive metadata-driven path
 within roughly 5% of fixed NINT4 at M=1, and at parity in the sampled M=2--16
 range, without a configuration-specific fast path. More importantly, the representation avoids
 the combinatorial growth in logical tensors and kernel dispatches that made
-fine-grained precision allocation awkward in NINTv1.
+fine-grained precision allocation awkward under fixed-profile NINT.
 
 NINTv2 also fits naturally inside the mixed-format expert container MFE. MFE
 registers it simply as `NINT`; the per-neuron precision map remains inside the
 tensor payload. Experts do not need to be split or regrouped by their internal
 assignments, and two NINTv2 tensors may use entirely different precision
 distributions while presenting the same format identity to the container and
-runtime.
+runtime. A derived tensor descriptor exposes the aggregate encoded bpw and the
+Shannon entropy of the internal joint `(q, k)` distribution, while retaining
+`NINT` as the only public dtype.
 
-Conceptually, the fixed NINTv1 profiles become a small set of presets inside
+Conceptually, the former fixed NINT profiles become a small set of presets inside
 the NINTv2 search space. A conventional NINT4 profile is the point obtained by
-assigning the same `q` and `k` to every neuron; other familiar NINTv1 profiles
+assigning the same `q` and `k` to every neuron; other familiar profiles
 are analogous uniform points. They remain useful as simple, robust presets and
 uniform-allocation baselines, but they no longer define the boundary of the
 representable precision space. NINTv2 is better described by an aggregate
@@ -73,10 +75,11 @@ space alone.
 Every additional degree of freedom also requires calibration methodology and
 calibration scale to match. Otherwise, the enlarged search space can easily
 overfit. This raises the demands placed on calibration, which is increasingly
-becoming the bottleneck. NINTv2 therefore does not simply supersede NINTv1: it
-offers a higher attainable ceiling and, with sound calibration, should almost
-always outperform NINTv1. Without that calibration, the additional freedom is
-not automatically beneficial.
+becoming the bottleneck. NINTv2 is therefore the sole canonical `NINT` format,
+while uniform allocations remain robust presets within it. Its larger search
+space offers a higher attainable ceiling and, with sound calibration, should
+almost always improve on the matching uniform preset; without that calibration,
+the additional freedom is not automatically beneficial.
 
 ## NAQ-imatrix: importance in the context of a neural network
 
@@ -127,10 +130,20 @@ universal source of truth increasingly becomes a false premise. Conditioning a
 format on the model's actual source precision creates useful rate–distortion
 and representation opportunities.
 
-MXFP4-SQ2 and MXFP4-SQ3 were designed for native MXFP4 weights. Their decoded
-values never leave the set of values representable by MXFP4. In our tests to
-date, they outperform equal-size VQ formats and larger conventional SQ formats
-on most real native-MXFP4 weights, while remaining fast to quantize and unpack.
+MXFP4-SQ is a single adaptive format for native MXFP4 weights. Each neuron has
+one two-bit `q` descriptor selecting SQ1, SQ2, SQ3, or SQ4. SQ1–SQ3 trade symbol
+precision for compression; SQ4 is the identity endpoint and preserves the
+original E2M1 symbols and block-32 E8M0 scales exactly. This lets important
+neurons remain unquantized without splitting a logical tensor into separate
+formats or execution paths. All four profiles share one container and one
+metadata-driven kernel.
+
+Decoded values never leave the set representable by MXFP4. In our tests to
+date, the SQ2 and SQ3 operating points outperform equal-size VQ formats and
+larger conventional SQ formats on most real native-MXFP4 weights, while
+remaining fast to quantize and unpack. Initial real-weight tests also confirm
+that SQ1 is a useful low-rate endpoint for the same per-neuron allocation
+space.
 
 They also address a practical systems question: can a custom high-fidelity
 quantization format benefit from native low-precision hardware acceleration?
@@ -141,6 +154,11 @@ reason the design uses scalar quantization. In practice, its rate–distortion
 efficiency has already proved sufficient for this role, exceeding our initial
 expectations.
 
-The next planned formats are MXFP8-SQ4/5/6 and FP8-SQ4/5/6. Their goal is to
-provide high-fidelity compression for native FP8 QAT weights while retaining
-access to W8A8 acceleration.
+The native-FP8 extension now consists of two separate formats: `MXFP8-SQ`
+retains E8M0 microscales and their native block geometry, while `FP8-128SQ`
+retains a 128x128 BF16/F16/F32 multiplier grid. Each neuron carries one
+three-bit descriptor selecting SQ1 through SQ8; SQ8 is the exact native E4M3
+endpoint. Their symbol machinery can share implementation internally, but
+their public dtypes, scale contracts, and hardware kernels remain distinct.
+Every decoded weight code is legal E4M3, preserving the representation needed
+for native FP8 execution rather than introducing an intermediate code domain.

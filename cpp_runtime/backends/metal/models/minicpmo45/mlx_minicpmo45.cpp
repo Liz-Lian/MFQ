@@ -1,6 +1,7 @@
 #include "mlx_minicpmo45.h"
 #include "mlx_multimodal.h"
 
+#include "mlx_platform.h"
 #include "mlx_sampling.h"
 #include "mlx_tensor.h"
 #include "mlx_transformer.h"
@@ -11,8 +12,6 @@
 #include <mlx/allocator.h>
 #include <mlx/backend/metal/device.h>
 #include <mlx/primitives.h>
-
-#include <sys/sysctl.h>
 
 #include <algorithm>
 #include <chrono>
@@ -39,23 +38,6 @@ enum class MiniCPMOMetalProfile {
     m3,
 };
 
-std::string apple_chip_name() {
-    std::size_t size = 0;
-    if (::sysctlbyname(
-            "machdep.cpu.brand_string", nullptr, &size, nullptr, 0) != 0 ||
-        size <= 1) {
-        return {};
-    }
-    std::string value(size, '\0');
-    if (::sysctlbyname(
-            "machdep.cpu.brand_string", value.data(), &size, nullptr, 0) !=
-        0) {
-        return {};
-    }
-    if (!value.empty() && value.back() == '\0') value.pop_back();
-    return value;
-}
-
 MiniCPMOMetalProfile minicpmo_metal_profile_for_chip_name(
     const std::string& chip_name) {
     return chip_name.rfind("Apple M3", 0) == 0
@@ -74,7 +56,7 @@ MiniCPMOMetalProfile minicpmo_metal_profile() {
                 return MiniCPMOMetalProfile::baseline;
             }
         }
-        return minicpmo_metal_profile_for_chip_name(apple_chip_name());
+        return minicpmo_metal_profile_for_chip_name(mlx_apple_chip_name());
     }();
     return profile;
 }

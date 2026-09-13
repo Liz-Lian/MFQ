@@ -287,13 +287,6 @@ def _run(args: argparse.Namespace) -> int:
                 initial_artifact.resource.architecture,
                 initial_artifact.path,
             )
-            if (
-                runtime_route.requires_mfq
-                and initial_artifact.resource.format != "mfq"
-            ):
-                raise RuntimeError(
-                    "this Python MLX architecture must be converted to MFQ before inference"
-                )
             runtime = NativeRuntime(
                 executable=executable,
                 model=model,

@@ -1,5 +1,8 @@
 #include "mlx_mx.h"
 
+#include "mlx_platform.h"
+#include "mlx_transformer.h"
+
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -23,6 +26,135 @@ using mlx::core::array;
 
 constexpr std::array<std::uint8_t, 4> kMagic{'M', 'X', 'T', '1'};
 constexpr std::uint8_t kVersion = 1;
+
+constexpr const char* kMxActivationSimHeader = R"METAL(
+    METAL_FUNC float mfq_mx_e4m3_quantize(float value) {
+        float magnitude = min(abs(value), 448.0f);
+        float quantized;
+        if (magnitude < 0x1p-6f) {
+            quantized = rint(magnitude * 512.0f) / 512.0f;
+        } else {
+            float exponent = floor(log2(magnitude));
+            float step = exp2(exponent - 3.0f);
+            quantized = min(rint(magnitude / step) * step, 448.0f);
+        }
+        return copysign(quantized, value);
+    }
+    METAL_FUNC float mfq_mx_pow2_ceil(float value) {
+        uint bits = as_type<uint>(value);
+        uint exponent = (bits >> 23u) & 0xffu;
+        bool has_mantissa = (bits & 0x7fffffu) != 0u;
+        return as_type<float>((exponent + uint(has_mantissa)) << 23u);
+    }
+    METAL_FUNC float mfq_mx_e2m1_quantize(float value, float scale) {
+        float normalized = clamp(value / scale, -6.0f, 6.0f);
+        float magnitude = abs(normalized);
+        float quantized;
+        if (magnitude <= 0.25f) quantized = 0.0f;
+        else if (magnitude < 0.75f) quantized = 0.5f;
+        else if (magnitude <= 1.25f) quantized = 1.0f;
+        else if (magnitude < 1.75f) quantized = 1.5f;
+        else if (magnitude <= 2.5f) quantized = 2.0f;
+        else if (magnitude < 3.5f) quantized = 3.0f;
+        else if (magnitude <= 5.0f) quantized = 4.0f;
+        else quantized = 6.0f;
+        return copysign(quantized * scale, normalized);
+    }
+)METAL";
+
+constexpr const char* kMxfp8SimSource = R"METAL(
+    uint lane = thread_index_in_simdgroup;
+    uint group = threadgroup_position_in_grid.x;
+    uint offset = group * 32u + lane;
+    float value = float(x[offset]);
+    float maximum = simd_max(abs(value));
+    float scale = mfq_mx_pow2_ceil(
+        max(maximum, 448.0f * 0x1p-126f) / 448.0f);
+    out[offset] = half(
+        mfq_mx_e4m3_quantize(value / scale) * scale);
+)METAL";
+
+constexpr const char* kMxfp4E4m3ScaleSimSource = R"METAL(
+    uint lane = thread_index_in_simdgroup;
+    uint group = threadgroup_position_in_grid.x;
+    uint offset = group * 16u + min(lane, 15u);
+    float value = lane < 16u ? float(x[offset]) : 0.0f;
+    float maximum = simd_max(abs(value));
+    float raw_scale = max(maximum, 6.0f * 0x1p-9f) / 6.0f;
+    float scale = max(mfq_mx_e4m3_quantize(raw_scale), 0x1p-9f);
+    if (lane < 16u) {
+        out[offset] = half(mfq_mx_e2m1_quantize(value, scale));
+    }
+)METAL";
+
+constexpr const char* kWeightedRmsRopeMxfp8SimSource = R"METAL(
+    uint row = threadgroup_position_in_grid.x;
+    uint local_thread = thread_index_in_threadgroup;
+    uint lane = thread_index_in_simdgroup;
+    uint simd_group = simdgroup_index_in_threadgroup;
+    constexpr uint HALF = 256u;
+    constexpr uint PREFIX = uint(DIM - ROTARY);
+    uint row_base = row * uint(DIM);
+    uint first_column = local_thread;
+    uint second_column = local_thread + HALF;
+    float first_input = float(x[row_base + first_column]);
+    float second_input = float(x[row_base + second_column]);
+
+    threadgroup float reductions[8];
+    float subtotal = simd_sum(
+        first_input * first_input + second_input * second_input);
+    if (lane == 0u) {
+        reductions[simd_group] = subtotal;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (local_thread == 0u) {
+        float total = 0.0f;
+        for (uint group = 0u; group < 8u; ++group) {
+            total += reductions[group];
+        }
+        reductions[0] = metal::precise::rsqrt(
+            total / float(DIM) + params[0]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float inverse_rms = reductions[0];
+
+    T first_value = T(
+        first_input * inverse_rms * float(norm_weight[first_column]));
+    T second_value = T(
+        second_input * inverse_rms * float(norm_weight[second_column]));
+    if (second_column >= PREFIX) {
+        uint rotary_column = second_column - PREFIX;
+        uint pair = rotary_column >> 1u;
+        uint pair_column = PREFIX + (pair << 1u);
+        float pair_first = float(T(
+            float(x[row_base + pair_column]) * inverse_rms *
+            float(norm_weight[pair_column])));
+        float pair_second = float(T(
+            float(x[row_base + pair_column + 1u]) * inverse_rms *
+            float(norm_weight[pair_column + 1u])));
+        uint token = row % uint(TOKENS);
+        float cosine = cos_values[token * uint(PAIRS) + pair];
+        float sine = sin_values[token * uint(PAIRS) + pair];
+        float rotated = (rotary_column & 1u) == 0u
+            ? pair_first * cosine - pair_second * sine
+            : pair_first * sine + pair_second * cosine;
+        second_value = T(rotated);
+    }
+
+    float first_float = float(half(first_value));
+    float first_maximum = simd_max(abs(first_float));
+    float first_scale = mfq_mx_pow2_ceil(
+        max(first_maximum, 448.0f * 0x1p-126f) / 448.0f);
+    out[row_base + first_column] = half(
+        mfq_mx_e4m3_quantize(first_float / first_scale) * first_scale);
+
+    float second_float = float(half(second_value));
+    float second_maximum = simd_max(abs(second_float));
+    float second_scale = mfq_mx_pow2_ceil(
+        max(second_maximum, 448.0f * 0x1p-126f) / 448.0f);
+    out[row_base + second_column] = half(
+        mfq_mx_e4m3_quantize(second_float / second_scale) * second_scale);
+)METAL";
 
 class Cursor {
 public:
@@ -147,7 +279,9 @@ inline float mfq_mx_weight(
     uint output,
     uint column,
     uint mx_bits,
-    uint width
+    uint width,
+    uint scale_row_block,
+    uint scale_column_block
 ) {
     if (mx_bits == 4u) {
         uchar packed = values[output * (width / 2u) + (column >> 1u)];
@@ -156,9 +290,10 @@ inline float mfq_mx_weight(
         return mfq_mx_fp4(code) * mfq_mx_e8m0(scale);
     } else {
         uchar code = values[output * width + column];
-        uint scale_row = output / 128u;
-        uint scale_column = column / 128u;
-        uchar scale = scales[scale_row * (width / 128u) + scale_column];
+        uint scale_row = output / scale_row_block;
+        uint scale_column = column / scale_column_block;
+        uchar scale = scales[
+            scale_row * (width / scale_column_block) + scale_column];
         return mfq_mx_fp8(code) * mfq_mx_e8m0(scale);
     }
 }
@@ -179,7 +314,8 @@ constexpr const char* kMxMatmul = R"METAL(
     }
     for (uint column = lane; column < uint(K); column += 32u) {
         float weight = mfq_mx_weight(
-            values, scales, output, column, uint(MX_BITS), uint(K));
+            values, scales, output, column, uint(MX_BITS), uint(K),
+            uint(SCALE_ROW_BLOCK), uint(SCALE_COLUMN_BLOCK));
         for (uint local = 0u; local < uint(TILE_M); ++local) {
             uint row = first_row + local;
             if (row < uint(M)) {
@@ -326,7 +462,9 @@ constexpr const char* kMxGemv = R"METAL(
                         output,
                         column,
                         uint(MX_BITS),
-                        uint(K));
+                        uint(K),
+                        uint(SCALE_ROW_BLOCK),
+                        uint(SCALE_COLUMN_BLOCK));
             }
         }
     }
@@ -400,9 +538,9 @@ constexpr const char* kMxfp8Gemv = R"METAL(
     }
 )METAL";
 
-// Short DSpark verifier blocks need the diagonal MultiLinear projection used
-// by DeepSeek-V4's O-LoRA output path.  The generic grouped-row fallback
-// dequantizes the complete MXFP8 matrix and launches one GEMM per group.  This
+// Short verifier blocks need a diagonal MultiLinear projection. The generic
+// grouped-row fallback dequantizes the complete MXFP8 matrix and launches one
+// GEMM per group. This
 // schedule instead keeps M=2..6 activation rows in registers and reuses each
 // packed weight byte across all of them.  Its 32-lane reduction and four
 // outputs per SIMD group match MLX's decode QMV arithmetic.
@@ -559,7 +697,7 @@ constexpr const char* kMxfp8SmallMExact = R"METAL(
     }
 )METAL";
 
-// DeepSeek-V4 O-LoRA projection for decode and short DSpark verifier blocks.
+// Diagonal grouped projection for decode and short verifier blocks.
 // The output row selects its diagonal input group, and inverse RoPE is
 // applied while M=1..6 activation rows are in registers. Keeping the same
 // eight K lanes, FP16 RoPE boundary, FMA order, and shuffle tree for every M
@@ -666,8 +804,8 @@ constexpr const char* kMxfp8GroupedInverseRope = R"METAL(
     }
 )METAL";
 
-// DeepSeek-V4.1 stores O-LoRA weights as independent 32x32 MXFP8 blocks.
-// MLX's ordinary grouped path launches one QMV for each of the eight output
+// Native 32-column MXFP8 sidecars can be expanded once to MLX's per-output
+// scale layout. MLX's ordinary grouped path launches one QMV for each output
 // groups after a separate inverse-RoPE dispatch. Decode only needs M=1, so a
 // single threadgroup schedule can select the diagonal input group, rotate its
 // activation in registers, and retain the native block32 QMV accumulation
@@ -765,7 +903,9 @@ constexpr const char* kMxDequantize = R"METAL(
             output,
             column,
             uint(MX_BITS),
-            uint(K)));
+            uint(K),
+            uint(SCALE_ROW_BLOCK),
+            uint(SCALE_COLUMN_BLOCK)));
     }
 )METAL";
 
@@ -778,7 +918,8 @@ constexpr const char* kMxEmbedding = R"METAL(
         uint output = uint(x[token]);
         y[index] = output < uint(OUT)
             ? T(mfq_mx_weight(
-                values, scales, output, column, uint(MX_BITS), uint(K)))
+                values, scales, output, column, uint(MX_BITS), uint(K),
+                uint(SCALE_ROW_BLOCK), uint(SCALE_COLUMN_BLOCK)))
             : T(NAN);
     }
 )METAL";
@@ -821,6 +962,67 @@ const mlx::core::fast::CustomKernelFunction& mxfp8_gemv_kernel() {
     static const auto kernel = make_kernel(
         "mfq_cpp_mxfp8_block_gemv", kMxfp8Gemv);
     return kernel;
+}
+
+const mlx::core::fast::CustomKernelFunction& mxfp8_sim_kernel() {
+    static const auto kernel = [] {
+        CompileOptions options;
+        options.math_mode = MathMode::Fast;
+        return mlx::core::fast::metal_kernel(
+            "mfq_cpp_mxfp8_activation_sim",
+            {"x"},
+            {"out"},
+            kMxfp8SimSource,
+            kMxActivationSimHeader,
+            true,
+            false,
+            options);
+    }();
+    return kernel;
+}
+
+const mlx::core::fast::CustomKernelFunction&
+mxfp4_e4m3_scale_sim_kernel() {
+    static const auto kernel = [] {
+        CompileOptions options;
+        options.math_mode = MathMode::Fast;
+        return mlx::core::fast::metal_kernel(
+            "mfq_cpp_mxfp4_e4m3_scale_activation_sim",
+            {"x"},
+            {"out"},
+            kMxfp4E4m3ScaleSimSource,
+            kMxActivationSimHeader,
+            true,
+            false,
+            options);
+    }();
+    return kernel;
+}
+
+const mlx::core::fast::CustomKernelFunction&
+weighted_rms_rope_mxfp8_sim_kernel() {
+    static const auto kernel = [] {
+        CompileOptions options;
+        options.math_mode = MathMode::Fast;
+        return mlx::core::fast::metal_kernel(
+            "mfq_cpp_weighted_rms_rope_mxfp8_sim",
+            {"x", "cos_values", "sin_values", "norm_weight", "params"},
+            {"out"},
+            kWeightedRmsRopeMxfp8SimSource,
+            kMxActivationSimHeader,
+            true,
+            false,
+            options);
+    }();
+    return kernel;
+}
+
+bool fused_mxfp8_prepare_enabled() noexcept {
+    if (const char* value = std::getenv("MFQ_METAL_FUSED_KV_PREP")) {
+        const auto setting = std::string_view(value);
+        return setting != "0" && setting != "false" && setting != "off";
+    }
+    return mlx_apple_chip_is("Apple M3 Ultra");
 }
 
 const mlx::core::fast::CustomKernelFunction&
@@ -908,11 +1110,14 @@ const mlx::core::fast::CustomKernelFunction& mx_embedding_kernel() {
 }
 
 std::vector<std::pair<std::string, mlx::core::fast::TemplateArg>>
-templates(Dtype dtype, int bits, int input_size, int output_size, int rows = 1,
+templates(Dtype dtype, int bits, int input_size, int output_size,
+          int scale_row_block, int scale_column_block, int rows = 1,
           int tile_rows = 1) {
     return {
         {"T", dtype},
         {"MX_BITS", bits},
+        {"SCALE_ROW_BLOCK", scale_row_block},
+        {"SCALE_COLUMN_BLOCK", scale_column_block},
         {"K", input_size},
         {"OUT", output_size},
         {"M", rows},
@@ -926,6 +1131,132 @@ bool is_mx_dtype(std::string_view dtype) noexcept {
     return dtype == "MXFP4" || dtype == "MXFP8";
 }
 
+array mlx_mxfp8_sim(const array& input) {
+    auto source = input.dtype() == mlx::core::float16
+        ? input
+        : mlx::core::astype(input, mlx::core::float16);
+    source = mlx::core::contiguous(std::move(source));
+    if (source.size() == 0 || source.shape(-1) % 32 != 0 ||
+        source.size() >
+            static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+        throw std::invalid_argument(
+            "MXFP8 simulation expects nonempty [...,32*n]");
+    }
+    const int size = static_cast<int>(source.size());
+    auto output = mxfp8_sim_kernel()(
+        {source},
+        {source.shape()},
+        {mlx::core::float16},
+        {size, 1, 1},
+        {32, 1, 1},
+        {},
+        std::nullopt,
+        false,
+        {});
+    return std::move(output.front());
+}
+
+array mlx_mxfp4_e4m3_scale_sim(const array& input) {
+    auto source = input.dtype() == mlx::core::float16
+        ? input
+        : mlx::core::astype(input, mlx::core::float16);
+    source = mlx::core::contiguous(std::move(source));
+    if (source.size() == 0 || source.shape(-1) % 16 != 0 ||
+        source.size() >
+            static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+        throw std::invalid_argument(
+            "MXFP4 E4M3-scale simulation expects nonempty [...,16*n]");
+    }
+    const int groups = static_cast<int>(source.size() / 16);
+    auto output = mxfp4_e4m3_scale_sim_kernel()(
+        {source},
+        {source.shape()},
+        {mlx::core::float16},
+        {groups * 32, 1, 1},
+        {32, 1, 1},
+        {},
+        std::nullopt,
+        false,
+        {});
+    return std::move(output.front());
+}
+
+array mlx_weighted_rms_rope_mxfp8_sim(
+    const array& input,
+    const array& norm_weight,
+    float eps,
+    int rotary_dimension,
+    const array& cosine,
+    const array& sine) {
+    if (input.ndim() < 2 || input.shape(-1) <= 0 ||
+        norm_weight.shape() != Shape{input.shape(-1)} ||
+        !std::isfinite(eps) || eps <= 0.0f) {
+        throw std::invalid_argument(
+            "invalid weighted RMS/RoPE/MXFP8 preparation input");
+    }
+    const auto reference = [&] {
+        auto source = mlx::core::astype(input, mlx::core::float32);
+        auto scale = mlx::core::rsqrt(
+            mlx::core::mean(source * source, -1, true) + eps);
+        auto result = source * scale *
+            mlx::core::astype(norm_weight, mlx::core::float32);
+        result = mlx::core::astype(std::move(result), input.dtype());
+        result = mlx_rope_adjacent(
+            result,
+            rotary_dimension,
+            cosine,
+            sine);
+        return mlx_mxfp8_sim(result);
+    };
+
+    const bool activation16 =
+        input.dtype() == mlx::core::float16 ||
+        input.dtype() == mlx::core::bfloat16;
+    if (!fused_mxfp8_prepare_enabled() || input.ndim() != 3 ||
+        input.shape(-1) != 512 || rotary_dimension != 64 ||
+        !activation16) {
+        return reference();
+    }
+    const int tokens = input.shape(1);
+    if (tokens <= 0 || cosine.shape() != sine.shape() ||
+        cosine.shape() != Shape{tokens, rotary_dimension / 2}) {
+        throw std::invalid_argument(
+            "invalid fused weighted RMS/RoPE/MXFP8 preparation input");
+    }
+    auto source = mlx::core::contiguous(input);
+    auto weight = mlx::core::contiguous(
+        mlx::core::astype(norm_weight, mlx::core::float32));
+    auto cos_values = mlx::core::contiguous(
+        mlx::core::astype(cosine, mlx::core::float32));
+    auto sin_values = mlx::core::contiguous(
+        mlx::core::astype(sine, mlx::core::float32));
+    const auto rows_size = source.size() / 512u;
+    if (rows_size > static_cast<std::size_t>(
+            std::numeric_limits<int>::max() / 256)) {
+        throw std::invalid_argument(
+            "fused weighted RMS/RoPE/MXFP8 row count exceeds Metal limits");
+    }
+    const int rows = static_cast<int>(rows_size);
+    const array params({eps}, mlx::core::float32);
+    auto outputs = weighted_rms_rope_mxfp8_sim_kernel()(
+        {source, cos_values, sin_values, weight, params},
+        {source.shape()},
+        {mlx::core::float16},
+        {rows * 256, 1, 1},
+        {256, 1, 1},
+        {
+            {"T", source.dtype()},
+            {"DIM", 512},
+            {"ROTARY", rotary_dimension},
+            {"PAIRS", rotary_dimension / 2},
+            {"TOKENS", tokens},
+        },
+        std::nullopt,
+        false,
+        {});
+    return std::move(outputs.front());
+}
+
 MlxMxWeight::MlxMxWeight(
     array values,
     array scales,
@@ -937,10 +1268,18 @@ MlxMxWeight::MlxMxWeight(
       bits_(bits),
       input_size_(input_size),
       output_size_(output_size) {
+    if (bits_ == 4) {
+        mxfp8_scale_row_block_size_ = 1;
+        mxfp8_scale_column_block_size_ = 32;
+    }
     const auto* native_env = std::getenv("MFQ_METAL_MXFP8_NATIVE_QMV");
     const bool native_enabled = native_env == nullptr ||
         std::string_view(native_env) != "0";
     if (bits_ == 8) {
+        const Shape row1x32_shape{
+            output_size_,
+            input_size_ / 32,
+        };
         const Shape block32_shape{
             (output_size_ + 31) / 32,
             input_size_ / 32,
@@ -949,32 +1288,38 @@ MlxMxWeight::MlxMxWeight(
             (output_size_ + 127) / 128,
             input_size_ / 128,
         };
-        if (input_size_ % 32 == 0 && scales_.shape() == block32_shape) {
-            mxfp8_scale_block_size_ = 32;
-        } else if (input_size_ % 128 == 0 &&
-                   scales_.shape() == block128_shape) {
-            mxfp8_scale_block_size_ = 128;
+        if (input_size_ % 128 == 0 &&
+            scales_.shape() == block128_shape) {
+            mxfp8_scale_row_block_size_ = 128;
+            mxfp8_scale_column_block_size_ = 128;
+        } else if (input_size_ % 32 == 0 &&
+                   scales_.shape() == block32_shape) {
+            mxfp8_scale_row_block_size_ = 32;
+            mxfp8_scale_column_block_size_ = 32;
+        } else if (input_size_ % 32 == 0 &&
+                   scales_.shape() == row1x32_shape) {
+            mxfp8_scale_row_block_size_ = 1;
+            mxfp8_scale_column_block_size_ = 32;
         } else {
             throw std::invalid_argument(
                 "unsupported MXFP8 scale block geometry");
         }
     }
     if (bits_ == 8 &&
-        (native_enabled || mxfp8_scale_block_size_ == 32)) {
+        (native_enabled || mxfp8_scale_column_block_size_ == 32)) {
         // MLX's native MXFP8 kernels use one E8M0 scale per output row and
-        // 32 input columns. Legacy V4 checkpoints use 128x128 blocks while
-        // V4.1 uses 32x32 blocks. Expand only the scale sidecar to MLX's
-        // per-output-row layout and keep the FP8 payload zero-copy.
+        // 32 input columns. Expand any supported source geometry to that
+        // common sidecar layout while keeping the FP8 payload zero-copy.
         auto expanded = scales_;
-        if (mxfp8_scale_block_size_ > 32) {
+        if (mxfp8_scale_column_block_size_ > 32) {
             expanded = mlx::core::repeat(
                 expanded,
-                mxfp8_scale_block_size_ / 32,
+                mxfp8_scale_column_block_size_ / 32,
                 1);
         }
         expanded = mlx::core::repeat(
             expanded,
-            mxfp8_scale_block_size_,
+            mxfp8_scale_row_block_size_,
             0);
         if (expanded.shape() != Shape{
                 output_size_, input_size_ / 32}) {
@@ -1023,14 +1368,19 @@ MlxMxWeight MlxMxWeight::from_blob(
     const auto output_size = checked_dimension(rows, "output size");
     const auto input_size = checked_dimension(columns, "input size");
     const auto expected_storage_columns = bits == 4 ? columns / 2 : columns;
-    const auto expected_scale_rows = bits == 4 ? rows : (rows + 127) / 128;
-    const auto expected_scale_columns = bits == 4 ? columns / 32 : columns / 128;
-    if ((bits == 4 && columns % 32 != 0) ||
-        (bits == 8 && columns % 128 != 0) ||
+    const bool valid_mxfp4_scales = bits == 4 &&
+        scale_rows == rows && scale_columns == columns / 32;
+    const bool valid_mxfp8_scales = bits == 8 && (
+        (columns % 128 == 0 &&
+         scale_rows == (rows + 127) / 128 &&
+         scale_columns == columns / 128) ||
+        (scale_rows == (rows + 31) / 32 &&
+         scale_columns == columns / 32) ||
+        (scale_rows == rows && scale_columns == columns / 32));
+    if (columns % 32 != 0 ||
         storage_rows != rows ||
         storage_columns != expected_storage_columns ||
-        scale_rows != expected_scale_rows ||
-        scale_columns != expected_scale_columns) {
+        (!valid_mxfp4_scales && !valid_mxfp8_scales)) {
         throw std::runtime_error("invalid MX MFQ block geometry");
     }
     const auto value_count = checked_product(
@@ -1094,6 +1444,10 @@ MlxMxWeight MlxMxWeight::from_arrays(
         (output_size + 127) / 128,
         input_size / 128,
     };
+    const Shape row1x32_scale_shape{
+        output_size,
+        input_size / 32,
+    };
     const Shape mxfp4_scale_shape{output_size, input_size / 32};
     const auto shape_size = [](const Shape& shape) {
         std::size_t result = 1;
@@ -1102,26 +1456,56 @@ MlxMxWeight MlxMxWeight::from_arrays(
         }
         return result;
     };
-    std::optional<Shape> scale_shape;
-    if (bits == 4 && scales.size() == shape_size(mxfp4_scale_shape)) {
-        scale_shape = mxfp4_scale_shape;
-    } else if (bits == 8 && scales.size() == shape_size(block32_scale_shape)) {
-        scale_shape = block32_scale_shape;
-    } else if (bits == 8 && input_size % 128 == 0 &&
-               scales.size() == shape_size(block128_scale_shape)) {
-        scale_shape = block128_scale_shape;
-    }
+    const auto scale_shape_for_size = [&]() -> std::optional<Shape> {
+        if (bits == 4 && scales.shape() == mxfp4_scale_shape) {
+            return mxfp4_scale_shape;
+        }
+        if (bits == 8 && input_size % 128 == 0 &&
+            scales.shape() == block128_scale_shape) {
+            return block128_scale_shape;
+        }
+        if (bits == 8 && scales.shape() == block32_scale_shape) {
+            return block32_scale_shape;
+        }
+        if (bits == 8 && scales.shape() == row1x32_scale_shape) {
+            return row1x32_scale_shape;
+        }
+        if (scales.ndim() != 1) {
+            return std::nullopt;
+        }
+        if (bits == 4 && scales.size() == shape_size(mxfp4_scale_shape)) {
+            return mxfp4_scale_shape;
+        }
+        if (bits == 8 && scales.size() == shape_size(block32_scale_shape)) {
+            return block32_scale_shape;
+        }
+        if (bits == 8 && input_size % 128 == 0 &&
+            scales.size() == shape_size(block128_scale_shape)) {
+            return block128_scale_shape;
+        }
+        if (bits == 8 && scales.size() == shape_size(row1x32_scale_shape)) {
+            return row1x32_scale_shape;
+        }
+        return std::nullopt;
+    };
+    const auto scale_shape = scale_shape_for_size();
     if (values.size() != expected_values || !scale_shape) {
         throw std::invalid_argument("MX packed array size mismatch");
     }
-    // SSD arenas expose zero-copy one-dimensional slices into their backing
-    // banks, while checkpoint tensors normally arrive with canonical matrix
-    // shapes. Normalize the view here so both sources share the same kernels.
-    if (values.shape() != expected_values_shape) {
+
+    const bool canonical_shapes =
+        values.shape() == expected_values_shape &&
+        scales.shape() == *scale_shape;
+    const bool flat_storage = values.ndim() == 1 && scales.ndim() == 1;
+    if (!canonical_shapes && !flat_storage) {
+        throw std::invalid_argument("MX packed array shape mismatch");
+    }
+    // SSD arenas expose both byte banks as explicit one-dimensional slices.
+    // Only that unambiguous storage contract may be reshaped. A transposed or
+    // otherwise malformed matrix with the same element count is rejected.
+    if (flat_storage) {
         values = mlx::core::reshape(
             std::move(values), expected_values_shape);
-    }
-    if (scales.shape() != *scale_shape) {
         scales = mlx::core::reshape(
             std::move(scales), *scale_shape);
     }
@@ -1137,7 +1521,7 @@ array MlxMxWeight::dequantize(Dtype dtype) const {
     if (dtype != mlx::core::float16 && dtype != mlx::core::float32) {
         throw std::runtime_error("MX dequantization requires float16 or float32");
     }
-    if (bits_ == 8 && mxfp8_scale_block_size_ == 32) {
+    if (bits_ == 8 && mxfp8_scale_column_block_size_ == 32) {
         auto packed = mlx::core::reshape(
             mlx::core::view(values_, mlx::core::uint32),
             Shape{output_size_, input_size_ / 4});
@@ -1164,7 +1548,13 @@ array MlxMxWeight::dequantize(Dtype dtype) const {
         {dtype},
         {static_cast<int>(elements), 1, 1},
         {std::min(256, static_cast<int>(elements)), 1, 1},
-        templates(dtype, bits_, input_size_, output_size_),
+        templates(
+            dtype,
+            bits_,
+            input_size_,
+            output_size_,
+            mxfp8_scale_row_block_size_,
+            mxfp8_scale_column_block_size_),
         std::nullopt,
         false,
         {});
@@ -1191,7 +1581,7 @@ array MlxMxWeight::matmul(const array& input) const {
         Shape{static_cast<int>(rows), input_size_});
     if (bits_ == 8 &&
         expanded_mxfp8_scales_.has_value() &&
-        (mxfp8_scale_block_size_ == 32 ||
+        (mxfp8_scale_column_block_size_ == 32 ||
          (rows == 1 && source.dtype() == mlx::core::float16))) {
         auto packed = mlx::core::reshape(
             mlx::core::view(values_, mlx::core::uint32),
@@ -1287,6 +1677,8 @@ array MlxMxWeight::matmul(const array& input) const {
         bits_,
         input_size_,
         output_size_,
+        mxfp8_scale_row_block_size_,
+        mxfp8_scale_column_block_size_,
         static_cast<int>(rows),
         tile_rows);
     if (small_m) {
@@ -1336,43 +1728,98 @@ array MlxMxWeight::grouped_row_matmul(
             mlx::core::float16);
     }
     const int output_per_group = output_size_ / group_count;
-    if (mxfp8_scale_block_size_ == 32) {
-        // DeepSeek-V4.1 stores independent 32x32 MXFP8 blocks. The fused
-        // grouped kernels below assume the legacy 128x128 sidecar layout,
-        // so use MLX's native MXFP8 matmul once per O-LoRA group here.
-        auto packed = mlx::core::reshape(
-            mlx::core::view(values_, mlx::core::uint32),
-            Shape{output_size_, input_size_ / 4});
-        std::vector<array> pieces;
-        pieces.reserve(static_cast<std::size_t>(group_count));
-        for (int group = 0; group < group_count; ++group) {
-            auto group_input = mlx::core::take(
-                source,
-                group,
-                source.ndim() - 2);
-            auto group_weight = mlx::core::slice(
-                packed,
-                Shape{group * output_per_group, 0},
-                Shape{(group + 1) * output_per_group, input_size_ / 4});
-            auto group_scales = mlx::core::slice(
-                *expanded_mxfp8_scales_,
-                Shape{group * output_per_group, 0},
-                Shape{(group + 1) * output_per_group, input_size_ / 32});
-            pieces.push_back(mlx::core::quantized_matmul(
-                std::move(group_input),
-                std::move(group_weight),
-                std::move(group_scales),
-                std::nullopt,
-                true,
-                32,
-                8,
-                "mxfp8"));
-        }
-        return mlx::core::stack(pieces, input.ndim() - 2);
-    }
     std::size_t rows = 1;
     for (std::size_t axis = 0; axis + 2 < source.ndim(); ++axis) {
         rows *= static_cast<std::size_t>(source.shape(axis));
+    }
+    if (mxfp8_scale_column_block_size_ == 32) {
+        const auto* grouped_layout = std::getenv(
+            "MFQ_METAL_MXFP8_GROUPED_PREFILL_LAYOUT");
+        if (grouped_layout != nullptr &&
+            std::string_view(grouped_layout) == "serial") {
+            auto packed = mlx::core::reshape(
+                mlx::core::view(values_, mlx::core::uint32),
+                Shape{output_size_, input_size_ / 4});
+            std::vector<array> pieces;
+            pieces.reserve(static_cast<std::size_t>(group_count));
+            for (int group = 0; group < group_count; ++group) {
+                pieces.push_back(mlx::core::quantized_matmul(
+                    mlx::core::take(
+                        source,
+                        group,
+                        source.ndim() - 2),
+                    mlx::core::slice(
+                        packed,
+                        Shape{group * output_per_group, 0},
+                        Shape{
+                            (group + 1) * output_per_group,
+                            input_size_ / 4,
+                        }),
+                    mlx::core::slice(
+                        *expanded_mxfp8_scales_,
+                        Shape{group * output_per_group, 0},
+                        Shape{
+                            (group + 1) * output_per_group,
+                            input_size_ / 32,
+                        }),
+                    std::nullopt,
+                    true,
+                    32,
+                    8,
+                    "mxfp8"));
+            }
+            return mlx::core::stack(
+                pieces,
+                input.ndim() - 2);
+        }
+
+        // Present every logical output group to MLX as one batched native
+        // MXFP8 QMM. This keeps the packed payload and expanded scale view
+        // zero-copy while replacing N separate launches plus a stack node.
+        auto packed = mlx::core::reshape(
+            mlx::core::view(values_, mlx::core::uint32),
+            Shape{
+                group_count,
+                output_per_group,
+                input_size_ / 4,
+            });
+        auto scales = mlx::core::reshape(
+            *expanded_mxfp8_scales_,
+            Shape{
+                group_count,
+                output_per_group,
+                input_size_ / 32,
+            });
+        auto grouped_source = mlx::core::contiguous(
+            mlx::core::transpose(
+                mlx::core::reshape(
+                    source,
+                    Shape{
+                        checked_dimension(rows, "grouped MXFP8 row count"),
+                        group_count,
+                        input_size_,
+                    }),
+                {1, 0, 2}));
+        auto grouped_output = mlx::core::quantized_matmul(
+            std::move(grouped_source),
+            std::move(packed),
+            std::move(scales),
+            std::nullopt,
+            true,
+            32,
+            8,
+            "mxfp8");
+        auto row_major = mlx::core::transpose(
+            std::move(grouped_output),
+            {1, 0, 2});
+        Shape output_shape(
+            input.shape().begin(),
+            input.shape().end() - 2);
+        output_shape.push_back(group_count);
+        output_shape.push_back(output_per_group);
+        return mlx::core::reshape(
+            std::move(row_major),
+            std::move(output_shape));
     }
     const auto* layout = std::getenv(
         "MFQ_METAL_MXFP8_GROUPED_SMALL_M_LAYOUT");
@@ -1518,7 +1965,7 @@ array MlxMxWeight::grouped_row_matmul_inverse_rope(
         mlx::core::reshape(
             sin_values,
             Shape{static_cast<int>(rows) * rotary_dimension / 2}));
-    if (mxfp8_scale_block_size_ == 32) {
+    if (mxfp8_scale_column_block_size_ == 32) {
         if (rows != 1 || input.dtype() != mlx::core::float32 ||
             !expanded_mxfp8_scales_.has_value() ||
             input_size_ % 512 != 0 ||
@@ -1640,6 +2087,8 @@ array MlxMxWeight::embedding(const array& token_ids, Dtype dtype) const {
             bits_,
             input_size_,
             output_size_,
+            mxfp8_scale_row_block_size_,
+            mxfp8_scale_column_block_size_,
             static_cast<int>(tokens)),
         std::nullopt,
         false,

@@ -193,8 +193,8 @@ constexpr const char* kDenseRouterTopKSource = R"METAL(
             float raw = simd_sum(accumulators[local]);
             if (lane == 0u) {
                 uint expert = expert_base + local;
-                // DeepSeek-V4 routes from x.float() @ weight.float(). Keep
-                // each expert's SIMD reduction in the original FP32 order.
+                // Keep each expert's SIMD reduction in FP32 order so the
+                // fused router matches its unfused dense reference.
                 raw = isnan(raw) ? -FLT_MAX : raw;
                 float softplus = raw > 20.0f ? raw : log1p(exp(raw));
                 float route_weight = sqrt(softplus);

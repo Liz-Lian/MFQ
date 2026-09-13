@@ -157,6 +157,53 @@ const mlx::core::fast::CustomKernelFunction& mrope_kernel() {
     return kernel;
 }
 
+constexpr const char* kAdjacentRopeSource = R"METAL(
+    uint index = thread_position_in_grid.x;
+    if (index >= uint(SIZE)) {
+        return;
+    }
+    uint column = index % uint(DIM);
+    uint row = index / uint(DIM);
+    constexpr uint PREFIX = uint(DIM - ROTARY);
+    if (column < PREFIX) {
+        y[index] = x[index];
+        return;
+    }
+
+    uint rotary_column = column - PREFIX;
+    uint pair = rotary_column >> 1u;
+    uint token = (row / uint(HEADS)) % uint(TOKENS);
+    float cosine = float(cos_values[token * uint(PAIRS) + pair]);
+    float sine = float(sin_values[token * uint(PAIRS) + pair]);
+    if (INVERSE != 0) {
+        sine = -sine;
+    }
+    uint pair_base = row * uint(DIM) + PREFIX + (pair << 1u);
+    float first = float(x[pair_base]);
+    float second = float(x[pair_base + 1u]);
+    float result = (rotary_column & 1u) == 0u
+        ? first * cosine - second * sine
+        : first * sine + second * cosine;
+    y[index] = T(result);
+)METAL";
+
+const mlx::core::fast::CustomKernelFunction& adjacent_rope_kernel() {
+    static const auto kernel = [] {
+        CompileOptions options;
+        options.math_mode = MathMode::Fast;
+        return mlx::core::fast::metal_kernel(
+            "mfq_cpp_adjacent_rope",
+            {"x", "cos_values", "sin_values"},
+            {"y"},
+            kAdjacentRopeSource,
+            "",
+            true,
+            false,
+            options);
+    }();
+    return kernel;
+}
+
 array floating(const array& input, mlx::core::Dtype dtype) {
     auto result = input;
     if (result.dtype() != dtype) {
@@ -173,6 +220,146 @@ void require_attention_shape(const array& value, const char* name) {
 }
 
 } // namespace
+
+std::pair<array, array> mlx_yarn_tables(
+    int dimension,
+    int length,
+    float theta,
+    const MlxYarnScaling& scaling) {
+    if (dimension <= 0 || dimension % 2 != 0 || length <= 0 ||
+        !std::isfinite(theta) || theta <= 0.0f) {
+        throw std::invalid_argument("invalid YaRN table parameters");
+    }
+    const int pairs = dimension / 2;
+    std::vector<float> frequency(pairs);
+    for (int pair = 0; pair < pairs; ++pair) {
+        frequency[pair] = 1.0f / std::pow(
+            theta,
+            static_cast<float>(2 * pair) / static_cast<float>(dimension));
+    }
+    if (scaling.enabled &&
+        scaling.original_max_position_embeddings > 0) {
+        if (!std::isfinite(scaling.factor) || scaling.factor <= 0.0 ||
+            !std::isfinite(scaling.beta_fast) || scaling.beta_fast <= 0.0 ||
+            !std::isfinite(scaling.beta_slow) || scaling.beta_slow <= 0.0) {
+            throw std::invalid_argument("invalid YaRN scaling");
+        }
+        const auto correction = [&](double rotations) {
+            return static_cast<double>(dimension) *
+                std::log(
+                    static_cast<double>(
+                        scaling.original_max_position_embeddings) /
+                    (rotations * 2.0 * std::acos(-1.0))) /
+                (2.0 * std::log(static_cast<double>(theta)));
+        };
+        const int low = std::max(
+            static_cast<int>(std::floor(correction(scaling.beta_fast))), 0);
+        double high = std::min(
+            std::ceil(correction(scaling.beta_slow)),
+            static_cast<double>(dimension - 1));
+        if (static_cast<double>(low) == high) {
+            high += 0.001;
+        }
+        for (int pair = 0; pair < pairs; ++pair) {
+            const float ramp = std::clamp(
+                static_cast<float>(
+                    (static_cast<double>(pair) - low) / (high - low)),
+                0.0f,
+                1.0f);
+            const float smooth = 1.0f - ramp;
+            frequency[pair] =
+                frequency[pair] / static_cast<float>(scaling.factor) *
+                    (1.0f - smooth) +
+                frequency[pair] * smooth;
+        }
+    }
+    std::vector<float> cosine(
+        static_cast<std::size_t>(length) * pairs);
+    std::vector<float> sine(cosine.size());
+    for (int position = 0; position < length; ++position) {
+        for (int pair = 0; pair < pairs; ++pair) {
+            const float angle = static_cast<float>(position) * frequency[pair];
+            cosine[position * pairs + pair] = std::cos(angle);
+            sine[position * pairs + pair] = std::sin(angle);
+        }
+    }
+    return {
+        array(cosine.begin(), Shape{length, pairs}),
+        array(sine.begin(), Shape{length, pairs}),
+    };
+}
+
+array mlx_rope_adjacent(
+    const array& value,
+    int rotary_dimension,
+    const array& cosine,
+    const array& sine,
+    bool inverse) {
+    if (value.ndim() < 2 || value.ndim() > 4 || value.shape(-1) <= 0 ||
+        rotary_dimension <= 0 || rotary_dimension > value.shape(-1) ||
+        rotary_dimension % 2 != 0 || cosine.shape() != sine.shape() ||
+        cosine.shape(-1) != rotary_dimension / 2) {
+        throw std::invalid_argument("invalid adjacent RoPE input");
+    }
+
+    auto source = value;
+    if (source.dtype() != mlx::core::float16 &&
+        source.dtype() != mlx::core::bfloat16 &&
+        source.dtype() != mlx::core::float32) {
+        source = mlx::core::astype(source, mlx::core::float16);
+    }
+    source = mlx::core::contiguous(source);
+    const int dimension = source.shape(-1);
+    const int tokens = source.ndim() == 2 ? source.shape(0) : source.shape(1);
+    const int heads = source.ndim() == 4 ? source.shape(2) : 1;
+    const int pairs = rotary_dimension / 2;
+    if (tokens <= 0 || heads <= 0 ||
+        cosine.size() != static_cast<std::size_t>(tokens) * pairs) {
+        throw std::invalid_argument(
+            "adjacent RoPE table is not token-broadcastable");
+    }
+    auto cos_values = mlx::core::contiguous(
+        mlx::core::astype(cosine, mlx::core::float32));
+    auto sin_values = mlx::core::contiguous(
+        mlx::core::astype(sine, mlx::core::float32));
+    if (source.size() >
+        static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+        throw std::invalid_argument("adjacent RoPE tensor exceeds Metal limits");
+    }
+    const int grid = static_cast<int>(source.size());
+    auto outputs = adjacent_rope_kernel()(
+        {source, cos_values, sin_values},
+        {source.shape()},
+        {source.dtype()},
+        {grid, 1, 1},
+        {std::min(256, grid), 1, 1},
+        {
+            {"T", source.dtype()},
+            {"SIZE", grid},
+            {"DIM", dimension},
+            {"ROTARY", rotary_dimension},
+            {"PAIRS", pairs},
+            {"TOKENS", tokens},
+            {"HEADS", heads},
+            {"INVERSE", inverse ? 1 : 0},
+        },
+        std::nullopt,
+        false,
+        {});
+    return std::move(outputs.front());
+}
+
+array mlx_rope_adjacent(
+    const array& value,
+    const array& cosine,
+    const array& sine,
+    bool inverse) {
+    if (value.ndim() == 0) {
+        throw std::invalid_argument("invalid adjacent RoPE input");
+    }
+    return mlx_rope_adjacent(
+        value, value.shape(-1), cosine, sine, inverse);
+}
 
 MlxRmsNorm::MlxRmsNorm(
     array weight,

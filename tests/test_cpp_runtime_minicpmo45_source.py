@@ -29,6 +29,9 @@ METAL_DECODE = (ROOT / "cpp_runtime" / "backends" / "metal" / "apps" / "mfq_deco
 METAL_COMPONENTS = (
     ROOT / "cpp_runtime" / "backends" / "metal" / "runtime" / "mlx_server_components.cpp"
 ).read_text(encoding="utf-8")
+METAL_PLATFORM = (
+    ROOT / "cpp_runtime" / "backends" / "metal" / "runtime" / "mlx_platform.h"
+).read_text(encoding="utf-8")
 SERVER_HEADER = (ROOT / "cpp_runtime" / "server" / "include" / "mfq" / "server.h").read_text(
     encoding="utf-8"
 )
@@ -285,7 +288,9 @@ def test_minicpmo45_native_servers_share_mfqd_vision_tensors():
 
 
 def test_minicpmo45_metal_dispatches_m3_family_tuning_by_device():
-    assert 'sysctlbyname(\n            "machdep.cpu.brand_string"' in METAL_GRAPH
+    assert '#include "mlx_platform.h"' in METAL_GRAPH
+    assert "mlx_apple_chip_name()" in METAL_GRAPH
+    assert 'sysctlbyname(\n                    "machdep.cpu.brand_string"' in METAL_PLATFORM
     assert '"MFQ_MINICPM_METAL_PROFILE"' in METAL_GRAPH
     assert 'std::strcmp(requested, "m3") == 0' in METAL_GRAPH
     assert 'std::strcmp(requested, "baseline") == 0' in METAL_GRAPH

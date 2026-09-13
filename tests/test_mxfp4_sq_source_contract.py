@@ -9,9 +9,16 @@ def test_metal_mxfp4_sq_uses_one_profile_independent_compute_kernel() -> None:
         ROOT / "cpp_runtime/backends/metal/ops/mlx_mxfp4_sq.cpp"
     ).read_text()
     assert source.count('"mfq_cpp_mxfp4_sq_matmul"') == 1
+    assert source.count('"mfq_cpp_mxfp4_sq_backward_matrix"') == 1
     assert '"mfq_cpp_mxfp4_sq2_' not in source
     assert '"mfq_cpp_mxfp4_sq3_' not in source
-    assert "uint bits = uint(blob[2]) - 48u;" in source
+    assert "uint bits = uint(row_q[output]);" in source
+    assert "if (bits == 1u)" in source
+    assert "if (bits == 4u)" in source
+    assert "row_symbol_byte_offsets[output]" in source
+    assert "const bool mixed_q = !has_uniform_q();" in source
+    assert "? 32" in source
+    assert "K_LANES_VALUE >= 32u" in source
     assert 'arguments.emplace_back("ROUTED", 1)' in source
     assert '"mfq_cpp_mxfp4_sq_moe' not in source
 
@@ -35,6 +42,10 @@ def test_cuda_dense_and_routed_sq_share_one_compute_kernel_definition() -> None:
     assert "__global__ void sq2_" not in source
     assert "__global__ void sq3_" not in source
     assert "__global__ void mxfp4_sq_moe" not in source
+    assert "kSq1Palette[64]" in source
+    assert "const int bits = row_q[output];" in source
+    assert "if (bits == 4)" in source
+    assert "row_symbol_byte_offsets" in source
 
 
 def test_cpp_runtimes_route_mfe_sq_through_the_shared_linear_kernel() -> None:
@@ -48,3 +59,24 @@ def test_cpp_runtimes_route_mfe_sq_through_the_shared_linear_kernel() -> None:
     assert "impl->grouped_mmq = false;" in metal
     assert "mxfp4_sq_moe_matmul_cuda(" in cuda
     assert 'pool.dtype == "MXFP4-SQ"' in cuda
+
+
+def test_python_cuda_mfe_registers_mxfp4_sq_as_its_own_family() -> None:
+    bindings = (ROOT / "mfq/kernels/cuda/mfq_cuda.cpp").read_text()
+    runtime = (ROOT / "mfq/kernels/cuda/moe.py").read_text()
+    assert 'm.def("mxfp4_sq_moe_matmul_cuda"' in bindings
+    assert 'family = "mxfp4_sq"' in runtime
+    assert 'if pool.family == "mxfp4_sq":' in runtime
+    assert "ext().mxfp4_sq_moe_matmul_cuda(" in runtime
+
+
+def test_cpp_loader_uses_shared_variable_width_row_selection() -> None:
+    shared = (
+        ROOT / "cpp_runtime/core/include/mfq/mxfp4_sq_blob.h"
+    ).read_text()
+    cuda = (
+        ROOT / "cpp_runtime/backends/cuda/apps/mfq_decode.cpp"
+    ).read_text()
+    assert "inline std::vector<std::uint8_t> select_rows(" in shared
+    assert "mfq::sq::select_rows(source.payload, rows)" in cuda
+    assert "select_mxfp4_sq_payload_rows" not in cuda

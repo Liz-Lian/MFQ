@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 
 from mfq.formats import io
-from mfq.formats.mfe import MfePool, MfeTensor
+from mfq.formats.mfe import MfePool, MfeTensor, merge_nint_pools
 from mfq.formats.mx import MxTensor
 from mfq.formats.nepq import NEPQ0_L, NEPQ0_S, NEPQ1_L, NEPQ1_S
 from mfq.formats.nint import NintSpec
@@ -62,6 +62,30 @@ def test_mfe_roundtrips_every_nint_family(spec):
     )
     restored = io.unpack_mfe(io.pack_mfe(container))
     assert restored.expert_profiles == ("NINT", "NINT")
+
+
+def test_nint_pool_merge_partitions_disjoint_k_selector_windows():
+    rng = np.random.default_rng(111)
+    pools = tuple(
+        MfePool(
+            np.asarray([expert], dtype=np.int32),
+            quantize(
+                rng.normal(0, 0.04, (2, 48)).astype(np.float32),
+                NintSpec(4, 24, sub_bits),
+                axis=0,
+            ),
+        )
+        for expert, sub_bits in enumerate((1, 4, 7))
+    )
+
+    merged = merge_nint_pools(pools, out_per_expert=2, neuron_len=48)
+
+    assert len(merged) == 2
+    np.testing.assert_array_equal(merged[0].expert_ids, [0, 1])
+    np.testing.assert_array_equal(merged[0].tensor.row_q_bits, [4, 4, 4, 4])
+    np.testing.assert_array_equal(merged[0].tensor.row_sub_bits, [1, 1, 4, 4])
+    assert merged[0].tensor.spec == NintSpec(4, 24, 2)
+    np.testing.assert_array_equal(merged[1].expert_ids, [2])
 
 
 def test_legacy_nim2_pool_name_is_canonicalized_at_the_boundary():

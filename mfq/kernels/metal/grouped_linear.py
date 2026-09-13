@@ -1,8 +1,8 @@
-"""Single-dispatch non-NINT linear projections for Apple silicon.
+"""Single-dispatch packed linear projections for Apple silicon.
 
 The decode path concatenates packed NINT8-0, VQ-family, and TPQ streams once.
-NINT stays on its one metadata-driven matmul kernel and is composed at graph
-level instead of entering this heterogeneous kernel.
+NINT pair/triple groups use a separate zero-copy metadata-driven operator;
+they never enter the older heterogeneous decoder below.
 """
 
 from __future__ import annotations
@@ -22,19 +22,10 @@ except ModuleNotFoundError as exc:  # pragma: no cover - optional dependency
 from mfq.kernels.metal.moe import (
     _DESCRIPTOR_SIZE,
     _FAMILY,
-    _FAMILY_NINT,
     _FAMILY_NINT8_ZERO,
     _FAMILY_VQ,
-    _GROUPED_HEADER,
     _K,
     _LOCAL_EXPERT,
-    _NINT_ANCHOR_OFFSET,
-    _NINT_BITS,
-    _NINT_GS,
-    _NINT_NG,
-    _NINT_Q5_EXEC,
-    _NINT_Q_OFFSET,
-    _NINT_SUB_OFFSET,
     _OUT,
     _Q8_NG,
     _Q8_Q_OFFSET,
@@ -66,14 +57,14 @@ from mfq.kernels.metal.moe import (
     _join,
     _size,
 )
-from mfq.kernels.metal.nint import MetalNintWeight
+from mfq.kernels.metal.nint import MetalNintWeight, _NINT_HEADER_SOURCE
 from mfq.kernels.metal.nint8_zero import MetalNint8ZeroWeight
 from mfq.kernels.metal.tpq import (
     _PQ_INDEX_HEADER,
     MetalTpqInt4Weight,
     MetalTpqPqWeight,
 )
-from mfq.kernels.metal.vq import MetalVqWeight, signed_hadamard
+from mfq.kernels.metal.vq import _BITSTREAM_HEADER, MetalVqWeight, signed_hadamard
 
 _FAMILY_TPQ_INT4 = 3
 _FAMILY_TPQ_PQ = 4
@@ -93,6 +84,360 @@ _TPQ_PQ_CODEBOOK_OFFSET = 8
 
 PackedLinearWeight: TypeAlias = (
     MetalNintWeight | MetalNint8ZeroWeight | MetalVqWeight | MetalTpqInt4Weight | MetalTpqPqWeight
+)
+HeterogeneousLinearWeight: TypeAlias = (
+    MetalNint8ZeroWeight | MetalVqWeight | MetalTpqInt4Weight | MetalTpqPqWeight
+)
+
+
+def _nint_group_input_names(projections: int) -> list[str]:
+    names: list[str] = []
+    for projection in range(projections):
+        suffix = str(projection)
+        names.extend(
+            (
+                f"q_packed_{suffix}",
+                f"row_q_layout_{suffix}",
+                f"row_q_byte_offsets_{suffix}",
+                f"sub_scale_{suffix}",
+                f"sub_min_{suffix}",
+                f"neuron_scale_{suffix}",
+                f"neuron_min_{suffix}",
+            )
+        )
+    names.extend(("x", "params"))
+    return names
+
+
+def _nint_group_source(projections: int) -> str:
+    parts = [
+        r"""
+    constexpr uint SIMD_GROUPS = 8u;
+    constexpr uint OUTPUTS_PER_SIMD = 2u;
+    constexpr uint OUTPUTS_PER_TG = SIMD_GROUPS * OUTPUTS_PER_SIMD;
+    constexpr uint CHUNKS = (uint(GS) + 3u) / 4u;
+
+    uint lane = thread_index_in_simdgroup;
+    uint simd_group = simdgroup_index_in_threadgroup;
+    uint output_base =
+        threadgroup_position_in_grid.x * OUTPUTS_PER_TG
+        + simd_group * OUTPUTS_PER_SIMD;
+    if (output_base >= uint(MAX_OUT)) {
+        return;
+    }
+"""
+    ]
+    for projection in range(projections):
+        suffix = str(projection)
+        parts.append(
+            f"""
+    bool active_{suffix} = output_base < uint(P{suffix}_OUT);
+    uint metadata_bases_{suffix}[OUTPUTS_PER_SIMD];
+    uint q_widths_{suffix}[OUTPUTS_PER_SIMD];
+    uint q_byte_offsets_{suffix}[OUTPUTS_PER_SIMD];
+    uint q_bit_shifts_{suffix}[OUTPUTS_PER_SIMD];
+    float neuron_scales_{suffix}[OUTPUTS_PER_SIMD];
+    float neuron_minimums_{suffix}[OUTPUTS_PER_SIMD];
+    float accumulators_{suffix}[OUTPUTS_PER_SIMD][M];
+    for (uint output_row = 0u;
+         output_row < OUTPUTS_PER_SIMD;
+         ++output_row) {{
+        uint output = min(
+            output_base + output_row,
+            uint(P{suffix}_OUT) - 1u);
+        metadata_bases_{suffix}[output_row] = output * uint(NG);
+        uint row_layout = uint(row_q_layout_{suffix}[output]);
+        q_widths_{suffix}[output_row] = row_layout & 15u;
+        q_byte_offsets_{suffix}[output_row] =
+            row_q_byte_offsets_{suffix}[output];
+        q_bit_shifts_{suffix}[output_row] = row_layout >> 4u;
+        neuron_scales_{suffix}[output_row] = neuron_scale_{suffix}[output];
+        neuron_minimums_{suffix}[output_row] = neuron_min_{suffix}[output];
+        for (uint row = 0u; row < uint(M); ++row) {{
+            accumulators_{suffix}[output_row][row] = 0.0f;
+        }}
+    }}
+"""
+        )
+    parts.append(
+        r"""
+    for (uint group = lane; group < uint(NG); group += 32u) {
+        float activation_sums[M];
+        for (uint row = 0u; row < uint(M); ++row) {
+            activation_sums[row] = 0.0f;
+        }
+"""
+    )
+    for projection in range(projections):
+        suffix = str(projection)
+        parts.append(
+            f"""
+        float quantized_dots_{suffix}[OUTPUTS_PER_SIMD][M];
+        for (uint output_row = 0u;
+             output_row < OUTPUTS_PER_SIMD;
+             ++output_row) {{
+            for (uint row = 0u; row < uint(M); ++row) {{
+                quantized_dots_{suffix}[output_row][row] = 0.0f;
+            }}
+        }}
+"""
+        )
+    parts.append(
+        r"""
+        for (uint chunk = 0u; chunk < CHUNKS; ++chunk) {
+            uint group_element = chunk * 4u;
+            uint column = group * uint(GS) + group_element;
+"""
+    )
+    for projection in range(projections):
+        suffix = str(projection)
+        parts.append(
+            f"""
+            uint4 codes_{suffix}[OUTPUTS_PER_SIMD];
+            if (active_{suffix}) {{
+                for (uint output_row = 0u;
+                     output_row < OUTPUTS_PER_SIMD;
+                     ++output_row) {{
+                    codes_{suffix}[output_row] = mfq_nint_read_row_value4(
+                        q_packed_{suffix},
+                        q_byte_offsets_{suffix}[output_row],
+                        q_bit_shifts_{suffix}[output_row],
+                        column,
+                        q_widths_{suffix}[output_row]);
+                }}
+            }}
+"""
+        )
+    parts.append(
+        r"""
+            for (uint row = 0u; row < uint(M); ++row) {
+                uint input_base = row * uint(K) + column;
+                float4 activation = float4(0.0f);
+                if (group_element + 3u < uint(GS) &&
+                    column + 3u < uint(K)) {
+                    const vec<T, 4> packed_activation =
+                        *reinterpret_cast<device const vec<T, 4>*>(
+                            x + input_base);
+                    activation = float4(packed_activation);
+                } else {
+                    activation.x = column < uint(K)
+                        ? float(x[input_base]) : 0.0f;
+                    activation.y = group_element + 1u < uint(GS) &&
+                            column + 1u < uint(K)
+                        ? float(x[input_base + 1u]) : 0.0f;
+                    activation.z = group_element + 2u < uint(GS) &&
+                            column + 2u < uint(K)
+                        ? float(x[input_base + 2u]) : 0.0f;
+                    activation.w = group_element + 3u < uint(GS) &&
+                            column + 3u < uint(K)
+                        ? float(x[input_base + 3u]) : 0.0f;
+                }
+                activation_sums[row] +=
+                    activation.x + activation.y
+                    + activation.z + activation.w;
+"""
+    )
+    for projection in range(projections):
+        suffix = str(projection)
+        parts.append(
+            f"""
+                if (active_{suffix}) {{
+                    for (uint output_row = 0u;
+                         output_row < OUTPUTS_PER_SIMD;
+                         ++output_row) {{
+                        quantized_dots_{suffix}[output_row][row] += dot(
+                            activation,
+                            float4(codes_{suffix}[output_row]));
+                    }}
+                }}
+"""
+        )
+    parts.append(
+        r"""
+            }
+        }
+"""
+    )
+    for projection in range(projections):
+        suffix = str(projection)
+        parts.append(
+            f"""
+        if (active_{suffix}) {{
+            for (uint output_row = 0u;
+                 output_row < OUTPUTS_PER_SIMD;
+                 ++output_row) {{
+                uint metadata_index =
+                    metadata_bases_{suffix}[output_row] + group;
+                float scale = neuron_scales_{suffix}[output_row]
+                    * float(sub_scale_{suffix}[metadata_index]);
+                float minimum = neuron_minimums_{suffix}[output_row]
+                    * float(sub_min_{suffix}[metadata_index]);
+                for (uint row = 0u; row < uint(M); ++row) {{
+                    accumulators_{suffix}[output_row][row] = fma(
+                        scale,
+                        quantized_dots_{suffix}[output_row][row],
+                        fma(
+                            -minimum,
+                            activation_sums[row],
+                            accumulators_{suffix}[output_row][row]));
+                }}
+            }}
+        }}
+"""
+        )
+    parts.append("    }\n")
+    if projections == 2:
+        parts.append(
+            r"""
+    if (uint(SWIGLU) != 0u) {
+        if (active_0 && active_1) {
+            for (uint output_row = 0u;
+                 output_row < OUTPUTS_PER_SIMD;
+                 ++output_row) {
+                uint output = output_base + output_row;
+                for (uint row = 0u; row < uint(M); ++row) {
+                    float gate = float(T(simd_sum(
+                        accumulators_0[output_row][row])));
+                    float up = float(T(simd_sum(
+                        accumulators_1[output_row][row])));
+                    if (lane == 0u && output < uint(P0_OUT)) {
+                        if (params[0] > 0.0f) {
+                            gate = min(gate, params[0]);
+                            up = clamp(up, -params[0], params[0]);
+                        }
+                        y[row * uint(P0_OUT) + output] =
+                            T((gate / (1.0f + exp(-gate))) * up);
+                    }
+                }
+            }
+        }
+        return;
+    }
+"""
+        )
+    for projection in range(projections):
+        suffix = str(projection)
+        parts.append(
+            f"""
+    if (active_{suffix}) {{
+        for (uint output_row = 0u;
+             output_row < OUTPUTS_PER_SIMD;
+             ++output_row) {{
+            uint output = output_base + output_row;
+            for (uint row = 0u; row < uint(M); ++row) {{
+                float total = simd_sum(
+                    accumulators_{suffix}[output_row][row]);
+                if (lane == 0u && output < uint(P{suffix}_OUT)) {{
+                    y[row * uint(TOTAL_OUT)
+                        + uint(P{suffix}_OFFSET) + output] = T(total);
+                }}
+            }}
+        }}
+    }}
+"""
+        )
+    return "".join(parts)
+
+
+_NINT_GROUP_KERNELS: dict[int, object] = {}
+
+
+def _nint_group_kernel(projections: int):
+    kernel = _NINT_GROUP_KERNELS.get(projections)
+    if kernel is None:
+        kernel = mx.fast.metal_kernel(
+            name=f"mfq_nint_metadata_grouped_p{projections}",
+            input_names=_nint_group_input_names(projections),
+            output_names=["y"],
+            header=_NINT_HEADER_SOURCE,
+            source=_nint_group_source(projections),
+            compile_options={"math_mode": "fast"},
+        )
+        _NINT_GROUP_KERNELS[projections] = kernel
+    return kernel
+
+
+_GROUPED_LINEAR_HEADER = (
+    _BITSTREAM_HEADER
+    + r"""
+template <
+    typename DescriptorPtr,
+    typename Q8Ptr,
+    typename Q8ScalePtr,
+    typename VqIndicesPtr,
+    typename VqStatePtr,
+    typename VqAuxPtr,
+    typename VqAnchorsPtr,
+    typename VqCodebooksPtr,
+    typename VqScalesPtr,
+    typename VqStateBankPtr,
+    typename VqBanksPtr,
+    typename VqParametersPtr
+>
+inline float mfq_grouped_linear_decode_weight(
+    DescriptorPtr descriptors,
+    Q8Ptr q8_q,
+    Q8ScalePtr q8_scales,
+    VqIndicesPtr vq_indices,
+    VqStatePtr vq_state,
+    VqAuxPtr vq_aux,
+    VqAnchorsPtr vq_anchors,
+    VqCodebooksPtr vq_codebooks,
+    VqScalesPtr vq_scales,
+    VqStateBankPtr vq_state_to_codebank,
+    VqBanksPtr vq_banks,
+    VqParametersPtr vq_parameters,
+    uint descriptor_base,
+    ulong output,
+    uint column,
+    uint K
+) {
+    uint family = uint(descriptors[descriptor_base]);
+    if (family == 2u) {
+        uint groups = uint(descriptors[descriptor_base + 4u]);
+        uint group = column >> 5;
+        return float(q8_scales[
+            uint(descriptors[descriptor_base + 6u])
+                + output * groups + group
+        ]) * float(q8_q[
+            uint(descriptors[descriptor_base + 5u])
+                + output * K + column
+        ]);
+    }
+
+    uint groupsize = uint(descriptors[descriptor_base + 4u]);
+    uint groups = uint(descriptors[descriptor_base + 5u]);
+    uint vector_size = uint(descriptors[descriptor_base + 6u]);
+    return mfq_vq_decode_weight(
+        vq_indices + uint(descriptors[descriptor_base + 18u]),
+        vq_state + uint(descriptors[descriptor_base + 19u]),
+        vq_aux + uint(descriptors[descriptor_base + 20u]),
+        vq_anchors + uint(descriptors[descriptor_base + 21u]),
+        vq_codebooks + uint(descriptors[descriptor_base + 22u]),
+        vq_scales + uint(descriptors[descriptor_base + 23u]),
+        vq_state_to_codebank + uint(descriptors[descriptor_base + 24u]),
+        vq_banks + uint(descriptors[descriptor_base + 25u]),
+        vq_parameters + uint(descriptors[descriptor_base + 26u]),
+        uint(output),
+        column,
+        groupsize,
+        groups,
+        vector_size,
+        uint(descriptors[descriptor_base + 7u]),
+        uint(descriptors[descriptor_base + 8u]),
+        uint(descriptors[descriptor_base + 9u]),
+        uint(descriptors[descriptor_base + 10u]),
+        uint(descriptors[descriptor_base + 11u]),
+        uint(descriptors[descriptor_base + 12u]),
+        uint(descriptors[descriptor_base + 13u]),
+        uint(descriptors[descriptor_base + 14u]),
+        uint(descriptors[descriptor_base + 15u]),
+        uint(descriptors[descriptor_base + 16u]),
+        uint(descriptors[descriptor_base + 17u]),
+        (K + 7u) / 8u
+    );
+}
+"""
 )
 
 
@@ -191,13 +536,8 @@ _GROUPED_LINEAR_SOURCE = r"""
                     codebook_offset + code * vector_size + component
                 ]);
             } else {
-                weight = mfq_grouped_decode_weight(
+                weight = mfq_grouped_linear_decode_weight(
                     descriptors,
-                    nint_q,
-                    nint_sub_scale,
-                    nint_sub_min,
-                    nint_anchor_scale,
-                    nint_anchor_min,
                     q8_q,
                     q8_scales,
                     vq_indices,
@@ -209,8 +549,6 @@ _GROUPED_LINEAR_SOURCE = r"""
                     vq_state_to_codebank,
                     vq_banks,
                     vq_parameters,
-                    vq_aux,
-                    vq_aux,
                     descriptor_base,
                     output,
                     column,
@@ -244,11 +582,6 @@ _GROUPED_LINEAR_KERNEL = mx.fast.metal_kernel(
         "descriptors",
         "projection_tile_offsets",
         "projection_output_offsets",
-        "nint_q",
-        "nint_sub_scale",
-        "nint_sub_min",
-        "nint_anchor_scale",
-        "nint_anchor_min",
         "q8_q",
         "q8_scales",
         "vq_indices",
@@ -269,10 +602,56 @@ _GROUPED_LINEAR_KERNEL = mx.fast.metal_kernel(
         "x",
     ],
     output_names=["y"],
-    header=_GROUPED_HEADER + _PQ_INDEX_HEADER,
+    header=_GROUPED_LINEAR_HEADER + _PQ_INDEX_HEADER,
     source=_GROUPED_LINEAR_SOURCE,
     compile_options={"math_mode": "fast"},
 )
+
+
+@dataclass(frozen=True)
+class MetalNintLinearGroupWeight:
+    """Zero-copy pair/triple of canonical metadata-driven NINT weights."""
+
+    weights: tuple[MetalNintWeight, ...]
+    output_widths: tuple[int, ...]
+    neuron_len: int
+    groupsize: int
+    groups: int
+
+    @classmethod
+    def from_weights(
+        cls,
+        weights: tuple[MetalNintWeight, ...],
+    ) -> MetalNintLinearGroupWeight:
+        if len(weights) not in (2, 3):
+            raise ValueError("grouped NINT requires two or three projections")
+        first = weights[0]
+        if any(
+            weight.neuron_len != first.neuron_len
+            or weight.groupsize != first.groupsize
+            or weight.groups != first.groups
+            for weight in weights[1:]
+        ):
+            raise ValueError("grouped NINT projections must share matrix geometry")
+        return cls(
+            weights=weights,
+            output_widths=tuple(int(weight.out) for weight in weights),
+            neuron_len=int(first.neuron_len),
+            groupsize=int(first.groupsize),
+            groups=int(first.groups),
+        )
+
+    @property
+    def projections(self) -> int:
+        return len(self.weights)
+
+    @property
+    def total_out(self) -> int:
+        return sum(self.output_widths)
+
+    @property
+    def packed_nbytes(self) -> int:
+        return sum(weight.packed_nbytes for weight in self.weights)
 
 
 @dataclass(frozen=True)
@@ -282,11 +661,6 @@ class MetalLinearGroupWeight:
     descriptors: mx.array
     projection_tile_offsets: mx.array
     projection_output_offsets: mx.array
-    nint_q: mx.array
-    nint_sub_scale: mx.array
-    nint_sub_min: mx.array
-    nint_anchor_scale: mx.array
-    nint_anchor_min: mx.array
     q8_q: mx.array
     q8_scales: mx.array
     vq_indices: mx.array
@@ -315,14 +689,10 @@ class MetalLinearGroupWeight:
     @classmethod
     def from_weights(
         cls,
-        weights: tuple[PackedLinearWeight, ...],
+        weights: tuple[HeterogeneousLinearWeight, ...],
     ) -> MetalLinearGroupWeight:
         if len(weights) < 2:
             raise ValueError("grouped linear requires at least two weights")
-        if any(isinstance(weight, MetalNintWeight) for weight in weights):
-            raise ValueError(
-                "NINT projections must reuse the unified NINT matmul kernel"
-            )
         neuron_len = int(weights[0].neuron_len)
         if neuron_len <= 0 or any(int(weight.neuron_len) != neuron_len for weight in weights):
             raise ValueError("grouped linear weights must share one input width")
@@ -332,11 +702,6 @@ class MetalLinearGroupWeight:
             dtype=np.int32,
         )
         streams: dict[str, list[mx.array]] = {
-            "nint_q": [],
-            "nint_sub_scale": [],
-            "nint_sub_min": [],
-            "nint_anchor_scale": [],
-            "nint_anchor_min": [],
             "q8_q": [],
             "q8_scales": [],
             "vq_indices": [],
@@ -372,31 +737,6 @@ class MetalLinearGroupWeight:
                 if isinstance(weight, MetalVqWeight)
                 else (int(weight.out),)
             )
-
-            if isinstance(weight, MetalNintWeight):
-                if not weight.has_uniform_q_bits:
-                    raise ValueError(
-                        "adaptive NINT projections use the unified NINT kernel"
-                    )
-                descriptor[_FAMILY] = _FAMILY_NINT
-                descriptor[_NINT_BITS] = weight.bits
-                descriptor[_NINT_GS] = weight.groupsize
-                descriptor[_NINT_NG] = weight.groups
-                descriptor[_NINT_Q_OFFSET] = offsets["nint_q"]
-                descriptor[_NINT_SUB_OFFSET] = offsets["nint_sub_scale"]
-                descriptor[_NINT_ANCHOR_OFFSET] = offsets["nint_anchor_scale"]
-                descriptor[_NINT_Q5_EXEC] = 0
-                streams["nint_q"].append(weight.q_packed)
-                streams["nint_sub_scale"].append(weight.sub_scale)
-                streams["nint_sub_min"].append(weight.sub_min)
-                streams["nint_anchor_scale"].append(weight.neuron_scale)
-                streams["nint_anchor_min"].append(weight.neuron_min)
-                offsets["nint_q"] += _size(weight.q_packed) + 2
-                offsets["nint_sub_scale"] += _size(weight.sub_scale)
-                offsets["nint_sub_min"] += _size(weight.sub_min)
-                offsets["nint_anchor_scale"] += _size(weight.neuron_scale)
-                offsets["nint_anchor_min"] += _size(weight.neuron_min)
-                continue
 
             if isinstance(weight, MetalNint8ZeroWeight):
                 descriptor[_FAMILY] = _FAMILY_NINT8_ZERO
@@ -514,20 +854,6 @@ class MetalLinearGroupWeight:
             descriptors=mx.array(descriptors),
             projection_tile_offsets=mx.array(tile_offsets),
             projection_output_offsets=mx.array(output_offsets),
-            nint_q=_join(streams["nint_q"], dtype=mx.uint8, padding=2),
-            nint_sub_scale=_join(
-                streams["nint_sub_scale"],
-                dtype=mx.uint8,
-            ),
-            nint_sub_min=_join(streams["nint_sub_min"], dtype=mx.uint8),
-            nint_anchor_scale=_join(
-                streams["nint_anchor_scale"],
-                dtype=mx.float32,
-            ),
-            nint_anchor_min=_join(
-                streams["nint_anchor_min"],
-                dtype=mx.float32,
-            ),
             q8_q=_join(streams["q8_q"], dtype=mx.int8),
             q8_scales=_join(streams["q8_scales"], dtype=mx.float16),
             vq_indices=_join(
@@ -600,11 +926,6 @@ class MetalLinearGroupWeight:
             self.descriptors,
             self.projection_tile_offsets,
             self.projection_output_offsets,
-            self.nint_q,
-            self.nint_sub_scale,
-            self.nint_sub_min,
-            self.nint_anchor_scale,
-            self.nint_anchor_min,
             self.q8_q,
             self.q8_scales,
             self.vq_indices,
@@ -626,11 +947,99 @@ class MetalLinearGroupWeight:
         return sum(int(array.nbytes) for array in arrays)
 
 
+GroupedLinearWeight: TypeAlias = MetalNintLinearGroupWeight | MetalLinearGroupWeight
+
+
+def _nint_group_dispatch(
+    weight: MetalNintLinearGroupWeight,
+    x: mx.array | np.ndarray,
+    *,
+    swiglu: bool,
+    limit: float,
+) -> tuple[mx.array, tuple[int, ...], int]:
+    source = x if isinstance(x, mx.array) else mx.array(x)
+    if source.ndim < 1 or int(source.shape[-1]) != weight.neuron_len:
+        raise ValueError("grouped NINT input must end in the shared weight width")
+    if source.dtype not in (mx.float16, mx.float32):
+        source = source.astype(mx.float16)
+    prefix = tuple(int(value) for value in source.shape[:-1])
+    rows = int(source.size) // weight.neuron_len
+    if rows < 1 or rows > 6:
+        raise ValueError("grouped NINT metadata operator supports one through six rows")
+    if swiglu and (
+        weight.projections != 2
+        or weight.output_widths[0] != weight.output_widths[1]
+    ):
+        raise ValueError("grouped NINT SwiGLU requires two equal-width projections")
+    source = mx.contiguous(source.reshape((rows, weight.neuron_len)))
+    inputs: list[mx.array] = []
+    for projection in weight.weights:
+        inputs.extend(
+            (
+                projection.q_packed,
+                projection.row_q_layout,
+                projection.row_q_byte_offsets,
+                projection.sub_scale,
+                projection.sub_min,
+                projection.neuron_scale,
+                projection.neuron_min,
+            )
+        )
+    inputs.extend((source, mx.array([limit], dtype=mx.float32)))
+    templates: list[tuple[str, object]] = [
+        ("T", source.dtype),
+        ("GS", weight.groupsize),
+        ("NG", weight.groups),
+        ("K", weight.neuron_len),
+        ("M", rows),
+        ("MAX_OUT", max(weight.output_widths)),
+        ("TOTAL_OUT", weight.total_out),
+    ]
+    if weight.projections == 2:
+        templates.append(("SWIGLU", int(swiglu)))
+    offset = 0
+    for projection, width in enumerate(weight.output_widths):
+        templates.extend(
+            (
+                (f"P{projection}_OUT", width),
+                (f"P{projection}_OFFSET", offset),
+            )
+        )
+        offset += width
+    output_width = weight.output_widths[0] if swiglu else weight.total_out
+    threadgroups = (max(weight.output_widths) + 15) // 16
+    result = _nint_group_kernel(weight.projections)(
+        inputs=inputs,
+        template=templates,
+        grid=(threadgroups * 256, 1, 1),
+        threadgroup=(256, 1, 1),
+        output_shapes=[(rows, output_width)],
+        output_dtypes=[source.dtype],
+    )[0]
+    return result, prefix, rows
+
+
 def grouped_linear_matmul(
-    weight: MetalLinearGroupWeight,
+    weight: GroupedLinearWeight,
     x: mx.array | np.ndarray,
 ) -> tuple[mx.array, ...]:
     """Apply all packed projections to a shared input in one Metal dispatch."""
+
+    if isinstance(weight, MetalNintLinearGroupWeight):
+        result, prefix, _ = _nint_group_dispatch(
+            weight,
+            x,
+            swiglu=False,
+            limit=0.0,
+        )
+        outputs: list[mx.array] = []
+        offset = 0
+        for width in weight.output_widths:
+            outputs.append(
+                result[:, offset : offset + width].reshape((*prefix, width))
+            )
+            offset += width
+        return tuple(outputs)
 
     source = x if isinstance(x, mx.array) else mx.array(x)
     if source.ndim < 1 or int(source.shape[-1]) != weight.neuron_len:
@@ -655,11 +1064,6 @@ def grouped_linear_matmul(
             weight.descriptors,
             weight.projection_tile_offsets,
             weight.projection_output_offsets,
-            weight.nint_q,
-            weight.nint_sub_scale,
-            weight.nint_sub_min,
-            weight.nint_anchor_scale,
-            weight.nint_anchor_min,
             weight.q8_q,
             weight.q8_scales,
             weight.vq_indices,
@@ -705,8 +1109,31 @@ def grouped_linear_matmul(
     return tuple(outputs)
 
 
+def grouped_linear_swiglu(
+    weight: MetalNintLinearGroupWeight,
+    x: mx.array | np.ndarray,
+    *,
+    limit: float = 0.0,
+) -> mx.array:
+    """Run a NINT gate/up pair and SwiGLU in one metadata-driven dispatch."""
+
+    if not np.isfinite(limit) or float(limit) < 0.0:
+        raise ValueError("grouped NINT SwiGLU limit must be finite and non-negative")
+    result, prefix, _ = _nint_group_dispatch(
+        weight,
+        x,
+        swiglu=True,
+        limit=float(limit),
+    )
+    return result.reshape((*prefix, weight.output_widths[0]))
+
+
 __all__ = [
+    "GroupedLinearWeight",
+    "HeterogeneousLinearWeight",
     "MetalLinearGroupWeight",
+    "MetalNintLinearGroupWeight",
     "PackedLinearWeight",
     "grouped_linear_matmul",
+    "grouped_linear_swiglu",
 ]

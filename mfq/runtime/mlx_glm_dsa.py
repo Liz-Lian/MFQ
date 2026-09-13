@@ -217,7 +217,7 @@ def _dense_vector(model: MlxNintModel, name: str) -> mx.array:
     return mx.contiguous(value.astype(mx.float32))
 
 
-def _nint_moe(model: MlxNintModel, name: str) -> MfeTensor:
+def _mfe_tensor(model: MlxNintModel, name: str) -> MfeTensor:
     if name not in model.tensors:
         raise KeyError(f"tensor {name!r} is not present in the GLM DSA model")
     value = model.tensors[name]
@@ -247,8 +247,8 @@ class MlxGlmDsaMoE:
         config: MlxGlmDsaConfig,
         prefix: str,
     ) -> None:
-        gate_up = _nint_moe(model, f"{prefix}.experts.gate_up.weight")
-        down = _nint_moe(model, f"{prefix}.experts.down.weight")
+        gate_up = _mfe_tensor(model, f"{prefix}.experts.gate_up.weight")
+        down = _mfe_tensor(model, f"{prefix}.experts.down.weight")
         if (
             gate_up.n_experts != config.num_experts
             or down.n_experts != config.num_experts
@@ -366,11 +366,11 @@ class MlxGlmDsaLayer:
         self.input_projection = MlxLinearGroup(tuple(model.linear(name) for name in first_names))
         q_layers = tuple(model.linear(name) for name in second_names)
         self.q_projection = MlxLinearGroup(q_layers) if len(q_layers) > 1 else q_layers[0]
-        embed = _nint_moe(
+        embed = _mfe_tensor(
             model,
             f"{attention_prefix}.latent.query_embedding.weight",
         )
-        unembed = _nint_moe(
+        unembed = _mfe_tensor(
             model,
             f"{attention_prefix}.latent.output_unembedding.weight",
         )

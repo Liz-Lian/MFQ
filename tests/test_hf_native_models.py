@@ -11,26 +11,33 @@ from gguf import GGUFReader
 
 from mfq.formats.assets import (
     HF_GENERATION_CONFIG_ASSET,
+    HF_SOURCE_MAP_ASSET,
     HF_TOKENIZER_CONFIG_ASSET,
     HF_TOKENIZER_JSON_ASSET,
     MODEL_CONFIG_ASSET,
+    MODEL_GRAPH_ASSET,
 )
 from mfq.formats.header import FileHeader
+from mfq.formats.hf_source import HfSourceTensorStore
 from mfq.formats.io import save
-from mfq.server.catalog import ModelCatalog, native_hf_model_type_supported
+from mfq.server.catalog import ModelCatalog
 from mfq.server.hf_tokenizer import (
-    DEEPSEEK_V41_CHAT_TEMPLATE,
     ensure_hf_tokenizer_gguf,
     ensure_mfq_tokenizer_gguf,
     native_hf_asset_environment,
 )
-from mfq.server.native import native_tokenizer_arguments
+from mfq.server.native import native_runtime_environment, native_tokenizer_arguments
 
 
-def _hf_fixture(root: Path) -> None:
+def _hf_fixture(
+    root: Path,
+    *,
+    model_type: str = "qwen3_5",
+    tensor_name: str = "model.language_model.embed_tokens.weight",
+) -> None:
     root.mkdir()
     (root / "config.json").write_text(
-        json.dumps({"model_type": "qwen3_5", "text_config": {"vocab_size": 6}}),
+        json.dumps({"model_type": model_type, "text_config": {"vocab_size": 6}}),
         encoding="utf-8",
     )
     (root / "generation_config.json").write_text(
@@ -83,7 +90,7 @@ def _hf_fixture(root: Path) -> None:
     )
     header = json.dumps(
         {
-            "weight": {
+            tensor_name: {
                 "dtype": "BF16",
                 "shape": [1],
                 "data_offsets": [0, 2],
@@ -114,7 +121,7 @@ def test_catalog_discovers_native_hf_checkpoint(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize("model_type", ["qwen4_exp", "glm5_next"])
-def test_catalog_recognizes_flash_next_hf_as_conversion_source_only(
+def test_catalog_uses_registered_schema_for_native_hf(
     tmp_path: Path,
     model_type: str,
 ) -> None:
@@ -130,8 +137,8 @@ def test_catalog_recognizes_flash_next_hf_as_conversion_source_only(
     assert artifact.complete
     assert artifact.format == "hf"
     assert artifact.architecture == f"{model_type}-hf-full-mfq"
-    assert not artifact.loadable
-    assert "convert it to MFQ" in (artifact.error or "")
+    assert artifact.loadable
+    assert artifact.error is None
 
 
 def test_catalog_prefers_same_name_mfq_over_its_hf_source(tmp_path: Path) -> None:
@@ -152,13 +159,86 @@ def test_catalog_prefers_same_name_mfq_over_its_hf_source(tmp_path: Path) -> Non
     assert artifacts.data[0].loadable
 
 
-def test_native_hf_support_matches_cpp_dispatch_families() -> None:
-    assert native_hf_model_type_supported("deepseek_v4_vision")
-    assert native_hf_model_type_supported("deepseek_v41")
-    assert native_hf_model_type_supported("minicpmo")
-    assert native_hf_model_type_supported("qwen3_8")
-    assert not native_hf_model_type_supported("qwen4_exp")
-    assert not native_hf_model_type_supported("glm5_next")
+@pytest.mark.parametrize("model_type", ["qwen3_5", "qwen4_exp", "glm5_next"])
+def test_native_hf_source_view_comes_from_registered_schema(
+    tmp_path: Path,
+    model_type: str,
+) -> None:
+    model = tmp_path / model_type
+    _hf_fixture(model)
+    (model / "config.json").write_text(
+        json.dumps({"model_type": model_type}),
+        encoding="utf-8",
+    )
+
+    environment = native_hf_asset_environment(model, tmp_path / "assets")
+    asset_root = Path(environment["MFQ_RUNTIME_ASSET_DIRECTORY"])
+    source_map = json.loads(
+        (asset_root / HF_SOURCE_MAP_ASSET.removeprefix("__mfq_asset__/")).read_text()
+    )
+    graph = json.loads(
+        (asset_root / MODEL_GRAPH_ASSET.removeprefix("__mfq_asset__/")).read_text()
+    )
+
+    assert source_map["schema"] == "mfq.hf-source-map"
+    assert source_map["canonical_to_source"] == {
+        "model.token_embedding.weight": (
+            "model.language_model.embed_tokens.weight"
+        )
+    }
+    assert graph["canonical_naming"]["namespace"] == "mfq.tensor"
+
+
+@pytest.mark.parametrize(
+    ("model_type", "source_name"),
+    [
+        ("qwen3_5", "model.language_model.embed_tokens.weight"),
+        ("qwen4_exp", "model.language_model.embed_tokens.weight"),
+        ("glm5_next", "model.language_model.embed_tokens.weight"),
+        ("deepseek_v4", "embed.weight"),
+        ("deepseek_v41", "embed.weight"),
+        ("minicpmo", "llm.model.embed_tokens.weight"),
+        ("glm_moe_dsa", "model.embed_tokens.weight"),
+        ("gemma4", "model.language_model.embed_tokens.weight"),
+    ],
+)
+def test_every_registered_architecture_inherits_the_same_hf_source_loader(
+    tmp_path: Path,
+    model_type: str,
+    source_name: str,
+) -> None:
+    model = tmp_path / model_type
+    _hf_fixture(model, model_type=model_type, tensor_name=source_name)
+
+    environment = native_hf_asset_environment(model, tmp_path / "assets")
+    asset_root = Path(environment["MFQ_RUNTIME_ASSET_DIRECTORY"])
+    source_map = json.loads(
+        (asset_root / HF_SOURCE_MAP_ASSET.removeprefix("__mfq_asset__/")).read_text()
+    )
+
+    assert source_map["canonical_to_source"] == {
+        "model.token_embedding.weight": source_name
+    }
+    with HfSourceTensorStore(model) as store:
+        assert "model.token_embedding.weight" in store
+        assert np.asarray(store["model.token_embedding.weight"]).shape == (1,)
+
+
+def test_native_hf_source_view_is_not_metal_specific(tmp_path: Path) -> None:
+    model = tmp_path / "Qwen-Test"
+    _hf_fixture(model)
+
+    environment = native_runtime_environment(
+        tmp_path / "unused-runtime",
+        "cuda",
+        {},
+        model=model,
+    )
+
+    asset_root = Path(environment["MFQ_RUNTIME_ASSET_DIRECTORY"])
+    assert (
+        asset_root / HF_SOURCE_MAP_ASSET.removeprefix("__mfq_asset__/")
+    ).is_file()
 
 
 def test_hf_tokenizer_cache_is_reusable_and_runtime_selected(
@@ -243,12 +323,15 @@ def test_minicpmo_native_runtime_materializes_exact_resampler_asset(
         encoding="utf-8",
     )
     environment = native_hf_asset_environment(model, tmp_path / "assets")
-    asset = Path(environment["MFQ_MINICPMO45_RESAMPLER_POSITION_ASSET"])
+    asset = (
+        Path(environment["MFQ_RUNTIME_ASSET_DIRECTORY"])
+        / "minicpmo45-resampler-pos-embed-v1.bf16"
+    )
     assert asset.is_file()
     assert asset.read_bytes()[:20] == b"MFQRSPB1" + struct.pack("<III", 70, 70, 4096)
 
 
-def test_deepseek_v41_gets_chat_template_and_engram_token_map(
+def test_deepseek_v41_materializes_canonical_engram_asset(
     tmp_path: Path,
 ) -> None:
     model = tmp_path / "DeepSeek-V41-Test"
@@ -268,26 +351,23 @@ def test_deepseek_v41_gets_chat_template_and_engram_token_map(
                     "engram_vocab_size": 5,
                     "engram_n_heads": 2,
                     "engram_compressed_vocab_size": 5,
+                    "engram_pad_token_id": 3,
                 },
             }
         ),
         encoding="utf-8",
     )
-    tokenizer_config = json.loads((model / "tokenizer_config.json").read_text())
-    tokenizer_config.pop("chat_template")
-    (model / "tokenizer_config.json").write_text(
-        json.dumps(tokenizer_config), encoding="utf-8"
-    )
-
     tokenizer = ensure_hf_tokenizer_gguf(model, tmp_path / "tokenizers")
     reader = GGUFReader(tokenizer, "r")
     assert reader.get_field("tokenizer.chat_template").contents() == (
-        DEEPSEEK_V41_CHAT_TEMPLATE
+        "{{ messages[0].content }}"
     )
 
     environment = native_hf_asset_environment(model, tmp_path / "assets")
-    asset = Path(environment["MFQ_DEEPSEEK_V41_ENGRAM_TOKEN_MAP"])
+    asset = (
+        Path(environment["MFQ_RUNTIME_ASSET_DIRECTORY"])
+        / "deepseek-v41-engram-v1.bin"
+    )
     payload = asset.read_bytes()
-    assert payload[:28] == struct.pack("<4sIIIIII", b"D41T", 2, 5, 5, 1, 3, 2)
-    # header + token map + layer IDs + multipliers + prime bucket sizes
-    assert len(payload) == 28 + 5 * 4 + 4 + 3 * 8 + 4 * 4
+    assert payload[:28] == struct.pack("<8sIIIII", b"MFQENGR1", 5, 5, 1, 3, 2)
+    assert len(payload) == 152

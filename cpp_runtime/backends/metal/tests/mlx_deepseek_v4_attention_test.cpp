@@ -1,9 +1,13 @@
 #include "mlx_deepseek_v4_attention.h"
+#include "mlx_deepseek_v41_attention.h"
+#include "mlx_mx.h"
+#include "mlx_transformer.h"
 
 #include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -342,13 +346,13 @@ MlxDeepseekV4Attention attention(
     int ratio,
     int max_context) {
     auto base =
-        mfq::metal::deepseek_v4_yarn_tables(
+        mfq::metal::mlx_yarn_tables(
             static_cast<int>(
                 config.qk_rope_head_dim),
             max_context,
             static_cast<float>(config.rope_theta));
     auto compressed =
-        mfq::metal::deepseek_v4_yarn_tables(
+        mfq::metal::mlx_yarn_tables(
             static_cast<int>(
                 config.qk_rope_head_dim),
             max_context,
@@ -663,7 +667,7 @@ std::vector<float> local_attention_reference(
 
 void test_yarn_rope_and_rms() {
     auto tables =
-        mfq::metal::deepseek_v4_yarn_tables(
+        mfq::metal::mlx_yarn_tables(
             4,
             3,
             100.0f);
@@ -699,12 +703,12 @@ void test_yarn_rope_and_rms() {
         {std::sin(angle0), std::sin(angle1)},
         Shape{1, 2});
     const auto rotated =
-        mfq::metal::deepseek_v4_rope_adjacent(
+        mfq::metal::mlx_rope_adjacent(
             value,
             cos_pair,
             sin_pair);
     const auto restored =
-        mfq::metal::deepseek_v4_rope_adjacent(
+        mfq::metal::mlx_rope_adjacent(
             rotated,
             cos_pair,
             sin_pair,
@@ -730,14 +734,14 @@ void test_yarn_rope_and_rms() {
         1e-6f,
         "unweighted RMS");
 
-    auto scaled = test_config().rope_scaling;
+    mfq::metal::MlxYarnScaling scaled;
     scaled.enabled = true;
     scaled.factor = 2.0;
     scaled.beta_fast = 32.0;
     scaled.beta_slow = 1.0;
     scaled.original_max_position_embeddings = 64;
     auto scaled_tables =
-        mfq::metal::deepseek_v4_yarn_tables(
+        mfq::metal::mlx_yarn_tables(
             64,
             4,
             10'000.0f,
@@ -746,6 +750,132 @@ void test_yarn_rope_and_rms() {
         scaled_tables.first.shape() ==
             Shape{4, 32},
         "scaled Yarn table shape mismatch");
+}
+
+void test_v41_fused_window_kv_matches_composition() {
+    constexpr int batch = 2;
+    constexpr int tokens = 3;
+    constexpr int width = 512;
+    constexpr int rotary = 64;
+    std::vector<float> input_values(batch * tokens * width);
+    for (std::size_t index = 0; index < input_values.size(); ++index) {
+        input_values[index] =
+            std::sin(static_cast<float>(index) * 0.013f) * 1.7f +
+            std::cos(static_cast<float>(index) * 0.003f) * 0.2f;
+    }
+    std::vector<float> norm_values(width);
+    for (int index = 0; index < width; ++index) {
+        norm_values[index] = 0.75f + static_cast<float>(index % 19) * 0.025f;
+    }
+    std::vector<float> cosine_values(tokens * rotary / 2);
+    std::vector<float> sine_values(tokens * rotary / 2);
+    for (int token = 0; token < tokens; ++token) {
+        for (int pair = 0; pair < rotary / 2; ++pair) {
+            const float angle =
+                static_cast<float>((token + 1) * (pair + 1)) * 0.002f;
+            const auto index = token * rotary / 2 + pair;
+            cosine_values[index] = std::cos(angle);
+            sine_values[index] = std::sin(angle);
+        }
+    }
+    const auto input = mlx::core::astype(
+        float_array(
+            input_values,
+            Shape{batch, tokens, width}),
+        mlx::core::float16);
+    const auto norm = float_array(norm_values, Shape{width});
+    const auto cosine = float_array(
+        cosine_values,
+        Shape{tokens, rotary / 2});
+    const auto sine = float_array(
+        sine_values,
+        Shape{tokens, rotary / 2});
+
+    ::setenv("MFQ_METAL_FUSED_KV_PREP", "0", 1);
+    const auto reference = evaluated_float(
+        mfq::metal::mlx_weighted_rms_rope_mxfp8_sim(
+            input, norm, 1.0e-6f, rotary, cosine, sine));
+    ::setenv("MFQ_METAL_FUSED_KV_PREP", "1", 1);
+    const auto fused = evaluated_float(
+        mfq::metal::mlx_weighted_rms_rope_mxfp8_sim(
+            input, norm, 1.0e-6f, rotary, cosine, sine));
+    ::unsetenv("MFQ_METAL_FUSED_KV_PREP");
+    require_close(
+        fused,
+        reference,
+        0.03125f,
+        "V4.1 fused window KV preparation");
+}
+
+void test_v41_attention_snapshot_is_detached() {
+    using mfq::metal::MlxDeepseekV41AttentionState;
+    MlxDeepseekV41AttentionState state;
+    state.local_kv = mlx::core::ones(
+        Shape{1, 8, 16}, mlx::core::float16);
+    state.compressed_kv = mlx::core::ones(
+        Shape{1, 4, 16}, mlx::core::float16);
+    state.index_k = mlx::core::ones(
+        Shape{1, 4, 8}, mlx::core::float16);
+    state.partial_kv = mlx::core::zeros(
+        Shape{1, 2, 16}, mlx::core::float32);
+    state.partial_score = mlx::core::zeros(
+        Shape{1, 2, 16}, mlx::core::float32);
+    state.position = 7;
+    state.compressed_length = 3;
+    state.partial_length = 1;
+
+    auto snapshot = state.snapshot();
+    state.local_kv.eval();
+    snapshot.local_kv.eval();
+    require(
+        snapshot.local_kv.buffer().ptr() != state.local_kv.buffer().ptr(),
+        "DeepSeek-V4.1 attention snapshot aliases live local cache");
+    const std::size_t expected_bytes =
+        snapshot.local_kv.nbytes() + snapshot.compressed_kv->nbytes()
+        + snapshot.index_k->nbytes() + snapshot.partial_kv->nbytes()
+        + snapshot.partial_score->nbytes();
+    require(snapshot.nbytes() == expected_bytes,
+            "DeepSeek-V4.1 attention snapshot byte count mismatch");
+
+    MlxDeepseekV41AttentionState restored;
+    restored.local_kv = mlx::core::zeros(
+        state.local_kv.shape(), state.local_kv.dtype());
+    restored.compressed_kv = mlx::core::zeros(
+        state.compressed_kv->shape(), state.compressed_kv->dtype());
+    restored.index_k = mlx::core::zeros(
+        state.index_k->shape(), state.index_k->dtype());
+    restored.partial_kv = mlx::core::zeros(
+        state.partial_kv->shape(), state.partial_kv->dtype());
+    restored.partial_score = mlx::core::zeros(
+        state.partial_score->shape(), state.partial_score->dtype());
+    restored.restore_snapshot(std::move(snapshot));
+    require(
+        restored.position == 7 && restored.compressed_length == 3
+            && restored.partial_length == 1 && !restored.speculation,
+        "DeepSeek-V4.1 attention snapshot metadata was not restored");
+
+    restored.local_kv.eval();
+    restored.compressed_kv->eval();
+    restored.index_k->eval();
+    restored.partial_kv->eval();
+    restored.partial_score->eval();
+    const auto* local_storage = restored.local_kv.buffer().ptr();
+    const auto* compressed_storage = restored.compressed_kv->buffer().ptr();
+    const auto* index_storage = restored.index_k->buffer().ptr();
+    const auto* partial_storage = restored.partial_kv->buffer().ptr();
+    const auto* score_storage = restored.partial_score->buffer().ptr();
+    restored.reset();
+    require(
+        restored.position == 0 && restored.compressed_length == 0
+            && restored.partial_length == 0 && !restored.speculation,
+        "DeepSeek-V4.1 logical attention reset retained live metadata");
+    require(
+        local_storage == restored.local_kv.buffer().ptr()
+            && compressed_storage == restored.compressed_kv->buffer().ptr()
+            && index_storage == restored.index_k->buffer().ptr()
+            && partial_storage == restored.partial_kv->buffer().ptr()
+            && score_storage == restored.partial_score->buffer().ptr(),
+        "DeepSeek-V4.1 logical attention reset reallocated cache storage");
 }
 
 void test_pool_and_ratio_schedule() {
@@ -789,7 +919,7 @@ void test_pool_and_ratio_schedule() {
         1,
         8);
     auto tables =
-        mfq::metal::deepseek_v4_yarn_tables(
+        mfq::metal::mlx_yarn_tables(
             64,
             8,
             160'000.0f);
@@ -1327,6 +1457,8 @@ int main() {
     try {
         test_image_visibility_starts_at_image_start();
         test_yarn_rope_and_rms();
+        test_v41_fused_window_kv_matches_composition();
+        test_v41_attention_snapshot_is_detached();
         test_pool_and_ratio_schedule();
         test_local_attention_cpu_reference();
         test_prefill_mma_cpu_reference();

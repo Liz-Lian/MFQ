@@ -1,5 +1,6 @@
 """Source contracts for runtime safety and boundary checks."""
 
+import ast
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -21,6 +22,27 @@ NVQ3J_CUDA = (ROOT / "mfq" / "quantize" / "cuda" / "nvq3j_assign.cu").read_text(
 UNIFIED_CUDA_EXT = (ROOT / "mfq" / "kernels" / "cuda" / "_ext.py").read_text(
     encoding="utf-8"
 )
+CUDA_ATTENTION = (ROOT / "mfq" / "kernels" / "cuda" / "attention_mma.cu").read_text(
+    encoding="utf-8"
+)
+CUDA_FATTN = (
+    ROOT / "mfq" / "kernels" / "cuda" / "mfq_fattn_mma_f16.cuh"
+).read_text(encoding="utf-8")
+CUDA_MOE = (ROOT / "mfq" / "kernels" / "cuda" / "moe.cu").read_text(
+    encoding="utf-8"
+)
+CUDA_MOE_PYTHON = (ROOT / "mfq" / "kernels" / "cuda" / "moe.py").read_text(
+    encoding="utf-8"
+)
+CUDA_FATTN_SWIZZLE = (
+    ROOT
+    / "cpp_runtime"
+    / "components"
+    / "ggml"
+    / "src"
+    / "ggml-cuda"
+    / "fattn-swizzle.cuh"
+).read_text(encoding="utf-8")
 
 
 def test_single_source_moe_cache_holds_full_demand_set() -> None:
@@ -99,3 +121,38 @@ def test_unified_cuda_extension_can_include_runtime_headers() -> None:
     assert "extra_include_paths=[" in UNIFIED_CUDA_EXT
     assert '"--extended-lambda"' in UNIFIED_CUDA_EXT
     assert '"-U__CUDA_NO_HALF_CONVERSIONS__"' in UNIFIED_CUDA_EXT
+
+
+def test_cuda_swa_prefill_uses_implicit_kv_ranges() -> None:
+    assert "mfq_causal_kv_range_kernel" in CUDA_ATTENTION
+    assert "cache.kv_range" in CUDA_ATTENTION
+    assert "mfq_swa_causal_mask_kernel" not in CUDA_ATTENTION
+
+
+def test_cuda_flash_attention_swizzles_shared_kv_tiles() -> None:
+    assert '#include "fattn-swizzle.cuh"' in CUDA_FATTN
+    assert "ggml_cuda_fattn_smem_swizzle::bytes_rc" in CUDA_FATTN
+    assert "namespace ggml_cuda_fattn_smem_swizzle" in CUDA_FATTN_SWIZZLE
+
+
+def test_cuda_nint8_zero_prefill_can_consume_coarse_route_tiles() -> None:
+    assert "template <int BM, bool COARSE_TILES = false>" in CUDA_MOE
+    assert "COARSE_TILES ? BM : kRouteTile" in CUDA_MOE
+    assert "coarse NINT8-0 route tile must match the MMA row tile" in CUDA_MOE
+    assert "use_coarse_q8_tiles" in DECODE
+    assert "use_coarse_q8_tiles ? route.mma_tile_m : 8" in DECODE
+
+
+def test_python_nint8_zero_pool_passes_the_route_tile_size() -> None:
+    tree = ast.parse(CUDA_MOE_PYTHON)
+    calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "nint8_zero_moe_grouped_matmul_pool_ws_cuda"
+    ]
+    assert len(calls) == 1
+    assert len(calls[0].args) == 21
+    assert isinstance(calls[0].args[-1], ast.Constant)
+    assert calls[0].args[-1].value == 8

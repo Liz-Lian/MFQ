@@ -1,5 +1,5 @@
-#include "hf_safetensors_store.h"
-#include "mlx_hf_tensor.h"
+#include "mfe_expert_store.h"
+#include "mfq_container.h"
 
 #include <algorithm>
 #include <atomic>
@@ -121,31 +121,28 @@ int main(int argc, char** argv) {
     try {
         const auto options = parse_options(argc, argv);
         const auto index_begin = std::chrono::steady_clock::now();
-        mfq::metal::MlxHfTensorStore model(options.model);
+        mfq::metal::MfqContainer model(options.model);
         std::vector<std::string> layer_prefixes;
         layer_prefixes.reserve(43);
         for (std::size_t layer = 0; layer < 43; ++layer) {
             layer_prefixes.push_back(
                 "model.block." + std::to_string(layer));
         }
-        mfq::metal::MlxNativeMxfp4ExpertStore store(
-            model.shared_checkpoint(),
+        mfq::metal::MlxMfeMxfp4ExpertStore store(
+            model,
             std::move(layer_prefixes),
-            256,
+            std::vector<std::size_t>(43, 256),
             4096,
-            2048,
-            [&model](std::string_view canonical) {
-                return model.stored_name(canonical);
-            });
+            2048);
         const auto index_seconds = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - index_begin).count();
         if (options.layer >= store.num_layers()) {
             throw std::runtime_error("layer is outside the checkpoint");
         }
 
-        std::cout << "model=" << store.checkpoint().root() << '\n'
-                  << "shards=" << store.checkpoint().shard_count()
-                  << " tensors=" << store.checkpoint().tensor_count()
+        std::cout << "model=" << options.model << '\n'
+                  << "shards=" << model.source_paths().size()
+                  << " tensors=" << model.records().size()
                   << " index_seconds=" << std::fixed << std::setprecision(3)
                   << index_seconds << '\n'
                   << "layer=" << options.layer
@@ -162,14 +159,14 @@ int main(int argc, char** argv) {
              iteration < options.iterations;
              ++iteration) {
             std::vector<std::size_t> expert_ids(
-                options.random ? store.num_experts() : options.experts);
+                options.random ? store.num_experts(options.layer) : options.experts);
             std::iota(expert_ids.begin(), expert_ids.end(), 0);
             if (options.random) {
                 std::mt19937_64 generator(0x4d465100ULL + iteration);
                 std::shuffle(expert_ids.begin(), expert_ids.end(), generator);
                 expert_ids.resize(options.experts);
             }
-            store.checkpoint().drop_file_cache();
+            model.drop_source_file_cache();
             std::atomic<std::size_t> next{0};
             std::atomic<std::uint64_t> bytes{0};
             std::atomic<std::uint64_t> calls{0};

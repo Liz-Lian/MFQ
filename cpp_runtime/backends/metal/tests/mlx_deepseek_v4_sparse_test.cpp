@@ -1,4 +1,5 @@
-#include "mlx_deepseek_v4_sparse.h"
+#include "mlx_dsa.h"
+#include "mlx_sparse_attention.h"
 
 #include "mlx_detached_copy.h"
 
@@ -175,7 +176,7 @@ void test_fp4_sim() {
                 scale);
         }
     }
-    auto actual = mfq::metal::dsv4_fp4_sim(
+    auto actual = mfq::metal::mlx_mxfp4_sim(
         float_array(input, Shape{2, 32}));
     require(
         actual.shape() == Shape{2, 32},
@@ -250,7 +251,7 @@ array run_compress(
             gate,
             mlx::core::float16);
     }
-    return mfq::metal::dsv4_compress(
+    return mfq::metal::mlx_dsa_compress(
         kv,
         gate,
         float_array(
@@ -330,7 +331,7 @@ void test_compressor_quantization() {
         "overlap compressor history");
 }
 
-mfq::metal::MlxDsv4PoolStep pool_step(
+mfq::metal::MlxDsaPoolStep pool_step(
     const CompressorFixture& fixture,
     const array& token,
     const array& state_kv,
@@ -340,7 +341,7 @@ mfq::metal::MlxDsv4PoolStep pool_step(
         std::nullopt,
     const std::optional<array>& previous_gate =
         std::nullopt) {
-    return mfq::metal::dsv4_decode_pool_step(
+    return mfq::metal::mlx_dsa_decode_pool_step(
         token,
         token * array(0.0f),
         float_array(
@@ -419,7 +420,7 @@ void test_decode_pool_state_and_bounds() {
         "decode compressor emitted row");
 
     auto valid_update =
-        mfq::metal::dsv4_decode_pool_update(
+        mfq::metal::mlx_dsa_decode_pool_update(
             token,
             token * array(0.0f),
             float_array(
@@ -456,7 +457,7 @@ void test_decode_pool_state_and_bounds() {
         std::vector<float>(128, 0.25f),
         Shape{1, 1, 128});
     auto bounded_update =
-        mfq::metal::dsv4_decode_pool_update(
+        mfq::metal::mlx_dsa_decode_pool_update(
             token,
             token * array(0.0f),
             float_array(
@@ -490,7 +491,7 @@ void test_fixed_cache_write() {
         auto cache = mlx::core::zeros(Shape{2, 5, 3}, dtype);
         cache.eval();
         const void* allocation = cache.buffer().ptr();
-        auto updated = mfq::metal::dsv4_cache_write_inplace(
+        auto updated = mfq::metal::mlx_cache_write_inplace(
             cache,
             mlx::core::astype(
                 float_array(
@@ -536,7 +537,7 @@ void test_fixed_cache_snapshot_copy() {
     require(
         snapshot.buffer().ptr() != cache.buffer().ptr(),
         "fixed cache snapshot copy aliases the source allocation");
-    auto updated = mfq::metal::dsv4_cache_write_inplace(
+    auto updated = mfq::metal::mlx_cache_write_inplace(
         cache,
         mlx::core::astype(
             float_array(
@@ -613,7 +614,7 @@ void test_indexer_paths() {
     const std::vector<float> weights(
         queries * 64,
         1.0f / 64.0f);
-    auto scores = mfq::metal::dsv4_indexer_scores(
+    auto scores = mfq::metal::mlx_dsa_indexer_scores(
         float_array(
             query,
             Shape{1, queries, 64, 128}),
@@ -649,7 +650,7 @@ void test_indexer_paths() {
     }
 
     constexpr int decode_keys = 129;
-    auto decode = mfq::metal::dsv4_indexer_scores_decode(
+    auto decode = mfq::metal::mlx_dsa_indexer_scores_decode(
         float_array(
             std::vector<float>(64 * 128, 1.0f),
             Shape{1, 1, 64, 128}),
@@ -681,7 +682,7 @@ void test_indexer_paths() {
     }
 
     constexpr int v41_heads = 32;
-    auto v41_scores = mfq::metal::dsv4_indexer_scores(
+    auto v41_scores = mfq::metal::mlx_dsa_indexer_scores(
         mlx::core::astype(
             float_array(
                 std::vector<float>(queries * v41_heads * 128, 1.0f),
@@ -765,7 +766,7 @@ void test_indexer_paths() {
         }
     }
     const auto patterned_actual = evaluated_float(
-        mfq::metal::dsv4_indexer_scores(
+        mfq::metal::mlx_dsa_indexer_scores(
             mlx::core::astype(
                 float_array(
                     patterned_query,
@@ -820,7 +821,7 @@ void test_indexer_paths() {
         }
     }
 
-    auto v41_decode = mfq::metal::dsv4_indexer_scores_decode(
+    auto v41_decode = mfq::metal::mlx_dsa_indexer_scores_decode(
         mlx::core::astype(
             float_array(
                 std::vector<float>(v41_heads * 128, 1.0f),
@@ -864,7 +865,7 @@ void test_indexer_paths() {
 
     constexpr int fixed_capacity = 257;
     constexpr int fixed_prefix = 129;
-    auto fixed_scores = mfq::metal::dsv4_indexer_scores_decode(
+    auto fixed_scores = mfq::metal::mlx_dsa_indexer_scores_decode(
         float_array(
             std::vector<float>(64 * 128, 1.0f),
             Shape{1, 1, 64, 128}),
@@ -883,7 +884,7 @@ void test_indexer_paths() {
         fixed_scores.shape() == Shape{1, 1, fixed_capacity},
         "fixed decode indexer scratch shape mismatch");
     const auto fixed_topk = evaluated_int(
-        mfq::metal::dsv4_topk512(
+        mfq::metal::mlx_dsa_topk512(
             fixed_scores,
             true,
             fixed_prefix));
@@ -902,10 +903,10 @@ void test_topk() {
         values[index] = static_cast<float>(index);
     }
     const auto first = evaluated_int(
-        mfq::metal::dsv4_topk512(
+        mfq::metal::mlx_dsa_topk512(
             float_array(values, Shape{1, 1, keys})));
     const auto second = evaluated_int(
-        mfq::metal::dsv4_topk512(
+        mfq::metal::mlx_dsa_topk512(
             float_array(values, Shape{1, 1, keys})));
     require(first == second,
             "deterministic top-k changed across launches");
@@ -917,7 +918,7 @@ void test_topk() {
             "top-k membership mismatch");
     }
     auto atomic = evaluated_int(
-        mfq::metal::dsv4_topk512(
+        mfq::metal::mlx_dsa_topk512(
             float_array(values, Shape{1, 1, keys}),
             false));
     std::sort(atomic.begin(), atomic.end());
@@ -925,7 +926,7 @@ void test_topk() {
         atomic == sorted,
         "atomic top-k membership mismatch");
     const auto tied = evaluated_int(
-        mfq::metal::dsv4_topk512(
+        mfq::metal::mlx_dsa_topk512(
             float_array(
                 std::vector<float>(keys, 1.0f),
                 Shape{1, 1, keys})));
@@ -936,7 +937,7 @@ void test_topk() {
     }
 
     const auto short_result = evaluated_int(
-        mfq::metal::dsv4_topk512(
+        mfq::metal::mlx_dsa_topk512(
             float_array(
                 std::vector<float>{
                     0.0f,
@@ -954,10 +955,129 @@ void test_topk() {
             short_result[index] == expected,
             "short top-k padding mismatch");
     }
+
+    constexpr int deepselect_keys = 8192;
+    std::vector<float> deepselect_values(deepselect_keys);
+    for (int index = 0; index < deepselect_keys; ++index) {
+        const std::uint32_t mixed =
+            std::uint32_t(index) * 747796405u + 2891336453u;
+        deepselect_values[index] = static_cast<float>(mixed & 0xffffu) /
+            65536.0f + static_cast<float>(index) * 1.0e-8f;
+    }
+    auto deepselect_selected = evaluated_int(
+        mfq::metal::mlx_deepselect_topk512(
+            float_array(deepselect_values, Shape{1, 1, deepselect_keys})));
+    std::sort(deepselect_selected.begin(), deepselect_selected.end());
+    auto reference = std::vector<int>(deepselect_keys);
+    for (int index = 0; index < deepselect_keys; ++index) {
+        reference[index] = index;
+    }
+    std::partial_sort(
+        reference.begin(),
+        reference.begin() + 512,
+        reference.end(),
+        [&](int left, int right) {
+            return deepselect_values[left] > deepselect_values[right];
+        });
+    reference.resize(512);
+    std::sort(reference.begin(), reference.end());
+    require(
+        deepselect_selected == reference,
+        "DeepSelect top-k membership mismatch");
+
+    const auto valid_counts = int_array({700}, Shape{1, 1});
+    auto prefix_selected = evaluated_int(
+        mfq::metal::mlx_deepselect_topk512(
+            float_array(deepselect_values, Shape{1, 1, deepselect_keys}),
+            valid_counts));
+    std::sort(prefix_selected.begin(), prefix_selected.end());
+    reference.resize(700);
+    for (int index = 0; index < 700; ++index) {
+        reference[index] = index;
+    }
+    std::partial_sort(
+        reference.begin(),
+        reference.begin() + 512,
+        reference.end(),
+        [&](int left, int right) {
+            return deepselect_values[left] > deepselect_values[right];
+        });
+    reference.resize(512);
+    std::sort(reference.begin(), reference.end());
+    require(
+        prefix_selected == reference,
+        "DeepSelect visible-prefix mismatch");
+
+    const auto short_prefix = evaluated_int(
+        mfq::metal::mlx_deepselect_topk512(
+            float_array(deepselect_values, Shape{1, 1, deepselect_keys}),
+            int_array({7}, Shape{1, 1})));
+    for (int index = 0; index < 512; ++index) {
+        require(
+            short_prefix[index] == (index < 7 ? index : 7),
+            "DeepSelect short-prefix sentinel mismatch");
+    }
+
+    constexpr int batched_rows = 6;
+    constexpr int batched_keys = 16384;
+    const std::vector<std::int32_t> batched_valid{
+        0, 7, 511, 512, 513, batched_keys,
+    };
+    std::vector<float> batched_values(
+        static_cast<std::size_t>(batched_rows) * batched_keys);
+    for (int row = 0; row < batched_rows; ++row) {
+        for (int key = 0; key < batched_keys; ++key) {
+            batched_values[static_cast<std::size_t>(row) * batched_keys + key] =
+                static_cast<float>(key) - 8192.0f +
+                static_cast<float>(row) / 16.0f;
+        }
+    }
+    const auto batched_selected = evaluated_int(
+        mfq::metal::mlx_deepselect_topk512(
+            float_array(
+                batched_values,
+                Shape{2, 3, batched_keys}),
+            int_array(batched_valid, Shape{2, 3})));
+    for (int row = 0; row < batched_rows; ++row) {
+        std::vector<int> selected(
+            batched_selected.begin() + row * 512,
+            batched_selected.begin() + (row + 1) * 512);
+        std::sort(selected.begin(), selected.end());
+        if (batched_valid[row] <= 512) {
+            for (int index = 0; index < 512; ++index) {
+                require(
+                    selected[index] ==
+                        (index < batched_valid[row]
+                             ? index
+                             : batched_valid[row]),
+                    "DeepSelect batched short row mismatch");
+            }
+        } else {
+            for (int index = 0; index < 512; ++index) {
+                require(
+                    selected[index] == batched_valid[row] - 512 + index,
+                    "DeepSelect batched long row mismatch");
+            }
+        }
+    }
+
+    auto tied_deepselect = evaluated_int(
+        mfq::metal::mlx_deepselect_topk512(
+            float_array(
+                std::vector<float>(batched_keys, 1.0f),
+                Shape{1, 1, batched_keys})));
+    std::sort(tied_deepselect.begin(), tied_deepselect.end());
+    require(
+        std::adjacent_find(tied_deepselect.begin(), tied_deepselect.end()) ==
+            tied_deepselect.end(),
+        "DeepSelect returned duplicate tied indices");
+    require(
+        tied_deepselect.front() >= 0 && tied_deepselect.back() < batched_keys,
+        "DeepSelect tied index escaped the score row");
 }
 
 void test_sparse_plans() {
-    auto prefill = mfq::metal::dsv4_build_prefill_plan(
+    auto prefill = mfq::metal::mlx_dsa_build_prefill_plan(
         int_array(
             {
                 0,
@@ -1006,7 +1126,7 @@ void test_sparse_plans() {
             "prefill invalid mask mismatch");
     }
 
-    auto decode = mfq::metal::dsv4_build_decode_plan(
+    auto decode = mfq::metal::mlx_dsa_build_decode_plan(
         int_array(
             {
                 0,
@@ -1217,7 +1337,7 @@ void test_sparse_attention_path(int queries) {
         mask,
         Shape{1, queries, selected});
     auto sink_array = float_array(sinks, Shape{heads});
-    auto output = mfq::metal::attention_dsv4_sparse(
+    auto output = mfq::metal::mlx_dsa_sparse_attention(
         query_array,
         cache_array,
         index_array,
@@ -1235,7 +1355,7 @@ void test_sparse_attention_path(int queries) {
              query_index < queries;
              ++query_index) {
             serial_rows.push_back(
-                mfq::metal::attention_dsv4_sparse(
+                mfq::metal::mlx_dsa_sparse_attention(
                     mlx::core::slice(
                         query_array,
                         Shape{0, 0, query_index, 0},
@@ -1320,13 +1440,13 @@ void test_direct_decode_attention_path() {
     auto sink_array = float_array(
         sinks,
         Shape{heads});
-    auto plan = mfq::metal::dsv4_build_decode_plan(
+    auto plan = mfq::metal::mlx_dsa_build_decode_plan(
         topk,
         int_array({seq_len}, Shape{1}),
         pool_len,
         ratio,
         window);
-    auto legacy = mfq::metal::attention_dsv4_sparse(
+    auto legacy = mfq::metal::mlx_dsa_sparse_attention(
         float_array(
             query,
             Shape{1, heads, 1, dimension}),
@@ -1336,7 +1456,7 @@ void test_direct_decode_attention_path() {
         plan.first,
         plan.second,
         sink_array);
-    auto direct = mfq::metal::attention_dsv4_sparse_decode(
+    auto direct = mfq::metal::mlx_dsa_sparse_decode_attention(
         float_array(
             query,
             Shape{1, heads, 1, dimension}),
@@ -1357,19 +1477,19 @@ void test_direct_decode_attention_path() {
     auto empty_topk = mlx::core::zeros(
         Shape{1, 1, 0},
         mlx::core::int32);
-    auto local_plan = mfq::metal::dsv4_build_decode_plan(
+    auto local_plan = mfq::metal::mlx_dsa_build_decode_plan(
         empty_topk,
         int_array({seq_len}, Shape{1}),
         0,
         1,
         window);
-    auto selected_local = mfq::metal::attention_dsv4_sparse(
+    auto selected_local = mfq::metal::mlx_dsa_sparse_attention(
         float_array(query, Shape{1, heads, 1, dimension}),
         local_array,
         local_plan.first,
         local_plan.second,
         sink_array);
-    auto direct_local = mfq::metal::attention_dsv4_sparse_decode(
+    auto direct_local = mfq::metal::mlx_dsa_sparse_decode_attention(
         float_array(query, Shape{1, heads, 1, dimension}),
         local_array,
         std::nullopt,
@@ -1425,7 +1545,7 @@ void test_short_prefill_plan_matches_circular_decode() {
     auto empty_topk = mlx::core::zeros(
         Shape{1, queries, 0},
         mlx::core::int32);
-    auto plan = mfq::metal::dsv4_build_prefill_plan(
+    auto plan = mfq::metal::mlx_dsa_build_prefill_plan(
         empty_topk,
         history,
         history,
@@ -1435,7 +1555,7 @@ void test_short_prefill_plan_matches_circular_decode() {
     require(
         plan.first.shape() == Shape{1, queries, 32},
         "short verifier plan retained the full local window");
-    auto batched = mfq::metal::attention_dsv4_sparse(
+    auto batched = mfq::metal::mlx_dsa_sparse_attention(
         query_array,
         visible_cache,
         plan.first,
@@ -1447,14 +1567,14 @@ void test_short_prefill_plan_matches_circular_decode() {
         auto serial_topk = mlx::core::zeros(
             Shape{1, 1, 0},
             mlx::core::int32);
-        auto serial_plan = mfq::metal::dsv4_build_prefill_plan(
+        auto serial_plan = mfq::metal::mlx_dsa_build_prefill_plan(
             serial_topk,
             history + row,
             history + row,
             0,
             1,
             window);
-        serial.push_back(mfq::metal::attention_dsv4_sparse(
+        serial.push_back(mfq::metal::mlx_dsa_sparse_attention(
             mlx::core::slice(
                 query_array,
                 Shape{0, 0, row, 0},
@@ -1477,7 +1597,7 @@ void test_short_prefill_plan_matches_circular_decode() {
 void test_invalid_inputs() {
     require_invalid(
         [] {
-            (void)mfq::metal::dsv4_fp4_sim(
+            (void)mfq::metal::mlx_mxfp4_sim(
                 mlx::core::zeros(
                     Shape{31},
                     mlx::core::float16));
@@ -1485,7 +1605,7 @@ void test_invalid_inputs() {
         "invalid FP4 width");
     require_invalid(
         [] {
-            (void)mfq::metal::dsv4_compress(
+            (void)mfq::metal::mlx_dsa_compress(
                 mlx::core::zeros(
                     Shape{1, 1, 1, 128},
                     mlx::core::float16),
@@ -1533,7 +1653,7 @@ void test_invalid_inputs() {
         "missing overlap state");
     require_invalid(
         [] {
-            (void)mfq::metal::dsv4_indexer_scores(
+            (void)mfq::metal::mlx_dsa_indexer_scores(
                 mlx::core::zeros(
                     Shape{1, 1, 63, 128},
                     mlx::core::float16),
@@ -1549,7 +1669,7 @@ void test_invalid_inputs() {
         "invalid indexer heads");
     require_invalid(
         [] {
-            (void)mfq::metal::dsv4_topk512(
+            (void)mfq::metal::mlx_dsa_topk512(
                 mlx::core::zeros(
                     Shape{1, 1, 0},
                     mlx::core::float16));
@@ -1557,7 +1677,7 @@ void test_invalid_inputs() {
         "empty top-k input");
     require_invalid(
         [] {
-            (void)mfq::metal::dsv4_build_prefill_plan(
+            (void)mfq::metal::mlx_dsa_build_prefill_plan(
                 mlx::core::zeros(
                     Shape{1, 1, 1},
                     mlx::core::int32),
@@ -1570,7 +1690,7 @@ void test_invalid_inputs() {
         "invalid prefill window");
     require_invalid(
         [] {
-            (void)mfq::metal::attention_dsv4_sparse(
+            (void)mfq::metal::mlx_dsa_sparse_attention(
                 mlx::core::zeros(
                     Shape{1, 64, 1, 512},
                     mlx::core::float32),

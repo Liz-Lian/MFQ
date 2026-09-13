@@ -25,13 +25,18 @@
 
 namespace mfq::metal {
 
-struct MlxDeepseekV41TextSessionState {
-    std::vector<std::int64_t> tokens;
-    std::size_t bytes = 0;
-};
-
 struct MlxDeepseekV41LayerState {
     MlxDeepseekV41AttentionState attention;
+};
+
+struct MlxDeepseekV41TextSessionState {
+    std::vector<std::int64_t> tokens;
+    std::vector<MlxDeepseekV41LayerState> layers;
+    std::optional<MlxDeepseekV41DSparkState> dspark;
+    DeepseekV41EngramHashSnapshot engram_hash;
+    int cache_position = 0;
+    int cache_batch = 0;
+    std::size_t bytes = 0;
 };
 
 struct MlxDeepseekV41LayerResult {
@@ -53,7 +58,8 @@ public:
         int max_context,
         std::pair<mlx::core::array, mlx::core::array> rope_base,
         std::pair<mlx::core::array, mlx::core::array> rope_compressed,
-        std::shared_ptr<MlxMoeSsdExpertCache> ssd_expert_cache = nullptr);
+        std::shared_ptr<MlxMoeSsdExpertCache> ssd_expert_cache = nullptr,
+        std::shared_ptr<MlxMfeOffloadCache> mfe_offload_cache = nullptr);
 
     MlxDeepseekV41LayerResult forward(
         const mlx::core::array& hidden,
@@ -76,6 +82,11 @@ public:
 
     int index() const noexcept { return index_; }
     bool has_engram() const noexcept { return engram_ != nullptr; }
+    void prefetch_engram(DeepseekV41EngramHashBatch& hashes) const;
+    std::optional<MlxMxfp8RowStoreStats> engram_ssd_stats() const;
+    int recommended_prefill_chunk_size() const noexcept {
+        return moe_.recommended_prefill_chunk_size();
+    }
 
 private:
     MlxDeepseekV41Layer(
@@ -115,6 +126,7 @@ public:
         MlxDeepseekV41EngramHashState engram_hash,
         int max_context,
         std::shared_ptr<MlxMoeSsdExpertCache> ssd_expert_cache = nullptr,
+        std::shared_ptr<MlxMfeOffloadCache> mfe_offload_cache = nullptr,
         std::optional<MlxDeepseekV41Vision> vision = std::nullopt,
         std::optional<MlxDeepseekV41DSpark> dspark = std::nullopt);
 
@@ -171,14 +183,16 @@ public:
     std::size_t layer_count() const noexcept { return layers_.size(); }
     bool supports_multimodal() const noexcept { return vision_.has_value(); }
     bool supports_mtp() const noexcept { return dspark_.has_value(); }
+    int preferred_prefill_chunk_size(int portable_default) const noexcept;
     std::size_t expert_cache_limit_bytes() const noexcept;
     std::optional<MlxSsdExpertCacheStats> ssd_expert_cache_stats() const;
+    std::optional<MlxMxfp8RowStoreStats> engram_ssd_stats() const;
     void prewarm_ssd_expert_arena();
     void clear_expert_cache();
     const MlxMtpGenerationStats& last_mtp_stats() const noexcept {
         return last_mtp_stats_;
     }
-    bool supports_text_session_state() const noexcept { return false; }
+    bool supports_text_session_state() const noexcept { return true; }
     MlxDeepseekV41TextSessionState capture_text_session_state(
         const std::vector<std::int64_t>& tokens) const;
     void restore_text_session_state(
@@ -192,7 +206,8 @@ private:
         bool reuse_cache,
         const std::optional<mlx::core::array>& input_embeddings = std::nullopt,
         mlx::core::array* dspark_hidden = nullptr,
-        bool update_dspark = true);
+        bool update_dspark = true,
+        bool skip_lm_head = false);
     void begin_speculative_target(
         const mlx::core::array& token_ids,
         int confirmed_tokens);
@@ -208,6 +223,8 @@ private:
         std::int32_t limit,
         const std::function<bool(std::int64_t)>& callback,
         const MfqTokenConstraintPtr& token_constraint);
+    void materialize_states(
+        const std::vector<MlxDeepseekV41LayerState>& states) const;
 
     DeepseekV41Config config_;
     MlxEmbedding embedding_;
@@ -216,6 +233,7 @@ private:
     MlxLinear output_;
     MlxDeepseekV41EngramHashState engram_hash_;
     std::shared_ptr<MlxMoeSsdExpertCache> ssd_expert_cache_;
+    std::shared_ptr<MlxMfeOffloadCache> mfe_offload_cache_;
     std::optional<MlxDeepseekV41Vision> vision_;
     std::optional<MlxDeepseekV41DSpark> dspark_;
     std::optional<MlxDeepseekV41DSparkState> dspark_state_;
@@ -223,6 +241,8 @@ private:
     int cache_position_ = 0;
     int cache_batch_ = 0;
     std::vector<MlxDeepseekV41LayerState> states_;
+    std::vector<std::int64_t> stable_cache_tokens_;
+    std::optional<MlxDeepseekV41DSparkState> stable_dspark_state_;
     std::optional<DeepseekV41EngramHashSnapshot>
         speculative_engram_snapshot_;
     std::optional<mlx::core::array> speculative_token_ids_;

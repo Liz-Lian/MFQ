@@ -51,7 +51,9 @@ METAL_FUNC float mfq_mx_weight(
     uint output,
     uint column,
     uint mx_bits,
-    uint width
+    uint width,
+    uint scale_row_block,
+    uint scale_column_block
 ) {
     if (mx_bits == 4u) {
         uchar packed = values[output * (width / 2u) + (column >> 1u)];
@@ -60,9 +62,11 @@ METAL_FUNC float mfq_mx_weight(
         return mfq_mx_fp4(code) * mfq_mx_e8m0(scale);
     }
     uchar code = values[output * width + column];
-    uint scale_row = output / 128u;
-    uint scale_column = column / 128u;
-    uchar scale = scales[scale_row * (width / 128u) + scale_column];
+    uint scale_row = output / scale_row_block;
+    uint scale_column = column / scale_column_block;
+    uchar scale = scales[
+        scale_row * (width / scale_column_block) + scale_column
+    ];
     return mfq_mx_fp8(code) * mfq_mx_e8m0(scale);
 }
 """
@@ -81,7 +85,8 @@ _MATMUL_SOURCE = r"""
     }
     for (uint column = lane; column < uint(K); column += 32u) {
         float weight = mfq_mx_weight(
-            values, scales, output, column, uint(MX_BITS), uint(K));
+            values, scales, output, column, uint(MX_BITS), uint(K),
+            uint(SCALE_ROW_BLOCK), uint(SCALE_COLUMN_BLOCK));
         for (uint local = 0u; local < uint(TILE_M); ++local) {
             uint row = first_row + local;
             if (row < uint(M)) {
@@ -111,7 +116,8 @@ _BACKWARD_INPUT_SOURCE = r"""
     }
     for (uint output = lane; output < uint(OUT); output += 32u) {
         float weight = mfq_mx_weight(
-            values, scales, output, column, uint(MX_BITS), uint(K));
+            values, scales, output, column, uint(MX_BITS), uint(K),
+            uint(SCALE_ROW_BLOCK), uint(SCALE_COLUMN_BLOCK));
         for (uint local = 0u; local < uint(TILE_M); ++local) {
             uint row = first_row + local;
             if (row < uint(M)) {
@@ -157,10 +163,13 @@ _BACKWARD_QUAD_SOURCE = r"""
                 mfq_mx_fp4(packed1 >> 4u));
         } else {
             uint value_offset = output * uint(K) + column;
-            uint scale_row = output >> 7u;
-            uint scale_column = column >> 7u;
+            uint scale_row = output / uint(SCALE_ROW_BLOCK);
+            uint scale_column = column / uint(SCALE_COLUMN_BLOCK);
             float multiplier = mfq_mx_e8m0(
-                scales[scale_row * (uint(K) >> 7u) + scale_column]
+                scales[
+                    scale_row * (uint(K) / uint(SCALE_COLUMN_BLOCK))
+                    + scale_column
+                ]
             );
             uchar4 codes = *((const device uchar4*)(values + value_offset));
             weights = multiplier * float4(
@@ -240,7 +249,9 @@ _BACKWARD_MATRIX_SOURCE = r"""
                     output,
                     column,
                     uint(MX_BITS),
-                    uint(K))
+                    uint(K),
+                    uint(SCALE_ROW_BLOCK),
+                    uint(SCALE_COLUMN_BLOCK))
                 : 0.0f;
             weight_tile[local_output * BK + local_column] = half(value);
         }
@@ -303,7 +314,8 @@ _GEMV_SOURCE = r"""
             uint output = first_output + local;
             if (output < uint(OUT)) {
                 accum[local] += activation * mfq_mx_weight(
-                    values, scales, output, column, uint(MX_BITS), uint(K));
+                    values, scales, output, column, uint(MX_BITS), uint(K),
+                    uint(SCALE_ROW_BLOCK), uint(SCALE_COLUMN_BLOCK));
             }
         }
     }
@@ -323,7 +335,8 @@ _DEQUANT_SOURCE = r"""
         uint output = index / uint(K);
         uint column = index - output * uint(K);
         y[index] = T(mfq_mx_weight(
-            values, scales, output, column, uint(MX_BITS), uint(K)));
+            values, scales, output, column, uint(MX_BITS), uint(K),
+            uint(SCALE_ROW_BLOCK), uint(SCALE_COLUMN_BLOCK)));
     }
 """
 
@@ -336,7 +349,8 @@ _EMBEDDING_SOURCE = r"""
         uint output = uint(ids[token]);
         y[index] = output < uint(OUT)
             ? T(mfq_mx_weight(
-                values, scales, output, column, uint(MX_BITS), uint(K)))
+                values, scales, output, column, uint(MX_BITS), uint(K),
+                uint(SCALE_ROW_BLOCK), uint(SCALE_COLUMN_BLOCK)))
             : T(NAN);
     }
 """
@@ -415,15 +429,46 @@ class MetalMxWeight:
     bits: int
     out: int
     in_features: int
+    scale_row_block: int
+    scale_column_block: int
 
     @classmethod
     def from_tensor(cls, tensor: MxTensor) -> MetalMxWeight:
+        if tensor.dtype == MXFP4_DTYPE:
+            scale_row_block, scale_column_block = (1, 32)
+        else:
+            rows, columns = (int(value) for value in tensor.shape)
+            scale_shape = tuple(int(value) for value in tensor.scales.shape)
+            candidates = [
+                (32, 32, ((rows + 31) // 32, columns // 32)),
+                (1, 32, (rows, columns // 32)),
+            ]
+            if columns % 128 == 0:
+                candidates.insert(
+                    0,
+                    (128, 128, ((rows + 127) // 128, columns // 128)),
+                )
+            geometry = next(
+                (
+                    (row_block, column_block)
+                    for row_block, column_block, expected in candidates
+                    if scale_shape == expected
+                ),
+                None,
+            )
+            if geometry is None:  # MxTensor validation should make this unreachable.
+                raise ValueError(
+                    f"unsupported MXFP8 scale geometry: {scale_shape}"
+                )
+            scale_row_block, scale_column_block = geometry
         return cls(
             values=mx.array(np.ascontiguousarray(tensor.values, dtype=np.uint8)),
             scales=mx.array(np.ascontiguousarray(tensor.scales, dtype=np.uint8)),
             bits=4 if tensor.dtype == MXFP4_DTYPE else 8,
             out=int(tensor.shape[0]),
             in_features=int(tensor.shape[1]),
+            scale_row_block=scale_row_block,
+            scale_column_block=scale_column_block,
         )
 
     @classmethod
@@ -452,6 +497,8 @@ def _templates(
     return [
         ("T", dtype),
         ("MX_BITS", weight.bits),
+        ("SCALE_ROW_BLOCK", weight.scale_row_block),
+        ("SCALE_COLUMN_BLOCK", weight.scale_column_block),
         ("K", weight.in_features),
         ("OUT", weight.out),
         ("M", rows),

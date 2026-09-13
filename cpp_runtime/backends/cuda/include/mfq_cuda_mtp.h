@@ -108,8 +108,6 @@ public:
         }
         milliseconds_since_probe_ += cycle_ms;
         milliseconds_since_explore_ += cycle_ms;
-        exit_streak_ = speculation_losing() ? exit_streak_ + 1 : 0;
-
         if (!warmup_.empty()) {
             warmup_.erase(warmup_.begin());
             if (!warmup_.empty()) {
@@ -145,8 +143,6 @@ public:
         if (explore_due) milliseconds_since_explore_ = 0.0;
     }
 
-    bool should_exit() const noexcept { return exit_streak_ >= kExitStreak; }
-
     double conditional_acceptance(int position) const {
         if (position < 0 || position >= maximum_depth_) {
             throw std::out_of_range("MTP acceptance position is out of range");
@@ -173,9 +169,6 @@ private:
     static constexpr double kSpikeDamp = 0.25;
     static constexpr double kMarginalMs = 7.0;
     static constexpr double kHysteresis = 1.03;
-    static constexpr double kExitMargin = 1.15;
-    static constexpr int kExitStreak = 16;
-
     void update_time(int depth, double cycle_ms) {
         auto& estimate = cycle_ms_[static_cast<std::size_t>(depth)];
         if (!estimate) {
@@ -245,16 +238,6 @@ private:
         return expected / std::max(1.0e-6, time_estimate(depth));
     }
 
-    bool speculation_losing() const {
-        if (!warmup_.empty() || !cycle_ms_.front()) return false;
-        const double baseline = score(0);
-        double best = 0.0;
-        for (int depth = 1; depth <= maximum_depth_; ++depth) {
-            best = std::max(best, score(depth));
-        }
-        return baseline > 0.0 && best < baseline * kExitMargin;
-    }
-
     int best_depth() const {
         int best = current_depth_;
         double best_score = -1.0;
@@ -321,7 +304,6 @@ private:
     int current_depth_ = 1;
     int cycles_ = 0;
     int probe_left_ = 0;
-    int exit_streak_ = 0;
     double milliseconds_since_probe_ = 0.0;
     double milliseconds_since_explore_ = 0.0;
     std::vector<double> acceptance_;

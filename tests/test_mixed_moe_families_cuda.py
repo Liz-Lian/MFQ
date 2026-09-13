@@ -164,7 +164,7 @@ def _all_family_container() -> MfeTensor:
     )
 
 
-@pytest.mark.parametrize("tokens", (3, 13, 257, 1024))
+@pytest.mark.parametrize("tokens", (3, 9, 13, 257, 1024))
 def test_cpp_runtime_matches_python_for_all_mfe_families(tmp_path, tokens: int):
     root = Path(__file__).resolve().parents[1]
     executable = next(
@@ -223,8 +223,6 @@ def test_cpp_runtime_matches_python_for_all_mfe_families(tmp_path, tokens: int):
         path_parts.append(str(Path(cuda_root) / "bin"))
     path_parts.append(env.get("PATH", ""))
     env["PATH"] = os.pathsep.join(path_parts)
-    if tokens > 8:
-        env["MFQ_MOE_PREFILL_MMA_MIN_TOKENS"] = "9"
     command = [
         str(executable),
         "--mfq",

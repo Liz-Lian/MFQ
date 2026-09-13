@@ -33,7 +33,7 @@ def test_architecture_registry_is_partial() -> None:
     assert deepseek_v41 is not None
     assert deepseek_v41["chat"]["temperature"] == 1.0
     assert deepseek_v41["chat"]["top_p"] == 0.95
-    assert deepseek_v41["chat"]["enable_mtp"] is False
+    assert "enable_mtp" not in deepseek_v41["chat"]
     assert "repetition_penalty" not in deepseek_v41["chat"]
 
 

@@ -11,6 +11,8 @@ namespace mfq {
 
 inline constexpr std::string_view kMfqModelGraphAsset =
     "__mfq_asset__/model_graph.json";
+inline constexpr std::string_view kMfqHfSourceMapAsset =
+    "__mfq_asset__/hf/source_tensor_map.json";
 inline constexpr std::string_view kMfqCanonicalTensorNamespace =
     "mfq.tensor";
 inline constexpr std::string_view kMfqGridVisionInputContract =

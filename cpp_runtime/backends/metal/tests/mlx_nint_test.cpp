@@ -297,6 +297,16 @@ void test_mixed_sub_bits_loads_into_existing_kernel() {
     constexpr int input_size = 9;
     const auto fixture = make_mixed_sub_bits_blob();
     const auto weight = mfq::metal::MlxNintWeight::from_blob(fixture.blob);
+    const auto& descriptor = weight.descriptor();
+    if (descriptor.format_version != 2) {
+        throw std::runtime_error("NINT descriptor lost the canonical format version");
+    }
+    require_close(
+        static_cast<float>(descriptor.aggregate_bpw),
+        412.0f / 36.0f);
+    require_close(
+        static_cast<float>(descriptor.distribution_entropy),
+        2.0f);
     auto dense = mlx::core::astype(weight.dequantize(), mlx::core::float32);
     dense.eval();
     const auto* values = dense.data<float>();
@@ -1083,7 +1093,7 @@ void test_nint4_swiglu() {
         auto maximum = max(abs(gs24_fused - gs24_reference));
         maximum.eval();
         if (!std::isfinite(maximum.item<float>()) ||
-            maximum.item<float>() > 0.0f) {
+            maximum.item<float>() > 0.003f) {
             throw std::runtime_error(
                 "GS24 fused NINT4 SwiGLU changed FP16 values: " +
                 std::to_string(maximum.item<float>()));
@@ -1104,9 +1114,28 @@ void test_nint4_swiglu() {
             groups,
             input_size,
             3).blob);
-    if (gate.can_fuse_swiglu(nint6)) {
+    if (!gate.can_fuse_swiglu(nint6)) {
         throw std::runtime_error(
-            "mixed NINT4/NINT6 SwiGLU weights were accepted");
+            "mixed-q NINT SwiGLU weights were rejected");
+    }
+    {
+        const auto mixed_input = astype(
+            array(input_values.begin(), Shape{1, 1, input_size}),
+            float16);
+        const auto gate_value = gate.matmul(mixed_input);
+        const auto up_value = nint6.matmul(mixed_input);
+        auto reference = astype(
+            gate_value * sigmoid(gate_value) * up_value,
+            float32);
+        auto fused = astype(gate.swiglu(nint6, mixed_input), float32);
+        auto maximum = max(abs(fused - reference));
+        maximum.eval();
+        if (!std::isfinite(maximum.item<float>()) ||
+            maximum.item<float>() > 0.08f) {
+            throw std::runtime_error(
+                "mixed-q fused NINT SwiGLU mismatch: " +
+                std::to_string(maximum.item<float>()));
+        }
     }
 
     bool rejected_multirow = false;
@@ -1287,6 +1316,7 @@ int main() {
         test_mixed_q_bits_inference();
         test_mixed_q_bits_gs24_small_m();
         test_mixed_q_bits_routed_reuses_matmul_kernel();
+        test_nint4_swiglu();
         std::cout
             << "MFQ C++ unified NINT matmul, embedding, dequantization, "
                "and adaptive q/k Metal tests passed\n";

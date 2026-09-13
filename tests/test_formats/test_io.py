@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import struct
 
 import numpy as np
 import pytest
@@ -63,6 +64,31 @@ def _mk(seed: int = 0, shape: tuple[int, ...] = (8, 96)) -> nint_quant.NintTenso
     return nint_quant.quantize(W, NintSpec(4, 24, 6), axis=0)
 
 
+def _pack_legacy_uniform_nint(tensor: nint_quant.NintTensor) -> bytes:
+    out, groups, _groupsize = tensor.q.shape
+    spec = tensor.spec
+    return b"".join(
+        (
+            struct.pack(
+                "<BBiii",
+                spec.bits,
+                spec.sub_bits,
+                spec.groupsize,
+                tensor.axis,
+                tensor.neuron_len,
+            ),
+            struct.pack("<I", len(tensor.shape)),
+            struct.pack(f"<{len(tensor.shape)}q", *tensor.shape),
+            struct.pack("<II", out, groups),
+            np.asarray(tensor.neuron_scale, dtype=np.float16).tobytes(),
+            np.asarray(tensor.neuron_min, dtype=np.float16).tobytes(),
+            io.pack_bits(tensor.sub_scale, spec.sub_bits),
+            io.pack_bits(tensor.sub_min, spec.sub_bits),
+            io.pack_bits(tensor.q, spec.bits),
+        )
+    )
+
+
 def _mixed_sub_bits_tensor(
     seed: int = 91,
     shape: tuple[int, int] = (12, 53),
@@ -98,6 +124,11 @@ def test_pack_roundtrip_fields():
     np.testing.assert_array_equal(t2.sub_min, t.sub_min)
     np.testing.assert_allclose(t2.neuron_scale, t.neuron_scale)
     np.testing.assert_allclose(t2.neuron_min, t.neuron_min)
+    assert t2.descriptor.format_version == 2
+    assert t2.descriptor.distribution_entropy == 0.0
+    assert t2.descriptor.aggregate_bpw == pytest.approx(
+        (96 * 4 + 2 * 4 * 6 + 32 + 5) / 96
+    )
 
 
 @pytest.mark.parametrize("bits", range(1, 8))
@@ -117,6 +148,24 @@ def test_pack_roundtrip_dequant():
     t = _mk(5)
     t2 = io.unpack_nint(io.pack_nint(t))
     np.testing.assert_allclose(nint_quant.dequantize(t2), nint_quant.dequantize(t))
+
+
+def test_legacy_uniform_nint_is_expanded_to_the_version_two_object_model():
+    tensor = _mk(17, (6, 77))
+
+    restored = io.unpack_nint(_pack_legacy_uniform_nint(tensor))
+
+    assert restored.format_version == 2
+    assert restored.descriptor.format_version == 2
+    assert restored.descriptor.distribution_entropy == 0.0
+    np.testing.assert_array_equal(restored.row_q_bits, np.full(6, 4, np.uint8))
+    np.testing.assert_array_equal(restored.row_sub_bits, np.full(6, 6, np.uint8))
+    np.testing.assert_allclose(
+        nint_quant.dequantize(restored),
+        nint_quant.dequantize(tensor),
+        rtol=0,
+        atol=0,
+    )
 
 
 def test_pack_roundtrip_mixed_sub_bits_keeps_one_logical_nint_tensor():
@@ -175,6 +224,8 @@ def test_pack_roundtrip_mixed_q_and_sub_bits_keeps_one_logical_nint_tensor():
     assert restored.has_mixed_sub_bits
     assert restored.mean_q_bits == pytest.approx(4.0)
     assert restored.mean_sub_bits == pytest.approx(6.0)
+    assert restored.descriptor.format_version == 2
+    assert restored.descriptor.distribution_entropy == pytest.approx(np.log2(5.0))
     np.testing.assert_array_equal(restored.row_q_bits, row_q_bits)
     np.testing.assert_array_equal(restored.row_sub_bits, row_sub_bits)
     np.testing.assert_array_equal(restored.q, tensor.q)
@@ -186,9 +237,10 @@ def test_pack_roundtrip_mixed_q_and_sub_bits_keeps_one_logical_nint_tensor():
         rtol=0,
         atol=0,
     )
-    assert tensor.bpw() == pytest.approx(
-        4.0 + 32.0 / 77.0 + 12.0 / 24.0 + 5.0 / 77.0
-    )
+    expected_bpw = (96 * 4.0 + 2 * 4 * 6.0 + 32.0 + 5.0) / 77.0
+    assert tensor.descriptor.aggregate_bpw == pytest.approx(expected_bpw)
+    assert restored.descriptor == tensor.descriptor
+    assert tensor.bpw() == pytest.approx(expected_bpw)
 
 
 def test_mixed_sub_bits_selector_overhead_stays_negligible_at_equal_average_bits():
@@ -205,9 +257,8 @@ def test_mixed_sub_bits_selector_overhead_stays_negligible_at_equal_average_bits
     uniform_nbytes = len(io.pack_nint(uniform))
 
     assert mixed_nbytes - uniform_nbytes <= 80
-    assert tensor.bpw() == pytest.approx(
-        4.0 + 32.0 / 5120.0 + 12.0 / 24.0 + 5.0 / 5120.0
-    )
+    expected_bpw = (5136 * 4.0 + 2 * 214 * 6.0 + 32.0 + 5.0) / 5120.0
+    assert tensor.bpw() == pytest.approx(expected_bpw)
 
 
 def test_dense_bfloat16_roundtrip_preserves_raw_bits():
@@ -272,7 +323,17 @@ def test_mfe_roundtrip_preserves_expert_profiles():
     restored = io.unpack_mfe(io.pack_mfe(tensor))
     assert restored.shape == tensor.shape
     assert restored.expert_profiles == tensor.expert_profiles
-    assert len(restored.pools) == 4
+    assert len(restored.pools) == 2
+    merged = restored.pools[0]
+    np.testing.assert_array_equal(merged.expert_ids, [0, 1, 2, 3, 5])
+    np.testing.assert_array_equal(
+        merged.tensor.row_q_bits.reshape(5, 5)[:, 0],
+        [4, 6, 4, 8, 6],
+    )
+    np.testing.assert_array_equal(
+        merged.tensor.row_sub_bits.reshape(5, 5)[:, 0],
+        [6, 6, 6, 8, 6],
+    )
     np.testing.assert_allclose(
         dequantize_expertwise(restored),
         dequantize_expertwise(tensor),
@@ -318,8 +379,8 @@ def test_mfe_blob_view_exposes_packed_cohorts_without_decoding():
     shape, pools = io.view_mfe_blob(blob)
 
     assert shape == tensor.shape
-    assert tuple(tuple(pool.expert_ids) for pool in pools) == ((0, 2), (1, 3))
-    assert tuple(pool.dtype for pool in pools) == ("NINT", "NINT")
+    assert tuple(tuple(pool.expert_ids) for pool in pools) == ((0, 1, 2, 3),)
+    assert tuple(pool.dtype for pool in pools) == ("NINT",)
     assert all(not pool.runtime_payload for pool in pools)
     assert all(pool.tensor_payload.obj is not None for pool in pools)
 

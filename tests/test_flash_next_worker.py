@@ -837,7 +837,7 @@ def test_python_mlx_runtime_command_reenters_mfq_cli(tmp_path: Path) -> None:
         "-m",
         "mfq.cli",
         "_flash-next-worker",
-        "--mfq",
+        "--model",
         "model.mfq",
         "--host",
         "127.0.0.1",
@@ -913,7 +913,6 @@ def test_runtime_route_uses_graph_backbone_and_native_qwen_components(
     assert route.backbone == "qwen3_5"
     assert route.vision_available
     assert not route.python_mlx_worker
-    assert not route.requires_mfq
     runtime = NativeRuntime(
         executable=Path("/runtime/mfq-decode-metal"),
         model=model,
@@ -938,12 +937,10 @@ def test_runtime_route_uses_graph_backbone_and_native_qwen_components(
     route = resolve_runtime_route("qwen3_5-hf-full-mfq", text_only)
     assert not route.vision_available
     assert not route.python_mlx_worker
-    assert not route.requires_mfq
 
     flash_next = resolve_runtime_route("glm5_next-hf-mfq-nint-recipe", text_only)
     assert flash_next.architecture_family == "qwen3_5"
     assert not flash_next.python_mlx_worker
-    assert not flash_next.requires_mfq
 
 
 def test_runtime_route_selects_native_cpp_for_qwen4_exp(tmp_path: Path) -> None:
@@ -978,7 +975,6 @@ def test_runtime_route_selects_native_cpp_for_qwen4_exp(tmp_path: Path) -> None:
     assert route.architecture_family == "qwen4_exp"
     assert route.backbone == "qwen4_exp"
     assert not route.python_mlx_worker
-    assert not route.requires_mfq
 
 
 class _FakeWorker:

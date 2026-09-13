@@ -25,7 +25,6 @@
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
-#include <fstream>
 #include <iostream>
 #include <limits>
 #include <memory>
@@ -34,6 +33,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <type_traits>
 #include <unordered_map>
 #include <utility>
@@ -53,8 +53,6 @@ constexpr std::size_t kMinimumServerCacheLimitBytes =
     std::size_t{1} << 30;
 constexpr std::size_t kMaximumServerCacheLimitBytes =
     std::size_t{8} << 30;
-constexpr std::size_t kDeepseekV41AutomaticExpertCacheLimitBytes =
-    std::size_t{128} << 30;
 
 void release_model_load_staging_memory() {
     // Model conversion and MFE repacking leave large, now-unused buffers in
@@ -82,6 +80,7 @@ struct Arguments {
     int port = 8080;
     std::int64_t context_size = 32768;
     int prefill_chunk_size = 2048;
+    bool prefill_chunk_size_explicit = false;
     std::optional<double> expert_cache_gb;
     std::string model_name;
     std::string api_key;
@@ -203,6 +202,7 @@ Arguments parse_arguments(int argc, char** argv) {
             }
             result.prefill_chunk_size =
                 static_cast<int>(parsed);
+            result.prefill_chunk_size_explicit = true;
         } else if (value == "--moe-gpu-cache-gb") {
             const auto text =
                 require_value(value.c_str());
@@ -249,7 +249,7 @@ void print_help() {
            "--tokenizer-gguf TOKENIZER.gguf\n"
         << "  mfq-decode-metal --self-test-metal\n\n"
         << "Options:\n"
-        << "  --mfq PATH             MFQ model/shard, or a supported HF directory\n"
+        << "  --mfq PATH             MFQ model/shard, or an HF Safetensors directory\n"
         << "  --check-mfq-container  validate headers, records, and shard set\n"
         << "  --list-tensors         print record dtype, bytes, and name\n"
         << "  --tensor NAME          load and execute one supported linear weight\n"
@@ -266,26 +266,14 @@ void print_help() {
         << "  --host ADDRESS         server bind address (default 127.0.0.1)\n"
         << "  --port PORT            server port (default 8080)\n"
         << "  --ctx-size TOKENS      runtime/API context limit (default 32768)\n"
-        << "  --prefill-chunk-size N maximum prompt chunk (default 2048)\n"
+        << "  --prefill-chunk-size N maximum prompt chunk (portable default 2048;\n"
+        << "                          capable runtimes may autotune when omitted)\n"
         << "  --moe-gpu-cache-gb N   unified-memory hot-expert cache\n"
         << "                          MFQ default: full residency; HF default: auto\n"
         << "  --model-name NAME      API model name (default MFQ filename)\n"
         << "  --api-key KEY          optional bearer token\n"
         << "  --tokenizer-gguf PATH  external tokenizer GGUF when not embedded\n"
         << "  --sampling-profile P  explicit runtime sampling profile JSON\n";
-}
-
-std::string read_text(const std::filesystem::path& path) {
-    std::ifstream input(path, std::ios::binary);
-    if (!input) {
-        throw std::runtime_error("cannot open file: " + path.string());
-    }
-    std::ostringstream output;
-    output << input.rdbuf();
-    if (!input.good() && !input.eof()) {
-        throw std::runtime_error("cannot read file: " + path.string());
-    }
-    return output.str();
 }
 
 std::size_t physical_memory_bytes() {
@@ -309,6 +297,13 @@ std::size_t server_cache_limit_bytes() {
         physical_memory_bytes() / 16,
         kMinimumServerCacheLimitBytes,
         kMaximumServerCacheLimitBytes);
+}
+
+bool prefill_autotune_enabled() noexcept {
+    const char* value = std::getenv("MFQ_METAL_PREFILL_AUTOTUNE");
+    if (value == nullptr) return true;
+    const auto setting = std::string_view(value);
+    return setting != "0" && setting != "false" && setting != "off";
 }
 
 std::size_t requested_cache_bytes(
@@ -337,53 +332,6 @@ std::size_t requested_cache_bytes(
     return std::max<std::size_t>(
         std::uint64_t{1} << 30,
         physical_memory_bytes() * 2 / 3);
-}
-
-std::size_t resident_hf_wired_limit_bytes(
-    const std::filesystem::path& model_root) {
-    constexpr std::size_t gib = std::size_t{1} << 30;
-    if (const char* value = std::getenv("MFQ_HF_RESIDENT_WIRED_GIB")) {
-        const auto requested = std::stoull(value);
-        if (requested > std::numeric_limits<std::size_t>::max() / gib) {
-            throw std::invalid_argument(
-                "resident HF wired limit exceeds addressable memory");
-        }
-        return static_cast<std::size_t>(requested) * gib;
-    }
-
-    std::size_t checkpoint_bytes = 0;
-    std::error_code error;
-    for (std::filesystem::directory_iterator entries(model_root, error), end;
-         !error && entries != end;
-         entries.increment(error)) {
-        if (!entries->is_regular_file(error) || error ||
-            entries->path().extension() != ".safetensors") {
-            continue;
-        }
-        const auto bytes = entries->file_size(error);
-        if (error || bytes > std::numeric_limits<std::size_t>::max() -
-                checkpoint_bytes) {
-            throw std::runtime_error(
-                "cannot size resident HF checkpoint for its wired budget");
-        }
-        checkpoint_bytes += static_cast<std::size_t>(bytes);
-    }
-    if (error || checkpoint_bytes == 0) {
-        throw std::runtime_error(
-            "cannot discover resident HF safetensor payload");
-    }
-    const auto memory = physical_memory_bytes();
-    const auto reserve = std::max<std::size_t>(32 * gib, memory / 4);
-    if (memory <= reserve || checkpoint_bytes > memory - reserve) {
-        throw std::runtime_error(
-            "resident HF checkpoint does not fit the safe UMA budget");
-    }
-    const auto headroom = std::max<std::size_t>(32 * gib, checkpoint_bytes / 8);
-    return std::min(
-        memory - reserve,
-        checkpoint_bytes > std::numeric_limits<std::size_t>::max() - headroom
-            ? memory - reserve
-            : checkpoint_bytes + headroom);
 }
 
 std::filesystem::path executable_path() {
@@ -1350,7 +1298,7 @@ std::int32_t generate_with_prefill_metrics(
 template <typename Runtime, typename Loader>
 int serve_loaded_runtime(
     const Arguments& arguments,
-    const mfq::metal::MfqContainer* container,
+    const mfq::metal::MfqContainer& container,
     Runtime runtime,
     Loader load_runtime,
     std::string model_type,
@@ -1359,6 +1307,22 @@ int serve_loaded_runtime(
     mlx::core::Stream runtime_stream) {
     constexpr const char* tokenizer_asset =
         "__mfq_asset__/tokenizer.gguf";
+    int prefill_chunk_size = arguments.prefill_chunk_size;
+    if (!arguments.prefill_chunk_size_explicit &&
+        prefill_autotune_enabled()) {
+        if constexpr (requires(const Runtime& value) {
+                value.preferred_prefill_chunk_size(prefill_chunk_size);
+            }) {
+            const int preferred = runtime.preferred_prefill_chunk_size(
+                prefill_chunk_size);
+            if (preferred > 0 && preferred != prefill_chunk_size) {
+                prefill_chunk_size = preferred;
+                std::cout
+                    << "Metal prefill autotune: chunk_size="
+                    << prefill_chunk_size << std::endl;
+            }
+        }
+    }
     const auto allocator_cache_limit = server_cache_limit_bytes();
     mlx::core::set_cache_limit(allocator_cache_limit);
     MfqServerConfig server;
@@ -1368,13 +1332,10 @@ int serve_loaded_runtime(
         ? arguments.mfq.stem().string()
         : arguments.model_name;
     server.model_type = std::move(model_type);
-    const auto model_graph = container == nullptr
-        ? std::optional<mfq::MfqModelGraph>{}
-        : std::optional<mfq::MfqModelGraph>{
-              mfq::metal::effective_model_graph(*container)};
-    if (container != nullptr && container->contains(tokenizer_asset)) {
+    const auto model_graph = mfq::metal::effective_model_graph(container);
+    if (container.contains(tokenizer_asset)) {
         server.tokenizer_gguf =
-            container->read(tokenizer_asset);
+            container.read(tokenizer_asset);
     } else {
         server.tokenizer_model =
             arguments.tokenizer_gguf.string();
@@ -1387,26 +1348,19 @@ int serve_loaded_runtime(
     server.vocab_size = vocabulary_size;
     constexpr const char* model_config_asset =
         "__mfq_asset__/model_config.json";
-    const auto embedded = container == nullptr
-        ? std::string()
-        : [&] {
-              const auto found = container->header().extra_json.find(
-                  "runtime.sampling.v1");
-              return found == container->header().extra_json.end()
-                  ? std::string()
-                  : found->second;
-          }();
-    const auto architecture = container == nullptr
-        ? std::string("deepseek_v4")
-        : model_graph->architecture;
-    const auto model_config = container == nullptr
-        ? read_text(arguments.mfq / "config.json")
-        : container->contains(model_config_asset)
-        ? container->read_text(model_config_asset)
+    const auto embedded = [&] {
+        const auto found = container.header().extra_json.find(
+            "runtime.sampling.v1");
+        return found == container.header().extra_json.end()
+            ? std::string()
+            : found->second;
+    }();
+    const auto model_config = container.contains(model_config_asset)
+        ? container.read_text(model_config_asset)
         : std::string();
     server.runtime_profile = resolve_mfq_runtime_profile(
         arguments.mfq.string(),
-        architecture,
+        model_graph.architecture,
         server.model_type,
         server.model_name,
         embedded,
@@ -1418,11 +1372,10 @@ int serve_loaded_runtime(
         std::make_shared<std::optional<Runtime>>(
             std::move(runtime));
     const auto paged_cache_factory =
-        [container](std::int64_t context_size)
+        [&container](std::int64_t context_size)
             -> std::shared_ptr<mfq::cache::PagedPrefixCache> {
-            if (container == nullptr) return {};
             return make_metal_paged_cache<Runtime>(
-                *container, context_size);
+                container, context_size);
         };
     auto session_cache =
         std::make_shared<MlxServerTextSessionCache<Runtime>>(
@@ -1430,17 +1383,17 @@ int serve_loaded_runtime(
     auto loaded_context =
         std::make_shared<std::int64_t>(server.max_context);
     auto runtime_components = mfq::metal::make_mlx_server_components(
-        model_graph ? &*model_graph : nullptr,
+        &model_graph,
         runtime_mutex,
         runtime_holder,
         runtime_stream);
-    if (model_graph) {
+    {
         MfqModelCapabilities capabilities;
-        capabilities.family = model_graph->architecture;
+        capabilities.family = model_graph.architecture;
         capabilities.source = "model-graph";
-        capabilities.text = model_graph->has_component("text");
+        capabilities.text = model_graph.has_component("text");
         capabilities.mtp = runtime_components.mtp_available;
-        if (const auto* vision = model_graph->component("vision");
+        if (const auto* vision = model_graph.component("vision");
             vision != nullptr && runtime_components.multimodal_generate) {
             capabilities.image_input = true;
             capabilities.video_input =
@@ -1448,17 +1401,17 @@ int serve_loaded_runtime(
                 vision->input_contract == "minicpmo45.v1";
         }
         capabilities.audio_input =
-            model_graph->has_component("audio_input") &&
+            model_graph.has_component("audio_input") &&
             static_cast<bool>(runtime_components.multimodal_generate);
         capabilities.audio_output =
-            model_graph->has_component("audio_output");
+            model_graph.has_component("audio_output");
         capabilities.full_duplex =
             static_cast<bool>(runtime_components.duplex);
         server.model_capabilities = std::move(capabilities);
     }
     const MfqGenerateFn generate =
         [runtime_mutex, runtime_holder, session_cache, runtime_stream,
-         prefill_chunk_size = arguments.prefill_chunk_size](
+         prefill_chunk_size](
             const std::vector<std::int64_t>& prompt,
             const MfqSamplingParams& sampling,
             const MfqTokenCallback& callback,
@@ -1834,110 +1787,6 @@ int serve_loaded_runtime(
         });
 }
 
-int run_native_hf_server(const Arguments& arguments) {
-    if (arguments.tokenizer_gguf.empty()) {
-        throw std::runtime_error(
-            "HF model directories currently require --tokenizer-gguf PATH");
-    }
-    const auto config = mfq::metal::DeepseekV4Config::from_json(
-        read_text(arguments.mfq / "config.json"));
-    const int context = static_cast<int>(
-        std::min<std::int64_t>(
-            arguments.context_size,
-            config.max_position_embeddings));
-    auto expert_cache_bytes = requested_cache_bytes(
-        arguments.expert_cache_gb, true);
-    // V4.1's large routed pool makes the generic two-thirds-of-UMA default
-    // needlessly reserve 341 GiB on a 512-GiB Mac. A 128-GiB arena retains
-    // the complete measured 128-token working set while leaving ample UMA
-    // for a concurrent model server. Explicit CLI values still win.
-    if (config.is_v41() && !arguments.expert_cache_gb.has_value()) {
-        expert_cache_bytes = std::min(
-            expert_cache_bytes,
-            kDeepseekV41AutomaticExpertCacheLimitBytes);
-    }
-    std::size_t resident_wired_limit = 0;
-    if (expert_cache_bytes == 0) {
-        resident_wired_limit = resident_hf_wired_limit_bytes(arguments.mfq);
-        mlx::core::set_wired_limit(resident_wired_limit);
-    }
-    constexpr std::size_t prefill_buffers_minimum =
-        std::size_t{7} << 30;
-    constexpr std::size_t v41_prefill_buffers_minimum =
-        std::size_t{16} << 30;
-    const bool prefill_overlap =
-        expert_cache_bytes >= (config.is_v41()
-            ? v41_prefill_buffers_minimum
-            : prefill_buffers_minimum);
-    const auto runtime_stream = mlx::core::new_thread_unsafe_stream(
-        mlx::core::Device::gpu);
-    mlx::core::set_default_stream(runtime_stream);
-    const auto started = std::chrono::steady_clock::now();
-    std::cout
-        << "Loading native-format DeepSeek-V4 HF weights on Apple UMA: "
-        << (expert_cache_bytes == 0
-                ? "fully resident"
-                : "SSD expert streaming")
-        << (resident_wired_limit == 0
-                ? ""
-                : " (wired budget GiB=" + std::to_string(
-                      static_cast<double>(resident_wired_limit) /
-                      static_cast<double>(std::uint64_t{1} << 30)) + ")")
-        << std::endl;
-    auto runtime = mfq::metal::MlxDeepseekV4CausalLm::load_hf(
-        arguments.mfq,
-        context,
-        expert_cache_bytes,
-        8,
-        prefill_overlap);
-    runtime.prewarm_ssd_expert_arena();
-    release_model_load_staging_memory();
-    const auto load_seconds = std::chrono::duration<double>(
-        std::chrono::steady_clock::now() - started).count();
-    constexpr double gib = static_cast<double>(std::uint64_t{1} << 30);
-    std::cout
-        << "Loaded " << runtime.layer_count()
-        << " DeepSeek-V4 layers in " << load_seconds << " s"
-        << " expert_backing="
-        << (expert_cache_bytes == 0
-                ? "hf-native-resident"
-                : "hf-safetensors-ssd")
-        << " expert_cache_gib="
-        << static_cast<double>(runtime.expert_cache_limit_bytes()) / gib
-        << " prefill_double_buffer="
-        << static_cast<int>(prefill_overlap)
-        << std::endl;
-    const auto model_root = arguments.mfq;
-    const auto load_runtime =
-        [model_root, expert_cache_bytes, prefill_overlap](
-            std::int64_t requested_context) {
-            if (requested_context < 1 ||
-                requested_context > std::numeric_limits<int>::max()) {
-                throw std::invalid_argument(
-                    "Metal runtime context is out of range");
-            }
-            return mfq::metal::MlxDeepseekV4CausalLm::load_hf(
-                model_root,
-                static_cast<int>(requested_context),
-                expert_cache_bytes,
-                8,
-                prefill_overlap);
-        };
-    return serve_loaded_runtime(
-        arguments,
-        nullptr,
-        std::move(runtime),
-        load_runtime,
-        config.has_vision()
-            ? std::string(config.is_v41()
-                  ? "deepseek_v41_vision"
-                  : "deepseek_v4_vision")
-            : config.model_type,
-        config.max_position_embeddings,
-        config.vocab,
-        runtime_stream);
-}
-
 int run_native_server(
     const Arguments& arguments,
     const mfq::metal::MfqContainer& container) {
@@ -2011,7 +1860,7 @@ int run_native_server(
             };
         return serve_loaded_runtime(
             arguments,
-            &container,
+            container,
             std::move(runtime),
             load_runtime,
             config.has_vision()
@@ -2079,13 +1928,11 @@ int run_native_server(
             };
         return serve_loaded_runtime(
             arguments,
-            &container,
+            container,
             std::move(runtime),
             load_runtime,
             config.has_vision()
-                ? std::string(config.is_v41()
-                      ? "deepseek_v41_vision"
-                      : "deepseek_v4_vision")
+                ? std::string("deepseek_v4_vision")
                 : config.model_type,
             config.max_position_embeddings,
             config.vocab,
@@ -2124,7 +1971,7 @@ int run_native_server(
             };
         return serve_loaded_runtime(
             arguments,
-            &container,
+            container,
             std::move(runtime),
             load_runtime,
             "minicpmo",
@@ -2140,12 +1987,20 @@ int run_native_server(
             std::min<std::int64_t>(
                 arguments.context_size,
                 config.max_position_embeddings));
+        std::optional<std::size_t> expert_cache_bytes;
+        if (arguments.expert_cache_gb.has_value() || native_hf) {
+            const auto bytes = requested_cache_bytes(
+                arguments.expert_cache_gb, native_hf);
+            if (bytes > 0) expert_cache_bytes = bytes;
+        }
         std::cout
             << "Loading native C++/MLX Qwen4-Exp model "
                "on Apple GPU..."
             << std::endl;
         auto runtime =
-            mfq::metal::MlxQwen4CausalLm::load(container, context);
+            mfq::metal::MlxQwen4CausalLm::load(
+                container, context, expert_cache_bytes);
+        runtime.prewarm_ssd_expert_arena();
         release_model_load_staging_memory();
         const auto load_seconds = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - started).count();
@@ -2153,9 +2008,14 @@ int run_native_server(
             << "Loaded " << runtime.layer_count()
             << " Qwen4-Exp layers in "
             << load_seconds << " s; runtime=native-cpp"
+            << " expert_backing="
+            << (expert_cache_bytes.has_value()
+                    ? "mfe-ssd"
+                    : "full-resident")
             << std::endl;
         const auto load_runtime =
-            [&container](std::int64_t requested_context) {
+            [&container, expert_cache_bytes](
+                std::int64_t requested_context) {
                 if (requested_context < 1 ||
                     requested_context > std::numeric_limits<int>::max()) {
                     throw std::invalid_argument(
@@ -2163,11 +2023,12 @@ int run_native_server(
                 }
                 return mfq::metal::MlxQwen4CausalLm::load(
                     container,
-                    static_cast<int>(requested_context));
+                    static_cast<int>(requested_context),
+                    expert_cache_bytes);
             };
         return serve_loaded_runtime(
             arguments,
-            &container,
+            container,
             std::move(runtime),
             load_runtime,
             config.text_model_type.empty()
@@ -2207,7 +2068,7 @@ int run_native_server(
         };
     return serve_loaded_runtime(
         arguments,
-        &container,
+        container,
         std::move(runtime),
         load_runtime,
         config.text_model_type.empty()
@@ -2239,28 +2100,6 @@ int main(int argc, char** argv) {
                 usage_error("--mfq is required");
             }
             return EXIT_SUCCESS;
-        }
-
-        // Raw Hugging Face DeepSeek checkpoints use the M3 Ultra tuned path:
-        // native Safetensors streaming, SSD Engram, and the exact fused HC
-        // kernels. Converted MFQ containers continue through the portable
-        // architecture-specific runtimes below.
-        if (std::filesystem::is_directory(arguments.mfq)) {
-            if (arguments.server) {
-                configure_mlx_metal();
-#ifdef MFQ_METAL_SERVER
-                const auto config_path = arguments.mfq / "config.json";
-                const auto config = nlohmann::json::parse(read_text(config_path));
-                const auto model_type = config.value("model_type", std::string{});
-                if (model_type.rfind("deepseek_v4", 0) == 0) {
-                    return run_native_hf_server(arguments);
-                }
-#else
-                throw std::runtime_error(
-                    "this build has no C++ server support; configure with "
-                    "-DMFQ_BUILD_CPP_SERVER=ON");
-#endif
-            }
         }
 
         const mfq::metal::MfqContainer model(arguments.mfq);

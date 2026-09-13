@@ -29,6 +29,7 @@ from mfq.architectures.tensor_schema import (
     TensorComponent,
     graph_spec_for_plan,
     map_source_tensor_name,
+    source_runtime_assets,
     tensor_schema_for_config,
     topology_from_config,
 )
@@ -42,18 +43,14 @@ from mfq.calibration.artifact import (
 from mfq.formats.assets import (
     ASSET_DTYPE,
     ASSET_MANIFEST_KEY,
-    DEEPSEEK_V41_ENGRAM_ASSET,
     HF_TOKENIZER_JSON_ASSET,
-    MINICPMO45_RESAMPLER_POS_EMBED_ASSET,
     MODEL_CONFIG_ASSET,
     MODEL_GRAPH_ASSET,
     TOKENIZER_GGUF_ASSET,
     RuntimeAsset,
-    deepseek_v41_engram_asset,
     gguf_metadata_asset,
     hf_runtime_assets,
     is_asset_record,
-    minicpmo45_resampler_pos_embed_asset,
     model_config_asset,
     model_graph_asset,
     runtime_asset_manifest,
@@ -73,6 +70,11 @@ from mfq.formats.io import (
     pack_bits,
 )
 from mfq.formats.mx import mx_header_bytes
+from mfq.formats.fp8_sq import (
+    FP8_128SQ_DTYPE,
+    MXFP8_SQ_DTYPE,
+    fp8_sq_blob_nbytes,
+)
 from mfq.formats.nepq import (
     _FLAG_ROTATED as _NEPQ_FLAG_ROTATED,
 )
@@ -108,6 +110,13 @@ from mfq.formats.nint import (
     NINT_K_SELECTOR_BITS,
     NINT_Q_SELECTOR_BITS,
     NintSpec,
+    metadata_envelope_spec,
+    normalize_row_q_bits,
+    normalize_row_sub_bits,
+)
+from mfq.formats.nint8_zero import (
+    pack_nint8_zero_header,
+    payload_nbytes as nint8_zero_payload_nbytes,
 )
 from mfq.formats.compat import NINT_DTYPE, canonical_dtype
 from mfq.formats.npq0_l import (
@@ -228,6 +237,8 @@ from mfq.quantize.expert_nint import (
 )
 from mfq.quantize.imatrix import ImportanceMatrix, load_importance_matrix
 from mfq.quantize.mxfp import decode_e8m0, decode_mxfp4
+from mfq.quantize.mxfp4_sq import mxfp4_sq_blob_nbytes, write_mxfp4_sq_blob
+from mfq.quantize.fp8_sq import write_fp8_128_sq_blob, write_mxfp8_sq_blob
 from mfq.quantize.nepq import NepqQuantConfig, quantize_nepq_fixed
 from mfq.quantize.nepq_a import (
     NepqAArtifact,
@@ -280,12 +291,18 @@ class TensorPlan:
     source_quantization: str | None = None
     source_scale_name: str | None = None
     source_scale_shard: str | None = None
+    source_scale_dtype: str | None = None
     expert_source_names: tuple[tuple[str, ...], ...] | None = None
     expert_source_shards: tuple[tuple[str, ...], ...] | None = None
     expert_source_quantizations: tuple[tuple[str | None, ...], ...] | None = None
     expert_source_scale_names: tuple[tuple[str | None, ...], ...] | None = None
     expert_source_scale_shards: tuple[tuple[str | None, ...], ...] | None = None
+    expert_source_scale_dtypes: tuple[tuple[str | None, ...], ...] | None = None
     precision_locked: bool = False
+    target_options: tuple[tuple[str, str | int | float | bool], ...] = ()
+
+    def target_option(self, name: str, default=None):
+        return dict(self.target_options).get(name, default)
 
     @property
     def expert_specs(self) -> tuple[NintSpec, ...] | None:
@@ -612,6 +629,105 @@ class _ScaledFp8TensorSlice:
         return self.read_rows(start, end)
 
 
+def _raw_scale_array(source: _RawSafeTensorSlice) -> np.ndarray:
+    value = source.tensor().contiguous().cpu()
+    if source.dtype_name == "F8_E8M0":
+        return np.ascontiguousarray(value.numpy(), dtype=np.uint8)
+    if source.dtype_name == "BF16":
+        return np.ascontiguousarray(value.view(torch.uint16).numpy(), dtype="<u2")
+    if source.dtype_name == "F16":
+        return np.ascontiguousarray(value.numpy(), dtype="<f2")
+    if source.dtype_name == "F32":
+        return np.ascontiguousarray(value.numpy(), dtype="<f4")
+    raise TypeError(f"unsupported native FP8 scale storage: {source.dtype_name}")
+
+
+def _write_fp8_sq_readers(
+    readers: Sequence[_ScaledFp8TensorSlice],
+    output_path: str | Path,
+    *,
+    q: int,
+    neuron_importance: np.ndarray | None = None,
+) -> int:
+    """Write one matrix-local FP8-SQ tensor from exact source segments."""
+
+    if not readers:
+        raise ValueError("FP8-SQ needs at least one native source segment")
+    contracts = [
+        _fp8_sq_contract(reader.scheme, reader.scale_source.dtype_name)
+        for reader in readers
+    ]
+    if any(contract is None for contract in contracts):
+        raise TypeError("FP8-SQ requires native E4M3 block-scale source storage")
+    resolved = [contract for contract in contracts if contract is not None]
+    if any(contract != resolved[0] for contract in resolved[1:]):
+        raise ValueError("FP8-SQ source segments use incompatible scale contracts")
+    family, block_shape = resolved[0]
+    block_rows, block_columns = block_shape
+    columns = readers[0].columns
+    encoded_parts: list[np.ndarray] = []
+    scale_parts: list[np.ndarray] = []
+    logical_rows = 0
+    scale_dtype = readers[0].scale_source.dtype_name
+    for reader in readers:
+        if reader.weight.dtype_name != "F8_E4M3" or reader.columns != columns:
+            raise ValueError("FP8-SQ source segments must be equal-width E4M3 matrices")
+        if reader.scale_source.dtype_name != scale_dtype:
+            raise ValueError("FP8-SQ source segments use different scale dtypes")
+        if logical_rows and logical_rows % block_rows:
+            raise ValueError(
+                "FP8-SQ concatenation boundary must align to the source scale rows"
+            )
+        raw = (
+            reader.weight.read_rows(0, reader.rows, device="cpu")
+            .contiguous()
+            .view(torch.uint8)
+            .numpy()
+        )
+        encoded_parts.append(np.ascontiguousarray(raw, dtype=np.uint8))
+        scale = _raw_scale_array(reader.scale_source)
+        expected_scale_shape = (
+            math.ceil(reader.rows / block_rows),
+            math.ceil(columns / block_columns),
+        )
+        if tuple(scale.shape) != expected_scale_shape:
+            raise ValueError(
+                f"FP8-SQ source scale shape differs: {scale.shape} != {expected_scale_shape}"
+            )
+        scale_parts.append(scale)
+        logical_rows += reader.rows
+    encoded = (
+        encoded_parts[0]
+        if len(encoded_parts) == 1
+        else np.concatenate(encoded_parts, axis=0)
+    )
+    scales = (
+        scale_parts[0]
+        if len(scale_parts) == 1
+        else np.concatenate(scale_parts, axis=0)
+    )
+    expected_rows = math.ceil(logical_rows / block_rows)
+    if scales.shape[0] != expected_rows:
+        raise ValueError("FP8-SQ concatenated scale rows do not describe the matrix")
+    if family == MXFP8_SQ_DTYPE:
+        return write_mxfp8_sq_blob(
+            output_path,
+            encoded,
+            scales,
+            block_shape=block_shape,
+            row_q_bits=q,
+            neuron_importance=neuron_importance,
+        )
+    return write_fp8_128_sq_blob(
+        output_path,
+        encoded,
+        scales,
+        row_q_bits=q,
+        scale_dtype=scale_dtype,
+        neuron_importance=neuron_importance,
+    )
+
+
 class _Mxfp4TensorSlice:
     """Expose packed E2M1/E8M0 storage as one logical floating matrix."""
 
@@ -744,6 +860,7 @@ class _SourceQuantization:
     scheme: str
     scale_name: str
     scale_shard: str
+    scale_dtype: str
     logical_shape: tuple[int, ...] | None = None
     logical_dtype: str | None = None
 
@@ -803,6 +920,7 @@ def _source_quantization(
                 "mxfp4_block32",
                 scale_name,
                 scale.shard,
+                scale.dtype,
                 logical_shape=logical_shape,
                 logical_dtype="MXFP4",
             )
@@ -866,7 +984,12 @@ def _source_quantization(
                 raise ValueError(
                     f"float8 block scale has unsupported dtype for {name}: {block_scale.dtype}"
                 )
-            return _SourceQuantization(scheme, scale_name, block_scale.shard)
+            return _SourceQuantization(
+                scheme,
+                scale_name,
+                block_scale.shard,
+                block_scale.dtype,
+            )
         if int(np.prod(block_scale.shape)) == 1:
             if block_scale.dtype not in {"BF16", "F16", "F32", "F8_E8M0"}:
                 raise ValueError(
@@ -876,6 +999,7 @@ def _source_quantization(
                 "fp8_tensor_scale",
                 scale_name,
                 block_scale.shard,
+                block_scale.dtype,
             )
     tensor_scale_names: list[str] = []
     ngram_match = re.match(r"^(.+\.ngram_embedding)\.shard_\d+\.weight$", name)
@@ -902,6 +1026,7 @@ def _source_quantization(
             "fp8_tensor_scale",
             scale_name,
             scale.shard,
+            scale.dtype,
         )
     raise ValueError(f"float8 HF tensor has no supported scale multiplier: {name}")
 
@@ -1059,7 +1184,10 @@ _TENSOR_OVERRIDE_DTYPES = frozenset(
 
 
 def _is_compact_dtype(dtype: str) -> bool:
-    return dtype.startswith(("NINT", "NVQ")) or dtype == "NPQ0-L"
+    return (
+        dtype.startswith(("NINT", "NVQ"))
+        or dtype in {"NPQ0-L", MXFP8_SQ_DTYPE, FP8_128SQ_DTYPE}
+    )
 
 
 _NATIVE_SOURCE_BITS = {"MXFP4": 4.0, "MXFP8": 8.0}
@@ -1112,6 +1240,10 @@ def _validate_native_source_precision(plan: Sequence[TensorPlan]) -> None:
             if family == item.source_dtype:
                 # Exact native preservation is lossless and does not pretend
                 # to recover precision absent from the source checkpoint.
+                continue
+            if family == "MXFP4-SQ" and item.source_dtype == "MXFP4":
+                # q=1--3 are compressed native-output transcodes and q=4 is
+                # the exact MXFP4 endpoint inside the same logical format.
                 continue
             target_bits = _compact_family_bits(family)
             # A dense target is a faithful materialization of native values,
@@ -2289,6 +2421,160 @@ def _apply_balanced_random_expert_mix(
     return result
 
 
+def _apply_native_mxfp4_expert_sq(
+    plan: list[TensorPlan],
+    mode: str,
+) -> list[TensorPlan]:
+    """Apply a uniform q preset to native-MXFP4 routed-expert tensors."""
+
+    if mode == "preserve":
+        return plan
+    if not re.fullmatch(r"sq[1-4]", mode):
+        raise ValueError(f"unsupported native MXFP4 expert SQ mode: {mode}")
+    q = int(mode[-1])
+    replacement = ExpertPrecision(
+        family="MXFP4-SQ",
+        options=(("q", q),),
+    )
+    result: list[TensorPlan] = []
+    for item in plan:
+        if (
+            item.target_dtype != "MFE"
+            or item.expert_precisions is None
+            or item.source_dtype != "MXFP4"
+        ):
+            result.append(item)
+            continue
+        result.append(
+            replace(
+                item,
+                target_spec=None,
+                expert_precisions=(replacement,) * len(item.expert_precisions),
+            )
+        )
+    return result
+
+
+def _fp8_sq_contract(
+    scheme: str | None,
+    scale_dtype: str | None,
+) -> tuple[str, tuple[int, int]] | None:
+    """Resolve a native E4M3 source contract to one public FP8-SQ family."""
+
+    match = re.fullmatch(r"mxfp8_block(\d+)(?:x(\d+))?", scheme or "")
+    if match is not None and scale_dtype == "F8_E8M0":
+        block = (int(match.group(1)), int(match.group(2) or match.group(1)))
+        if block in {(1, 32), (32, 32), (128, 128)}:
+            return MXFP8_SQ_DTYPE, block
+        return None
+    match = re.fullmatch(r"fp8_block(\d+)(?:x(\d+))?_inv", scheme or "")
+    if match is not None and scale_dtype in {"BF16", "F16", "F32"}:
+        block = (int(match.group(1)), int(match.group(2) or match.group(1)))
+        if block == (128, 128):
+            return FP8_128SQ_DTYPE, block
+    return None
+
+
+def _fp8_sq_precision(
+    family: str,
+    block_shape: tuple[int, int],
+    scale_dtype: str,
+    q: int,
+) -> ExpertPrecision:
+    return ExpertPrecision(
+        family=family,
+        options=(
+            ("block_columns", int(block_shape[1])),
+            ("block_rows", int(block_shape[0])),
+            ("q", int(q)),
+            ("scale_dtype", scale_dtype),
+        ),
+    )
+
+
+def _apply_native_fp8_sq(
+    plan: list[TensorPlan],
+    mode: str,
+) -> list[TensorPlan]:
+    """Transcode eligible native E4M3 matrices without architecture branches."""
+
+    if mode == "preserve":
+        return plan
+    if not re.fullmatch(r"sq[1-8]", mode):
+        raise ValueError(f"unsupported native FP8 SQ mode: {mode}")
+    q = int(mode[-1])
+    result: list[TensorPlan] = []
+    for item in plan:
+        if item.precision_locked or item.source_dtype != "F8_E4M3":
+            result.append(item)
+            continue
+        if item.target_dtype == "MFE" and item.expert_precisions is not None:
+            schemes = item.expert_source_quantizations
+            scale_dtypes = item.expert_source_scale_dtypes
+            if schemes is None or scale_dtypes is None:
+                result.append(item)
+                continue
+            replacements: list[ExpertPrecision] = []
+            changed = False
+            for existing, expert_schemes, expert_scale_dtypes in zip(
+                item.expert_precisions,
+                schemes,
+                scale_dtypes,
+                strict=True,
+            ):
+                contracts = [
+                    _fp8_sq_contract(scheme, scale_dtype)
+                    for scheme, scale_dtype in zip(
+                        expert_schemes,
+                        expert_scale_dtypes,
+                        strict=True,
+                    )
+                ]
+                if not contracts or any(value is None for value in contracts):
+                    replacements.append(existing)
+                    continue
+                resolved = [value for value in contracts if value is not None]
+                if any(value != resolved[0] for value in resolved[1:]):
+                    raise ValueError(
+                        f"one expert mixes incompatible native FP8 contracts: {item.name}"
+                    )
+                family, block = resolved[0]
+                scale_dtype = str(expert_scale_dtypes[0])
+                replacements.append(_fp8_sq_precision(family, block, scale_dtype, q))
+                changed = True
+            result.append(
+                replace(item, expert_precisions=tuple(replacements)) if changed else item
+            )
+            continue
+        contract = _fp8_sq_contract(item.source_quantization, item.source_scale_dtype)
+        if (
+            contract is None
+            or len(item.shape) != 2
+            or item.row_start is not None
+            or item.row_end is not None
+            or item.transform is not None
+        ):
+            result.append(item)
+            continue
+        family, block = contract
+        result.append(
+            replace(
+                item,
+                target_dtype=family,
+                target_spec=None,
+                expert_shape=None,
+                expert_precisions=None,
+                target_options=(
+                    ("block_columns", int(block[1])),
+                    ("block_rows", int(block[0])),
+                    ("q", q),
+                    ("scale_dtype", str(item.source_scale_dtype)),
+                ),
+            )
+        )
+    return result
+
+
 def _apply_standard_preset(
     plan: list[TensorPlan],
     preset: str,
@@ -2661,16 +2947,24 @@ def _separate_hf_expert_plans(
         tuple[tuple[str | None, ...], ...],
         tuple[tuple[str | None, ...], ...],
         tuple[tuple[str | None, ...], ...],
+        tuple[tuple[str | None, ...], ...],
     ]:
         schemes: list[tuple[str | None, ...]] = []
         scale_names: list[tuple[str | None, ...]] = []
         scale_shards: list[tuple[str | None, ...]] = []
+        scale_dtypes: list[tuple[str | None, ...]] = []
         for names in tuples:
             values = [source_quantizations.get(name) for name in names]
             schemes.append(tuple(value.scheme if value else None for value in values))
             scale_names.append(tuple(value.scale_name if value else None for value in values))
             scale_shards.append(tuple(value.scale_shard if value else None for value in values))
-        return tuple(schemes), tuple(scale_names), tuple(scale_shards)
+            scale_dtypes.append(tuple(value.scale_dtype if value else None for value in values))
+        return (
+            tuple(schemes),
+            tuple(scale_names),
+            tuple(scale_shards),
+            tuple(scale_dtypes),
+        )
 
     for prefix, experts in sorted(groups.items()):
         preserve_source = (
@@ -2731,9 +3025,13 @@ def _separate_hf_expert_plans(
         gate_target = prefix + ".gate.weight"
         up_target = prefix + ".up.weight"
         down_target = prefix + ".down.weight"
-        gate_q, gate_scale_names, gate_scale_shards = source_fields(gate_names)
-        up_q, up_scale_names, up_scale_shards = source_fields(up_names)
-        down_q, down_scale_names, down_scale_shards = source_fields(down_names)
+        gate_q, gate_scale_names, gate_scale_shards, gate_scale_dtypes = source_fields(
+            gate_names
+        )
+        up_q, up_scale_names, up_scale_shards, up_scale_dtypes = source_fields(up_names)
+        down_q, down_scale_names, down_scale_shards, down_scale_dtypes = source_fields(
+            down_names
+        )
 
         def target_fields(
             names: list[tuple[str, ...]],
@@ -2792,6 +3090,7 @@ def _separate_hf_expert_plans(
                     expert_source_quantizations=gate_q,
                     expert_source_scale_names=gate_scale_names,
                     expert_source_scale_shards=gate_scale_shards,
+                    expert_source_scale_dtypes=gate_scale_dtypes,
                     **target_fields(gate_names, gate_target, projection_shape),
                 ),
                 TensorPlan(
@@ -2805,6 +3104,7 @@ def _separate_hf_expert_plans(
                     expert_source_quantizations=up_q,
                     expert_source_scale_names=up_scale_names,
                     expert_source_scale_shards=up_scale_shards,
+                    expert_source_scale_dtypes=up_scale_dtypes,
                     **target_fields(up_names, up_target, projection_shape),
                 ),
                 TensorPlan(
@@ -2818,6 +3118,7 @@ def _separate_hf_expert_plans(
                     expert_source_quantizations=down_q,
                     expert_source_scale_names=down_scale_names,
                     expert_source_scale_shards=down_scale_shards,
+                    expert_source_scale_dtypes=down_scale_dtypes,
                     **target_fields(down_names, down_target, down_shape),
                 ),
             )
@@ -2928,6 +3229,9 @@ def _glm5_next_mla_derived_plans(
             ),
             "source_scale_shard": (
                 source_quantization.scale_shard if source_quantization is not None else None
+            ),
+            "source_scale_dtype": (
+                source_quantization.scale_dtype if source_quantization is not None else None
             ),
         }
         for suffix, transform, shape in (
@@ -3350,6 +3654,11 @@ def _plan(
                             if source_quantization is not None
                             else None
                         ),
+                        source_scale_dtype=(
+                            source_quantization.scale_dtype
+                            if source_quantization is not None
+                            else None
+                        ),
                     )
                 )
                 out.append(
@@ -3375,6 +3684,11 @@ def _plan(
                         ),
                         source_scale_shard=(
                             source_quantization.scale_shard
+                            if source_quantization is not None
+                            else None
+                        ),
+                        source_scale_dtype=(
+                            source_quantization.scale_dtype
                             if source_quantization is not None
                             else None
                         ),
@@ -3427,6 +3741,9 @@ def _plan(
                     ),
                     source_scale_shard=(
                         source_quantization.scale_shard if source_quantization is not None else None
+                    ),
+                    source_scale_dtype=(
+                        source_quantization.scale_dtype if source_quantization is not None else None
                     ),
                 )
             )
@@ -3774,6 +4091,8 @@ def _write_nint_axis0_blob(
     neuron_importance_rows=None,
     nint_data_free: bool = False,
     synthetic: bool = False,
+    row_q_bits: np.ndarray | None = None,
+    row_sub_bits: np.ndarray | None = None,
 ) -> int:
     if len(shape) != 2:
         raise ValueError(f"NINT stream writer only supports 2D tensors, got {shape}")
@@ -3781,10 +4100,12 @@ def _write_nint_axis0_blob(
     gs = int(spec.groupsize)
     ng = (neuron_len + gs - 1) // gs
     scale_nbytes = out * np.dtype(np.float16).itemsize
-    q_nbytes = (out * ng * gs * spec.bits + 7) // 8
-    row_q_bits = None
-    row_sub_bits = None
-    if (nint_data_free or neuron_importance_rows is not None) and not synthetic:
+    if (row_q_bits is None) != (row_sub_bits is None):
+        raise ValueError("NINT row q/k metadata must be supplied together")
+    if row_q_bits is not None:
+        row_q_bits = normalize_row_q_bits(spec, row_q_bits, out)
+        row_sub_bits = normalize_row_sub_bits(spec, row_sub_bits, out)
+    elif (nint_data_free or neuron_importance_rows is not None) and not synthetic:
         allocation = _allocate_nint_v2_rows(
             sl,
             (out, neuron_len),
@@ -4025,6 +4346,7 @@ class _SeparateExpertRowSource:
         source_quantizations: tuple[tuple[str | None, ...], ...] | None = None,
         source_scale_names: tuple[tuple[str | None, ...], ...] | None = None,
         source_scale_shards: tuple[tuple[str | None, ...], ...] | None = None,
+        source_scale_dtypes: tuple[tuple[str | None, ...], ...] | None = None,
     ) -> None:
         self.root = root
         self.n_experts, self.rows_per_expert, self.columns = expert_shape
@@ -4036,10 +4358,12 @@ class _SeparateExpertRowSource:
         self.source_quantizations = source_quantizations or empty
         self.source_scale_names = source_scale_names or empty
         self.source_scale_shards = source_scale_shards or empty
+        self.source_scale_dtypes = source_scale_dtypes or empty
         for values in (
             self.source_quantizations,
             self.source_scale_names,
             self.source_scale_shards,
+            self.source_scale_dtypes,
         ):
             if len(values) != self.n_experts or any(
                 len(row) != len(names) for row, names in zip(values, source_names, strict=True)
@@ -4167,6 +4491,91 @@ class _SeparateExpertRowSource:
                 for index in range(len(self.source_names[expert])):
                     self._copy_raw_payload(readers[(expert, index)].scale_source, output)
         return target.stat().st_size
+
+    def write_mxfp4_sq_expert_pool(
+        self,
+        expert: int,
+        output_path: str | Path,
+        *,
+        q: int,
+    ) -> int:
+        """Encode one exact native-MXFP4 expert with a uniform SQ q preset."""
+
+        expert = int(expert)
+        if expert < 0 or expert >= self.n_experts:
+            raise IndexError("MXFP4-SQ expert pool contains an invalid expert ID")
+        packed_parts: list[np.ndarray] = []
+        scale_parts: list[np.ndarray] = []
+        logical_rows = 0
+        for index in range(len(self.source_names[expert])):
+            reader = self._source(expert, index)
+            if not isinstance(reader, _Mxfp4TensorSlice):
+                raise TypeError("MXFP4-SQ requires native MXFP4 source storage")
+            if reader.columns != self.columns:
+                raise ValueError(
+                    f"MXFP4-SQ expert width differs: {reader.columns} != {self.columns}"
+                )
+            packed_parts.append(
+                reader.weight.read_rows(0, reader.rows, device="cpu")
+                .view(torch.uint8)
+                .contiguous()
+                .numpy()
+            )
+            scale_parts.append(
+                reader.scale_source.read_rows(0, reader.rows, device="cpu")
+                .view(torch.uint8)
+                .contiguous()
+                .numpy()
+            )
+            logical_rows += reader.rows
+        if logical_rows != self.rows_per_expert:
+            raise ValueError(
+                f"MXFP4-SQ expert rows differ: {logical_rows} != {self.rows_per_expert}"
+            )
+        packed = packed_parts[0] if len(packed_parts) == 1 else np.concatenate(packed_parts)
+        scales = scale_parts[0] if len(scale_parts) == 1 else np.concatenate(scale_parts)
+        return write_mxfp4_sq_blob(
+            output_path,
+            packed,
+            scales,
+            row_q_bits=q,
+        )
+
+    def write_fp8_sq_expert_pool(
+        self,
+        expert: int,
+        output_path: str | Path,
+        *,
+        q: int,
+        neuron_importance: np.ndarray | None = None,
+    ) -> int:
+        """Encode one exact native E4M3 expert under its scale contract."""
+
+        expert = int(expert)
+        if expert < 0 or expert >= self.n_experts:
+            raise IndexError("FP8-SQ expert pool contains an invalid expert ID")
+        readers: list[_ScaledFp8TensorSlice] = []
+        logical_rows = 0
+        for index in range(len(self.source_names[expert])):
+            reader = self._source(expert, index)
+            if not isinstance(reader, _ScaledFp8TensorSlice):
+                raise TypeError("FP8-SQ requires native E4M3 block-scale storage")
+            if reader.columns != self.columns:
+                raise ValueError(
+                    f"FP8-SQ expert width differs: {reader.columns} != {self.columns}"
+                )
+            readers.append(reader)
+            logical_rows += reader.rows
+        if logical_rows != self.rows_per_expert:
+            raise ValueError(
+                f"FP8-SQ expert rows differ: {logical_rows} != {self.rows_per_expert}"
+            )
+        return _write_fp8_sq_readers(
+            readers,
+            output_path,
+            q=q,
+            neuron_importance=neuron_importance,
+        )
 
     def read_rows(
         self,
@@ -4309,7 +4718,129 @@ def _transform_glm_kv_b(source: torch.Tensor, item: TensorPlan) -> torch.Tensor:
     raise ValueError(f"unknown GLM kv_b transform: {item.transform}")
 
 
-def _write_nint_moe_axis0_blob(
+@dataclass(frozen=True)
+class _NintPoolPlan:
+    spec: NintSpec
+    expert_ids: tuple[int, ...]
+    row_q_bits: np.ndarray | None = None
+    row_sub_bits: np.ndarray | None = None
+    use_importance: bool = True
+
+
+@dataclass(frozen=True)
+class _MfePoolPlan:
+    precision: ExpertPrecision
+    expert_ids: tuple[int, ...]
+    row_q_bits: np.ndarray | None = None
+    row_sub_bits: np.ndarray | None = None
+    use_importance: bool = True
+
+
+_MATRIX_LOCAL_SQ_FAMILIES = frozenset(
+    {"MXFP4-SQ", MXFP8_SQ_DTYPE, FP8_128SQ_DTYPE}
+)
+
+
+def _uniform_nint_pool_plans(
+    expert_specs: tuple[NintSpec, ...],
+    rows_per_expert: int,
+    *,
+    split_importance_class: bool = False,
+    expert_ids: tuple[int, ...] | None = None,
+) -> tuple[_NintPoolPlan, ...]:
+    """Group q/k presets into the fewest compatible fixed-g NINT payloads."""
+
+    ids = tuple(range(len(expert_specs))) if expert_ids is None else expert_ids
+    if len(ids) != len(expert_specs):
+        raise ValueError("NINT pool planner expert IDs do not match its specs")
+    grouped: dict[tuple[int, bool], list[tuple[int, NintSpec]]] = {}
+    for expert, spec in zip(ids, expert_specs, strict=True):
+        key = (
+            int(spec.groupsize),
+            bool(split_importance_class and int(spec.bits) not in {2, 3, 4, 5, 6}),
+        )
+        grouped.setdefault(key, []).append((expert, spec))
+
+    plans: list[_NintPoolPlan] = []
+    for grouped_key, entries in grouped.items():
+        remaining = sorted(entries, key=lambda item: (int(item[1].sub_bits), item[0]))
+        while remaining:
+            minimum_k = int(remaining[0][1].sub_bits)
+            selected = [
+                item for item in remaining
+                if int(item[1].sub_bits) <= minimum_k + (1 << NINT_K_SELECTOR_BITS) - 1
+            ]
+            selected_ids = {expert for expert, _ in selected}
+            remaining = [item for item in remaining if item[0] not in selected_ids]
+            selected.sort(key=lambda item: item[0])
+            selected_experts = tuple(expert for expert, _ in selected)
+            q_per_expert = np.asarray(
+                [int(spec.bits) for _, spec in selected], dtype=np.uint8
+            )
+            k_per_expert = np.asarray(
+                [int(spec.sub_bits) for _, spec in selected], dtype=np.uint8
+            )
+            plans.append(
+                _NintPoolPlan(
+                    spec=metadata_envelope_spec(
+                        selected[0][1].groupsize,
+                        q_per_expert,
+                        k_per_expert,
+                    ),
+                    expert_ids=selected_experts,
+                    row_q_bits=np.repeat(q_per_expert, int(rows_per_expert)),
+                    row_sub_bits=np.repeat(k_per_expert, int(rows_per_expert)),
+                    use_importance=not grouped_key[1],
+                )
+            )
+    return tuple(sorted(plans, key=lambda plan: min(plan.expert_ids)))
+
+
+def _uniform_mfe_pool_plans(
+    expert_precisions: tuple[ExpertPrecision, ...],
+    rows_per_expert: int,
+    *,
+    split_importance_class: bool = False,
+) -> tuple[_MfePoolPlan, ...]:
+    exact: dict[ExpertPrecision, list[int]] = {}
+    nint_ids: list[int] = []
+    nint_specs: list[NintSpec] = []
+    for expert, precision in enumerate(expert_precisions):
+        if precision.nint_spec is None:
+            exact.setdefault(precision, []).append(expert)
+        else:
+            nint_ids.append(expert)
+            nint_specs.append(precision.nint_spec)
+    plans = [
+        _MfePoolPlan(precision, tuple(experts))
+        for precision, experts in exact.items()
+        if precision.family not in _MATRIX_LOCAL_SQ_FAMILIES
+    ]
+    for precision, experts in exact.items():
+        if precision.family in _MATRIX_LOCAL_SQ_FAMILIES:
+            plans.extend(
+                _MfePoolPlan(precision, (expert,)) for expert in experts
+            )
+    if nint_specs:
+        for nint in _uniform_nint_pool_plans(
+            tuple(nint_specs),
+            rows_per_expert,
+            split_importance_class=split_importance_class,
+            expert_ids=tuple(nint_ids),
+        ):
+            plans.append(
+                _MfePoolPlan(
+                    ExpertPrecision(NINT_DTYPE, nint_spec=nint.spec),
+                    nint.expert_ids,
+                    nint.row_q_bits,
+                    nint.row_sub_bits,
+                    nint.use_importance,
+                )
+            )
+    return tuple(sorted(plans, key=lambda plan: min(plan.expert_ids)))
+
+
+def _write_mfe_nint_axis0_blob(
     source,
     source_shape: tuple[int, ...],
     expert_shape: tuple[int, int, int],
@@ -4328,9 +4859,30 @@ def _write_nint_moe_axis0_blob(
     n_experts, rows_per_expert, columns = expert_shape
     if len(expert_specs) != n_experts:
         raise ValueError(f"received {len(expert_specs)} expert specs for {n_experts} experts")
-    cohorts: dict[NintSpec, list[int]] = {}
-    for expert, profile in enumerate(expert_specs):
-        cohorts.setdefault(profile, []).append(expert)
+    adaptive_rows = bool(
+        not synthetic and (nint_data_free or neuron_importance is not None)
+    )
+    if adaptive_rows:
+        cohorts: list[_NintPoolPlan] = []
+        exact: dict[NintSpec, list[int]] = {}
+        for expert, profile in enumerate(expert_specs):
+            exact.setdefault(profile, []).append(expert)
+        cohorts.extend(
+            _NintPoolPlan(
+                profile,
+                tuple(experts),
+                use_importance=int(profile.bits) in {2, 3, 4, 5, 6},
+            )
+            for profile, experts in exact.items()
+        )
+    else:
+        cohorts = list(
+            _uniform_nint_pool_plans(
+                expert_specs,
+                rows_per_expert,
+                split_importance_class=importance is not None,
+            )
+        )
     all_neuron_importance = None
     if neuron_importance is not None:
         all_neuron_importance = (
@@ -4354,8 +4906,9 @@ def _write_nint_moe_axis0_blob(
                     len(cohorts),
                 )
             )
-            for pool_index, (profile, expert_list) in enumerate(cohorts.items()):
-                expert_ids = tuple(int(value) for value in expert_list)
+            for pool_index, plan in enumerate(cohorts):
+                profile = plan.spec
+                expert_ids = plan.expert_ids
                 if importance is None:
                     pool_importance = None
                 else:
@@ -4429,7 +4982,7 @@ def _write_nint_moe_axis0_blob(
                     row_chunk,
                     quant_backend,
                     device,
-                    importance_rows=(importance_rows if profile.bits in {2, 3, 4, 5, 6} else None),
+                    importance_rows=(importance_rows if plan.use_importance else None),
                     neuron_importance_rows=(
                         neuron_importance_rows
                         if pool_neuron_importance is not None
@@ -4437,6 +4990,8 @@ def _write_nint_moe_axis0_blob(
                     ),
                     nint_data_free=nint_data_free,
                     synthetic=synthetic,
+                    row_q_bits=plan.row_q_bits,
+                    row_sub_bits=plan.row_sub_bits,
                 )
                 dtype = _nint_blob_public_dtype(pool_path).encode("ascii")
                 output.write(
@@ -5057,6 +5612,21 @@ def _write_synthetic_mxfp4_axis0_blob(
     return int(size)
 
 
+def _write_synthetic_nint8_zero_axis0_blob(
+    shape: tuple[int, int],
+    blob_path: Path,
+) -> int:
+    """Write a structurally valid all-zero NINT8-0 matrix for performance tests."""
+
+    rows, columns = (int(value) for value in shape)
+    header = pack_nint8_zero_header((rows, columns), 0, columns)
+    size = nint8_zero_payload_nbytes((rows, columns), 0, columns)
+    with blob_path.open("wb+") as output:
+        output.write(header)
+        output.truncate(size)
+    return int(size)
+
+
 def _write_mixed_moe_axis0_blob(
     source,
     source_shape: tuple[int, ...],
@@ -5109,7 +5679,7 @@ def _write_mixed_moe_axis0_blob(
         ).reshape(n_experts, rows_per_expert)
     if all(value.nint_spec is not None for value in expert_precisions):
         specs = tuple(value.nint_spec for value in expert_precisions if value.nint_spec is not None)
-        return _write_nint_moe_axis0_blob(
+        return _write_mfe_nint_axis0_blob(
             source,
             source_shape,
             expert_shape,
@@ -5124,9 +5694,39 @@ def _write_mixed_moe_axis0_blob(
             synthetic=synthetic,
         )
 
-    cohorts: dict[ExpertPrecision, list[int]] = {}
-    for expert, precision in enumerate(expert_precisions):
-        cohorts.setdefault(precision, []).append(expert)
+    adaptive_nint_rows = bool(
+        not synthetic and (nint_data_free or neuron_importance_array is not None)
+    )
+    if adaptive_nint_rows:
+        exact_cohorts: dict[ExpertPrecision, list[int]] = {}
+        for expert, precision in enumerate(expert_precisions):
+            exact_cohorts.setdefault(precision, []).append(expert)
+        cohorts = []
+        for precision, experts in exact_cohorts.items():
+            groups = (
+                ((expert,) for expert in experts)
+                if precision.family in _MATRIX_LOCAL_SQ_FAMILIES
+                else (tuple(experts),)
+            )
+            cohorts.extend(
+                _MfePoolPlan(
+                    precision,
+                    tuple(group),
+                    use_importance=(
+                        precision.nint_spec is None
+                        or int(precision.nint_spec.bits) in {2, 3, 4, 5, 6}
+                    ),
+                )
+                for group in groups
+            )
+    else:
+        cohorts = list(
+            _uniform_mfe_pool_plans(
+                expert_precisions,
+                rows_per_expert,
+                split_importance_class=importance is not None,
+            )
+        )
     pool_paths: list[Path] = []
     try:
         with blob_path.open("wb") as output:
@@ -5139,8 +5739,9 @@ def _write_mixed_moe_axis0_blob(
                     len(cohorts),
                 )
             )
-            for pool_index, (precision, expert_list) in enumerate(cohorts.items()):
-                expert_ids = tuple(int(value) for value in expert_list)
+            for pool_index, plan in enumerate(cohorts):
+                precision = plan.precision
+                expert_ids = plan.expert_ids
                 if importance is None or importance_shape == (columns,):
                     pool_importance = importance
                 elif isinstance(importance, torch.Tensor):
@@ -5233,9 +5834,7 @@ def _write_mixed_moe_axis0_blob(
                         row_chunk,
                         quant_backend,
                         device,
-                        importance_rows=(
-                            importance_rows if precision.nint_spec.bits in {2, 3, 4, 5, 6} else None
-                        ),
+                        importance_rows=(importance_rows if plan.use_importance else None),
                         neuron_importance_rows=(
                             neuron_importance_rows
                             if pool_neuron_importance is not None
@@ -5243,7 +5842,27 @@ def _write_mixed_moe_axis0_blob(
                         ),
                         nint_data_free=nint_data_free,
                         synthetic=synthetic,
+                        row_q_bits=plan.row_q_bits,
+                        row_sub_bits=plan.row_sub_bits,
                     )
+                    runtime_payload = b""
+                elif precision.family == "NINT8-0":
+                    if synthetic:
+                        pool_nbytes = _write_synthetic_nint8_zero_axis0_blob(
+                            (len(expert_ids) * rows_per_expert, columns),
+                            pool_path,
+                        )
+                    else:
+                        from mfq.tools import quantize_gguf_to_mfq as gguf_quantizer
+
+                        pool_nbytes = gguf_quantizer._write_nint8_zero_axis0_blob(
+                            pool_source,
+                            (len(expert_ids) * rows_per_expert, columns),
+                            pool_path,
+                            row_chunk,
+                            quant_backend,
+                            device,
+                        )
                     runtime_payload = b""
                 elif precision.family == "MXFP4":
                     if synthetic:
@@ -5258,6 +5877,44 @@ def _write_mixed_moe_axis0_blob(
                                 "MXFP4 expert preservation requires an exact native MXFP4 source"
                             )
                         pool_nbytes = exact_writer(expert_ids, pool_path)
+                    runtime_payload = b""
+                elif precision.family == "MXFP4-SQ":
+                    if synthetic:
+                        raise ValueError("synthetic native-MXFP4 SQ encoding is not supported")
+                    if len(expert_ids) != 1:
+                        raise RuntimeError("MXFP4-SQ pools must remain matrix-local")
+                    exact_writer = getattr(source, "write_mxfp4_sq_expert_pool", None)
+                    if exact_writer is None:
+                        raise TypeError(
+                            "MXFP4-SQ encoding requires an exact native MXFP4 source"
+                        )
+                    pool_nbytes = exact_writer(
+                        expert_ids[0],
+                        pool_path,
+                        q=int(precision.option("q", 2)),
+                    )
+                    runtime_payload = b""
+                elif precision.family in {MXFP8_SQ_DTYPE, FP8_128SQ_DTYPE}:
+                    if synthetic:
+                        raise ValueError("synthetic native-FP8 SQ encoding is not supported")
+                    if len(expert_ids) != 1:
+                        raise RuntimeError("native-FP8 SQ pools must remain matrix-local")
+                    exact_writer = getattr(source, "write_fp8_sq_expert_pool", None)
+                    if exact_writer is None:
+                        raise TypeError(
+                            "native-FP8 SQ encoding requires an exact E4M3 block-scale source"
+                        )
+                    expert = expert_ids[0]
+                    pool_nbytes = exact_writer(
+                        expert,
+                        pool_path,
+                        q=int(precision.option("q", 4)),
+                        neuron_importance=(
+                            None
+                            if neuron_importance_array is None
+                            else np.ascontiguousarray(neuron_importance_array[expert])
+                        ),
+                    )
                     runtime_payload = b""
                 elif precision.family.startswith("NEPQ"):
                     pool_nbytes, runtime_payload = _write_nepq_cohort_blob(
@@ -5339,7 +5996,7 @@ def _write_mfq(
         out.write(_u32(len(records)))
         for rec in records:
             name_b = rec.name.encode("utf-8")
-            dtype_b = rec.dtype.encode("utf-8")
+            dtype_b = canonical_dtype(rec.dtype).encode("utf-8")
             out.write(_u32(len(name_b)))
             out.write(name_b)
             out.write(_u32(len(dtype_b)))
@@ -5369,21 +6026,50 @@ def _nint_blob_nbytes(rows: int, columns: int, spec: NintSpec) -> int:
     return int(header + rows * 4 + k_selectors + 2 * sub + q_selectors + q)
 
 
-def _nint_moe_blob_nbytes(
+def _nint_blob_layout_nbytes(
+    columns: int,
+    spec: NintSpec,
+    row_q_bits: np.ndarray,
+    row_sub_bits: np.ndarray,
+) -> int:
+    q_widths = normalize_row_q_bits(spec, row_q_bits, int(row_q_bits.size))
+    k_widths = normalize_row_sub_bits(spec, row_sub_bits, int(row_sub_bits.size))
+    rows = int(q_widths.size)
+    groups = (int(columns) + int(spec.groupsize) - 1) // int(spec.groupsize)
+    header = _NINT_HDR.size + 4 + 2 * 8 + 8
+    total = header + rows * 4
+    total += (rows * NINT_K_SELECTOR_BITS + 7) // 8
+    for width in range(1, 9):
+        selected = int(np.count_nonzero(k_widths == width))
+        total += 2 * ((selected * groups * width + 7) // 8)
+    total += (rows * NINT_Q_SELECTOR_BITS + 7) // 8
+    values_per_row = groups * int(spec.groupsize)
+    for width in range(1, 9):
+        selected = int(np.count_nonzero(q_widths == width))
+        total += (selected * values_per_row * width + 7) // 8
+    return int(total)
+
+
+def _mfe_nint_blob_nbytes(
     expert_shape: tuple[int, int, int],
     expert_specs: tuple[NintSpec, ...],
 ) -> int:
     n_experts, rows_per_expert, columns = expert_shape
     if len(expert_specs) != n_experts:
         raise ValueError("expert spec count does not match expert tensor shape")
-    cohorts: dict[NintSpec, int] = {}
-    for profile in expert_specs:
-        cohorts[profile] = cohorts.get(profile, 0) + 1
+    cohorts = _uniform_nint_pool_plans(expert_specs, rows_per_expert)
     total = _MFE_HDR.size
-    for profile, count in cohorts.items():
+    for cohort in cohorts:
+        count = len(cohort.expert_ids)
         dtype_nbytes = len(NINT_DTYPE.encode("ascii"))
         total += _MFE_POOL_HDR.size + count * np.dtype(np.int32).itemsize + dtype_nbytes
-        total += _nint_blob_nbytes(count * rows_per_expert, columns, profile)
+        assert cohort.row_q_bits is not None and cohort.row_sub_bits is not None
+        total += _nint_blob_layout_nbytes(
+            columns,
+            cohort.spec,
+            cohort.row_q_bits,
+            cohort.row_sub_bits,
+        )
     return int(total)
 
 
@@ -5397,19 +6083,29 @@ def _mixed_moe_blob_nbytes(
         raise ValueError("expert precision count does not match expert tensor shape")
     if all(value.nint_spec is not None for value in expert_precisions):
         specs = tuple(value.nint_spec for value in expert_precisions if value.nint_spec is not None)
-        return _nint_moe_blob_nbytes(expert_shape, specs)
+        return _mfe_nint_blob_nbytes(expert_shape, specs)
 
-    cohorts: dict[ExpertPrecision, int] = {}
-    for precision in expert_precisions:
-        cohorts[precision] = cohorts.get(precision, 0) + 1
+    cohorts = _uniform_mfe_pool_plans(expert_precisions, rows_per_expert)
     total = _MFE_HDR.size
     flat_shape_header = 2 * 8 + 4
-    for precision, expert_count in cohorts.items():
+    for cohort in cohorts:
+        precision = cohort.precision
+        expert_count = len(cohort.expert_ids)
         rows = expert_count * rows_per_expert
         artifact = resolve_precision_artifact(precision, artifact_root=artifact_root)
         runtime_nbytes = 0
         if precision.nint_spec is not None:
-            payload_nbytes = _nint_blob_nbytes(rows, columns, precision.nint_spec)
+            assert cohort.row_q_bits is not None and cohort.row_sub_bits is not None
+            payload_nbytes = _nint_blob_layout_nbytes(
+                columns,
+                precision.nint_spec,
+                cohort.row_q_bits,
+                cohort.row_sub_bits,
+            )
+        elif precision.family == "NINT8-0":
+            payload_nbytes = nint8_zero_payload_nbytes(
+                (rows, columns), 0, columns
+            )
         elif precision.family == "MXFP4":
             payload_nbytes = len(
                 mx_header_bytes(
@@ -5419,6 +6115,35 @@ def _mixed_moe_blob_nbytes(
                     (rows, columns // 32),
                 )
             ) + rows * (columns // 2 + columns // 32)
+        elif precision.family == "MXFP4-SQ":
+            payload_nbytes = mxfp4_sq_blob_nbytes(
+                int(precision.option("q", 2)),
+                rows,
+                columns,
+            )
+        elif precision.family in {MXFP8_SQ_DTYPE, FP8_128SQ_DTYPE}:
+            block_shape = (
+                int(precision.option("block_rows", 128)),
+                int(precision.option("block_columns", 128)),
+            )
+            scale_shape = (
+                math.ceil(rows / block_shape[0]),
+                math.ceil(columns / block_shape[1]),
+            )
+            payload_nbytes = fp8_sq_blob_nbytes(
+                precision.family,
+                rows,
+                columns,
+                int(precision.option("q", 4)),
+                scale_dtype=str(
+                    precision.option(
+                        "scale_dtype",
+                        "F8_E8M0" if precision.family == MXFP8_SQ_DTYPE else "BF16",
+                    )
+                ),
+                scale_shape=scale_shape,
+                block_shape=block_shape,
+            )
         elif precision.family == "NVQ1-L":
             payload_nbytes = (
                 _NVQ1_L_HEADER.size
@@ -5607,6 +6332,8 @@ def _estimate_bytes(
             )
         elif item.target_dtype == "MXFP8":
             nint_total += _plan_blob_nbytes(item, spec, artifact_root)
+        elif item.target_dtype in {MXFP8_SQ_DTYPE, FP8_128SQ_DTYPE}:
+            nint_total += _plan_blob_nbytes(item, spec, artifact_root)
         else:
             item_size = {
                 "BF16": 2,
@@ -5696,6 +6423,30 @@ def _plan_blob_nbytes(
                 (scale_rows, scale_columns),
             )
         ) + rows * columns + scale_rows * scale_columns
+    if item.target_dtype in {MXFP8_SQ_DTYPE, FP8_128SQ_DTYPE}:
+        rows, columns = (int(value) for value in item.shape)
+        block_shape = (
+            int(item.target_option("block_rows", 128)),
+            int(item.target_option("block_columns", 128)),
+        )
+        scale_shape = (
+            math.ceil(rows / block_shape[0]),
+            math.ceil(columns / block_shape[1]),
+        )
+        return fp8_sq_blob_nbytes(
+            item.target_dtype,
+            rows,
+            columns,
+            int(item.target_option("q", 4)),
+            scale_dtype=str(
+                item.target_option(
+                    "scale_dtype",
+                    "F8_E8M0" if item.target_dtype == MXFP8_SQ_DTYPE else "BF16",
+                )
+            ),
+            scale_shape=scale_shape,
+            block_shape=block_shape,
+        )
     item_size = {
         "BF16": 2,
         "F8_E4M3": 1,
@@ -5766,6 +6517,8 @@ def convert(args: argparse.Namespace) -> None:
     random_expert_mix_arg = getattr(args, "random_expert_mix", "")
     random_expert_mix = _parse_expert_mix_profiles(random_expert_mix_arg)
     random_expert_mix_seed = int(getattr(args, "random_expert_mix_seed", 20260908))
+    native_mxfp4_expert_sq = getattr(args, "native_mxfp4_expert_sq", "preserve")
+    native_fp8_sq = getattr(args, "native_fp8_sq", "preserve")
     nint_data_free = bool(getattr(args, "nint_data_free", False))
     quantize_vision = bool(getattr(args, "quantize_vision", False))
     quantize_mtp = bool(getattr(args, "quantize_mtp", False))
@@ -5812,6 +6565,14 @@ def convert(args: argparse.Namespace) -> None:
         )
     if synthetic_expert_weights and not random_expert_mix:
         raise ValueError("--synthetic-expert-weights requires --random-expert-mix")
+    if native_mxfp4_expert_sq != "preserve" and random_expert_mix:
+        raise ValueError(
+            "--native-mxfp4-expert-sq cannot be combined with --random-expert-mix"
+        )
+    if native_fp8_sq != "preserve" and random_expert_mix:
+        raise ValueError(
+            "--native-fp8-sq cannot be combined with --random-expert-mix"
+        )
     if base_store is not None and (
         mostly_bf16
         or recipe_types is not None
@@ -5820,6 +6581,8 @@ def convert(args: argparse.Namespace) -> None:
         or getattr(args, "imatrix", "")
         or getattr(args, "tensor_precision_overrides", "")
         or random_expert_mix
+        or native_mxfp4_expert_sq != "preserve"
+        or native_fp8_sq != "preserve"
         or quantize_ple
         or nint_data_free
     ):
@@ -5876,6 +6639,8 @@ def convert(args: argparse.Namespace) -> None:
         tensor_precision_overrides,
     )
     plan = _normalize_hf_expert_storage(plan)
+    plan = _apply_native_mxfp4_expert_sq(plan, native_mxfp4_expert_sq)
+    plan = _apply_native_fp8_sq(plan, native_fp8_sq)
     plan = _apply_balanced_random_expert_mix(
         plan,
         random_expert_mix,
@@ -5971,6 +6736,8 @@ def convert(args: argparse.Namespace) -> None:
                 "standard_preset": standard_preset or None,
                 "random_expert_mix": [value.family for value in random_expert_mix],
                 "random_expert_mix_seed": (random_expert_mix_seed if random_expert_mix else None),
+                "native_mxfp4_expert_sq": native_mxfp4_expert_sq,
+                "native_fp8_sq": native_fp8_sq,
                 "synthetic_expert_weights": synthetic_expert_weights,
                 "nint_data_free": nint_data_free,
                 "quantize_vision": quantize_vision,
@@ -6130,17 +6897,35 @@ def convert(args: argparse.Namespace) -> None:
                     "NVQ3",
                 }
                 imatrix_binding = imatrix_bindings.get(item.name)
+                mfe_has_nint = bool(
+                    item.target_dtype == "MFE"
+                    and item.expert_precisions is not None
+                    and any(
+                        precision.nint_spec is not None
+                        for precision in item.expert_precisions
+                    )
+                )
                 if (
                     imatrix_binding is not None
-                    and imatrix_binding.neuron_rows is not None
-                    and item.target_dtype.startswith("NINT")
-                    and item.target_dtype != "NINT8-0"
+                    and (
+                        mfe_has_nint
+                        or (
+                            imatrix_binding.neuron_rows is not None
+                            and item.target_dtype.startswith("NINT")
+                            and item.target_dtype != "NINT8-0"
+                        )
+                    )
                 ):
                     variable_codebook_size = True
                 if (
                     nint_data_free
-                    and item.target_dtype.startswith("NINT")
-                    and item.target_dtype != "NINT8-0"
+                    and (
+                        mfe_has_nint
+                        or (
+                            item.target_dtype.startswith("NINT")
+                            and item.target_dtype != "NINT8-0"
+                        )
+                    )
                 ):
                     variable_codebook_size = True
                 if (
@@ -6202,6 +6987,7 @@ def convert(args: argparse.Namespace) -> None:
                             item.expert_source_quantizations,
                             item.expert_source_scale_names,
                             item.expert_source_scale_shards,
+                            item.expert_source_scale_dtypes,
                         )
                     )
                     try:
@@ -6254,10 +7040,14 @@ def convert(args: argparse.Namespace) -> None:
                     source_name = item.source_name or item.name
                     preserve_raw_e4m3 = item.target_dtype == "F8_E4M3"
                     preserve_native_mxfp8 = item.target_dtype == "MXFP8"
+                    transcode_native_fp8_sq = item.target_dtype in {
+                        MXFP8_SQ_DTYPE,
+                        FP8_128SQ_DTYPE,
+                    }
                     if mfq_checkpoint is not None:
-                        if preserve_native_mxfp8:
+                        if preserve_native_mxfp8 or transcode_native_fp8_sq:
                             raise ValueError(
-                                "native MXFP8 pass-through from an MFQ input is not yet supported"
+                                "native FP8 pass-through/transcoding from an MFQ input is not yet supported"
                             )
                         raw_source = mfq_checkpoint.tensor_source(source_name)
                         if item.source_quantization is not None and not preserve_raw_e4m3:
@@ -6271,15 +7061,20 @@ def convert(args: argparse.Namespace) -> None:
                                 item.source_quantization,
                             )
                     else:
-                        if preserve_native_mxfp8:
+                        if preserve_native_mxfp8 or transcode_native_fp8_sq:
                             if item.source_scale_name is None or item.source_scale_shard is None:
                                 raise ValueError(
-                                    f"native MXFP8 source lacks scale metadata: {item.name}"
+                                    f"native FP8 source lacks scale metadata: {item.name}"
                                 )
                             raw_source = _RawSafeTensorSlice(root / item.shard, source_name)
                             native_mxfp8_scale = _RawSafeTensorSlice(
                                 root / item.source_scale_shard,
                                 item.source_scale_name,
+                            )
+                            native_fp8_reader = _ScaledFp8TensorSlice(
+                                raw_source,
+                                native_mxfp8_scale,
+                                str(item.source_quantization),
                             )
                         else:
                             raw_source = (
@@ -6342,6 +7137,24 @@ def convert(args: argparse.Namespace) -> None:
                             item.shape,
                             item.source_quantization,
                             blob_path,
+                        )
+                        source = raw_source
+                    elif transcode_native_fp8_sq:
+                        if item.row_start is not None or item.row_end is not None:
+                            raise ValueError(
+                                f"native FP8-SQ transcoding does not support split rows: {item.name}"
+                            )
+                        binding = imatrix_bindings.get(item.name)
+                        dense_neuron_importance = (
+                            None
+                            if binding is None or binding.neuron_rows is None
+                            else binding.neuron_rows(0, int(item.shape[0]))
+                        )
+                        nbytes = _write_fp8_sq_readers(
+                            (native_fp8_reader,),
+                            blob_path,
+                            q=int(item.target_option("q", 4)),
+                            neuron_importance=dense_neuron_importance,
                         )
                         source = raw_source
                     elif item.target_dtype == "NINT8-0":
@@ -6628,25 +7441,8 @@ def convert(args: argparse.Namespace) -> None:
         )
         if graph_spec is not None:
             assets_by_name[MODEL_GRAPH_ASSET] = model_graph_asset(graph_spec.as_dict())
-        if (
-            _is_minicpmo45_config(config)
-            and MINICPMO45_RESAMPLER_POS_EMBED_ASSET not in assets_by_name
-        ):
-            position_asset = minicpmo45_resampler_pos_embed_asset()
-            assets_by_name[position_asset.name] = position_asset
-        if (
-            str(config.get("model_type", "")).lower() == "deepseek_v41"
-            and DEEPSEEK_V41_ENGRAM_ASSET not in assets_by_name
-        ):
-            tokenizer_path = root / "tokenizer.json"
-            if not tokenizer_path.is_file():
-                raise FileNotFoundError(
-                    "DeepSeek-V4.1 conversion requires tokenizer.json to build its Engram hash asset"
-                )
-            if not isinstance(config_text, dict):
-                raise ValueError("DeepSeek-V4.1 text_config must be an object")
-            engram_asset = deepseek_v41_engram_asset(tokenizer_path, config_text)
-            assets_by_name[engram_asset.name] = engram_asset
+        for source_asset in source_runtime_assets(root, config):
+            assets_by_name.setdefault(source_asset.name, source_asset)
         if mfq_checkpoint is None and (
             (root / "tokenizer.json").is_file() or (root / "tokenizer_config.json").is_file()
         ):
@@ -6889,6 +7685,8 @@ def convert(args: argparse.Namespace) -> None:
                 ),
                 "random_expert_mix": [value.family for value in random_expert_mix],
                 "random_expert_mix_seed": (random_expert_mix_seed if random_expert_mix else None),
+                "native_mxfp4_expert_sq": native_mxfp4_expert_sq,
+                "native_fp8_sq": native_fp8_sq,
                 "synthetic_expert_weights": synthetic_expert_weights,
                 "nint_data_free": nint_data_free,
                 "quantize_vision": quantize_vision,
@@ -7038,6 +7836,24 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=20260908,
         help="seed for --random-expert-mix expert placement",
+    )
+    parser.add_argument(
+        "--native-mxfp4-expert-sq",
+        choices=("preserve", "sq1", "sq2", "sq3", "sq4"),
+        default="preserve",
+        help=(
+            "encode native block-32 MXFP4 routed experts with a uniform "
+            "per-neuron SQ q preset"
+        ),
+    )
+    parser.add_argument(
+        "--native-fp8-sq",
+        choices=("preserve", "sq1", "sq2", "sq3", "sq4", "sq5", "sq6", "sq7", "sq8"),
+        default="preserve",
+        help=(
+            "encode eligible native E4M3 matrices as MXFP8-SQ or FP8-128SQ "
+            "according to their source scale contract"
+        ),
     )
     parser.add_argument(
         "--synthetic-expert-weights",

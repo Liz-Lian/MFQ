@@ -874,7 +874,9 @@ def _build_parser() -> argparse.ArgumentParser:
         help="verify optional MiniCPM-o voice output dependencies",
     ).set_defaults(_impl=_voice_runtime_check)
     flash_next_worker = sub.add_parser("_flash-next-worker", help=argparse.SUPPRESS)
-    flash_next_worker.add_argument("--mfq", type=Path, required=True)
+    flash_next_worker.add_argument(
+        "--model", "--mfq", dest="model", type=Path, required=True
+    )
     flash_next_worker.add_argument("--host", default="127.0.0.1")
     flash_next_worker.add_argument("--port", type=int, required=True)
     flash_next_worker.add_argument("--model-name", required=True)

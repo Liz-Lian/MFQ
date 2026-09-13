@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import struct
 from pathlib import Path
 
@@ -95,7 +96,12 @@ def test_python_metal_has_one_nint_matmul_kernel():
         for name in vars(metal_nint)
         if name.startswith("_NINT_") and name.endswith("_KERNEL")
     }
-    assert kernels == {"_NINT_MATMUL_KERNEL", "_NINT_ROW_DECODE_KERNEL"}
+    assert kernels == {
+        "_NINT_BACKWARD_KERNEL",
+        "_NINT_MATMUL_KERNEL",
+        "_NINT_ROW_DECODE_KERNEL",
+        "_NINT_SWIGLU_KERNEL",
+    }
 
 
 @pytest.mark.parametrize(
@@ -141,6 +147,7 @@ def test_mixed_qk_uses_same_matmul(from_blob: bool):
     expected = source @ nint_quant.dequantize(tensor).T
     np.testing.assert_allclose(actual, expected, rtol=2e-5, atol=2e-5)
     np.testing.assert_array_equal(_array(weight.row_q_bits), tensor.row_q_bits)
+    assert weight.descriptor == tensor.descriptor
 
 
 def test_tiny_float32_input_uses_same_address_space_agnostic_matmul():
@@ -234,6 +241,8 @@ def test_legacy_uniform_blob_is_normalized_to_row_metadata():
     np.testing.assert_array_equal(
         _array(weight.row_q_bits), np.full(17, 4, dtype=np.uint8)
     )
+    assert weight.descriptor.format_version == 2
+    assert weight.descriptor.distribution_entropy == 0.0
 
 
 def test_explicit_entry_points_reuse_common_matmul():
@@ -334,3 +343,32 @@ def test_mlx_model_roundtrip(tmp_path: Path):
             rtol=0,
             atol=1e-4,
         )
+
+
+def test_mlx_model_opens_hf_through_the_same_canonical_store(tmp_path: Path):
+    root = tmp_path / "hf-model"
+    root.mkdir()
+    (root / "config.json").write_text(
+        json.dumps({"model_type": "qwen3_5", "num_hidden_layers": 1}),
+        encoding="utf-8",
+    )
+    source = np.arange(8, dtype=np.float16).reshape(2, 4)
+    header = json.dumps(
+        {
+            "model.language_model.embed_tokens.weight": {
+                "dtype": "F16",
+                "shape": [2, 4],
+                "data_offsets": [0, source.nbytes],
+            }
+        },
+        separators=(",", ":"),
+    ).encode("utf-8")
+    (root / "model.safetensors").write_bytes(
+        struct.pack("<Q", len(header)) + header + source.tobytes()
+    )
+
+    with MlxNintModel.from_mfq(root) as model:
+        value = np.ones((3, 4), dtype=np.float16)
+        actual = _array(model.linear("model.token_embedding.weight")(value))
+
+    np.testing.assert_array_equal(actual, value @ source.T)

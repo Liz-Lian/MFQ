@@ -1,8 +1,8 @@
 #include "mlx_deepseek_v41_causal_lm.h"
 
-#include "mlx_deepseek_v4_attention.h"
 #include "mlx_eval_timing.h"
 #include "mlx_legacy_tensor_compat.h"
+#include "mlx_transformer.h"
 #include "mfe_expert_store.h"
 
 #include <algorithm>
@@ -30,12 +30,11 @@ array dense_array(const MfqContainer& model, const std::string& name) {
         load_dense_array(record.dtype, mapped.view()));
 }
 
-DeepseekV4RopeScaling rope_scaling(
+MlxYarnScaling rope_scaling(
     const DeepseekV41Config& config,
     bool enabled) {
-    DeepseekV4RopeScaling result;
+    MlxYarnScaling result;
     result.enabled = enabled;
-    result.type = enabled ? "yarn" : "";
     result.factor = config.rope_scaling.factor;
     result.beta_fast = config.rope_scaling.beta_fast;
     result.beta_slow = config.rope_scaling.beta_slow;
@@ -64,7 +63,8 @@ MlxDeepseekV41Layer MlxDeepseekV41Layer::load(
     int max_context,
     std::pair<array, array> rope_base,
     std::pair<array, array> rope_compressed,
-    std::shared_ptr<MlxMoeSsdExpertCache> ssd_expert_cache) {
+    std::shared_ptr<MlxMoeSsdExpertCache> ssd_expert_cache,
+    std::shared_ptr<MlxMfeOffloadCache> mfe_offload_cache) {
     config.validate();
     if (index < 0 || index >= config.n_layers) {
         throw std::out_of_range(
@@ -105,6 +105,7 @@ MlxDeepseekV41Layer MlxDeepseekV41Layer::load(
             name("mlp"),
             false,
             std::move(ssd_expert_cache),
+            std::move(mfe_offload_cache),
             static_cast<std::size_t>(index)),
         std::move(engram));
 }
@@ -174,9 +175,10 @@ MlxDeepseekV41LayerResult MlxDeepseekV41Layer::forward(
     const auto ffn_residual = value;
     auto ffn_mix = ffn_mhc_.collapse(
         ffn_residual, attention_mix.next_pre);
-    auto ffn_branch = moe_.forward(ffn_mix.branch, image_mask);
-    value = ffn_mhc_.expand(
-        ffn_branch,
+    auto ffn_branches = moe_.forward(ffn_mix.branch, image_mask);
+    value = ffn_mhc_.expand_sum(
+        ffn_branches.routed,
+        ffn_branches.shared,
         ffn_residual,
         ffn_mix.expansion);
     return {
@@ -184,6 +186,18 @@ MlxDeepseekV41LayerResult MlxDeepseekV41Layer::forward(
         std::move(ffn_mix.next_pre),
         std::move(attention_input),
     };
+}
+
+std::optional<MlxMxfp8RowStoreStats>
+MlxDeepseekV41Layer::engram_ssd_stats() const {
+    return engram_
+        ? std::optional<MlxMxfp8RowStoreStats>(engram_->ssd_stats())
+        : std::nullopt;
+}
+
+void MlxDeepseekV41Layer::prefetch_engram(
+    DeepseekV41EngramHashBatch& hashes) const {
+    if (engram_) engram_->prefetch(hashes);
 }
 
 std::vector<array> MlxDeepseekV41Layer::begin_speculative(
@@ -218,17 +232,18 @@ MlxDeepseekV41CausalLm MlxDeepseekV41CausalLm::load(
         throw std::invalid_argument(
             "invalid DeepSeek-V4.1 runtime context length");
     }
-    auto base_rope = deepseek_v4_yarn_tables(
+    auto base_rope = mlx_yarn_tables(
         static_cast<int>(config.rope_head_dim),
         max_context,
         static_cast<float>(config.rope_theta),
         rope_scaling(config, false));
-    auto compressed_rope = deepseek_v4_yarn_tables(
+    auto compressed_rope = mlx_yarn_tables(
         static_cast<int>(config.rope_head_dim),
         max_context,
         static_cast<float>(config.compress_rope_theta),
         rope_scaling(config, true));
     std::shared_ptr<MlxMoeSsdExpertCache> ssd_expert_cache;
+    std::shared_ptr<MlxMfeOffloadCache> mfe_offload_cache;
     if (expert_cache_bytes.has_value() && *expert_cache_bytes > 0) {
         std::vector<std::string> prefixes;
         std::vector<std::size_t> experts_per_layer;
@@ -251,15 +266,20 @@ MlxDeepseekV41CausalLm MlxDeepseekV41CausalLm::load(
         }
         constexpr std::size_t prefill_buffers_minimum =
             std::size_t{7} << 30;
-        ssd_expert_cache = std::make_shared<MlxMoeSsdExpertCache>(
-            model,
-            std::move(prefixes),
-            static_cast<std::size_t>(config.hidden),
-            static_cast<std::size_t>(config.moe_inter),
-            std::move(experts_per_layer),
-            *expert_cache_bytes,
-            8,
-            *expert_cache_bytes >= prefill_buffers_minimum);
+        try {
+            ssd_expert_cache = std::make_shared<MlxMoeSsdExpertCache>(
+                model,
+                std::move(prefixes),
+                static_cast<std::size_t>(config.hidden),
+                static_cast<std::size_t>(config.moe_inter),
+                std::move(experts_per_layer),
+                *expert_cache_bytes,
+                8,
+                *expert_cache_bytes >= prefill_buffers_minimum);
+        } catch (const MlxMfeMxfp4Unsupported&) {
+            mfe_offload_cache = std::make_shared<MlxMfeOffloadCache>(
+                model, *expert_cache_bytes);
+        }
     }
     std::vector<MlxDeepseekV41Layer> layers;
     layers.reserve(static_cast<std::size_t>(config.n_layers));
@@ -271,7 +291,8 @@ MlxDeepseekV41CausalLm MlxDeepseekV41CausalLm::load(
             max_context,
             base_rope,
             compressed_rope,
-            ssd_expert_cache));
+            ssd_expert_cache,
+            mfe_offload_cache));
     }
     auto embedding = MlxEmbedding::load(
         model, "model.token_embedding.weight");
@@ -287,6 +308,7 @@ MlxDeepseekV41CausalLm MlxDeepseekV41CausalLm::load(
         output,
         max_context,
         ssd_expert_cache,
+        mfe_offload_cache,
         static_cast<std::size_t>(config.n_layers));
     return MlxDeepseekV41CausalLm(
         config,
@@ -297,6 +319,7 @@ MlxDeepseekV41CausalLm MlxDeepseekV41CausalLm::load(
         MlxDeepseekV41EngramHashState::load(model, config),
         max_context,
         std::move(ssd_expert_cache),
+        std::move(mfe_offload_cache),
         std::move(vision),
         std::move(dspark));
 }
@@ -310,6 +333,7 @@ MlxDeepseekV41CausalLm::MlxDeepseekV41CausalLm(
     MlxDeepseekV41EngramHashState engram_hash,
     int max_context,
     std::shared_ptr<MlxMoeSsdExpertCache> ssd_expert_cache,
+    std::shared_ptr<MlxMfeOffloadCache> mfe_offload_cache,
     std::optional<MlxDeepseekV41Vision> vision,
     std::optional<MlxDeepseekV41DSpark> dspark)
     : config_(std::move(config)),
@@ -319,6 +343,7 @@ MlxDeepseekV41CausalLm::MlxDeepseekV41CausalLm(
       output_(std::move(output)),
       engram_hash_(std::move(engram_hash)),
       ssd_expert_cache_(std::move(ssd_expert_cache)),
+      mfe_offload_cache_(std::move(mfe_offload_cache)),
       vision_(std::move(vision)),
       dspark_(std::move(dspark)),
       max_context_(max_context) {
@@ -331,6 +356,7 @@ MlxDeepseekV41CausalLm::MlxDeepseekV41CausalLm(
         output_.output_size() != config_.vocab ||
         vision_.has_value() != config_.has_vision() ||
         (dspark_.has_value() && !config_.has_dspark()) ||
+        (ssd_expert_cache_ && mfe_offload_cache_) ||
         max_context_ <= 0 || max_context_ > config_.max_position_embeddings) {
         throw std::runtime_error(
             "DeepSeek-V4.1 text runtime geometry disagrees");
@@ -358,11 +384,17 @@ void MlxDeepseekV41CausalLm::reset_cache(int batch) {
         throw std::invalid_argument(
             "DeepSeek-V4.1 cache batch must be positive");
     }
-    states_.clear();
-    states_.reserve(layers_.size());
-    for (int index = 0; index < static_cast<int>(layers_.size()); ++index) {
-        states_.push_back({MlxDeepseekV41AttentionState::allocate(
-            config_, index, batch, max_context_)});
+    const bool reuse_storage =
+        cache_batch_ == batch && states_.size() == layers_.size();
+    if (reuse_storage) {
+        for (auto& state : states_) state.attention.reset();
+    } else {
+        states_.clear();
+        states_.reserve(layers_.size());
+        for (int index = 0; index < static_cast<int>(layers_.size()); ++index) {
+            states_.push_back({MlxDeepseekV41AttentionState::allocate(
+                config_, index, batch, max_context_)});
+        }
     }
     engram_hash_.reset(batch);
     dspark_state_.reset();
@@ -373,6 +405,8 @@ void MlxDeepseekV41CausalLm::reset_cache(int batch) {
     speculative_engram_snapshot_.reset();
     speculative_token_ids_.reset();
     speculative_cache_start_ = -1;
+    stable_cache_tokens_.clear();
+    stable_dspark_state_.reset();
     cache_position_ = 0;
     cache_batch_ = batch;
 }
@@ -385,23 +419,98 @@ void MlxDeepseekV41CausalLm::clear_cache() noexcept {
     speculative_token_ids_.reset();
     speculative_cache_start_ = -1;
     mtp_context_requested_ = false;
+    stable_cache_tokens_.clear();
+    stable_dspark_state_.reset();
     cache_position_ = 0;
     cache_batch_ = 0;
 }
 
+void MlxDeepseekV41CausalLm::materialize_states(
+    const std::vector<MlxDeepseekV41LayerState>& states) const {
+    std::vector<array> arrays;
+    arrays.reserve(states.size() * 5);
+    for (const auto& layer : states) {
+        const auto& state = layer.attention;
+        arrays.push_back(state.local_kv);
+        if (state.compressed_kv) arrays.push_back(*state.compressed_kv);
+        if (state.index_k) arrays.push_back(*state.index_k);
+        if (state.partial_kv) arrays.push_back(*state.partial_kv);
+        if (state.partial_score) arrays.push_back(*state.partial_score);
+    }
+    detail::eval_with_timing(std::move(arrays));
+}
+
+namespace {
+
+void materialize_deepseek_v41_dspark_state(
+    const MlxDeepseekV41DSparkState& state) {
+    std::vector<array> rings;
+    rings.reserve(state.stages());
+    for (std::size_t stage = 0; stage < state.stages(); ++stage) {
+        rings.push_back(state.ring(stage));
+    }
+    if (!rings.empty()) detail::eval_with_timing(std::move(rings));
+}
+
+} // namespace
+
 std::size_t
 MlxDeepseekV41CausalLm::expert_cache_limit_bytes() const noexcept {
-    return ssd_expert_cache_
-        ? ssd_expert_cache_->cache_limit_bytes()
+    if (ssd_expert_cache_) {
+        return ssd_expert_cache_->cache_limit_bytes();
+    }
+    return mfe_offload_cache_
+        ? mfe_offload_cache_->cache_limit_bytes()
         : 0;
+}
+
+int MlxDeepseekV41CausalLm::preferred_prefill_chunk_size(
+    int portable_default) const noexcept {
+    if (portable_default <= 0 || layers_.empty()) return portable_default;
+    int recommendation = 0;
+    for (const auto& layer : layers_) {
+        const int candidate = layer.recommended_prefill_chunk_size();
+        if (candidate <= 0) return portable_default;
+        recommendation = recommendation == 0
+            ? candidate
+            : std::min(recommendation, candidate);
+    }
+    return recommendation > 0 ? recommendation : portable_default;
 }
 
 std::optional<MlxSsdExpertCacheStats>
 MlxDeepseekV41CausalLm::ssd_expert_cache_stats() const {
-    return ssd_expert_cache_
-        ? std::optional<MlxSsdExpertCacheStats>(
-              ssd_expert_cache_->stats())
-        : std::nullopt;
+    if (ssd_expert_cache_) {
+        return ssd_expert_cache_->stats();
+    }
+    if (!mfe_offload_cache_) {
+        return std::nullopt;
+    }
+    MlxSsdExpertCacheStats stats;
+    stats.resident_experts = mfe_offload_cache_->cached_expert_count();
+    stats.resident_bytes = mfe_offload_cache_->resident_packed_bytes();
+    return stats;
+}
+
+std::optional<MlxMxfp8RowStoreStats>
+MlxDeepseekV41CausalLm::engram_ssd_stats() const {
+    std::optional<MlxMxfp8RowStoreStats> result;
+    for (const auto& layer : layers_) {
+        const auto current = layer.engram_ssd_stats();
+        if (!current) continue;
+        if (!result) result.emplace();
+        result->row_requests += current->row_requests;
+        result->cache_hits += current->cache_hits;
+        result->cache_misses += current->cache_misses;
+        result->rows_loaded += current->rows_loaded;
+        result->bytes_read += current->bytes_read;
+        result->read_calls += current->read_calls;
+        result->io_seconds += current->io_seconds;
+        result->resident_rows += current->resident_rows;
+        result->resident_payload_bytes += current->resident_payload_bytes;
+        result->cache_limit_bytes += current->cache_limit_bytes;
+    }
+    return result;
 }
 
 void MlxDeepseekV41CausalLm::prewarm_ssd_expert_arena() {
@@ -414,6 +523,9 @@ void MlxDeepseekV41CausalLm::clear_expert_cache() {
     if (ssd_expert_cache_) {
         ssd_expert_cache_->clear();
     }
+    if (mfe_offload_cache_) {
+        mfe_offload_cache_->clear();
+    }
 }
 
 array MlxDeepseekV41CausalLm::forward_impl(
@@ -422,7 +534,8 @@ array MlxDeepseekV41CausalLm::forward_impl(
     bool reuse_cache,
     const std::optional<array>& input_embeddings,
     array* dspark_hidden,
-    bool update_dspark) {
+    bool update_dspark,
+    bool skip_lm_head) {
     auto token_ids = normalized_ids(raw_token_ids);
     const int batch = token_ids.shape(0);
     const int tokens = token_ids.shape(1);
@@ -455,6 +568,13 @@ array MlxDeepseekV41CausalLm::forward_impl(
         cache_position_,
         participation,
         true);
+    if (tokens > 1 && !ssd_expert_cache_ && !mfe_offload_cache_) {
+        hashes.prefetched_rows.resize(
+            static_cast<std::size_t>(hashes.layers));
+        for (const auto& layer : layers_) {
+            layer.prefetch_engram(hashes);
+        }
+    }
     auto hidden = input_embeddings
         ? *input_embeddings
         : embedding_(token_ids, mlx::core::float16);
@@ -527,6 +647,11 @@ array MlxDeepseekV41CausalLm::forward_impl(
             cache_position_);
     }
     cache_position_ += tokens;
+    if (skip_lm_head) {
+        return mlx::core::zeros(
+            Shape{batch, 0, static_cast<int>(config_.vocab)},
+            mlx::core::float32);
+    }
     return output_(collapsed);
 }
 
@@ -623,6 +748,8 @@ void MlxDeepseekV41CausalLm::abort_speculative_target() noexcept {
 array MlxDeepseekV41CausalLm::forward(
     const array& token_ids,
     bool use_cache) {
+    stable_cache_tokens_.clear();
+    stable_dspark_state_.reset();
     return forward_impl(token_ids, std::nullopt, use_cache);
 }
 
@@ -653,7 +780,11 @@ array MlxDeepseekV41CausalLm::prefill(
         auto logits = forward_impl(
             slice_tokens(token_ids, begin, end),
             std::nullopt,
-            true);
+            true,
+            std::nullopt,
+            nullptr,
+            true,
+            !full_logits && end < tokens);
         if (full_logits) chunks.push_back(std::move(logits));
         else last = std::move(logits);
     }
@@ -671,6 +802,8 @@ array MlxDeepseekV41CausalLm::decode(const array& token_ids) {
         throw std::runtime_error(
             "DeepSeek-V4.1 decode requires a prefill cache");
     }
+    stable_cache_tokens_.clear();
+    stable_dspark_state_.reset();
     return forward_impl(token_ids, std::nullopt, true);
 }
 
@@ -776,8 +909,17 @@ std::int32_t MlxDeepseekV41CausalLm::generate_from_prefill(
                     {context.pending_token},
                     Shape{1, 1},
                     mlx::core::int32);
-                (void)draft_mtp(
-                    anchor_ids, select_token, context.requested_depth);
+                if (!dspark_state_ ||
+                    dspark_state_->position() != cache_position_) {
+                    throw std::runtime_error(
+                        "DeepSeek-V4.1 DSpark state is not synchronized "
+                        "with the target");
+                }
+                dspark_->propose(
+                    anchor_ids,
+                    *dspark_state_,
+                    select_token,
+                    context.requested_depth);
             };
         callbacks.verify_target =
             [&](std::int32_t pending_token,
@@ -820,19 +962,6 @@ std::int32_t MlxDeepseekV41CausalLm::generate_from_prefill(
                 rollback_speculative_target(
                     accepted_drafts, draft_count);
             };
-        callbacks.plain_decode = [&](std::int32_t pending_token) {
-            const array token_ids(
-                {pending_token}, Shape{1, 1}, mlx::core::int32);
-            return mlx_last_token_logits(
-                forward_impl(
-                    token_ids,
-                    std::nullopt,
-                    true,
-                    std::nullopt,
-                    nullptr,
-                    false),
-                vocab);
-        };
         return run_mlx_mtp_generation(
             MlxMtpEngineRequest{
                 vocab,
@@ -909,7 +1038,7 @@ std::int32_t MlxDeepseekV41CausalLm::generate(
     const std::function<bool(std::int64_t)>& callback,
     const std::function<void(std::size_t, double)>& prefill_callback,
     const MfqTokenConstraintPtr& token_constraint,
-    std::optional<std::size_t>,
+    std::optional<std::size_t> stable_prefix_tokens,
     int prefill_chunk_size) {
     if (prompt.empty() || max_tokens < 0 || prefill_chunk_size <= 0) {
         throw std::invalid_argument(
@@ -931,16 +1060,205 @@ std::int32_t MlxDeepseekV41CausalLm::generate(
     for (const auto token : prompt) {
         values.push_back(static_cast<std::int32_t>(token));
     }
-    const auto started = std::chrono::steady_clock::now();
-    mtp_context_requested_ = supports_mtp() && sampling.enable_mtp &&
+    const array prompt_ids(
+        values.begin(), Shape{1, static_cast<int>(values.size())},
+        mlx::core::int32);
+    const bool mtp_candidate = supports_mtp() && sampling.enable_mtp &&
         !token_constraint && max_tokens > 1;
+    mtp_context_requested_ = mtp_candidate;
+    const std::size_t requested_stable_count = stable_prefix_tokens
+        ? std::min(*stable_prefix_tokens, prompt.size())
+        : 0;
+    const bool retain_stable_prefix =
+        requested_stable_count > 0;
+    const std::size_t stable_count = retain_stable_prefix
+        ? requested_stable_count
+        : 0;
+    std::size_t reused_tokens = 0;
+    const bool dspark_prefix_ready =
+        !mtp_candidate ||
+        (stable_dspark_state_ &&
+         stable_dspark_state_->batch() == 1 &&
+         stable_dspark_state_->position() ==
+             static_cast<int>(stable_cache_tokens_.size()));
+    if (retain_stable_prefix && dspark_prefix_ready &&
+        cache_batch_ == 1 &&
+        cache_position_ == static_cast<int>(stable_cache_tokens_.size()) &&
+        !stable_cache_tokens_.empty() &&
+        stable_cache_tokens_.size() <= stable_count &&
+        stable_cache_tokens_.size() < prompt.size() &&
+        std::equal(
+            stable_cache_tokens_.begin(),
+            stable_cache_tokens_.end(),
+            prompt.begin())) {
+        reused_tokens = stable_cache_tokens_.size();
+    } else if (retain_stable_prefix) {
+        reset_cache(1);
+    }
+    if (mtp_candidate && reused_tokens > 0) {
+        dspark_state_.emplace(stable_dspark_state_->snapshot());
+        materialize_deepseek_v41_dspark_state(*dspark_state_);
+    } else if (!mtp_candidate) {
+        dspark_state_.reset();
+    }
+
+    struct StableCacheRestore {
+        std::vector<MlxDeepseekV41LayerState>& target_states;
+        MlxDeepseekV41EngramHashState& target_hash;
+        int& target_position;
+        int& target_batch;
+        std::vector<std::int64_t>& target_tokens;
+        std::optional<MlxDeepseekV41DSparkState>& target_active_dspark;
+        std::optional<MlxDeepseekV41DSparkState>& target_stable_dspark;
+        std::optional<std::vector<MlxDeepseekV41LayerState>> saved_states;
+        std::optional<DeepseekV41EngramHashSnapshot> saved_hash;
+        std::optional<MlxDeepseekV41DSparkState> saved_dspark;
+        std::vector<std::int64_t> saved_tokens;
+        int saved_position = 0;
+        int saved_batch = 0;
+
+        StableCacheRestore(
+            std::vector<MlxDeepseekV41LayerState>& states,
+            MlxDeepseekV41EngramHashState& hash,
+            int& position,
+            int& batch,
+            std::vector<std::int64_t>& tokens,
+            std::optional<MlxDeepseekV41DSparkState>& active_dspark,
+            std::optional<MlxDeepseekV41DSparkState>& stable_dspark)
+            : target_states(states),
+              target_hash(hash),
+              target_position(position),
+              target_batch(batch),
+              target_tokens(tokens),
+              target_active_dspark(active_dspark),
+              target_stable_dspark(stable_dspark) {}
+
+        void capture(
+            const std::vector<std::int64_t>& prompt_tokens,
+            std::size_t count) {
+            std::vector<MlxDeepseekV41LayerState> snapshots;
+            snapshots.reserve(target_states.size());
+            for (const auto& state : target_states) {
+                snapshots.push_back({state.attention.snapshot()});
+            }
+            saved_states = std::move(snapshots);
+            saved_hash = target_hash.snapshot();
+            saved_tokens.assign(
+                prompt_tokens.begin(),
+                prompt_tokens.begin() + static_cast<std::ptrdiff_t>(count));
+            saved_position = static_cast<int>(count);
+            saved_batch = target_batch;
+            if (target_active_dspark) {
+                if (target_active_dspark->batch() != target_batch ||
+                    target_active_dspark->position() != saved_position) {
+                    throw std::runtime_error(
+                        "DeepSeek-V4.1 stable DSpark checkpoint mismatch");
+                }
+                saved_dspark.emplace(target_active_dspark->snapshot());
+            } else {
+                saved_dspark.reset();
+            }
+        }
+
+        const std::vector<MlxDeepseekV41LayerState>& states() const {
+            return *saved_states;
+        }
+
+        const std::optional<MlxDeepseekV41DSparkState>& dspark() const {
+            return saved_dspark;
+        }
+
+        ~StableCacheRestore() noexcept {
+            if (!saved_states || !saved_hash) return;
+            try {
+                if (target_states.size() != saved_states->size()) {
+                    throw std::runtime_error(
+                        "DeepSeek-V4.1 stable cache layer count changed");
+                }
+                for (std::size_t index = 0;
+                     index < target_states.size(); ++index) {
+                    target_states[index].attention.restore_snapshot(
+                        std::move((*saved_states)[index].attention));
+                }
+                target_hash.restore(std::move(*saved_hash));
+                target_position = saved_position;
+                target_batch = saved_batch;
+                target_tokens = std::move(saved_tokens);
+                target_active_dspark.reset();
+                target_stable_dspark = std::move(saved_dspark);
+            } catch (...) {
+                target_states.clear();
+                target_hash.clear();
+                target_position = 0;
+                target_batch = 0;
+                target_tokens.clear();
+                target_active_dspark.reset();
+                target_stable_dspark.reset();
+            }
+        }
+    } stable_restore(
+        states_,
+        engram_hash_,
+        cache_position_,
+        cache_batch_,
+        stable_cache_tokens_,
+        dspark_state_,
+        stable_dspark_state_);
+
+    const auto started = std::chrono::steady_clock::now();
     array logits(0.0f);
     try {
-        logits = prefill(
-            array(values.begin(), Shape{1, static_cast<int>(values.size())},
-                  mlx::core::int32),
-            prefill_chunk_size,
-            false);
+        if (!retain_stable_prefix) {
+            logits = prefill(prompt_ids, prefill_chunk_size, false);
+        } else {
+            const auto prefill_range = [&](std::size_t begin, std::size_t end) {
+                std::optional<array> last;
+                for (std::size_t offset = begin; offset < end;
+                     offset += static_cast<std::size_t>(prefill_chunk_size)) {
+                    const auto stop = std::min(
+                        end,
+                        offset + static_cast<std::size_t>(prefill_chunk_size));
+                    last = forward_impl(
+                        slice_tokens(
+                            prompt_ids,
+                            static_cast<int>(offset),
+                            static_cast<int>(stop)),
+                        std::nullopt,
+                        true,
+                        std::nullopt,
+                        nullptr,
+                        true,
+                        stop < end);
+                }
+                if (!last) {
+                    throw std::runtime_error(
+                        "DeepSeek-V4.1 stable prefill range is empty");
+                }
+                auto final = slice_tokens(
+                    *last, last->shape(1) - 1, last->shape(1));
+                return mlx::core::squeeze(std::move(final), 1);
+            };
+
+            std::optional<array> stable_logits;
+            if (reused_tokens < stable_count) {
+                stable_logits = prefill_range(reused_tokens, stable_count);
+            }
+            materialize_states(states_);
+            stable_restore.capture(prompt, stable_count);
+            materialize_states(stable_restore.states());
+            if (stable_restore.dspark()) {
+                materialize_deepseek_v41_dspark_state(
+                    *stable_restore.dspark());
+            }
+            if (stable_count < prompt.size()) {
+                logits = prefill_range(stable_count, prompt.size());
+            } else if (stable_logits) {
+                logits = std::move(*stable_logits);
+            } else {
+                throw std::runtime_error(
+                    "DeepSeek-V4.1 stable cache has no logits for sampling");
+            }
+        }
     } catch (...) {
         mtp_context_requested_ = false;
         throw;
@@ -950,7 +1268,7 @@ std::int32_t MlxDeepseekV41CausalLm::generate(
     mlx::core::synchronize();
     if (prefill_callback) {
         prefill_callback(
-            prompt.size(),
+            prompt.size() - reused_tokens,
             std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - started).count());
     }
@@ -1010,15 +1328,88 @@ std::int32_t MlxDeepseekV41CausalLm::generate_multimodal(
 
 MlxDeepseekV41TextSessionState
 MlxDeepseekV41CausalLm::capture_text_session_state(
-    const std::vector<std::int64_t>&) const {
-    throw std::runtime_error(
-        "DeepSeek-V4.1 persistent text-session snapshots are not enabled yet");
+    const std::vector<std::int64_t>& tokens) const {
+    if (cache_batch_ != 1 || cache_position_ <= 0 ||
+        static_cast<std::size_t>(cache_position_) != tokens.size() ||
+        states_.size() != layers_.size() || dspark_state_ ||
+        speculative_engram_snapshot_ || speculative_token_ids_ ||
+        speculative_cache_start_ >= 0) {
+        throw std::runtime_error(
+            "DeepSeek-V4.1 text session token count does not match cache");
+    }
+    auto hash = engram_hash_.snapshot();
+    if (hash.batch != cache_batch_ || hash.position != cache_position_) {
+        throw std::runtime_error(
+            "DeepSeek-V4.1 Engram state does not match attention cache");
+    }
+    MlxDeepseekV41TextSessionState state;
+    state.tokens = tokens;
+    state.engram_hash = std::move(hash);
+    state.cache_position = cache_position_;
+    state.cache_batch = cache_batch_;
+    state.layers.reserve(states_.size());
+    for (const auto& layer : states_) {
+        auto snapshot = layer.attention.snapshot();
+        state.bytes += snapshot.nbytes();
+        state.layers.push_back({std::move(snapshot)});
+    }
+    if (stable_dspark_state_) {
+        if (!dspark_ || stable_dspark_state_->batch() != cache_batch_ ||
+            stable_dspark_state_->position() != cache_position_) {
+            throw std::runtime_error(
+                "DeepSeek-V4.1 stable DSpark state does not match cache");
+        }
+        state.dspark.emplace(stable_dspark_state_->snapshot());
+        state.bytes += state.dspark->nbytes();
+    }
+    materialize_states(state.layers);
+    if (state.dspark) {
+        materialize_deepseek_v41_dspark_state(*state.dspark);
+    }
+    return state;
 }
 
 void MlxDeepseekV41CausalLm::restore_text_session_state(
-    const MlxDeepseekV41TextSessionState&) {
-    throw std::runtime_error(
-        "DeepSeek-V4.1 persistent text-session snapshots are not enabled yet");
+    const MlxDeepseekV41TextSessionState& state) {
+    if (state.cache_batch != 1 || state.cache_position <= 0 ||
+        static_cast<std::size_t>(state.cache_position) !=
+            state.tokens.size() ||
+        state.layers.size() != layers_.size() ||
+        state.engram_hash.batch != state.cache_batch ||
+        state.engram_hash.position != state.cache_position) {
+        throw std::runtime_error(
+            "DeepSeek-V4.1 text session state is incompatible");
+    }
+    if (state.dspark &&
+        (!dspark_ || state.dspark->batch() != state.cache_batch ||
+         state.dspark->position() != state.cache_position)) {
+        throw std::runtime_error(
+            "DeepSeek-V4.1 text session DSpark state is incompatible");
+    }
+    try {
+        mtp_context_requested_ = false;
+        reset_cache(1);
+        for (std::size_t index = 0; index < states_.size(); ++index) {
+            states_[index].attention.restore_snapshot(
+                state.layers[index].attention.snapshot());
+        }
+        materialize_states(states_);
+        std::optional<MlxDeepseekV41DSparkState> restored_dspark;
+        if (state.dspark) {
+            restored_dspark.emplace(
+                dspark_->make_state(state.cache_batch, mlx::core::float16));
+            restored_dspark->restore_snapshot(state.dspark->snapshot());
+            materialize_deepseek_v41_dspark_state(*restored_dspark);
+        }
+        engram_hash_.restore(state.engram_hash);
+        cache_position_ = state.cache_position;
+        cache_batch_ = state.cache_batch;
+        stable_cache_tokens_ = state.tokens;
+        stable_dspark_state_ = std::move(restored_dspark);
+    } catch (...) {
+        clear_cache();
+        throw;
+    }
 }
 
 } // namespace mfq::metal

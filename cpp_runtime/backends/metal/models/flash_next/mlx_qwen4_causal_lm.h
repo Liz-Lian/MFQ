@@ -5,6 +5,7 @@
 #include "mfq_container.h"
 #include "mlx_mtp.h"
 #include "mlx_sampling.h"
+#include "mlx_ssd_expert_cache.h"
 
 #include "mfq/token_constraint.h"
 
@@ -81,7 +82,8 @@ class MlxQwen4CausalLm {
 public:
     static MlxQwen4CausalLm load(
         const MfqContainer& model,
-        int max_context = 4096);
+        int max_context = 4096,
+        std::optional<std::size_t> expert_cache_bytes = std::nullopt);
 
     ~MlxQwen4CausalLm();
     MlxQwen4CausalLm(MlxQwen4CausalLm&&) noexcept;
@@ -110,6 +112,10 @@ public:
     int cache_position() const noexcept;
     bool supports_mtp() const noexcept;
     const MlxMtpGenerationStats& last_mtp_stats() const noexcept;
+    std::size_t expert_cache_limit_bytes() const noexcept;
+    std::optional<MlxSsdExpertCacheStats> ssd_expert_cache_stats() const;
+    void prewarm_ssd_expert_arena();
+    void clear_expert_cache();
     bool supports_multimodal() const noexcept { return false; }
     bool supports_text_session_state() const noexcept { return false; }
     MlxQwen4TextSessionState capture_text_session_state(

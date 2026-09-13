@@ -29,6 +29,7 @@ import numpy as np
 import torch
 
 from mfq.formats.assets import ASSET_DTYPE, ASSET_PREFIX
+from mfq.formats.compat import canonical_dtype
 from mfq.formats.header import FileHeader
 from mfq.formats.io import MMapTensorRecord, open_mmap
 from mfq.formats.shards import write_blob_record_shards
@@ -292,22 +293,24 @@ def _container_overhead(
             total += 4 + len(key_bytes) + 4 + len(value_bytes)
     total += 4
     for name, dtype, _nbytes in record_meta:
+        stored_dtype = canonical_dtype(dtype)
         total += (
             4
             + len(name.encode("utf-8"))
             + 4
-            + len(dtype.encode("utf-8"))
+            + len(stored_dtype.encode("utf-8"))
             + 8
         )
     return total
 
 
 def _record_table_overhead(name: str, dtype: str) -> int:
+    stored_dtype = canonical_dtype(dtype)
     return (
         4
         + len(name.encode("utf-8"))
         + 4
-        + len(dtype.encode("utf-8"))
+        + len(stored_dtype.encode("utf-8"))
         + 8
     )
 

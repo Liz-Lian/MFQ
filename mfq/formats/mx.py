@@ -100,10 +100,13 @@ def validate_mx_shapes(
         # payload already records the scale matrix, so no format revision is
         # needed to preserve all three source-exact geometries.
         expected_scale_shapes = {
-            ((rows + 127) // 128, columns // 128),
             ((rows + 31) // 32, columns // 32),
             (rows, columns // 32),
         }
+        if columns % 128 == 0:
+            expected_scale_shapes.add(
+                ((rows + 127) // 128, columns // 128)
+            )
         if (scale_rows, scale_columns) not in expected_scale_shapes:
             expected = ", ".join(str(value) for value in sorted(expected_scale_shapes))
             raise ValueError(

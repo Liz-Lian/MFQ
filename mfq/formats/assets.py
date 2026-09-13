@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import struct
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -24,6 +25,7 @@ HF_TOKENIZER_JSON_ASSET = ASSET_PREFIX + "hf/tokenizer.json"
 HF_TOKENIZER_CONFIG_ASSET = ASSET_PREFIX + "hf/tokenizer_config.json"
 HF_CHAT_TEMPLATE_ASSET = ASSET_PREFIX + "hf/chat_template.jinja"
 HF_GENERATION_CONFIG_ASSET = ASSET_PREFIX + "hf/generation_config.json"
+HF_SOURCE_MAP_ASSET = ASSET_PREFIX + "hf/source_tensor_map.json"
 MINICPMO45_RESAMPLER_POS_EMBED_ASSET = ASSET_PREFIX + "minicpmo45-resampler-pos-embed-v1.bf16"
 DEEPSEEK_V41_ENGRAM_ASSET = ASSET_PREFIX + "deepseek-v41-engram-v1.bin"
 ASSET_DTYPE = "BLOB"
@@ -90,6 +92,45 @@ def model_graph_asset(graph: dict[str, Any] | bytes | str) -> RuntimeAsset:
     if not isinstance(naming, dict) or not naming.get("namespace"):
         raise ValueError("model graph must declare canonical_naming.namespace")
     return RuntimeAsset(MODEL_GRAPH_ASSET, "application/vnd.mfq.model-graph+json", data)
+
+
+def hf_source_map_asset(
+    canonical_to_source: Mapping[str, str],
+) -> RuntimeAsset:
+    """Serialize the canonical view of one native HF checkpoint.
+
+    The mapping is produced by the same tensor-schema registry used by the
+    quantizer. Native runtimes only consume this architecture-neutral
+    contract; they never select an HF loader by model family.
+    """
+
+    aliases: dict[str, str] = {}
+    for canonical, source in sorted(canonical_to_source.items()):
+        canonical_name = str(canonical)
+        source_name = str(source)
+        if not canonical_name or not source_name:
+            raise ValueError("HF source tensor names must be non-empty")
+        previous = aliases.setdefault(canonical_name, source_name)
+        if previous != source_name:
+            raise ValueError(
+                f"HF source tensors collide at {canonical_name!r}: "
+                f"{previous!r}, {source_name!r}"
+            )
+    data = json.dumps(
+        {
+            "schema": "mfq.hf-source-map",
+            "version": 1,
+            "canonical_to_source": aliases,
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return RuntimeAsset(
+        HF_SOURCE_MAP_ASSET,
+        "application/vnd.mfq.hf-source-map+json",
+        data,
+    )
 
 
 def hf_runtime_assets(source: str | Path) -> tuple[RuntimeAsset, ...]:

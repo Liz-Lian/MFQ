@@ -100,6 +100,10 @@ public:
     // buffers, so record staging never enters the process malloc depot.
     MfqMappedBytes map_record(const std::string& name) const;
     std::string read_text(const std::string& name) const;
+    // Best-effort eviction used by storage benchmarks. Native HF checkpoints
+    // delegate to the physical Safetensors store; regular MFQ containers are
+    // left untouched.
+    void drop_source_file_cache() const noexcept;
     // New canonical artifacts describe their executable graph explicitly.
     // A missing asset identifies a pre-schema artifact and is handled only by
     // the dedicated compatibility adapter at the application boundary.
@@ -111,6 +115,11 @@ public:
     void install_legacy_aliases(
         std::unordered_map<std::string, std::string> canonical_to_stored,
         mfq::MfqLegacyTensorLayout layout = {});
+    // Native HF checkpoints carry the same canonical map produced by the
+    // quantizer's tensor-schema registry. Unlike legacy aliases, this source
+    // view is valid alongside a schema-v1 model graph.
+    void install_source_aliases(
+        std::unordered_map<std::string, std::string> canonical_to_stored);
     // Turn per-expert native HF tensors into canonical, virtual MFE
     // projections. The logical container is assembled from exact tensor
     // ranges, so callers can stream one expert without materializing its
@@ -166,6 +175,10 @@ private:
         const std::string& name,
         std::uint64_t relative_offset,
         std::span<std::byte> destination) const;
+    void install_aliases(
+        std::unordered_map<std::string, std::string> canonical_to_stored,
+        mfq::MfqLegacyTensorLayout layout,
+        bool reject_model_graph);
 
     MfqHeader header_;
     std::vector<std::filesystem::path> source_paths_;

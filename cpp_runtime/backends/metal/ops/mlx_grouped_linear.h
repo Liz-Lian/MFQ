@@ -34,9 +34,9 @@ public:
 // Packed projection coordinator.
 //
 // All projections share an input width but may use different output widths.
-// NINT projections always reuse the single metadata-driven NINT v2 kernel;
-// q/k choices never create profile-specific or heterogeneous NINT kernels.
-// Other established formats may retain their format-level grouped paths.
+// NINT QKV and gate/up groups use one metadata-driven grouped operator;
+// per-neuron q/k choices never create profile-specific NINT kernels. Other
+// established formats may retain their format-level grouped paths.
 // Expert-shaped/rotated NEPQ belongs to the MoE path and is rejected here.
 class MlxGroupedLinear {
 public:
@@ -52,8 +52,8 @@ public:
     std::vector<mlx::core::array> matmul(
         const mlx::core::array& input) const;
 
-    // Decode-only MXFP8 two-projection fast path. NINT uses its common
-    // metadata-driven matmul plus the graph's elementwise SwiGLU.
+    // Decode-only two-projection SwiGLU. NINT reuses its metadata-driven
+    // decoder, including adaptive q/k rows; MXFP8 retains its native path.
     bool supports_single_row_swiglu(
         const mlx::core::array& input) const noexcept;
     mlx::core::array single_row_swiglu(
@@ -81,19 +81,28 @@ public:
     // that the grouped object owns another copy of those bytes.
     std::size_t packed_nbytes() const noexcept;
 
-    // NINT projection groups remain graph-level compositions of the one
-    // standalone NINT matmul kernel. Other production groups may bind each
-    // source array directly to a format-level Metal dispatch; groups which
-    // exceed the direct buffer limit and contain VQ, TPQ, or MX are
-    // unsupported.
+    // NINT projection groups bind the retained metadata streams directly.
+    // Other production groups may bind each source array to a format-level
+    // Metal dispatch; groups which exceed the direct buffer limit and contain
+    // VQ, TPQ, or MX are unsupported.
     bool uses_zero_copy_storage() const noexcept;
     std::size_t copied_packed_nbytes() const noexcept;
+
+    // True when a single-row projection group is executed by one fused
+    // operator instead of replaying the member projections independently.
+    bool supports_single_row_projection_fusion() const noexcept;
 
     // True when a float16, single-row invocation can use the MXFP8
     // projection-fused decode kernel.
     bool has_single_row_mxfp8_fast_path() const noexcept;
 
 private:
+    mlx::core::array run_nint_projection_group(
+        const mlx::core::array& source,
+        std::size_t rows,
+        bool swiglu,
+        float limit) const;
+
     struct Impl;
     std::shared_ptr<Impl> impl_;
 };

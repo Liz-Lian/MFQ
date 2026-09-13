@@ -1,5 +1,5 @@
 #include "mlx_nint8_zero.h"
-#include "mlx_deepseek_v4_attention.h"
+#include "mlx_transformer.h"
 #include "mlx_tensor.h"
 
 #include <cmath>
@@ -405,7 +405,7 @@ int main() {
             concatenate(
                 {
                     rope_prefix,
-                    mfq::metal::deepseek_v4_rope_adjacent(
+                    mfq::metal::mlx_rope_adjacent(
                         rope_tail,
                         rope_cosine,
                         rope_sine,

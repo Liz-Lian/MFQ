@@ -1,4 +1,4 @@
-#include "mlx_mxfp4_sq2.h"
+#include "mlx_mxfp4_sq.h"
 
 #include <algorithm>
 #include <array>
@@ -160,11 +160,233 @@ Fixture make_fixture(int rows, int columns) {
   };
 }
 
+Fixture make_adaptive_fixture(int rows, int columns) {
+  require(rows >= 4 && columns > 0 && columns % 32 == 0,
+          "invalid adaptive MXFP4-SQ test fixture geometry");
+  constexpr std::uint8_t matrix_scale_base = 124;
+  const int blocks_per_row = columns / 32;
+
+  std::vector<std::uint8_t> row_q(static_cast<std::size_t>(rows));
+  std::vector<std::vector<std::uint8_t>> symbol_rows;
+  std::vector<std::uint8_t> selectors;
+  std::vector<std::uint8_t> state_scales;
+  std::vector<std::uint8_t> state_palettes;
+  std::vector<std::uint8_t> native_scales;
+  std::vector<float> dense(static_cast<std::size_t>(rows) * columns);
+  symbol_rows.reserve(static_cast<std::size_t>(rows));
+
+  int sq_row = 0;
+  int native_row = 0;
+  for (int row = 0; row < rows; ++row) {
+    const unsigned bits = static_cast<unsigned>(row % 4 + 1);
+    row_q[static_cast<std::size_t>(row)] =
+        static_cast<std::uint8_t>(bits);
+    std::vector<std::uint8_t> symbols(static_cast<std::size_t>(columns));
+    const auto symbol_mask = static_cast<std::uint8_t>((1u << bits) - 1u);
+    for (int column = 0; column < columns; ++column) {
+      symbols[static_cast<std::size_t>(column)] =
+          static_cast<std::uint8_t>(
+              (row * 13 + column * 5 + (column >> 2)) & symbol_mask);
+    }
+
+    if (bits == 4) {
+      for (int block = 0; block < blocks_per_row; ++block) {
+        const auto exponent = static_cast<std::uint8_t>(
+            123 + ((native_row * 3 + block) & 3));
+        native_scales.push_back(exponent);
+        const float scale = std::ldexp(1.0f, static_cast<int>(exponent) - 127);
+        for (int lane = 0; lane < 32; ++lane) {
+          const int column = block * 32 + lane;
+          const auto index = static_cast<std::size_t>(row) * columns + column;
+          dense[index] = fp4(symbols[static_cast<std::size_t>(column)]) * scale;
+        }
+      }
+      ++native_row;
+    } else {
+      for (int state = 0; state < 8; ++state) {
+        state_scales.push_back(static_cast<std::uint8_t>(
+            (sq_row + state * 3) & 3));
+        state_palettes.push_back(static_cast<std::uint8_t>(
+            (sq_row * 7 + state * 5) & 31));
+      }
+      for (int block = 0; block < blocks_per_row; ++block) {
+        const auto selector = static_cast<std::uint8_t>(
+            (row + block * 3) & 1);
+        selectors.push_back(selector);
+        std::uint8_t low_tag = 0;
+        for (int lane = 0; lane < 32; ++lane) {
+          const auto symbol = symbols[
+              static_cast<std::size_t>(block * 32 + lane)];
+          if (bits == 1) {
+            low_tag ^= static_cast<std::uint8_t>(
+                symbol << static_cast<unsigned>(lane & 1));
+          } else {
+            low_tag ^= symbol;
+          }
+        }
+        low_tag &= 3u;
+        const auto tag = static_cast<std::uint8_t>(
+            low_tag | (selector << 2u));
+        const auto scale_offset = state_scales[
+            static_cast<std::size_t>(sq_row) * 8 + tag];
+        const auto palette = state_palettes[
+            static_cast<std::size_t>(sq_row) * 8 + tag];
+        const float scale = std::ldexp(
+            1.0f,
+            static_cast<int>(matrix_scale_base) + scale_offset - 127);
+        for (int lane = 0; lane < 32; ++lane) {
+          const int column = block * 32 + lane;
+          const auto symbol = symbols[static_cast<std::size_t>(column)];
+          std::uint8_t nibble = 0;
+          if (bits == 1) {
+            nibble = mfq::metal::kMxfp4Sq1PaletteNibbles[
+                static_cast<std::size_t>(palette) * 2 + symbol];
+          } else if (bits == 2) {
+            nibble = mfq::metal::kMxfp4Sq2PaletteNibbles[
+                static_cast<std::size_t>(palette) * 4 + symbol];
+          } else {
+            nibble = mfq::metal::kMxfp4Sq3PaletteNibbles[
+                static_cast<std::size_t>(palette) * 8 + symbol];
+          }
+          dense[static_cast<std::size_t>(row) * columns + column] =
+              fp4(nibble) * scale;
+        }
+      }
+      ++sq_row;
+    }
+    symbol_rows.push_back(pack_bits(symbols, bits));
+  }
+
+  std::vector<std::uint8_t> q_descriptors(row_q.size());
+  std::transform(
+      row_q.begin(), row_q.end(), q_descriptors.begin(),
+      [](std::uint8_t q) { return static_cast<std::uint8_t>(q - 1); });
+  auto packed_q = pack_bits(q_descriptors, 2);
+  packed_q.resize((packed_q.size() + 3) & ~std::size_t{3}, 0);
+
+  std::vector<std::uint8_t> blob{'S', 'Q', 'V', '2'};
+  append<std::uint8_t>(blob, 2);
+  append<std::uint8_t>(blob, matrix_scale_base);
+  append<std::uint16_t>(blob, 0);
+  append<std::uint64_t>(blob, rows);
+  append<std::uint64_t>(blob, columns);
+  append_bytes(blob, packed_q);
+  for (const auto &symbols : symbol_rows) {
+    append_bytes(blob, symbols);
+  }
+  append_bytes(blob, pack_bits(selectors, 1));
+  append_bytes(blob, pack_bits(state_scales, 2));
+  append_bytes(blob, pack_bits(state_palettes, 5));
+  append_bytes(blob, native_scales);
+  return {
+      rows,
+      columns,
+      matrix_scale_base,
+      blob.size(),
+      std::move(blob),
+      std::move(dense),
+  };
+}
+
+void test_adaptive_q1234_dequant_and_small_m() {
+  using namespace mlx::core;
+  // More than 16 block-32 groups exercises the full 32-lane reduction tree
+  // selected for heterogeneous q.
+  const auto fixture = make_adaptive_fixture(12, 640);
+  const auto weight =
+      mfq::metal::MlxMxfp4SqWeight::from_blob(fixture.blob);
+  require(weight.format_version() == 2,
+          "adaptive MXFP4-SQ format version mismatch");
+  require(weight.descriptor().format_version == 2,
+          "adaptive MXFP4-SQ descriptor version mismatch");
+  require(weight.bits() == 0,
+          "adaptive MXFP4-SQ must not expose one uniform q");
+  require(std::fabs(weight.descriptor().distribution_entropy - 2.0) < 1e-12,
+          "adaptive MXFP4-SQ q entropy mismatch");
+
+  auto decoded = contiguous(weight.dequantize(float32));
+  eval(decoded);
+  for (std::size_t index = 0; index < fixture.dense.size(); ++index) {
+    require(decoded.data<float>()[index] == fixture.dense[index],
+            "adaptive MXFP4-SQ dequantization mismatch");
+  }
+
+  for (int rows = 1; rows <= 6; ++rows) {
+    std::vector<float> input_values(
+        static_cast<std::size_t>(rows) * fixture.columns);
+    for (std::size_t index = 0; index < input_values.size(); ++index) {
+      input_values[index] = static_cast<float>(
+          static_cast<int>((index * 11 + 7) % 37) - 18) / 128.0f;
+    }
+    auto input = astype(
+        array(input_values.begin(), Shape{rows, fixture.columns}), float16);
+    auto actual = contiguous(astype(weight.matmul(input), float32));
+    eval(actual);
+    float maximum_difference = 0.0f;
+    for (int input_row = 0; input_row < rows; ++input_row) {
+      for (int output_row = 0; output_row < fixture.rows; ++output_row) {
+        float expected = 0.0f;
+        for (int column = 0; column < fixture.columns; ++column) {
+          expected += input_values[
+                          static_cast<std::size_t>(input_row) * fixture.columns
+                          + column]
+              * fixture.dense[
+                  static_cast<std::size_t>(output_row) * fixture.columns
+                  + column];
+        }
+        maximum_difference = std::max(
+            maximum_difference,
+            std::fabs(actual.data<float>()[
+                          static_cast<std::size_t>(input_row) * fixture.rows
+                          + output_row]
+                      - expected));
+      }
+    }
+    require(maximum_difference < 1.5e-2f,
+            "adaptive MXFP4-SQ M=" + std::to_string(rows)
+                + " mismatch: max_abs="
+                + std::to_string(maximum_difference));
+  }
+
+  const std::vector<std::int64_t> selected_rows{3, 0, 2, 1, 7};
+  const auto selected_blob = mfq::sq::select_rows(
+      fixture.blob, selected_rows);
+  const auto selected_layout = mfq::sq::parse(
+      selected_blob.data(), selected_blob.size());
+  const auto selected_metadata = mfq::sq::row_metadata(
+      selected_blob.data(), selected_layout);
+  require(selected_layout.version == 2,
+          "selected MXFP4-SQ rows must use the adaptive wire format");
+  require(selected_metadata.q ==
+              std::vector<std::uint8_t>({4, 1, 3, 2, 4}),
+          "selected MXFP4-SQ q descriptors changed order");
+  const auto selected_weight =
+      mfq::metal::MlxMxfp4SqWeight::from_blob(selected_blob);
+  auto selected_dense = contiguous(selected_weight.dequantize(float32));
+  eval(selected_dense);
+  for (std::size_t destination = 0;
+       destination < selected_rows.size();
+       ++destination) {
+    const auto source_row = static_cast<std::size_t>(
+        selected_rows[destination]);
+    for (int column = 0; column < fixture.columns; ++column) {
+      require(
+          selected_dense.data<float>()[
+              destination * static_cast<std::size_t>(fixture.columns)
+              + static_cast<std::size_t>(column)] ==
+              fixture.dense[
+                  source_row * static_cast<std::size_t>(fixture.columns)
+                  + static_cast<std::size_t>(column)],
+          "MXFP4-SQ selected-row payload changed decoded values");
+    }
+  }
+}
+
 void test_dequantize() {
   using namespace mlx::core;
   const auto fixture = make_fixture(7, 160);
   const auto weight =
-      mfq::metal::MlxMxfp4Sq2Weight::from_blob(fixture.blob);
+      mfq::metal::MlxMxfp4SqWeight::from_blob(fixture.blob);
   require(weight.input_size() == fixture.columns,
           "MXFP4-SQ2 input size mismatch");
   require(weight.output_size() == fixture.rows,
@@ -173,6 +395,8 @@ void test_dequantize() {
           "MXFP4-SQ2 scale base mismatch");
   require(weight.packed_nbytes() == fixture.payload_nbytes,
           "MXFP4-SQ2 payload byte count mismatch");
+  require(weight.descriptor().format_version == 1,
+          "legacy MXFP4-SQ descriptor version mismatch");
 
   auto fp32 = contiguous(weight.dequantize(float32));
   auto fp16 = contiguous(astype(weight.dequantize(float16), float32));
@@ -189,7 +413,7 @@ void test_fused_gemv() {
   using namespace mlx::core;
   const auto fixture = make_fixture(19, 160);
   const auto weight =
-      mfq::metal::MlxMxfp4Sq2Weight::from_blob(fixture.blob);
+      mfq::metal::MlxMxfp4SqWeight::from_blob(fixture.blob);
   std::vector<float> input_values(static_cast<std::size_t>(fixture.columns));
   for (int column = 0; column < fixture.columns; ++column) {
     input_values[static_cast<std::size_t>(column)] =
@@ -237,7 +461,7 @@ void test_multirow_buckets() {
   using namespace mlx::core;
   const auto fixture = make_fixture(19, 96);
   const auto weight =
-      mfq::metal::MlxMxfp4Sq2Weight::from_blob(fixture.blob);
+      mfq::metal::MlxMxfp4SqWeight::from_blob(fixture.blob);
   constexpr std::array<int, 9> row_counts{2, 6, 7, 16, 17, 32, 33, 64, 65};
   for (const int rows : row_counts) {
     std::vector<float> input_values(static_cast<std::size_t>(rows) *
@@ -290,7 +514,7 @@ void test_fp32_multirow_contract() {
   using namespace mlx::core;
   const auto fixture = make_fixture(9, 96);
   const auto weight =
-      mfq::metal::MlxMxfp4Sq2Weight::from_blob(fixture.blob);
+      mfq::metal::MlxMxfp4SqWeight::from_blob(fixture.blob);
   constexpr int rows = 7;
   std::vector<float> values(static_cast<std::size_t>(rows) * fixture.columns);
   for (std::size_t index = 0; index < values.size(); ++index) {
@@ -314,7 +538,7 @@ void test_backward_input() {
   using namespace mlx::core;
   const auto fixture = make_fixture(19, 96);
   const auto weight =
-      mfq::metal::MlxMxfp4Sq2Weight::from_blob(fixture.blob);
+      mfq::metal::MlxMxfp4SqWeight::from_blob(fixture.blob);
   constexpr int rows = 6;
   std::vector<float> values(static_cast<std::size_t>(rows) * fixture.rows);
   for (std::size_t index = 0; index < values.size(); ++index) {
@@ -343,6 +567,41 @@ void test_backward_input() {
   }
 }
 
+void test_adaptive_q1234_backward_input() {
+  using namespace mlx::core;
+  const auto fixture = make_adaptive_fixture(68, 640);
+  const auto weight =
+      mfq::metal::MlxMxfp4SqWeight::from_blob(fixture.blob);
+  for (const int rows : {1, 2, 4, 6, 8}) {
+    std::vector<float> values(
+        static_cast<std::size_t>(rows) * fixture.rows);
+    for (std::size_t index = 0; index < values.size(); ++index) {
+      values[index] = static_cast<float>(
+          static_cast<int>((index * 17 + 5) % 43) - 21) / 256.0f;
+    }
+    auto source = astype(
+        array(values.begin(), Shape{rows, fixture.rows}), float16);
+    auto actual = contiguous(astype(weight.backward_input(source), float32));
+    auto expected = contiguous(astype(matmul(
+        source,
+        weight.dequantize(float16)), float32));
+    eval(actual, expected);
+    require(actual.shape() == Shape{rows, fixture.columns},
+            "adaptive MXFP4-SQ backward-input shape mismatch");
+    float maximum_difference = 0.0f;
+    for (std::size_t index = 0; index < actual.size(); ++index) {
+      maximum_difference = std::max(
+          maximum_difference,
+          std::fabs(
+              actual.data<float>()[index] - expected.data<float>()[index]));
+    }
+    require(maximum_difference < 2.5e-2f,
+            "adaptive MXFP4-SQ backward M=" + std::to_string(rows)
+                + " mismatch: max_abs="
+                + std::to_string(maximum_difference));
+  }
+}
+
 void test_routed_cohort_uses_shared_kernel() {
   using namespace mlx::core;
   constexpr int experts = 3;
@@ -351,7 +610,7 @@ void test_routed_cohort_uses_shared_kernel() {
   constexpr int routes = 3;
   const auto fixture = make_fixture(experts * output, 96);
   const auto weight =
-      mfq::metal::MlxMxfp4Sq2Weight::from_blob(fixture.blob);
+      mfq::metal::MlxMxfp4SqWeight::from_blob(fixture.blob);
   std::vector<float> input_values(
       static_cast<std::size_t>(tokens) * fixture.columns);
   for (std::size_t index = 0; index < input_values.size(); ++index) {
@@ -405,13 +664,73 @@ void test_routed_cohort_uses_shared_kernel() {
               std::to_string(maximum_difference));
 }
 
+void test_adaptive_routed_cohort_uses_shared_kernel() {
+  using namespace mlx::core;
+  constexpr int experts = 3;
+  constexpr int output = 4;
+  constexpr int tokens = 2;
+  constexpr int routes = 3;
+  const auto fixture = make_adaptive_fixture(experts * output, 96);
+  const auto weight =
+      mfq::metal::MlxMxfp4SqWeight::from_blob(fixture.blob);
+  std::vector<float> input_values(
+      static_cast<std::size_t>(tokens) * fixture.columns);
+  for (std::size_t index = 0; index < input_values.size(); ++index) {
+    input_values[index] = static_cast<float>(
+        static_cast<int>((index * 7 + 3) % 31) - 15) / 128.0f;
+  }
+  const std::vector<std::int32_t> ids{0, 1, 3, 2, 0, -1};
+  const std::vector<std::int32_t> map{2, 0, 1, -1};
+  auto input = astype(
+      array(input_values.begin(), Shape{tokens, fixture.columns}), float16);
+  auto actual = contiguous(astype(
+      weight.routed_matmul(
+          input,
+          array(ids.begin(), Shape{tokens, routes}),
+          array(map.begin(), Shape{static_cast<int>(map.size())}),
+          output),
+      float32));
+  eval(actual);
+  float maximum_difference = 0.0f;
+  for (int token = 0; token < tokens; ++token) {
+    for (int route = 0; route < routes; ++route) {
+      const int expert = ids[token * routes + route];
+      const int local = expert >= 0 && expert < static_cast<int>(map.size())
+          ? map[static_cast<std::size_t>(expert)]
+          : -1;
+      for (int row = 0; row < output; ++row) {
+        float expected = 0.0f;
+        if (local >= 0) {
+          for (int column = 0; column < fixture.columns; ++column) {
+            expected += input_values[
+                            static_cast<std::size_t>(token) * fixture.columns
+                            + column]
+                * fixture.dense[
+                    (static_cast<std::size_t>(local) * output + row)
+                        * fixture.columns
+                    + column];
+          }
+        }
+        const auto index =
+            (static_cast<std::size_t>(token) * routes + route) * output + row;
+        maximum_difference = std::max(
+            maximum_difference,
+            std::fabs(actual.data<float>()[index] - expected));
+      }
+    }
+  }
+  require(maximum_difference < 1.5e-2f,
+          "adaptive MXFP4-SQ routed mismatch: max_abs=" +
+              std::to_string(maximum_difference));
+}
+
 void test_blob_validation() {
   auto fixture = make_fixture(3, 64);
   const auto require_rejected = [](const std::vector<std::uint8_t> &blob,
                                    const std::string &message) {
     bool rejected = false;
     try {
-      (void)mfq::metal::MlxMxfp4Sq2Weight::from_blob(blob);
+      (void)mfq::metal::MlxMxfp4SqWeight::from_blob(blob);
     } catch (const std::runtime_error &) {
       rejected = true;
     }
@@ -454,6 +773,14 @@ void test_blob_validation() {
   invalid_scale[5] = 252;
   require_rejected(invalid_scale,
                    "MXFP4-SQ2 invalid E8M0 base was accepted");
+
+  auto adaptive = make_adaptive_fixture(4, 64);
+  const auto adaptive_layout = mfq::sq::parse(
+      adaptive.blob.data(), adaptive.blob.size());
+  adaptive.blob[adaptive_layout.native_scales] = 255;
+  require_rejected(
+      adaptive.blob,
+      "adaptive MXFP4-SQ E8M0 NaN native scale was accepted");
 }
 
 } // namespace
@@ -461,11 +788,14 @@ void test_blob_validation() {
 int main() {
   try {
     test_dequantize();
+    test_adaptive_q1234_dequant_and_small_m();
     test_fused_gemv();
     test_multirow_buckets();
     test_fp32_multirow_contract();
     test_backward_input();
+    test_adaptive_q1234_backward_input();
     test_routed_cohort_uses_shared_kernel();
+    test_adaptive_routed_cohort_uses_shared_kernel();
     test_blob_validation();
     std::cout << "MFQ native-MXFP4 SQ2 Metal dequant/GEMV/MMQ passed\n";
     return 0;

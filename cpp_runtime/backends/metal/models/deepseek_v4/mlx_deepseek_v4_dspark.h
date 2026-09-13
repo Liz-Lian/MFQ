@@ -2,7 +2,6 @@
 
 #include "deepseek_v4_model.h"
 #include "mlx_deepseek_v4_moe.h"
-#include "mlx_hf_tensor.h"
 #include "mlx_mtp.h"
 #include "mlx_tensor.h"
 
@@ -34,6 +33,7 @@ public:
     int batch() const noexcept;
     int window() const noexcept;
     std::size_t stages() const noexcept { return rings_.size(); }
+    std::size_t nbytes() const noexcept;
     const mlx::core::array& ring(std::size_t stage) const;
 
     MlxDeepseekV4DSparkState snapshot() const;
@@ -76,9 +76,9 @@ struct MlxDeepseekV4DSparkStageComponents {
 
 struct MlxDeepseekV4DSparkHeadComponents {
     mlx::core::array norm;
-    std::optional<MlxLinear> hc_head_fn;
-    std::optional<mlx::core::array> hc_head_base;
-    std::optional<mlx::core::array> hc_head_scale;
+    MlxLinear hc_head_fn;
+    mlx::core::array hc_head_base;
+    mlx::core::array hc_head_scale;
     MlxEmbedding markov_embedding;
     MlxLinear markov_output;
     MlxLinear confidence;
@@ -107,16 +107,9 @@ public:
         int max_context,
         std::shared_ptr<MlxMfeOffloadCache> expert_offload =
             nullptr,
-        std::size_t expert_layer_base = 0);
-
-    static MlxDeepseekV4DSpark load_hf(
-        const MlxHfTensorStore& model,
-        const DeepseekV4Config& config,
-        const MlxEmbedding& embedding,
-        const MlxLinear& output,
-        int max_context,
-        std::shared_ptr<MlxDeepseekV4SsdExpertCache> expert_cache,
-        std::size_t expert_layer_base);
+        std::size_t expert_layer_base = 0,
+        std::shared_ptr<MlxMoeSsdExpertCache> ssd_expert_cache =
+            nullptr);
 
     MlxDeepseekV4DSpark(
         DeepseekV4Config config,
@@ -150,6 +143,14 @@ public:
         const MlxMtpTokenSelector& select_token,
         int width = 0) const;
 
+    // Production generation consumes proposals through select_token. Avoid
+    // retaining diagnostic logits/confidence graphs on that path.
+    void propose(
+        const mlx::core::array& anchor_ids,
+        MlxDeepseekV4DSparkState& state,
+        const MlxMtpTokenSelector& select_token,
+        int width = 0) const;
+
     // Test/reference convenience; production generation uses draft() so it
     // shares the runtime sampler with every other MTP implementation.
     MlxDeepseekV4DSparkDraft draft_greedy(
@@ -165,6 +166,13 @@ public:
     }
 
 private:
+    std::optional<MlxDeepseekV4DSparkDraft> draft_impl(
+        const mlx::core::array& anchor_ids,
+        MlxDeepseekV4DSparkState& state,
+        const MlxMtpTokenSelector& select_token,
+        int width,
+        bool collect_diagnostics) const;
+
     struct Impl;
     std::shared_ptr<Impl> impl_;
 };

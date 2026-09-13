@@ -2,9 +2,8 @@
 
 #include "deepseek_v4_model.h"
 #include "mlx_grouped_linear.h"
-#include "mlx_hf_tensor.h"
 #include "mlx_moe.h"
-#include "mlx_deepseek_v4_hf_ssd_expert_cache.h"
+#include "mlx_ssd_expert_cache.h"
 #include "mlx_tensor.h"
 
 #include <array>
@@ -43,16 +42,9 @@ public:
         const std::optional<mlx::core::array>& available =
             std::nullopt,
         std::shared_ptr<MlxMfeOffloadCache> offload =
+            nullptr,
+        std::shared_ptr<MlxMoeSsdExpertCache> ssd_expert_cache =
             nullptr);
-
-    static MlxDeepseekV4Moe load(
-        const MlxHfTensorStore& model,
-        const DeepseekV4Config& config,
-        std::size_t layer,
-        std::shared_ptr<MlxDeepseekV4SsdExpertCache>
-            expert_cache,
-        const std::optional<mlx::core::array>& available =
-            std::nullopt);
 
     // Load a complete eager MoE stored below an arbitrary namespace such as
     // ``mtp.0``.  This is the shared small-M operator used by DSpark stages;
@@ -65,16 +57,9 @@ public:
             std::nullopt,
         std::shared_ptr<MlxMfeOffloadCache> offload =
             nullptr,
-        std::size_t expert_cache_layer = 0);
-
-    static MlxDeepseekV4Moe load_named(
-        const MlxHfTensorStore& model,
-        const DeepseekV4Config& config,
-        const std::string& prefix,
-        std::shared_ptr<MlxDeepseekV4SsdExpertCache> expert_cache,
-        std::size_t expert_cache_layer,
-        const std::optional<mlx::core::array>& available =
-            std::nullopt);
+        std::size_t expert_cache_layer = 0,
+        std::shared_ptr<MlxMoeSsdExpertCache> ssd_expert_cache =
+            nullptr);
 
     MlxDeepseekV4Moe(
         DeepseekV4Config config,
@@ -106,12 +91,12 @@ public:
     // Begin the full-layer native-expert read before the layer's attention
     // work. The caller keeps the handle alive and passes it back to the
     // three-argument forward_branches overload after submitting attention.
-    std::optional<MlxDeepseekV4SsdPrefetchedLayer> prefetch_routed(
+    std::optional<MlxSsdPrefetchedExpertLayer> prefetch_routed(
         std::size_t rows) const;
     MlxDeepseekV4MoeBranches forward_branches(
         const mlx::core::array& input,
         const mlx::core::array& token_ids,
-        MlxDeepseekV4SsdPrefetchedLayer* prefetched) const;
+        MlxSsdPrefetchedExpertLayer* prefetched) const;
 
     mlx::core::array forward(
         const mlx::core::array& input,
@@ -131,6 +116,7 @@ public:
         return static_cast<bool>(expert_offload_)
             || static_cast<bool>(ssd_expert_cache_);
     }
+    int recommended_prefill_chunk_size() const noexcept;
 
 private:
     MlxDeepseekV4Moe(
@@ -145,7 +131,7 @@ private:
         std::optional<MlxRoutedLinear> routed_down,
         std::shared_ptr<MlxMfeOffloadCache>
             expert_offload,
-        std::shared_ptr<MlxDeepseekV4SsdExpertCache>
+        std::shared_ptr<MlxMoeSsdExpertCache>
             ssd_expert_cache,
         std::size_t layer,
         std::string streamed_gate_up_name,
@@ -173,13 +159,14 @@ private:
     std::optional<MlxRoutedLinear> routed_down_;
     std::shared_ptr<MlxMfeOffloadCache>
         expert_offload_;
-    std::shared_ptr<MlxDeepseekV4SsdExpertCache>
+    std::shared_ptr<MlxMoeSsdExpertCache>
         ssd_expert_cache_;
     std::size_t layer_ = 0;
     std::string streamed_gate_up_name_;
     std::string streamed_gate_name_;
     std::string streamed_up_name_;
     std::string streamed_down_name_;
+    bool legacy_tpq_stream_ = false;
     std::optional<MlxGroupedLinear> grouped_projections_;
     std::optional<MlxGroupedLinear>
         grouped_shared_gate_up_;

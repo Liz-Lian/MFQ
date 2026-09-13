@@ -305,7 +305,7 @@ def test_write_upgraded_routed_blob_replaces_only_selected_experts(tmp_path) -> 
     assert restored.expert_profiles == ("NVQ2J", "NINT", "NVQ2J")
     shape, allocation_profiles = _mfe_allocation_profiles(output.read_bytes())
     assert shape == (3, rows, neuron_len)
-    assert allocation_profiles == ("NVQ", "NINT4", "NVQ")
+    assert allocation_profiles == ("NVQ", "NINT", "NVQ")
     retained = restored.pools[0]
     assert retained.expert_ids.tolist() == [0, 2]
     original_rows = np.asarray(base_tensor.indices).reshape(3, rows, -1)

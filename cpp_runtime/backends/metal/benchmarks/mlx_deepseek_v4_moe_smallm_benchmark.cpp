@@ -1,5 +1,5 @@
 #include "mlx_moe_ops.h"
-#include "mlx_deepseek_v4_hf_ssd_expert_arena.h"
+#include "mlx_ssd_expert_arena.h"
 
 #include <algorithm>
 #include <array>
@@ -25,29 +25,31 @@ namespace {
 using Clock = std::chrono::steady_clock;
 using mlx::core::Shape;
 using mlx::core::array;
-using mfq::metal::MlxDeepseekV4SsdExpertArena;
-using mfq::metal::MlxDeepseekV4SsdExpertWeights;
+using mfq::metal::MlxMxfp4SsdExpertArena;
+using mfq::metal::MlxSsdExpertWeights;
 
+constexpr int kHidden = 4096;
+constexpr int kRouted = 2048;
+constexpr int kExperts = 256;
 constexpr int kRoutes = 6;
 constexpr int kMaximumRows = 6;
 constexpr int kSlots = kMaximumRows * kRoutes;
+constexpr std::size_t kGateUpBytesPerExpert =
+    2ull * 2048ull * 2048ull + 2ull * 2048ull * 128ull;
+constexpr std::size_t kDownBytesPerExpert =
+    2048ull * 2048ull + 2048ull * 128ull;
 
 struct Options {
     int rows = 5;
     int repetitions = 20;
     int trials = 5;
     int eval_batch = 1;
-    int hidden = 4096;
-    int routed = 2048;
-    int experts = 256;
     std::string pattern = "unique";
-    std::string geometry = "v4f";
 };
 
 enum class Path {
     sorted,
     unsorted,
-    fused,
     omlx,
     nax,
     adaptive,
@@ -65,7 +67,6 @@ void require(bool condition, const std::string& message) {
         throw std::runtime_error(message);
     }
 }
-
 int parse_positive(const char* text, const char* option) {
     try {
         std::size_t consumed = 0;
@@ -103,33 +104,18 @@ Options parse_options(int argc, char** argv) {
                 value("--eval-batch"), "--eval-batch");
         } else if (argument == "--pattern") {
             options.pattern = value("--pattern");
-        } else if (argument == "--geometry") {
-            options.geometry = value("--geometry");
-            if (options.geometry == "v4f") {
-                options.hidden = 4096;
-                options.routed = 2048;
-                options.experts = 256;
-            } else if (options.geometry == "v41") {
-                options.hidden = 5120;
-                options.routed = 2304;
-                options.experts = 384;
-            } else {
-                throw std::runtime_error(
-                    "--geometry must be v4f or v41");
-            }
         } else if (argument == "--help") {
             std::cout
                 << "Usage: mfq-metal-deepseek-v4-moe-smallm-benchmark "
-                   "[--rows 1..6] [--pattern unique|repeat|mixed] "
-                   "[--geometry v4f|v41] [--repetitions N] "
-                   "[--trials N] [--eval-batch N]\n";
+                   "[--rows 2..6] [--pattern unique|repeat|mixed] "
+                   "[--repetitions N] [--trials N] [--eval-batch N]\n";
             std::exit(0);
         } else {
             throw std::runtime_error("unknown option: " + argument);
         }
     }
-    require(options.rows >= 1 && options.rows <= kMaximumRows,
-            "--rows must be in [1, 6]");
+    require(options.rows >= 2 && options.rows <= kMaximumRows,
+            "--rows must be in [2, 6]");
     require(options.pattern == "unique" || options.pattern == "repeat" ||
                 options.pattern == "mixed",
             "--pattern must be unique, repeat, or mixed");
@@ -137,7 +123,7 @@ Options parse_options(int argc, char** argv) {
 }
 
 void fill_slot(
-    MlxDeepseekV4SsdExpertArena& arena,
+    MlxMxfp4SsdExpertArena& arena,
     std::size_t slot) {
     auto destination = arena.destination(slot);
     for (const auto bytes : {
@@ -211,8 +197,6 @@ const char* path_name(Path path) {
             return "sorted";
         case Path::unsorted:
             return "unsorted";
-        case Path::fused:
-            return "fused_down_reduce";
         case Path::omlx:
             return "omlx";
         case Path::nax:
@@ -249,38 +233,38 @@ class Benchmark {
 public:
     explicit Benchmark(const Options& options)
         : options_(options),
-          arena_(kSlots, options.hidden, options.routed),
-          input_(make_input(options.rows, options.hidden, 11)),
+          arena_(kSlots, kHidden, kRouted),
+          input_(make_input(options.rows, kHidden, 11)),
           down_input_(mlx::core::broadcast_to(
               mlx::core::expand_dims(
-                  make_input(options.rows, options.routed, 37),
+                  make_input(options.rows, kRouted, 37),
                   1),
-              Shape{options.rows, kRoutes, options.routed})),
+              Shape{options.rows, kRoutes, kRouted})),
           ids_(make_ids(options)),
           route_weights_(make_route_weights(options.rows)),
           routed_(make_routed_weights()),
           omlx_up_weight_(mlx::core::full(
-              Shape{kSlots, options.routed, options.hidden / 8},
+              Shape{kSlots, kRouted, kHidden / 8},
               static_cast<std::uint32_t>(0x22222222u),
               mlx::core::uint32)),
           omlx_gate_weight_(mlx::core::full(
-              Shape{kSlots, options.routed, options.hidden / 8},
+              Shape{kSlots, kRouted, kHidden / 8},
               static_cast<std::uint32_t>(0x22222222u),
               mlx::core::uint32)),
           omlx_down_weight_(mlx::core::full(
-              Shape{kSlots, options.hidden, options.routed / 8},
+              Shape{kSlots, kHidden, kRouted / 8},
               static_cast<std::uint32_t>(0x22222222u),
               mlx::core::uint32)),
           omlx_up_scale_(mlx::core::full(
-              Shape{kSlots, options.routed, options.hidden / 32},
+              Shape{kSlots, kRouted, kHidden / 32},
               static_cast<std::uint8_t>(127),
               mlx::core::uint8)),
           omlx_gate_scale_(mlx::core::full(
-              Shape{kSlots, options.routed, options.hidden / 32},
+              Shape{kSlots, kRouted, kHidden / 32},
               static_cast<std::uint8_t>(127),
               mlx::core::uint8)),
           omlx_down_scale_(mlx::core::full(
-              Shape{kSlots, options.hidden, options.routed / 32},
+              Shape{kSlots, kHidden, kRouted / 32},
               static_cast<std::uint8_t>(127),
               mlx::core::uint8)) {
         mlx::core::eval(
@@ -310,10 +294,6 @@ public:
             "MFQ_METAL_MFE_SMALLM_NAX",
             path == Path::adaptive ? "auto" : "0",
             1);
-        setenv(
-            "MFQ_METAL_MFE_DECODE_DOWN_REDUCE",
-            path == Path::fused ? "1" : "0",
-            1);
         if (path == Path::omlx) {
             return omlx(stage);
         }
@@ -331,23 +311,21 @@ public:
 
     std::size_t logical_bytes(Stage stage) const {
         std::size_t bytes = 0;
-        const auto matrix = static_cast<std::size_t>(options_.hidden)
-            * static_cast<std::size_t>(options_.routed);
         if (stage == Stage::gate_up || stage == Stage::full) {
-            bytes += matrix + matrix / 16u;
+            bytes += kGateUpBytesPerExpert;
         }
         if (stage == Stage::down || stage == Stage::full) {
-            bytes += matrix / 2u + matrix / 32u;
+            bytes += kDownBytesPerExpert;
         }
         return bytes * static_cast<std::size_t>(options_.rows) * kRoutes;
     }
 
 private:
-    MlxDeepseekV4SsdExpertWeights make_routed_weights() {
+    MlxSsdExpertWeights make_routed_weights() {
         for (int slot = 0; slot < kSlots; ++slot) {
             fill_slot(arena_, static_cast<std::size_t>(slot));
         }
-        std::vector<std::int32_t> slot_for_expert(options_.experts, 0);
+        std::vector<std::int32_t> slot_for_expert(kExperts, 0);
         std::vector<std::int32_t> active(kSlots);
         std::iota(active.begin(), active.end(), 0);
         for (int slot = 0; slot < kSlots; ++slot) {
@@ -366,15 +344,13 @@ private:
             return routed_.gate_up.swiglu(input, ids, 0.0f);
         }
         if (stage == Stage::down) {
-            return routed_.down.combine(
-                down_input,
-                ids,
+            return mfq::metal::moe_weighted_reduce(
+                routed_.down.forward(down_input, ids),
                 route_weights);
         }
         auto hidden = routed_.gate_up.swiglu(input, ids, 0.0f);
-        return routed_.down.combine(
-            hidden,
-            ids,
+        return mfq::metal::moe_weighted_reduce(
+            routed_.down.forward(hidden, ids),
             route_weights);
     }
 
@@ -411,12 +387,12 @@ private:
             return restore(
                 routed_.gate_up.swiglu_sorted(
                     input_, ids_, route_order, 0.0f, true),
-                options_.routed);
+                kRouted);
         }
         auto sorted_down_input = mlx::core::take(
             mlx::core::reshape(
                 down_input_,
-                Shape{route_count, options_.routed}),
+                Shape{route_count, kRouted}),
             route_order,
             0);
         if (stage == Stage::down) {
@@ -429,7 +405,7 @@ private:
                         true,
                         nullptr,
                         true),
-                    options_.hidden),
+                    kHidden),
                 route_weights_);
         }
         auto hidden = routed_.gate_up.swiglu_sorted(
@@ -443,7 +419,7 @@ private:
                     true,
                     nullptr,
                     true),
-                options_.hidden),
+                kHidden),
             route_weights_);
     }
 
@@ -492,7 +468,7 @@ private:
         }
         auto source = mlx::core::reshape(
             input_,
-            Shape{options_.rows, 1, 1, options_.hidden});
+            Shape{options_.rows, 1, 1, kHidden});
         auto up = omlx_qmm(
             source,
             omlx_up_weight_,
@@ -515,12 +491,12 @@ private:
     }
 
     const Options& options_;
-    MlxDeepseekV4SsdExpertArena arena_;
+    MlxMxfp4SsdExpertArena arena_;
     array input_;
     array down_input_;
     array ids_;
     array route_weights_;
-    MlxDeepseekV4SsdExpertWeights routed_;
+    MlxSsdExpertWeights routed_;
     array omlx_up_weight_;
     array omlx_gate_weight_;
     array omlx_down_weight_;
@@ -613,10 +589,9 @@ int main(int argc, char** argv) {
         std::cout
             << "CONFIG\trows=" << options.rows
             << "\troutes=" << kRoutes
-            << "\texperts=" << options.experts
-            << "\thidden=" << options.hidden
-            << "\trouted=" << options.routed
-            << "\tgeometry=" << options.geometry
+            << "\texperts=" << kExperts
+            << "\thidden=" << kHidden
+            << "\trouted=" << kRouted
             << "\tpattern=" << options.pattern
             << "\trepetitions=" << options.repetitions
             << "\ttrials=" << options.trials
@@ -626,7 +601,6 @@ int main(int argc, char** argv) {
         for (const auto path : {
                  Path::sorted,
                  Path::unsorted,
-                 Path::fused,
                  Path::omlx,
                  Path::nax,
                  Path::adaptive,
@@ -651,11 +625,6 @@ int main(int argc, char** argv) {
                 benchmark.operation(Path::sorted, Stage::full),
                 benchmark.operation(Path::unsorted, Stage::full)));
         report_delta(
-            "fused_down_reduce",
-            compare(
-                benchmark.operation(Path::sorted, Stage::full),
-                benchmark.operation(Path::fused, Stage::full)));
-        report_delta(
             "omlx",
             compare(
                 benchmark.operation(Path::sorted, Stage::full),
@@ -679,7 +648,6 @@ int main(int argc, char** argv) {
         constexpr std::array paths{
             Path::sorted,
             Path::unsorted,
-            Path::fused,
             Path::omlx,
             Path::nax,
             Path::adaptive,

@@ -57,7 +57,7 @@ def _array(value: mx.array) -> np.ndarray:
     return np.asarray(value)
 
 
-def _nint_moe(
+def _mfe_nint(
     dense: np.ndarray,
     cohorts: tuple[tuple[int, ...], ...],
     *,
@@ -86,7 +86,7 @@ def _nint_moe(
     return MfeTensor((experts, out, width), tuple(pools))
 
 
-def _decode_nint_moe(tensor: MfeTensor) -> np.ndarray:
+def _decode_mfe_nint(tensor: MfeTensor) -> np.ndarray:
     result = np.empty(tensor.shape, dtype=np.float32)
     for pool in tensor.pools:
         decoded = dequantize(pool.tensor).reshape(
@@ -129,7 +129,7 @@ def test_grouped_moe_chunks_routes_before_metal_grid_overflow(monkeypatch) -> No
         scale=0.1,
         size=(4, 8, 16),
     ).astype(np.float32)
-    layer = MlxRoutedLinear(_nint_moe(dense, ((0, 1, 2, 3),)))
+    layer = MlxRoutedLinear(_mfe_nint(dense, ((0, 1, 2, 3),)))
     assert layer.grouped_weight is not None
     source = np.random.default_rng(1202).normal(
         scale=0.1,
@@ -273,8 +273,8 @@ def test_routed_mfe_mxfp4_cohort_all_grouped_paths(path: str):
 def test_routed_mfe_mixed_precision_cohorts():
     rng = np.random.default_rng(10)
     dense = rng.normal(0, 0.1, size=(4, 7, 40)).astype(np.float32)
-    tensor = _nint_moe(dense, ((0, 2), (1, 3)), bits=(4, 5))
-    decoded = _decode_nint_moe(tensor)
+    tensor = _mfe_nint(dense, ((0, 2), (1, 3)), bits=(4, 5))
+    decoded = _decode_mfe_nint(tensor)
     source = rng.normal(0, 0.1, size=(3, 40)).astype(np.float32)
     ids = np.asarray([[0, 3], [2, 1], [3, 0]], dtype=np.int32)
     layer = MlxRoutedLinear(tensor)
@@ -296,8 +296,8 @@ def test_routed_mfe_mixed_precision_cohorts():
 def test_routed_grouped_nint_bit_widths(bits: int, width: int):
     rng = np.random.default_rng(100 + bits)
     dense = rng.normal(0, 0.1, size=(2, 7, width)).astype(np.float32)
-    tensor = _nint_moe(dense, ((0, 1),), bits=(bits,))
-    decoded = _decode_nint_moe(tensor)
+    tensor = _mfe_nint(dense, ((0, 1),), bits=(bits,))
+    decoded = _decode_mfe_nint(tensor)
     source = rng.normal(0, 0.1, size=(2, width)).astype(np.float32)
     ids = np.asarray([[0, 1], [1, 0]], dtype=np.int32)
     layer = MlxRoutedLinear(tensor)
@@ -319,7 +319,7 @@ def test_routed_grouped_nint_bit_widths(bits: int, width: int):
 def test_routed_mfe_blob_keeps_nint_cohorts_packed(cohorts, bits):
     rng = np.random.default_rng(20260905)
     dense = rng.normal(0, 0.1, size=(4, 7, 48)).astype(np.float32)
-    tensor = _nint_moe(dense, cohorts, bits=bits)
+    tensor = _mfe_nint(dense, cohorts, bits=bits)
     source = rng.normal(0, 0.1, size=(3, 48)).astype(np.float32)
     ids = np.asarray([[0, 3], [2, 1], [3, 0]], dtype=np.int32)
 
@@ -333,7 +333,7 @@ def test_routed_mfe_blob_keeps_nint_cohorts_packed(cohorts, bits):
     )
     actual = _array(layer(source, ids))
 
-    decoded = _decode_nint_moe(tensor)
+    decoded = _decode_mfe_nint(tensor)
     expected = np.stack(
         [
             np.stack([source[token] @ decoded[expert].T for expert in row])
@@ -352,8 +352,8 @@ def test_low_bit_nint_octet_loader_matches_dequant(
     rng = np.random.default_rng(180 + bits)
     width = 48
     dense = rng.normal(0, 0.1, size=(2, 13, width)).astype(np.float32)
-    tensor = _nint_moe(dense, ((0, 1),), bits=(bits,))
-    decoded = _decode_nint_moe(tensor)
+    tensor = _mfe_nint(dense, ((0, 1),), bits=(bits,))
+    decoded = _decode_mfe_nint(tensor)
     source = rng.normal(0, 0.1, size=(9, width)).astype(np.float16)
     ids = np.tile(np.asarray([[0, 1]], dtype=np.int32), (9, 1))
     layer = MlxRoutedLinear(tensor)
@@ -394,7 +394,7 @@ def test_nint_octet_loader_handles_group_boundaries(groupsize: int):
             ),
         ),
     )
-    decoded = _decode_nint_moe(tensor)
+    decoded = _decode_mfe_nint(tensor)
     source = rng.normal(0, 0.1, size=(9, width)).astype(np.float16)
     ids = np.tile(np.asarray([[0, 1]], dtype=np.int32), (9, 1))
     layer = MlxRoutedLinear(tensor)
@@ -729,9 +729,9 @@ def test_routed_mfe_swiglu_and_route_reduction():
     up_dense = rng.normal(0, 0.1, size=(experts, intermediate, hidden)).astype(np.float32)
     down_dense = rng.normal(0, 0.1, size=(experts, hidden, intermediate)).astype(np.float32)
     cohorts = ((0, 2), (1,))
-    gate = _nint_moe(gate_dense, cohorts, bits=(4, 5))
-    up = _nint_moe(up_dense, cohorts, bits=(4, 5))
-    down = _nint_moe(down_dense, cohorts, bits=(4, 5))
+    gate = _mfe_nint(gate_dense, cohorts, bits=(4, 5))
+    up = _mfe_nint(up_dense, cohorts, bits=(4, 5))
+    down = _mfe_nint(down_dense, cohorts, bits=(4, 5))
     source = rng.normal(0, 0.1, size=(2, hidden)).astype(np.float32)
     ids = np.asarray([[0, 2], [1, 0]], dtype=np.int32)
     weights = np.asarray([[0.7, 0.3], [0.6, 0.4]], dtype=np.float32)
@@ -742,9 +742,9 @@ def test_routed_mfe_swiglu_and_route_reduction():
     assert layer.down.uses_grouped_kernel
     actual = _array(layer(source, ids, weights))
 
-    gate_w = _decode_nint_moe(gate)
-    up_w = _decode_nint_moe(up)
-    down_w = _decode_nint_moe(down)
+    gate_w = _decode_mfe_nint(gate)
+    up_w = _decode_mfe_nint(up)
+    down_w = _decode_mfe_nint(down)
     expected = np.zeros((2, hidden), dtype=np.float32)
     for token in range(2):
         for route in range(2):
@@ -774,7 +774,7 @@ def test_routed_mfe_independent_random_gate_up_down_precisions():
             tuple(int(value) for value in np.flatnonzero(assignment == bits))
             for bits in precision_choices
         )
-        return _nint_moe(
+        return _mfe_nint(
             dense,
             cohorts,
             bits=tuple(int(value) for value in precision_choices),
@@ -823,9 +823,9 @@ def test_routed_mfe_independent_random_gate_up_down_precisions():
     assert io.pack_mfe(io.unpack_mfe(up_blob)) == up_blob
     assert io.pack_mfe(io.unpack_mfe(down_blob)) == down_blob
 
-    gate_dense = _decode_nint_moe(gate)
-    up_dense = _decode_nint_moe(up)
-    down_dense = _decode_nint_moe(down)
+    gate_dense = _decode_mfe_nint(gate)
+    up_dense = _decode_mfe_nint(up)
+    down_dense = _decode_mfe_nint(down)
     routes = 4
     for tokens in (1, 2, 6, 17):
         source = rng.normal(0, 0.08, size=(tokens, hidden)).astype(np.float16)

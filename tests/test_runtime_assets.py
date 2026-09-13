@@ -241,8 +241,8 @@ def test_pack_runtime_assets_adds_minicpmo45_position_asset(
     monkeypatch.setattr(pack_assets_module, "_load_gguf_reader", lambda: FakeReader)
     monkeypatch.setattr(
         pack_assets_module,
-        "minicpmo45_resampler_pos_embed_asset",
-        lambda: position,
+        "source_runtime_assets",
+        lambda _root, _config: (position,),
     )
 
     pack_assets_module.pack_runtime_assets(

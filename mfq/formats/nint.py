@@ -31,6 +31,73 @@ NINT_Q_SELECTOR_BITS = 3
 
 
 @dataclass(frozen=True)
+class NintDescriptor:
+    """Stable summary of one concrete NINT tensor.
+
+    ``aggregate_bpw`` describes the logical encoded rate of the tensor's
+    actual per-neuron q/k allocation.  It includes padded value groups, both
+    subgroup metadata streams, the two FP16 neuron anchors, and the q/k
+    selectors, but excludes fixed MFQ record/header bytes.
+
+    ``distribution_entropy`` is the Shannon entropy, in bits per neuron, of
+    the joint ``(q, k)`` allocation.  A uniform preset therefore has entropy
+    zero even though its absolute q/k values may differ from another preset.
+    """
+
+    aggregate_bpw: float
+    distribution_entropy: float
+    format_version: int = NINT_FORMAT_VERSION
+
+
+def describe_nint_allocation(
+    *,
+    groupsize: int,
+    groups: int,
+    neuron_len: int,
+    row_q_bits: np.ndarray,
+    row_sub_bits: np.ndarray,
+) -> NintDescriptor:
+    """Summarize one canonical per-neuron q/k allocation."""
+
+    q_widths = np.asarray(row_q_bits)
+    k_widths = np.asarray(row_sub_bits)
+    if (
+        q_widths.ndim != 1
+        or k_widths.shape != q_widths.shape
+        or q_widths.size == 0
+        or not np.issubdtype(q_widths.dtype, np.integer)
+        or not np.issubdtype(k_widths.dtype, np.integer)
+    ):
+        raise ValueError("NINT descriptor requires non-empty integer q/k vectors")
+    if int(groupsize) <= 0 or int(groups) <= 0 or int(neuron_len) <= 0:
+        raise ValueError("NINT descriptor requires positive tensor dimensions")
+    q_widths = np.asarray(q_widths, dtype=np.uint16)
+    k_widths = np.asarray(k_widths, dtype=np.uint16)
+    if np.any(q_widths < 1) or np.any(q_widths > 8):
+        raise ValueError("NINT descriptor q widths must be in [1, 8]")
+    if np.any(k_widths < 1) or np.any(k_widths > 8):
+        raise ValueError("NINT descriptor k widths must be in [1, 8]")
+
+    rows = int(q_widths.size)
+    padded_values_per_row = int(groups) * int(groupsize)
+    encoded_bits = (
+        padded_values_per_row * float(q_widths.astype(np.float64).sum())
+        + 2.0 * int(groups) * float(k_widths.astype(np.float64).sum())
+        + rows * 32.0
+        + rows * float(NINT_Q_SELECTOR_BITS + NINT_K_SELECTOR_BITS)
+    )
+    joint = q_widths * 9 + k_widths
+    _values, counts = np.unique(joint, return_counts=True)
+    probabilities = counts.astype(np.float64) / float(rows)
+    return NintDescriptor(
+        aggregate_bpw=encoded_bits / float(rows * int(neuron_len)),
+        distribution_entropy=float(
+            -np.sum(probabilities * np.log2(probabilities))
+        ),
+    )
+
+
+@dataclass(frozen=True)
 class NintSpec:
     """Neuron-anchored INT quantization specification; the quantizer searches these three controls per tensor.
 
@@ -81,8 +148,8 @@ class NintTensor:
 
         Legacy payloads omit the two selector vectors.  Their compatibility
         reader supplies ``None`` and this boundary expands them to the uniform
-        preset represented by ``spec``.  Quantizers and runtimes therefore do
-        not carry a second NINTv1 object model.
+        preset represented by ``spec``.  Quantizers and runtimes therefore
+        carry only the format-v2 object model internally.
         """
 
         rows = int(np.asarray(self.q).shape[0])
@@ -113,16 +180,23 @@ class NintTensor:
     def mean_q_bits(self) -> float:
         return float(np.asarray(self.row_q_bits, dtype=np.float64).mean())
 
-    def bpw(self) -> float:
-        selector_bits = (
-            NINT_K_SELECTOR_BITS + NINT_Q_SELECTOR_BITS
-        ) / float(self.neuron_len)
-        return (
-            self.mean_q_bits
-            + 32.0 / float(self.neuron_len)
-            + 2.0 * self.mean_sub_bits / float(self.spec.groupsize)
-            + selector_bits
+    @property
+    def descriptor(self) -> NintDescriptor:
+        """Return an exact summary derived from the canonical row metadata."""
+
+        groups = int(np.asarray(self.q).shape[1])
+        return describe_nint_allocation(
+            groupsize=int(self.spec.groupsize),
+            groups=groups,
+            neuron_len=int(self.neuron_len),
+            row_q_bits=np.asarray(self.row_q_bits),
+            row_sub_bits=np.asarray(self.row_sub_bits),
         )
+
+    def bpw(self) -> float:
+        """Return the descriptor's aggregate encoded rate."""
+
+        return self.descriptor.aggregate_bpw
 
 
 def normalize_row_q_bits(
@@ -175,6 +249,53 @@ def normalize_row_sub_bits(
             f"[{nominal - 1}, {nominal + 2}] for nominal sub_bits={nominal}"
         )
     return values.astype(np.uint8)
+
+
+def metadata_envelope_spec(
+    groupsize: int,
+    row_q_bits: np.ndarray,
+    row_sub_bits: np.ndarray,
+) -> NintSpec:
+    """Choose the header preset that encloses one NINT metadata map.
+
+    Primary widths are stored absolutely, while subgroup widths use a 2-bit
+    selector around the header ``k``.  The selected header values therefore do
+    not change any row's effective q/k allocation.
+    """
+
+    if int(groupsize) <= 0:
+        raise ValueError("NINT groupsize must be positive")
+    q_widths = np.asarray(row_q_bits)
+    k_widths = np.asarray(row_sub_bits)
+    if (
+        q_widths.ndim != 1
+        or k_widths.shape != q_widths.shape
+        or q_widths.size == 0
+        or not np.issubdtype(q_widths.dtype, np.integer)
+        or not np.issubdtype(k_widths.dtype, np.integer)
+    ):
+        raise ValueError("NINT q/k metadata must be non-empty integer vectors")
+    q_widths = np.asarray(q_widths, dtype=np.int16)
+    k_widths = np.asarray(k_widths, dtype=np.int16)
+    if np.any(q_widths < 1) or np.any(q_widths > 8):
+        raise ValueError("NINT q metadata values must be in [1, 8]")
+    if np.any(k_widths < 1) or np.any(k_widths > 8):
+        raise ValueError("NINT k metadata values must be in [1, 8]")
+    minimum_k = int(k_widths.min())
+    maximum_k = int(k_widths.max())
+    if maximum_k - minimum_k >= (1 << NINT_K_SELECTOR_BITS):
+        raise ValueError("NINT k metadata does not fit one selector window")
+    mean_q = int(np.floor(float(q_widths.mean()) + 0.5))
+    mean_k = int(np.floor(float(k_widths.mean()) + 0.5))
+    nominal_k = min(
+        min(8, minimum_k + 1),
+        max(1, max(maximum_k - 2, mean_k)),
+    )
+    return NintSpec(
+        bits=min(8, max(1, mean_q)),
+        groupsize=int(groupsize),
+        sub_bits=nominal_k,
+    )
 
 
 # Fixed point from the three-dimensional Pareto search on 2026-07-26:

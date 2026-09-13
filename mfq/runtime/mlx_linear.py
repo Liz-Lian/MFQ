@@ -34,9 +34,12 @@ from mfq.formats.nvq1_l import Nvq1LTensor
 from mfq.formats.nvq1_s import Nvq1STensor
 from mfq.formats.tpq import TpqInt4Tensor, TpqPqTensor
 from mfq.kernels.metal.grouped_linear import (
+    GroupedLinearWeight,
     MetalLinearGroupWeight,
+    MetalNintLinearGroupWeight,
     PackedLinearWeight,
     grouped_linear_matmul,
+    grouped_linear_swiglu,
 )
 from mfq.kernels.metal.mx import (
     MetalMxWeight,
@@ -560,13 +563,19 @@ class MlxLinearGroup:
         contains_nint = any(
             isinstance(weight, MetalNintWeight) for weight in packed
         )
-        self.grouped_weight = (
-            MetalLinearGroupWeight.from_weights(tuple(packed))
-            if len(packed) == len(self.layers)
-            and not residual_vq
-            and not contains_nint
-            else None
+        all_nint = bool(packed) and all(
+            isinstance(weight, MetalNintWeight) for weight in packed
         )
+        self.grouped_weight: GroupedLinearWeight | None = None
+        if len(packed) == len(self.layers) and not residual_vq:
+            if all_nint and len(packed) in (2, 3):
+                self.grouped_weight = MetalNintLinearGroupWeight.from_weights(
+                    tuple(packed)
+                )
+            elif not contains_nint:
+                self.grouped_weight = MetalLinearGroupWeight.from_weights(
+                    tuple(packed)
+                )
         if int(grouped_min_rows) <= 0:
             raise ValueError("grouped_min_rows must be positive")
         if grouped_max_rows is not None and int(grouped_max_rows) <= 0:
@@ -586,11 +595,21 @@ class MlxLinearGroup:
             rows = int(source.size) // int(source.shape[-1])
             if rows >= self.grouped_min_rows and (
                 self.grouped_max_rows is None or rows <= self.grouped_max_rows
+            ) and (
+                not isinstance(self.grouped_weight, MetalNintLinearGroupWeight)
+                or rows <= 6
             ):
                 return grouped_linear_matmul(self.grouped_weight, source)
         return tuple(layer(x) for layer in self.layers)
 
     def forward_swiglu(self, x: mx.array | np.ndarray) -> mx.array:
+        if isinstance(self.grouped_weight, MetalNintLinearGroupWeight):
+            source = x if isinstance(x, mx.array) else mx.array(x)
+            rows = int(source.size) // int(source.shape[-1])
+            if rows >= self.grouped_min_rows and rows <= 6 and (
+                self.grouped_max_rows is None or rows <= self.grouped_max_rows
+            ):
+                return grouped_linear_swiglu(self.grouped_weight, source)
         if all(isinstance(layer, MlxNintLinear) for layer in self.layers):
             gate, up = self.layers
             return nint_swiglu(gate.packed_weight, up.packed_weight, x)
@@ -631,7 +650,7 @@ class MlxSwiGLUFFN:
 
 
 class MlxNintModel:
-    """Load an MFQ file and construct Apple-silicon execution primitives."""
+    """Construct Apple-silicon primitives over one canonical tensor store."""
 
     def __init__(self, tensors: Mapping[str, MfqTensor]) -> None:
         self.tensors = tensors
@@ -644,6 +663,11 @@ class MlxNintModel:
 
     @classmethod
     def from_mfq(cls, path: str | Path, *, mmap: bool = True) -> MlxNintModel:
+        source = Path(path).expanduser().resolve()
+        if source.is_dir():
+            from mfq.formats.hf_source import HfSourceTensorStore
+
+            return cls(HfSourceTensorStore(source))
         _header, tensors = io.load_mmap(path) if mmap else io.load(path)
         if mmap:
             # This is the sole runtime migration hook. Model implementations

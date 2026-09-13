@@ -15,6 +15,7 @@
 namespace mfq::metal {
 
 class MfqContainer;
+class MlxMfeWeight;
 
 struct MlxMfeProjectionInfo {
     int experts = 0;
@@ -63,7 +64,7 @@ public:
     MlxMfeOffloadCache(
         const MfqContainer& model,
         std::size_t cache_limit_bytes,
-        int experts);
+        int experts = 0);
     ~MlxMfeOffloadCache();
 
     MlxMfeOffloadCache(
@@ -72,12 +73,18 @@ public:
         const MlxMfeOffloadCache&) = delete;
 
     // Returns false only for a valid non-streamable representation (for
-    // example legacy NIM1 or a mixed non-TPQ MFE record). Malformed TPQ records
-    // still raise.
+    // example legacy NINTv1, dense cohorts, or unsupported VQ layouts).
+    // Malformed streamable records still raise.
     bool can_offload(const std::string& name);
     bool can_stream(const std::string& name) {
         return can_offload(name);
     }
+    bool can_group_mfe(const std::string& name);
+
+    // Compatibility discriminator for the retired TPQ execution adapter.
+    // New formats must use grouped_mfe(); this exists only so old containers
+    // can stay readable without leaking TPQ parsing into model loaders.
+    bool is_legacy_tpq(const std::string& name);
 
     MlxMfeProjectionInfo projection_info(
         const std::string& name);
@@ -85,6 +92,14 @@ public:
         const std::string& name);
 
     MlxTpqRoutedWeight grouped(
+        const std::string& name,
+        const std::vector<std::int32_t>& active_experts);
+
+    // Materialize only the requested experts from a native MFE record and
+    // return one ordinary heterogeneous execution weight whose local expert
+    // order matches active_experts. NINTv2, NVQ-JSC, MXFP4, and aligned
+    // MXFP8 reuse their existing packed kernels after paging.
+    MlxMfeWeight grouped_mfe(
         const std::string& name,
         const std::vector<std::int32_t>& active_experts);
 
@@ -127,22 +142,31 @@ using MlxGroupedVqMmqPlan = MlxGroupedMmqPlan;
 
 // Native packed MFE routed-expert weight.
 //
-// VQ-family, MXFP4/MXFP8, and BF16/F16 cohorts use the common heterogeneous
-// Metal dispatch. NINT and MXFP4-SQ are composed at the routing layer and each
-// reuse their one standalone Linear matmul kernel; neither adds an MFE-specific
-// decoder. Expert IDs retain the global ordering from the MFE container while
-// each descriptor or standalone cohort map points at its local rows.
+// NINT, VQ-family, MXFP4/MXFP8, and BF16/F16 cohorts use the common
+// heterogeneous Metal dispatch. Canonical NINT q+k row metadata is consumed
+// directly by both the decode and grouped-prefill kernels; it is not split
+// into per-q execution pools. Native-QAT SQ cohorts remain composed at the
+// routing layer until their own heterogeneous grouped kernels are available.
+// Expert IDs retain the global ordering from the MFE container while each
+// descriptor or standalone cohort map points at its local rows.
 class MlxMfeWeight {
 public:
     static MlxMfeWeight from_blob(
         std::span<const std::uint8_t> blob);
 
-    // Gate/up and other shape-compatible projections can share one routed
-    // call. Formats with projection fusion use one dispatch; standalone NINT
-    // projections reuse the same NINT kernel in separate dispatches. The
+    // Gate/up and other shape-compatible projections share one packed routed
+    // call when their formats participate in the common dispatch. The
     // returned last dimension is
     // projections() * out_per_expert(), in projection-major order.
     static MlxMfeWeight concatenate_projections(
+        const std::vector<MlxMfeWeight>& weights);
+
+    // Assemble independently resident single-expert pages into one routed
+    // dispatch.  This changes only the packed storage view: every source must
+    // use the ordinary heterogeneous MFE execution streams, and the resulting
+    // expert IDs are the source-vector indices.  No format-specific kernel is
+    // introduced for SSD residency.
+    static MlxMfeWeight concatenate_experts(
         const std::vector<MlxMfeWeight>& weights);
 
     // Build a native MXFP4 routed view over a shared slot arena without
@@ -194,6 +218,11 @@ public:
     }
     bool prefers_mxfp4_smallm_nax(
         const mlx::core::array& expert_ids) const noexcept;
+    // Largest aligned token chunk within the native sorted-MXFP4 prefill row
+    // limit, or zero when this representation/device cannot use that path.
+    // The decision is derived from operator geometry rather than model ID.
+    int recommended_mxfp4_nax_prefill_tokens(
+        int routes_per_token) const noexcept;
     int recommended_grouped_mmq_block_rows(
         int route_count,
         bool fused_swiglu = false) const noexcept;
@@ -309,6 +338,11 @@ public:
     bool prefers_mxfp4_smallm_nax(
         const mlx::core::array& expert_ids) const noexcept {
         return weight_.prefers_mxfp4_smallm_nax(expert_ids);
+    }
+    int recommended_mxfp4_nax_prefill_tokens(
+        int routes_per_token) const noexcept {
+        return weight_.recommended_mxfp4_nax_prefill_tokens(
+            routes_per_token);
     }
     int recommended_grouped_mmq_block_rows(
         int route_count,

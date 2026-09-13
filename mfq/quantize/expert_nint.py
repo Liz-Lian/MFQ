@@ -12,7 +12,7 @@ import numpy as np
 import torch
 
 from mfq.calibration.artifact import ExpertPrecision, nint_expert_precision
-from mfq.formats.mfe import MfePool, MfeTensor
+from mfq.formats.mfe import MfePool, MfeTensor, merge_nint_pools
 from mfq.formats.nepq import NepqTensor
 from mfq.formats.nint import NintSpec
 from mfq.formats.nint8_zero import (
@@ -742,7 +742,10 @@ def quantize_expertwise(
                 device,
             )
         pools.append(MfePool(expert_ids=expert_ids, tensor=tensor))
-    return MfeTensor(shape=shape, pools=tuple(pools))
+    return MfeTensor(
+        shape=shape,
+        pools=merge_nint_pools(tuple(pools), out_per_expert, neuron_len),
+    )
 
 
 def _dequantize_pool(tensor: object) -> np.ndarray:

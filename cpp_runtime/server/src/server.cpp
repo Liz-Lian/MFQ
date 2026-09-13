@@ -761,8 +761,6 @@ static MfqRuntimeProfile architecture_runtime_profile(
     } else if (identity_matches(identities, "deepseek_v41")) {
         result.chat.temperature = 1.0;
         result.chat.top_p = 0.95;
-        result.chat.presence_penalty = 0.0;
-        result.chat.enable_mtp = false;
         result.chat.mtp_max_draft_tokens = 5;
         result.source = "architecture-registry:deepseek_v41";
     } else if (identity_matches(identities, "deepseek_v4")) {

@@ -475,7 +475,7 @@ int main() {
 
         test_nint_record_dtypes();
         std::cout
-            << "MFQ C++ dense and NINT1-NINT8 tensor/linear/"
+            << "MFQ C++ dense and canonical NINT tensor/linear/"
             << "embedding/tied-projection/grouped-row tests passed\n";
         return 0;
     } catch (const std::exception& error) {

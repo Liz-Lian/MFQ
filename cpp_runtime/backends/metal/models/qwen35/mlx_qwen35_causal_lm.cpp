@@ -1484,14 +1484,6 @@ std::int32_t MlxQwen35CausalLm::generate_prepared(
                         accepted_drafts, draft_count);
                 }
             };
-        mtp_callbacks.plain_decode = [&](std::int32_t pending_token) {
-            const array ids(
-                {pending_token},
-                Shape{1, 1},
-                mlx::core::int32);
-            return mlx_last_token_logits(forward_decode(ids), vocab);
-        };
-
         return run_mlx_mtp_generation(
             MlxMtpEngineRequest{
                 vocab,

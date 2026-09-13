@@ -44,8 +44,7 @@ constexpr std::uint64_t kMinRecordEntryBytes =
     2 * sizeof(std::uint32_t) + sizeof(std::uint64_t);
 constexpr std::string_view kModelConfigAsset =
     "__mfq_asset__/model_config.json";
-constexpr std::string_view kMinicpmoResamplerAsset =
-    "__mfq_asset__/minicpmo45-resampler-pos-embed-v1.bf16";
+constexpr std::string_view kAssetPrefix = "__mfq_asset__/";
 constexpr std::uint64_t kMxHeaderBytes = 56;
 
 using json = nlohmann::json;
@@ -165,14 +164,15 @@ std::vector<std::uint8_t> mx_prefix(
         }
         kind = 8;
         expected_storage = {rows, columns};
-        const std::vector<std::int64_t> block128_scales{
-            (rows + 127) / 128, columns / 128};
         const std::vector<std::int64_t> block32_scales{
             (rows + 31) / 32, columns / 32};
         const std::vector<std::int64_t> row_scales{
             rows, columns / 32};
+        const bool block128 = columns % 128 == 0 &&
+            scale_shape == std::vector<std::int64_t>{
+                (rows + 127) / 128, columns / 128};
         if (storage_shape != expected_storage ||
-            (scale_shape != block128_scales &&
+            (!block128 &&
              scale_shape != block32_scales &&
              scale_shape != row_scales)) {
             throw std::runtime_error(
@@ -694,29 +694,166 @@ void MfqContainer::load_hf_directory(
     config_record.nbytes = config_text.size();
     records_.emplace(config_record.name, std::move(config_record));
 
-    if (model_type->get<std::string>().rfind("minicpmo", 0) == 0) {
-        std::filesystem::path position_path;
-        if (const auto* configured = std::getenv(
-                "MFQ_MINICPMO45_RESAMPLER_POSITION_ASSET");
-            configured != nullptr && *configured != '\0') {
-            position_path = configured;
-        } else {
-            position_path = root /
-                "minicpmo45-resampler-pos-embed-v1.bf16";
+    const auto add_asset = [&](const std::string& record_name,
+                               const std::filesystem::path& asset_path) {
+        if (!record_name.starts_with(kAssetPrefix) ||
+            record_name.size() == kAssetPrefix.size()) {
+            throw std::runtime_error(
+                "invalid native HF runtime asset name: " + record_name);
         }
-        if (std::filesystem::is_regular_file(position_path)) {
-            const auto bytes = read_file_text(position_path);
-            hf_assets_.emplace(
-                std::string(kMinicpmoResamplerAsset),
-                std::vector<std::uint8_t>(bytes.begin(), bytes.end()));
-            MfqRecord asset_record;
-            asset_record.name = std::string(kMinicpmoResamplerAsset);
-            asset_record.dtype = "BLOB";
-            asset_record.source_path = std::filesystem::canonical(position_path);
-            asset_record.nbytes = bytes.size();
-            records_.emplace(asset_record.name, std::move(asset_record));
+        const auto bytes = read_file_text(asset_path);
+        if (bytes.empty()) {
+            throw std::runtime_error(
+                "native HF runtime asset is empty: " + asset_path.string());
+        }
+        MfqRecord asset_record;
+        asset_record.name = record_name;
+        asset_record.dtype = "BLOB";
+        asset_record.source_path = stable_source_path(asset_path);
+        asset_record.nbytes = bytes.size();
+        if (!records_.emplace(record_name, std::move(asset_record)).second ||
+            !hf_assets_.emplace(
+                record_name,
+                std::vector<std::uint8_t>(bytes.begin(), bytes.end())).second) {
+            throw std::runtime_error(
+                "duplicate native HF runtime asset: " + record_name);
+        }
+    };
+    static constexpr std::array<std::pair<std::string_view, std::string_view>, 4>
+        hf_sidecars{{
+            {"tokenizer.json", "hf/tokenizer.json"},
+            {"tokenizer_config.json", "hf/tokenizer_config.json"},
+            {"chat_template.jinja", "hf/chat_template.jinja"},
+            {"generation_config.json", "hf/generation_config.json"},
+        }};
+    for (const auto& [filename, asset_name] : hf_sidecars) {
+        const auto sidecar = root / filename;
+        if (std::filesystem::is_regular_file(sidecar)) {
+            add_asset(std::string(kAssetPrefix) + std::string(asset_name), sidecar);
         }
     }
+    const auto add_asset_directory = [&](const std::filesystem::path& directory) {
+        std::error_code directory_error;
+        if (!std::filesystem::is_directory(directory, directory_error) ||
+            directory_error) {
+            return;
+        }
+        const auto canonical_directory =
+            std::filesystem::canonical(directory, directory_error);
+        if (directory_error) {
+            throw std::runtime_error(
+                "cannot resolve native HF runtime asset directory: " +
+                directory.string());
+        }
+        for (std::filesystem::recursive_directory_iterator iterator(
+                 canonical_directory, directory_error), end;
+             !directory_error && iterator != end;
+             iterator.increment(directory_error)) {
+            if (!iterator->is_regular_file(directory_error) || directory_error) {
+                continue;
+            }
+            const auto relative = std::filesystem::relative(
+                iterator->path(), canonical_directory, directory_error);
+            if (directory_error || relative.empty() || relative.is_absolute() ||
+                relative.string().starts_with("..")) {
+                throw std::runtime_error(
+                    "invalid native HF runtime asset path: " +
+                    iterator->path().string());
+            }
+            add_asset(
+                std::string(kAssetPrefix) + relative.generic_string(),
+                iterator->path());
+        }
+        if (directory_error) {
+            throw std::runtime_error(
+                "cannot enumerate native HF runtime assets: " +
+                canonical_directory.string());
+        }
+    };
+    add_asset_directory(root / ".mfq-assets");
+    if (const auto* configured = std::getenv("MFQ_RUNTIME_ASSET_DIRECTORY");
+        configured != nullptr && *configured != '\0') {
+        add_asset_directory(configured);
+    }
+
+    std::unordered_map<std::string, std::string> canonical_to_source;
+    std::unordered_map<std::string, std::string> source_to_canonical;
+    if (const auto found = hf_assets_.find(
+            std::string(mfq::kMfqHfSourceMapAsset));
+        found != hf_assets_.end()) {
+        json payload;
+        try {
+            payload = json::parse(found->second);
+        } catch (const json::exception& exception) {
+            throw std::runtime_error(
+                "invalid native HF source map: " +
+                std::string(exception.what()));
+        }
+        const auto aliases = payload.find("canonical_to_source");
+        if (!payload.is_object() ||
+            payload.value("schema", std::string{}) != "mfq.hf-source-map" ||
+            payload.value("version", 0) != 1 ||
+            aliases == payload.end() || !aliases->is_object()) {
+            throw std::runtime_error(
+                "unsupported native HF source map contract");
+        }
+        for (const auto& [canonical, raw_source] : aliases->items()) {
+            if (canonical.empty() || !raw_source.is_string() ||
+                raw_source.get_ref<const std::string&>().empty()) {
+                throw std::runtime_error(
+                    "native HF source map has an invalid entry");
+            }
+            const auto source = raw_source.get<std::string>();
+            canonical_to_source.emplace(canonical, source);
+            const auto [position, inserted] =
+                source_to_canonical.emplace(source, canonical);
+            if (!inserted && position->second != canonical) {
+                throw std::runtime_error(
+                    "native HF source tensor has multiple canonical owners: " +
+                    source);
+            }
+        }
+    }
+
+    const auto native_mx_scale = [&](const std::string& source_name) {
+        std::vector<std::string> candidates;
+        if (!canonical_to_source.empty()) {
+            if (const auto canonical = source_to_canonical.find(source_name);
+                canonical != source_to_canonical.end() &&
+                canonical->second.ends_with(".weight")) {
+                const auto base = canonical->second.substr(
+                    0,
+                    canonical->second.size() -
+                        std::string_view(".weight").size());
+                for (const auto suffix :
+                     {".weight_scale", ".weight_scale_2", ".scale"}) {
+                    if (const auto scale = canonical_to_source.find(base + suffix);
+                        scale != canonical_to_source.end()) {
+                        candidates.push_back(scale->second);
+                    }
+                }
+            }
+        } else if (source_name.ends_with(".weight")) {
+            const auto base = source_name.substr(
+                0,
+                source_name.size() - std::string_view(".weight").size());
+            candidates.push_back(base + ".scale");
+            candidates.push_back(base + ".weight_scale");
+            candidates.push_back(base + ".weight_scale_2");
+            candidates.push_back(source_name + "_scale_inv");
+            candidates.push_back(source_name + "_scale");
+        }
+        for (const auto& candidate : candidates) {
+            const auto record = hf_store_->tensors().find(candidate);
+            if (record != hf_store_->tensors().end() &&
+                record->second.dtype == "F8_E8M0") {
+                return candidate;
+            }
+        }
+        throw std::runtime_error(
+            "native MX tensor has no canonical F8_E8M0 scale binding: " +
+            source_name);
+    };
 
     std::unordered_set<std::string> consumed_scales;
     std::vector<std::string> names;
@@ -728,6 +865,10 @@ void MfqContainer::load_hf_directory(
     std::sort(names.begin(), names.end());
     for (const auto& name : names) {
         const auto& values = hf_store_->tensor(name);
+        if (!canonical_to_source.empty() &&
+            source_to_canonical.find(name) == source_to_canonical.end()) {
+            continue;
+        }
         if (values.dtype == "F8_E8M0") {
             continue;
         }
@@ -753,18 +894,8 @@ void MfqContainer::load_hf_directory(
         } else if (values.dtype == "I8" ||
                    values.dtype == "F8_E4M3" ||
                    values.dtype == "F8_E4M3FN") {
-            if (!name.ends_with(".weight")) {
-                throw std::runtime_error(
-                    "native MX tensor is not named *.weight: " + name);
-            }
-            const auto scale_name =
-                name.substr(0, name.size() - std::string_view(".weight").size()) +
-                ".scale";
+            const auto scale_name = native_mx_scale(name);
             const auto& scales = hf_store_->tensor(scale_name);
-            if (scales.dtype != "F8_E8M0") {
-                throw std::runtime_error(
-                    "native MX scale is not F8_E8M0: " + scale_name);
-            }
             std::vector<std::int64_t> logical_shape = values.shape;
             if (values.dtype == "I8") {
                 if (logical_shape.size() != 2 ||
@@ -824,7 +955,7 @@ MfqContainer::MfqContainer(std::filesystem::path path)
     if (std::filesystem::is_directory(path, directory_error) &&
         !directory_error) {
         load_hf_directory(path);
-        install_legacy_tensor_compatibility(*this);
+        install_hf_source_compatibility(*this);
         return;
     }
     path = stable_source_path(path);
@@ -1188,6 +1319,12 @@ std::string MfqContainer::read_text(const std::string& name) const {
     return std::string(bytes.begin(), bytes.end());
 }
 
+void MfqContainer::drop_source_file_cache() const noexcept {
+    if (hf_store_) {
+        hf_store_->drop_file_cache();
+    }
+}
+
 std::optional<mfq::MfqModelGraph> MfqContainer::model_graph() const {
     const std::string asset(mfq::kMfqModelGraphAsset);
     if (!contains(asset)) return std::nullopt;
@@ -1197,7 +1334,20 @@ std::optional<mfq::MfqModelGraph> MfqContainer::model_graph() const {
 void MfqContainer::install_legacy_aliases(
         std::unordered_map<std::string, std::string> canonical_to_stored,
         mfq::MfqLegacyTensorLayout layout) {
-    if (model_graph()) {
+    install_aliases(std::move(canonical_to_stored), layout, true);
+}
+
+void MfqContainer::install_source_aliases(
+        std::unordered_map<std::string, std::string> canonical_to_stored) {
+    install_aliases(
+        std::move(canonical_to_stored), mfq::MfqLegacyTensorLayout{}, false);
+}
+
+void MfqContainer::install_aliases(
+        std::unordered_map<std::string, std::string> canonical_to_stored,
+        mfq::MfqLegacyTensorLayout layout,
+        bool reject_model_graph) {
+    if (reject_model_graph && model_graph()) {
         throw std::invalid_argument(
             "canonical MFQ model graphs cannot install legacy tensor aliases");
     }
@@ -1337,23 +1487,56 @@ void MfqContainer::install_hf_mfe_views(
             const auto record = records_.find(stored);
             const auto virtual_record = hf_records_.find(stored);
             if (record == records_.end() ||
-                virtual_record == hf_records_.end() ||
-                (record->second.dtype != "MXFP4" &&
-                 record->second.dtype != "MXFP8")) {
+                virtual_record == hf_records_.end()) {
                 throw std::runtime_error(
-                    "native HF expert is not an MX tensor: " + stored);
+                    "native HF expert has no virtual tensor: " + stored);
             }
             const auto& source = virtual_record->second;
-            if (!source.segments.empty() || source.prefix.size() != kMxHeaderBytes ||
-                std::memcmp(source.prefix.data(), "MXT1", 4) != 0 ||
-                source.values_name.empty() || source.scales_name.empty()) {
+            const bool mx = record->second.dtype == "MXFP4" ||
+                record->second.dtype == "MXFP8";
+            const bool dense = record->second.dtype == "BF16" ||
+                record->second.dtype == "F16";
+            if (!source.segments.empty() || source.values_name.empty() ||
+                (!mx && !dense)) {
                 throw std::runtime_error(
-                    "invalid native HF MX expert view: " + stored);
+                    "unsupported native HF expert dtype: " + stored);
             }
             std::uint64_t source_output = 0;
             std::uint64_t source_input = 0;
-            std::memcpy(&source_output, source.prefix.data() + 8, sizeof(source_output));
-            std::memcpy(&source_input, source.prefix.data() + 16, sizeof(source_input));
+            if (mx) {
+                if (source.prefix.size() != kMxHeaderBytes ||
+                    std::memcmp(source.prefix.data(), "MXT1", 4) != 0 ||
+                    source.scales_name.empty()) {
+                    throw std::runtime_error(
+                        "invalid native HF MX expert view: " + stored);
+                }
+                std::memcpy(
+                    &source_output,
+                    source.prefix.data() + 8,
+                    sizeof(source_output));
+                std::memcpy(
+                    &source_input,
+                    source.prefix.data() + 16,
+                    sizeof(source_input));
+            } else {
+                std::uint32_t rank = 0;
+                if (source.prefix.size() != 20 ||
+                    !source.scales_name.empty()) {
+                    throw std::runtime_error(
+                        "invalid native HF dense expert view: " + stored);
+                }
+                std::memcpy(&rank, source.prefix.data(), sizeof(rank));
+                std::int64_t rows = 0;
+                std::int64_t columns = 0;
+                std::memcpy(&rows, source.prefix.data() + 4, sizeof(rows));
+                std::memcpy(&columns, source.prefix.data() + 12, sizeof(columns));
+                if (rank != 2 || rows <= 0 || columns <= 0) {
+                    throw std::runtime_error(
+                        "native HF dense expert must be rank two: " + stored);
+                }
+                source_output = static_cast<std::uint64_t>(rows);
+                source_input = static_cast<std::uint64_t>(columns);
+            }
             if (source_output == 0 || source_input == 0 ||
                 source_output > std::numeric_limits<std::uint32_t>::max() ||
                 source_input > std::numeric_limits<std::uint32_t>::max()) {
@@ -1389,7 +1572,7 @@ void MfqContainer::install_hf_mfe_views(
             pool.insert(pool.end(), source.prefix.begin(), source.prefix.end());
             append_inline(std::move(pool));
             append_tensor(source.values_name);
-            append_tensor(source.scales_name);
+            if (mx) append_tensor(source.scales_name);
         }
 
         MfqRecord record;

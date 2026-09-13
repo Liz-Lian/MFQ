@@ -20,6 +20,7 @@ _REPOSITORY_ROOT = str(Path(_DIR).resolve().parents[2])
 _CUDA_RUNTIME_INCLUDE = str(
     Path(_REPOSITORY_ROOT) / "cpp_runtime" / "backends" / "cuda" / "include"
 )
+_CORE_INCLUDE = str(Path(_REPOSITORY_ROOT) / "cpp_runtime" / "core" / "include")
 _GGML_ROOT = Path(_REPOSITORY_ROOT) / "cpp_runtime" / "components" / "ggml"
 _GGML_INCLUDE = str(_GGML_ROOT / "include")
 _GGML_SOURCE_INCLUDE = str(_GGML_ROOT / "src")
@@ -38,6 +39,7 @@ _SOURCES = [
     os.path.join(_DIR, "ssm_conv.cu"),
     os.path.join(_DIR, "moe.cu"),
     os.path.join(_DIR, "mx_matmul.cu"),
+    os.path.join(_DIR, "fp8_sq.cu"),
     os.path.join(_DIR, "mxfp4_sq.cu"),
     os.path.join(_DIR, "nint_matmul.cu"),
     os.path.join(_DIR, "nvq_matmul.cu"),
@@ -96,6 +98,7 @@ def ext():
             extra_include_paths=[
                 _REPOSITORY_ROOT,
                 _CUDA_RUNTIME_INCLUDE,
+                _CORE_INCLUDE,
                 _GGML_INCLUDE,
                 _GGML_SOURCE_INCLUDE,
                 _GGML_CUDA_INCLUDE,

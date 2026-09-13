@@ -1,11 +1,10 @@
-"""Private OpenAI-compatible MLX worker for Flash-Next MFQ models.
+"""Private OpenAI-compatible MLX worker for Flash-Next models.
 
 The desktop server normally delegates inference to the C++ sidecar.  Qwen3.8
 Flash-Next and GLM-5.3 Flash have substantially different graphs from the
 older Qwen/GLM families, while their verified implementations currently live
-in MFQ's Python MLX runtime.  This worker makes those implementations usable by
-the same process pool and HTTP adapter without claiming that an HF source
-checkpoint can be executed before it has been converted to MFQ.
+in MFQ's Python MLX runtime. This worker consumes the same canonical tensor
+store whether its physical source is an MFQ artifact or an HF checkpoint.
 """
 
 from __future__ import annotations
@@ -645,19 +644,23 @@ def _parse_multimodal_images(
 
 
 def _asset_or_sibling(
-    store: MMapTensorStore,
+    store: MMapTensorStore | None,
     model_path: Path,
     record: str,
     filename: str,
     *,
     required: bool,
 ) -> bytes | None:
-    if record in store.records:
+    if store is not None and record in store.records:
         value = store[record]
         if not isinstance(value, bytes):
             raise FlashNextWorkerError(f"runtime asset {record!r} is not a BLOB")
         return value
-    sibling = model_path.parent / filename
+    sibling = (
+        model_path / filename
+        if model_path.is_dir()
+        else model_path.parent / filename
+    )
     if sibling.is_file():
         return sibling.read_bytes()
     if required:
@@ -669,7 +672,7 @@ def _asset_or_sibling(
 
 
 def load_flash_next_tokenizer(
-    store: MMapTensorStore,
+    store: MMapTensorStore | None,
     model_path: str | Path,
 ) -> tuple[Any, dict[str, Any]]:
     """Construct a generic fast tokenizer without importing remote model code."""
@@ -802,7 +805,7 @@ class FlashNextTextWorker:
         self.last_request: dict[str, Any] | None = None
 
     @classmethod
-    def from_mfq(
+    def from_artifact(
         cls,
         path: str | Path,
         *,
@@ -811,14 +814,29 @@ class FlashNextTextWorker:
         prefill_chunk_size: int = 2_048,
     ) -> FlashNextTextWorker:
         model_path = Path(path).expanduser().resolve()
-        with open_mmap(model_path) as store:
-            if MODEL_CONFIG_ASSET not in store.records:
-                raise FlashNextWorkerError("MFQ has no embedded model_config.json")
-            payload = store[MODEL_CONFIG_ASSET]
-            if not isinstance(payload, bytes):
-                raise FlashNextWorkerError("embedded model config is not a BLOB")
-            config = _parse_worker_config(_json_object(payload, "model_config.json"))
-            tokenizer, generation_config = load_flash_next_tokenizer(store, model_path)
+        if model_path.is_dir():
+            payload = (model_path / "config.json").read_bytes()
+            config = _parse_worker_config(_json_object(payload, "config.json"))
+            tokenizer, generation_config = load_flash_next_tokenizer(
+                None, model_path
+            )
+        else:
+            with open_mmap(model_path) as store:
+                if MODEL_CONFIG_ASSET not in store.records:
+                    raise FlashNextWorkerError(
+                        "MFQ has no embedded model_config.json"
+                    )
+                payload = store[MODEL_CONFIG_ASSET]
+                if not isinstance(payload, bytes):
+                    raise FlashNextWorkerError(
+                        "embedded model config is not a BLOB"
+                    )
+                config = _parse_worker_config(
+                    _json_object(payload, "model_config.json")
+                )
+                tokenizer, generation_config = load_flash_next_tokenizer(
+                    store, model_path
+                )
         registration = _worker_family_for_config(config)
         selected_context = int(max_context)
         if selected_context <= 0:
@@ -836,6 +854,24 @@ class FlashNextTextWorker:
             mtp=mtp,
             vision_supported=registration.vision_supported(config),
             mtp_supported=registration.mtp_supported,
+            prefill_chunk_size=prefill_chunk_size,
+        )
+
+    @classmethod
+    def from_mfq(
+        cls,
+        path: str | Path,
+        *,
+        model_name: str,
+        max_context: int,
+        prefill_chunk_size: int = 2_048,
+    ) -> FlashNextTextWorker:
+        """Compatibility spelling retained for existing callers."""
+
+        return cls.from_artifact(
+            path,
+            model_name=model_name,
+            max_context=max_context,
             prefill_chunk_size=prefill_chunk_size,
         )
 
@@ -2040,8 +2076,8 @@ def run_worker(args: argparse.Namespace) -> int:
         import uvicorn
     except ModuleNotFoundError as error:  # pragma: no cover - release dependency
         raise FlashNextWorkerError("the Flash-Next worker requires uvicorn") from error
-    worker = FlashNextTextWorker.from_mfq(
-        args.mfq,
+    worker = FlashNextTextWorker.from_artifact(
+        args.model,
         model_name=args.model_name,
         max_context=args.context_size,
         prefill_chunk_size=args.prefill_chunk_size,

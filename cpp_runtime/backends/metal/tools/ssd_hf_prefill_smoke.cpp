@@ -1,5 +1,6 @@
 #include "mlx_deepseek_v4_causal_lm.h"
 #include "mlx_eval_timing.h"
+#include "mfq_container.h"
 
 #include <mlx/mlx.h>
 
@@ -17,6 +18,7 @@
 
 int main(int argc, char** argv) {
     using mfq::metal::MlxDeepseekV4CausalLm;
+    using mfq::metal::MfqContainer;
     using mlx::core::Shape;
     using mlx::core::array;
 
@@ -34,12 +36,12 @@ int main(int argc, char** argv) {
         if (tokens < 2 || tokens > 8192) {
             throw std::invalid_argument("TOKENS must be in [2, 8192]");
         }
-        auto model = MlxDeepseekV4CausalLm::load_hf(
-            root,
+        static_cast<void>(prefill_buffer);
+        const MfqContainer source(root);
+        auto model = MlxDeepseekV4CausalLm::load(
+            source,
             tokens + 8,
-            cache_mib * 1024ull * 1024ull,
-            8,
-            prefill_buffer);
+            cache_mib * 1024ull * 1024ull);
         std::vector<std::int32_t> ids(static_cast<std::size_t>(tokens));
         for (int index = 0; index < tokens; ++index) {
             ids[static_cast<std::size_t>(index)] =

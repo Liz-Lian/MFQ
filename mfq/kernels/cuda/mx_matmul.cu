@@ -1384,8 +1384,9 @@ __global__ void __launch_bounds__(32) mxfp8_backward_scalar_partial_kernel(
     const float scale = decode_e8m0(scales[
         static_cast<int64_t>(output_group) * scale_columns +
         (column >> 7)]);
-    const uint8_t * weight = values +
-        static_cast<int64_t>(output0) * width + column;
+    const uint8_t * weight = output0 < outputs
+        ? values + static_cast<int64_t>(output0) * width + column
+        : values;
     for (int output = output0; output < output_end; ++output) {
         const float decoded = decode_e4m3fn(*weight) * scale;
 #pragma unroll
@@ -1407,6 +1408,101 @@ __global__ void __launch_bounds__(32) mxfp8_backward_scalar_partial_kernel(
                 width + column] = accumulators[row];
         }
     }
+}
+
+template <int Rows, int Warps>
+__global__ void __launch_bounds__(Warps * 32)
+mxfp8_backward_block_reduce_kernel(
+        const uint8_t * __restrict__ values,
+        const uint8_t * __restrict__ scales,
+        const __half * __restrict__ output_gradient,
+        __half * __restrict__ input_gradient,
+        int rows,
+        int outputs,
+        int width) {
+    __shared__ float warp_results[Rows][Warps][32];
+    const int lane = static_cast<int>(threadIdx.x) & 31;
+    const int warp = static_cast<int>(threadIdx.x) >> 5;
+    const int column = static_cast<int>(blockIdx.x) * 32 + lane;
+    const bool valid = column < width;
+    const int output0 = warp * 128;
+    const int output_end = min(output0 + 128, outputs);
+    const int scale_columns = width >> 7;
+    const float scale = valid && output0 < outputs
+        ? decode_e8m0(scales[
+            static_cast<int64_t>(warp) * scale_columns + (column >> 7)])
+        : 0.0f;
+    const uint8_t * weight = values +
+        static_cast<int64_t>(output0) * width + column;
+    float accumulators[Rows] = {};
+    if (valid) {
+        for (int output = output0; output < output_end; ++output) {
+            const float decoded = decode_e4m3fn(*weight) * scale;
+#pragma unroll
+            for (int row = 0; row < Rows; ++row) {
+                if (row < rows) {
+                    accumulators[row] = fmaf(
+                        __half2float(output_gradient[
+                            static_cast<int64_t>(row) * outputs + output]),
+                        decoded,
+                        accumulators[row]);
+                }
+            }
+            weight += width;
+        }
+    }
+#pragma unroll
+    for (int row = 0; row < Rows; ++row) {
+        warp_results[row][warp][lane] = accumulators[row];
+    }
+    __syncthreads();
+    const int result_index = static_cast<int>(threadIdx.x);
+    if (result_index < rows * 32) {
+        const int row = result_index >> 5;
+        const int result_lane = result_index & 31;
+        const int result_column = static_cast<int>(blockIdx.x) * 32 + result_lane;
+        if (result_column < width) {
+            float value = 0.0f;
+#pragma unroll
+            for (int source_warp = 0; source_warp < Warps; ++source_warp) {
+                value += warp_results[row][source_warp][result_lane];
+            }
+            input_gradient[static_cast<int64_t>(row) * width + result_column] =
+                __float2half_rn(value);
+        }
+    }
+}
+
+template <int Rows>
+void launch_mxfp8_backward_block_reduce(
+        const mfq_tensor_backend::Tensor & values,
+        const mfq_tensor_backend::Tensor & scales,
+        const mfq_tensor_backend::Tensor & output_gradient,
+        mfq_tensor_backend::Tensor & result,
+        int rows,
+        int outputs,
+        int width,
+        cudaStream_t stream) {
+    const int output_groups = (outputs + 127) / 128;
+    const int blocks = (width + 31) / 32;
+#define MFQ_LAUNCH_MXFP8_BLOCK_REDUCE(WARPS) \
+    mxfp8_backward_block_reduce_kernel<Rows, WARPS><<< \
+        blocks, (WARPS) * 32, 0, stream>>>( \
+            values.data_ptr<uint8_t>(), scales.data_ptr<uint8_t>(), \
+            reinterpret_cast<const __half *>( \
+                output_gradient.data_ptr<mfq_half>()), \
+            reinterpret_cast<__half *>(result.data_ptr<mfq_half>()), \
+            rows, outputs, width)
+    if (output_groups <= 1) {
+        MFQ_LAUNCH_MXFP8_BLOCK_REDUCE(1);
+    } else if (output_groups <= 2) {
+        MFQ_LAUNCH_MXFP8_BLOCK_REDUCE(2);
+    } else if (output_groups <= 4) {
+        MFQ_LAUNCH_MXFP8_BLOCK_REDUCE(4);
+    } else {
+        MFQ_LAUNCH_MXFP8_BLOCK_REDUCE(8);
+    }
+#undef MFQ_LAUNCH_MXFP8_BLOCK_REDUCE
 }
 
 template <int Rows>
@@ -1593,7 +1689,12 @@ mfq_tensor_backend::Tensor mx_backward_input_cuda(
         return result;
     }
     if (!mxfp4 && dtype == mfq_tensor_backend::kFloat16 && rows <= 8) {
-        if (rows == 1) {
+        const int output_groups = (outputs + 127) / 128;
+        if (rows == 1 && output_groups <= 8) {
+            launch_mxfp8_backward_block_reduce<1>(
+                values, scales, output_gradient, result,
+                rows, outputs, width, stream);
+        } else if (rows == 1) {
             launch_mxfp8_backward_scalar_small_m<1>(
                 values, scales, output_gradient, result,
                 rows, outputs, width, stream);

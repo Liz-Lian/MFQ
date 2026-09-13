@@ -12,7 +12,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Protocol
 from urllib.parse import urlsplit, urlunsplit
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import httpx
 
@@ -26,6 +26,10 @@ from mfq.server.models import (
     TokenUsage,
     ToolChoice,
     ToolDefinition,
+)
+from mfq.server.output_protocols import (
+    ParsedToolCall,
+    output_protocol_for_architecture,
 )
 from mfq.server.vision import (
     MiniCPMO45VisionProcessor,
@@ -151,6 +155,28 @@ class OpenAIChatBackend:
         tool_choice: ToolChoice = "auto",
         response_format: ResponseFormat | None = None,
     ) -> AsyncIterator[BackendDelta]:
+        output_protocol = output_protocol_for_architecture(
+            self._model_type or model
+        )
+        reasoning_parser = (
+            output_protocol.create_reasoning_parser()
+            if sampling.enable_thinking
+            else None
+        )
+        tool_call_parser = (
+            output_protocol.create_tool_call_parser(
+                {
+                    tool.function.name: tool.function.parameters
+                    for tool in tools
+                }
+            )
+            if tools and tool_choice != "none"
+            else None
+        )
+        pending_protocol_calls: list[ParsedToolCall] = []
+        native_tool_calls_seen = False
+        next_protocol_call_index = 0
+        last_backend_request_id: str | None = None
         backend_messages = list(messages)
         multimodal: dict[str, Any] | None = None
         cleanup_paths: tuple[Path, ...] = ()
@@ -206,7 +232,10 @@ class OpenAIChatBackend:
             "mtp_max_draft_tokens": sampling.mtp_max_draft_tokens,
             "stream": True,
             "stream_options": {"include_usage": True},
-            "reasoning_format": "auto",
+            # Protocol parsing belongs at this API boundary rather than in an
+            # architecture runtime, so every backend presents one OpenAI-
+            # compatible reasoning and tool-call contract.
+            "reasoning_format": output_protocol.reasoning_format,
             "chat_template_kwargs": {
                 "enable_thinking": sampling.enable_thinking,
             },
@@ -248,9 +277,104 @@ class OpenAIChatBackend:
                 saw_done = False
                 async for data in self._iter_sse_data(response):
                     if data == "[DONE]":
+                        trailing_reasoning = ""
+                        trailing_content = ""
+                        if reasoning_parser is not None:
+                            trailing_reasoning, trailing_content = reasoning_parser.finish()
+                            reasoning_parser = None
+                        if tool_call_parser is not None:
+                            try:
+                                visible, parsed = tool_call_parser.feed(trailing_content)
+                                final_visible, final_parsed = tool_call_parser.finish()
+                            except ValueError as error:
+                                raise BackendProtocolError(
+                                    "invalid "
+                                    f"{output_protocol.tool_call_protocol_name} "
+                                    f"tool-call output: {error}"
+                                ) from error
+                            trailing_content = visible + final_visible
+                            pending_protocol_calls.extend(parsed)
+                            pending_protocol_calls.extend(final_parsed)
+                            tool_call_parser = None
+                        parsed_tool_deltas: tuple[BackendToolCallDelta, ...] = ()
+                        if pending_protocol_calls and not native_tool_calls_seen:
+                            parsed_tool_deltas = self._parsed_tool_call_deltas(
+                                pending_protocol_calls,
+                                start_index=next_protocol_call_index,
+                            )
+                            next_protocol_call_index += len(parsed_tool_deltas)
+                        pending_protocol_calls.clear()
+                        if trailing_reasoning or trailing_content or parsed_tool_deltas:
+                            yield BackendDelta(
+                                content_delta=trailing_content,
+                                reasoning_delta=trailing_reasoning,
+                                tool_calls=parsed_tool_deltas,
+                                finish_reason=(
+                                    "tool_calls" if parsed_tool_deltas else None
+                                ),
+                                backend_request_id=last_backend_request_id,
+                            )
                         saw_done = True
                         break
                     delta = self._parse_event(data)
+                    if delta.backend_request_id is not None:
+                        last_backend_request_id = delta.backend_request_id
+                    if reasoning_parser is not None:
+                        if delta.reasoning_delta:
+                            # A backend with a working structured parser is
+                            # authoritative; do not parse its content twice.
+                            reasoning_parser = None
+                        else:
+                            reasoning, content = reasoning_parser.feed(
+                                delta.content_delta
+                            )
+                            if delta.finish_reason is not None:
+                                trailing_reasoning, trailing_content = (
+                                    reasoning_parser.finish()
+                                )
+                                reasoning += trailing_reasoning
+                                content += trailing_content
+                                reasoning_parser = None
+                            delta = replace(
+                                delta,
+                                content_delta=content,
+                                reasoning_delta=reasoning,
+                            )
+                    if delta.tool_calls:
+                        native_tool_calls_seen = True
+                    if tool_call_parser is not None:
+                        try:
+                            content, parsed = tool_call_parser.feed(delta.content_delta)
+                            pending_protocol_calls.extend(parsed)
+                            if delta.finish_reason is not None:
+                                trailing, parsed = tool_call_parser.finish()
+                                content += trailing
+                                pending_protocol_calls.extend(parsed)
+                                tool_call_parser = None
+                        except ValueError as error:
+                            raise BackendProtocolError(
+                                "invalid "
+                                f"{output_protocol.tool_call_protocol_name} "
+                                f"tool-call output: {error}"
+                            ) from error
+
+                        parsed_tool_deltas = ()
+                        finish_reason = delta.finish_reason
+                        if finish_reason is not None and pending_protocol_calls:
+                            if not native_tool_calls_seen:
+                                parsed_tool_deltas = self._parsed_tool_call_deltas(
+                                    pending_protocol_calls,
+                                    start_index=next_protocol_call_index,
+                                )
+                                next_protocol_call_index += len(parsed_tool_deltas)
+                                finish_reason = "tool_calls"
+                            pending_protocol_calls.clear()
+                        delta = replace(
+                            delta,
+                            content_delta=content,
+                            tool_calls=delta.tool_calls + parsed_tool_deltas,
+                            finish_reason=finish_reason,
+                        )
                     if delta.performance is not None and processor_ms > 0.0:
                         performance = self._with_processor_timing(
                             delta.performance,
@@ -278,6 +402,22 @@ class OpenAIChatBackend:
     async def aclose(self) -> None:
         if self._owns_client:
             await self._client.aclose()
+
+    @staticmethod
+    def _parsed_tool_call_deltas(
+        calls: Sequence[ParsedToolCall],
+        *,
+        start_index: int,
+    ) -> tuple[BackendToolCallDelta, ...]:
+        return tuple(
+            BackendToolCallDelta(
+                index=start_index + offset,
+                call_id=f"call_{uuid4().hex}",
+                name=call.name,
+                arguments_delta=call.arguments,
+            )
+            for offset, call in enumerate(calls)
+        )
 
     async def fork_session(self, source_session_id: UUID, target_session_id: UUID) -> bool:
         return await self._session_control_request(

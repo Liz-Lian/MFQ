@@ -73,6 +73,7 @@ set(MFQ_CUDA_KERNEL_SOURCES
     ${MFQ_CUDA_KERNEL_ROOT}/paged_kv.cu
     ${MFQ_CUDA_KERNEL_ROOT}/moe.cu
     ${MFQ_CUDA_KERNEL_ROOT}/mx_matmul.cu
+    ${MFQ_CUDA_KERNEL_ROOT}/fp8_sq.cu
     ${MFQ_CUDA_KERNEL_ROOT}/mxfp4_sq.cu
     ${MFQ_CUDA_KERNEL_ROOT}/nepq.cu
     ${MFQ_CUDA_KERNEL_ROOT}/nepq_residual.cu
@@ -99,7 +100,7 @@ target_include_directories(mfq-cuda-native-kernels PRIVATE
 )
 target_link_libraries(mfq-cuda-native-kernels
     PUBLIC mfq-cuda-core CUDA::cuda_driver
-    PRIVATE mfq-ggml-internal-headers
+    PRIVATE mfq-core mfq-ggml-internal-headers
 )
 target_compile_options(mfq-cuda-native-kernels PRIVATE
     "$<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda>"

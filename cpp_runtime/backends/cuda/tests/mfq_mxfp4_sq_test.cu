@@ -6,6 +6,7 @@
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <limits>
 #include <stdexcept>
 #include <vector>
 
@@ -66,6 +67,45 @@ void compare_backward(const Tensor& result, const std::vector<float>& expected,
     }
 }
 
+struct DeviceRowMetadata {
+    Tensor q;
+    Tensor symbol_byte_offsets;
+    Tensor auxiliary;
+    std::int64_t q_sum = 0;
+    std::int64_t sq4_rows = 0;
+};
+
+DeviceRowMetadata device_row_metadata(
+        const std::vector<std::uint8_t>& raw,
+        const mfq::sq::Layout& layout,
+        const Device& device) {
+    const auto rows = mfq::sq::row_metadata(raw.data(), layout);
+    std::vector<std::int32_t> symbol_offsets(rows.q.size());
+    std::vector<std::int32_t> auxiliary(rows.q.size());
+    DeviceRowMetadata result;
+    for (std::size_t row = 0; row < rows.q.size(); ++row) {
+        require(
+            rows.symbol_byte_offsets[row] <=
+                std::uint32_t(std::numeric_limits<std::int32_t>::max()),
+            "test symbol offset exceeds int32");
+        result.q_sum += rows.q[row];
+        result.sq4_rows += rows.q[row] == 4;
+        symbol_offsets[row] =
+            static_cast<std::int32_t>(rows.symbol_byte_offsets[row]);
+        auxiliary[row] = static_cast<std::int32_t>(rows.auxiliary_rows[row]);
+    }
+    result.q = from_blob(
+        const_cast<std::uint8_t*>(rows.q.data()),
+        {layout.outputs}, TensorOptions{}.dtype(kUInt8)).clone().to(device);
+    result.symbol_byte_offsets = from_blob(
+        symbol_offsets.data(), {layout.outputs},
+        TensorOptions{}.dtype(kInt32)).clone().to(device);
+    result.auxiliary = from_blob(
+        auxiliary.data(), {layout.outputs},
+        TensorOptions{}.dtype(kInt32)).clone().to(device);
+    return result;
+}
+
 void check_fixture(const std::filesystem::path& path, int& matmuls,
                    int& backwards, int& graphs) {
     const Device gpu{DeviceType::cuda, 0};
@@ -90,12 +130,25 @@ void check_fixture(const std::filesystem::path& path, int& matmuls,
     }
     auto blob_host = from_blob(raw.data(), {std::int64_t(raw.size())}, TensorOptions{}.dtype(kUInt8));
     auto blob = blob_host.to(gpu);
-    rejects([&] { mxfp4_sq_dequant_cuda(blob_host, q.bits, q.outputs, q.width, q.base, true); });
-    rejects([&] { mxfp4_sq_dequant_cuda(blob, q.bits, q.outputs, q.width + 1, q.base, true); });
-    rejects([&] { mxfp4_sq_dequant_cuda(blob, q.bits, q.outputs, q.width, 252, true); });
+    const auto metadata = device_row_metadata(raw, q, gpu);
+    rejects([&] { mxfp4_sq_dequant_cuda(
+        blob_host, metadata.q, metadata.symbol_byte_offsets, metadata.auxiliary,
+        q.bits, q.outputs, q.width, q.base,
+        metadata.q_sum, metadata.sq4_rows, true); });
+    rejects([&] { mxfp4_sq_dequant_cuda(
+        blob, metadata.q, metadata.symbol_byte_offsets, metadata.auxiliary,
+        q.bits, q.outputs, q.width + 1, q.base,
+        metadata.q_sum, metadata.sq4_rows, true); });
+    rejects([&] { mxfp4_sq_dequant_cuda(
+        blob, metadata.q, metadata.symbol_byte_offsets, metadata.auxiliary,
+        q.bits, q.outputs, q.width, 252,
+        metadata.q_sum, metadata.sq4_rows, true); });
 
     for (bool fp32 : {true, false}) {
-        auto dense = mxfp4_sq_dequant_cuda(blob, q.bits, q.outputs, q.width, q.base, fp32).cpu();
+        auto dense = mxfp4_sq_dequant_cuda(
+            blob, metadata.q, metadata.symbol_byte_offsets, metadata.auxiliary,
+            q.bits, q.outputs, q.width, q.base,
+            metadata.q_sum, metadata.sq4_rows, fp32).cpu();
         if (fp32) require(std::memcmp(dense.data_ptr<float>(), reference.data(), reference.size()) == 0,
                           "FP32 decode is not bit-exact");
         else {
@@ -116,7 +169,10 @@ void check_fixture(const std::filesystem::path& path, int& matmuls,
             for (std::size_t i = 0; i < values.size(); ++i)
                 values[i] = float(int((i * 17 + 11) % 65) - 32) / 32;
             auto x = from_blob(values.data(), {m, q.width}, TensorOptions{}.dtype(kFloat32)).to(gpu).to(dtype);
-            auto invoke = [&] { return mxfp4_sq_matmul_cuda(blob, x, q.bits, q.outputs, q.width, q.base); };
+            auto invoke = [&] { return mxfp4_sq_matmul_cuda(
+                blob, metadata.q, metadata.symbol_byte_offsets,
+                metadata.auxiliary, x, q.bits, q.outputs, q.width, q.base,
+                metadata.q_sum, metadata.sq4_rows); };
             compare(invoke(), expected, values, q, m);
             ++matmuls;
             std::vector<float> gradients(std::size_t(m) * q.outputs);
@@ -127,7 +183,9 @@ void check_fixture(const std::filesystem::path& path, int& matmuls,
             ).to(gpu).to(dtype);
             auto invoke_backward = [&] {
                 return mxfp4_sq_backward_input_cuda(
-                    blob, gradient, q.bits, q.outputs, q.width, q.base);
+                    blob, metadata.q, metadata.symbol_byte_offsets,
+                    metadata.auxiliary, gradient, q.bits, q.outputs,
+                    q.width, q.base, metadata.q_sum, metadata.sq4_rows);
             };
             compare_backward(invoke_backward(), expected, gradients, q, m);
             ++backwards;
@@ -177,9 +235,10 @@ void check_fixture(const std::filesystem::path& path, int& matmuls,
             {tokens, routes, out_per_expert},
             TensorOptions{}.device(gpu).dtype(kFloat16));
         mxfp4_sq_moe_matmul_cuda(
-            blob, x, route_ids, expert_local, q.bits,
+            blob, metadata.q, metadata.symbol_byte_offsets,
+            metadata.auxiliary, x, route_ids, expert_local, q.bits,
             n_experts, local_experts, out_per_expert,
-            q.width, q.base, output);
+            q.width, q.base, metadata.q_sum, metadata.sq4_rows, output);
         const auto host = output.to(kCPU, kFloat32).contiguous();
         for (int token = 0; token < tokens; ++token) {
             for (int route = 0; route < routes; ++route) {
@@ -223,7 +282,7 @@ int main(int argc, char** argv) {
             std::cout << "PASS " << entry.path().filename().string() << std::endl;
         }
         require(
-            fixtures == 30 && matmuls == 576 && backwards == 576 && graphs == 20,
+            fixtures == 37 && matmuls == 672 && backwards == 672 && graphs == 30,
             "incomplete gate coverage");
         std::cout << "PASS fixtures=" << fixtures << " matmuls=" << matmuls
                   << " backwards=" << backwards << " graphs=" << graphs << '\n';

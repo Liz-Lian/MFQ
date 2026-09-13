@@ -12,6 +12,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from time import monotonic
 
+from mfq.architectures.tensor_schema import (
+    graph_spec_for_source_names,
+)
 from mfq.formats.assets import is_asset_record
 from mfq.formats.io import open_mmap
 from mfq.formats.shards import matching_shard_paths, parse_shard_path
@@ -23,23 +26,6 @@ from mfq.server.models import (
 )
 
 MODEL_FILE_INDEX = ".mfq-files.json"
-
-_NATIVE_HF_MODEL_TYPE_PREFIXES = (
-    "deepseek_v41",
-    "deepseek_v4",
-    "minicpmo",
-    "qwen35",
-    "qwen3_5",
-    "qwen3_6",
-    "qwen3_8",
-)
-
-
-def native_hf_model_type_supported(model_type: str) -> bool:
-    """Match exactly the raw-HF families dispatched by native workers."""
-
-    identity = model_type.strip().lower()
-    return any(identity.startswith(prefix) for prefix in _NATIVE_HF_MODEL_TYPE_PREFIXES)
 
 
 class ModelArtifactNotFoundError(LookupError):
@@ -670,7 +656,7 @@ class ModelCatalog:
                 ]
             )
             identifier = hashlib.sha256(fingerprint.encode("utf-8")).hexdigest()[:32]
-            loadable = native_hf_model_type_supported(model_type)
+            loadable = graph_spec_for_source_names(config, sorted(tensors)) is not None
             resource = ModelArtifactResource(
                 id=identifier,
                 name=name,
@@ -690,8 +676,7 @@ class ModelCatalog:
                     None
                     if loadable
                     else (
-                        f"recognized {model_type} HF source checkpoint; convert it to MFQ "
-                        "before inference"
+                        f"{model_type} has no registered canonical tensor schema"
                     )
                 ),
             )

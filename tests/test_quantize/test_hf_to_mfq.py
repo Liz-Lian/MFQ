@@ -22,9 +22,11 @@ from mfq.formats.assets import (
     is_asset_record,
 )
 from mfq.formats.header import FileHeader
+from mfq.formats.fp8_sq import decode_fp8_sq_codes, fp8_sq_scale_bytes, unpack_fp8_sq
 from mfq.formats.io import is_bfloat16_array, load_mmap, open_mmap, save, unpack_dense
 from mfq.formats.mfe import MfePool, MfeTensor
 from mfq.formats.mx import unpack_mx
+from mfq.formats.mxfp4_sq import unpack_mxfp4_sq
 from mfq.formats.nint import NintSpec
 from mfq.formats.shards import format_shard_path
 from mfq.quantize.imatrix import ImportanceEntry, ImportanceMatrix
@@ -49,6 +51,7 @@ from mfq.tools.quantize_hf_to_mfq import (
     _validate_runtime_fused_pairs,
     _write_dense_axis0_blob,
     _write_native_mxfp8_blob,
+    _write_fp8_sq_readers,
     convert,
 )
 from mfq.tools.quantize_hf_to_mfq import (
@@ -113,6 +116,99 @@ def test_standard_preset_names_are_native_mfq_and_reject_legacy_names() -> None:
     assert hf_to_mfq._normalize_standard_preset("s5-m") == "S5-M"
     with pytest.raises(ValueError, match="unsupported standard quantization preset"):
         hf_to_mfq._normalize_standard_preset("Q4_K_M")
+
+
+@pytest.mark.parametrize(("mode", "q"), (("sq1", 1), ("sq2", 2), ("sq3", 3), ("sq4", 4)))
+def test_native_mxfp4_sq_cli_policy_uses_one_canonical_family(mode: str, q: int) -> None:
+    source = TensorPlan(
+        name="blk.0.ffn_gate_up_exps.weight",
+        shard="model.safetensors",
+        shape=(2, 3, 64),
+        source_dtype="MXFP4",
+        target_dtype="MFE",
+        expert_shape=(2, 3, 64),
+        expert_precisions=(ExpertPrecision("MXFP4"),) * 2,
+    )
+
+    mapped = hf_to_mfq._apply_native_mxfp4_expert_sq([source], mode)
+
+    assert mapped[0].target_dtype == "MFE"
+    assert mapped[0].expert_precisions is not None
+    assert [value.family for value in mapped[0].expert_precisions] == [
+        "MXFP4-SQ",
+        "MXFP4-SQ",
+    ]
+    assert [value.option("q") for value in mapped[0].expert_precisions] == [q, q]
+
+
+@pytest.mark.parametrize(
+    ("scheme", "scale_dtype", "family"),
+    (
+        ("mxfp8_block1x32", "F8_E8M0", "MXFP8-SQ"),
+        ("fp8_block128_inv", "BF16", "FP8-128SQ"),
+    ),
+)
+def test_native_fp8_sq_policy_uses_source_scale_contract(
+    scheme: str,
+    scale_dtype: str,
+    family: str,
+) -> None:
+    source = TensorPlan(
+        name="model.block.0.attn.q.weight",
+        shard="model.safetensors",
+        shape=(128, 128),
+        source_dtype="F8_E4M3",
+        target_dtype="NINT4",
+        source_quantization=scheme,
+        source_scale_name="scale",
+        source_scale_shard="model.safetensors",
+        source_scale_dtype=scale_dtype,
+    )
+
+    mapped = hf_to_mfq._apply_native_fp8_sq([source], "sq5")[0]
+
+    assert mapped.target_dtype == family
+    assert mapped.target_option("q") == 5
+    assert mapped.target_option("scale_dtype") == scale_dtype
+
+
+def test_native_fp8_sq_policy_keeps_vision_or_mtp_precision_lock() -> None:
+    source = TensorPlan(
+        name="vision.block.0.attn.q.weight",
+        shard="model.safetensors",
+        shape=(128, 128),
+        source_dtype="F8_E4M3",
+        target_dtype="F16",
+        source_quantization="fp8_block128_inv",
+        source_scale_name="scale",
+        source_scale_shard="model.safetensors",
+        source_scale_dtype="BF16",
+        precision_locked=True,
+    )
+
+    assert hf_to_mfq._apply_native_fp8_sq([source], "sq4") == [source]
+
+
+def test_staged_hf_writer_emits_canonical_container_dtypes(tmp_path) -> None:
+    records = []
+    for index, dtype in enumerate(("NINT5", "NVQ3J", "MXFP4-SQ3")):
+        blob = tmp_path / f"{index}.blob"
+        blob.write_bytes(bytes([index + 1]))
+        records.append(hf_to_mfq.BlobRecord(f"weight.{index}", dtype, 1, blob))
+    output = tmp_path / "staged.mfq"
+
+    hf_to_mfq._write_mfq(
+        output,
+        FileHeader(version=2, model_arch="canonical-staged-writer"),
+        records,
+    )
+
+    with open_mmap(output) as store:
+        assert [record.stored_dtype for record in store.records.values()] == [
+            "NINT",
+            "NVQ",
+            "MXFP4-SQ",
+        ]
 
 
 def test_s4_m_standard_preset_raises_sensitive_text_matrices() -> None:
@@ -225,6 +321,113 @@ def test_standard_preset_keeps_small_sensitive_control_paths_native() -> None:
     )
 
     assert {item.target_dtype for item in mapped} == {"BF16"}
+
+
+@pytest.mark.parametrize("preset", hf_to_mfq.STANDARD_PRESET_NAMES)
+def test_standard_preset_keeps_small_linear_attention_controls_at_nint8(
+    preset: str,
+) -> None:
+    source_and_canonical_names = (
+        (
+            "model.language_model.layers.0.linear_attn.in_proj_a.weight",
+            "model.block.0.linear_attention.alpha.weight",
+        ),
+        (
+            "model.language_model.layers.0.linear_attn.in_proj_b.weight",
+            "model.block.0.linear_attention.beta.weight",
+        ),
+        (
+            "model.language_model.layers.1.self_attn.f_a_proj.weight",
+            "model.block.1.linear_attention.forget_a.weight",
+        ),
+        (
+            "model.language_model.layers.1.self_attn.f_b_proj.weight",
+            "model.block.1.linear_attention.forget_b.weight",
+        ),
+        (
+            "model.language_model.layers.1.self_attn.g_a_proj.weight",
+            "model.block.1.linear_attention.gate_a.weight",
+        ),
+        (
+            "model.language_model.layers.1.self_attn.g_b_proj.weight",
+            "model.block.1.linear_attention.gate_b.weight",
+        ),
+        (
+            "model.language_model.layers.1.self_attn.b_proj.weight",
+            "model.block.1.linear_attention.beta.weight",
+        ),
+    )
+    plans = [
+        TensorPlan(
+            name=canonical_name,
+            shard="model.safetensors",
+            shape=(16, 48),
+            source_dtype="BF16",
+            target_dtype="NINT4",
+            source_name=source_name,
+        )
+        for source_name, canonical_name in source_and_canonical_names
+    ]
+
+    mapped = hf_to_mfq._apply_standard_preset(
+        plans,
+        preset,
+        {"num_hidden_layers": 2},
+    )
+
+    assert {item.target_dtype for item in mapped} == {"NINT8"}
+
+
+def test_standard_preset_does_not_raise_large_linear_attention_projections() -> None:
+    source_and_canonical_names = (
+        (
+            "model.language_model.layers.0.linear_attn.in_proj_qkv.weight",
+            "model.block.0.linear_attention.qkv.weight",
+        ),
+        (
+            "model.language_model.layers.0.linear_attn.in_proj_z.weight",
+            "model.block.0.linear_attention.gate.weight",
+        ),
+        (
+            "model.language_model.layers.0.linear_attn.out_proj.weight",
+            "model.block.0.linear_attention.output.weight",
+        ),
+        (
+            "model.language_model.layers.1.self_attn.q_proj.weight",
+            "model.block.1.linear_attention.query.weight",
+        ),
+        (
+            "model.language_model.layers.1.self_attn.k_proj.weight",
+            "model.block.1.linear_attention.key.weight",
+        ),
+        (
+            "model.language_model.layers.1.self_attn.v_proj.weight",
+            "model.block.1.linear_attention.value.weight",
+        ),
+        (
+            "model.language_model.layers.1.self_attn.o_proj.weight",
+            "model.block.1.linear_attention.output.weight",
+        ),
+    )
+    plans = [
+        TensorPlan(
+            name=canonical_name,
+            shard="model.safetensors",
+            shape=(16, 48),
+            source_dtype="BF16",
+            target_dtype="NINT4",
+            source_name=source_name,
+        )
+        for source_name, canonical_name in source_and_canonical_names
+    ]
+
+    mapped = hf_to_mfq._apply_standard_preset(
+        plans,
+        "S2-S",
+        {"num_hidden_layers": 2},
+    )
+
+    assert {item.target_dtype for item in mapped} == {"NINT2"}
 
 
 @pytest.mark.parametrize(
@@ -601,6 +804,61 @@ def test_deepseek_v41_engram_mxfp8_is_preserved_source_exact(tmp_path):
     assert mapped[0].target_dtype == "MXFP8"
 
 
+@pytest.mark.parametrize(
+    ("scheme", "scale_dtype", "scale_shape", "scale_raw", "dtype"),
+    (
+        (
+            "mxfp8_block1x32",
+            "F8_E8M0",
+            (4, 2),
+            np.full((4, 2), 127, dtype=np.uint8).tobytes(),
+            "MXFP8-SQ",
+        ),
+        (
+            "fp8_block128_inv",
+            "BF16",
+            (1, 1),
+            np.asarray([0x3F80], dtype="<u2").tobytes(),
+            "FP8-128SQ",
+        ),
+    ),
+)
+def test_native_fp8_sq_writer_preserves_scale_contract_and_legal_codes(
+    tmp_path,
+    scheme,
+    scale_dtype,
+    scale_shape,
+    scale_raw,
+    dtype,
+):
+    shape = (4, 64) if scheme == "mxfp8_block1x32" else (128, 128)
+    encoded = np.resize(
+        np.asarray([0x00, 0x38, 0x40, 0xB8, 0xC0], dtype=np.uint8),
+        shape,
+    )
+    path = tmp_path / "model.safetensors"
+    _write_raw_safetensor(
+        path,
+        {
+            "weight": ("F8_E4M3", shape, encoded.tobytes()),
+            "scale": (scale_dtype, scale_shape, scale_raw),
+        },
+    )
+    reader = _ScaledFp8TensorSlice(
+        _RawSafeTensorSlice(path, "weight"),
+        _RawSafeTensorSlice(path, "scale"),
+        scheme,
+    )
+    blob = tmp_path / "weight.fp8-sq"
+
+    _write_fp8_sq_readers((reader,), blob, q=8)
+
+    restored = unpack_fp8_sq(dtype, blob.read_bytes())
+    np.testing.assert_array_equal(decode_fp8_sq_codes(restored), encoded)
+    assert fp8_sq_scale_bytes(restored) == scale_raw
+    assert restored.row_q_bits == (8,) * shape[0]
+
+
 def test_canonical_source_contract_decodes_and_exactly_copies_mxfp4(tmp_path):
     path = tmp_path / "model.safetensors"
     config = {
@@ -648,13 +906,18 @@ def test_canonical_source_contract_decodes_and_exactly_copies_mxfp4(tmp_path):
         gate.expert_source_scale_shards,
     )
     blob = tmp_path / "gate.mxfp4"
+    sq_blob = tmp_path / "gate.sq"
     try:
         source.write_mxfp4_expert_pool((0,), blob)
+        source.write_mxfp4_sq_expert_pool(0, sq_blob, q=2)
     finally:
         source.close()
     exact = unpack_mx("MXFP4", blob.read_bytes())
     np.testing.assert_array_equal(exact.values, np.full((32, 16), 0x22, dtype=np.uint8))
     np.testing.assert_array_equal(exact.scales, np.full((32, 1), 127, dtype=np.uint8))
+    sq = unpack_mxfp4_sq(sq_blob.read_bytes())
+    assert sq.shape == (32, 32)
+    assert sq.row_q_bits == (2,) * 32
 
 
 @pytest.mark.skipif(

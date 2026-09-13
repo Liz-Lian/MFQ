@@ -46,6 +46,7 @@ class TensorRole(str, Enum):
     ATTENTION_V = "attention_v"
     ATTENTION_OUTPUT = "attention_output"
     ATTENTION_INDEXER = "attention_indexer"
+    LINEAR_ATTENTION_CONTROL = "linear_attention_control"
     FFN_GATE = "ffn_gate"
     FFN_UP = "ffn_up"
     FFN_DOWN = "ffn_down"
@@ -110,6 +111,12 @@ class TensorDescriptor:
 
 
 _LAYER_PATTERN = re.compile(r"(?:^|\.)(?:layers|blocks|block|blk)\.(\d+)(?:\.|$)")
+_BLOCK_FF_GATE_PATTERN = re.compile(
+    r"(?:model|vision|predictor)\.block\.\d+\.mlp\.gate\.weight"
+)
+_LINEAR_ATTENTION_NINT8_CONTROLS = frozenset(
+    {"alpha", "beta", "forget_a", "forget_b", "gate_a", "gate_b"}
+)
 _VISION_COMPONENTS = frozenset(
     {
         "visual",
@@ -209,6 +216,14 @@ def _role(name: str, canonical_name: str | None) -> TensorRole:
         for value in names
     ):
         return TensorRole.SHORT_CONVOLUTION
+    canonical_components = canonical.split(".")
+    if (
+        len(canonical_components) >= 3
+        and canonical_components[-3] == "linear_attention"
+        and canonical_components[-2] in _LINEAR_ATTENTION_NINT8_CONTROLS
+        and canonical_components[-1] == "weight"
+    ):
+        return TensorRole.LINEAR_ATTENTION_CONTROL
     if any(
         any(component in {"shared_expert", "shared_experts"} for component in value.split("."))
         or "_shexp." in value
@@ -301,9 +316,16 @@ def describe_tensor(
     is_expert_bank = len(shape) == 3 and role is TensorRole.ROUTED_EXPERT
     quantizable = (is_matrix or is_expert_bank) and source_dtype not in {"I32", "I64"}
     quantizable &= any(value.endswith(".weight") for value in names)
+    # `.mlp.gate.weight` marks a MoE router in raw checkpoints; the canonical
+    # schema maps those routers to `mlp.router.weight` and names the dense FFN
+    # gate `model.block.<N>.mlp.gate.weight`, so block-scoped gates stay
+    # quantizable and keep their fused gate/up precision pair.
+    router_gate_names = [
+        value for value in names if _BLOCK_FF_GATE_PATTERN.fullmatch(value) is None
+    ]
     quantizable &= not any(
         marker in value
-        for value in names
+        for value in router_gate_names
         for marker in (
             "_norm.weight",
             "layernorm.weight",
@@ -355,6 +377,8 @@ def select_target_dtype(
 
     preset = normalize_preset(preset)
     target = _DEFAULT_DTYPE[preset]
+    if role is TensorRole.LINEAR_ATTENTION_CONTROL:
+        return "NINT8"
     if role in {TensorRole.OUTPUT, TensorRole.TOKEN_EMBEDDING}:
         return "NINT8" if preset == "S8" else "NINT6"
     if role is TensorRole.SHARED_EXPERT:

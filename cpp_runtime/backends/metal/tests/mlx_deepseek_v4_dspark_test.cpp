@@ -1,6 +1,8 @@
 #include "mlx_deepseek_v4_dspark.h"
 #include "mlx_deepseek_v4_attention.h"
+#include "mlx_transformer.h"
 #include "mlx_moe.h"
+#include "mlx_sampling.h"
 
 #include <cmath>
 #include <cstdint>
@@ -207,7 +209,7 @@ MlxDeepseekV4DSpark make_dspark() {
                 kHidden + static_cast<int>(cfg.dspark_markov_rank))),
         },
         32,
-        mfq::metal::deepseek_v4_yarn_tables(4, 32, 10'000.0f));
+        mfq::metal::mlx_yarn_tables(4, 32, 10'000.0f));
 }
 
 void test_context_and_parallel_draft() {
@@ -219,6 +221,7 @@ void test_context_and_parallel_draft() {
     require(
         state.position() == 5 && state.stages() == 2,
         "DSpark context position mismatch");
+    require(state.nbytes() > 0, "DSpark state byte size is empty");
     auto saved = state.snapshot();
 
     const array anchor({1}, Shape{1, 1}, mlx::core::int32);
@@ -239,6 +242,24 @@ void test_context_and_parallel_draft() {
             std::fabs(confidence[index]) < 1e-6f,
             "DSpark confidence projection mismatch");
     }
+
+    std::vector<array> proposed;
+    dspark.propose(
+        anchor,
+        state,
+        [&proposed](const array& logits) {
+            auto token = mfq::metal::sample_greedy(logits);
+            proposed.push_back(token);
+            return token;
+        },
+        2);
+    auto proposal = mlx::core::concatenate(proposed, 0);
+    proposal.eval();
+    require(
+        proposed.size() == 2 && proposal.size() == 2 &&
+            proposal.data<std::int32_t>()[0] == 3 &&
+            proposal.data<std::int32_t>()[1] == 3,
+        "DSpark production proposal differs from diagnostic draft");
 
     dspark.append_context(
         mlx::core::zeros(Shape{1, 2, kHidden}, mlx::core::float16),

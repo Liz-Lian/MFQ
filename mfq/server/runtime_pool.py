@@ -218,11 +218,6 @@ class ManagedRuntimePool:
             artifact.path,
         )
         python_mlx_worker = runtime_route.python_mlx_worker
-        if runtime_route.requires_mfq and artifact.resource.format != "mfq":
-            raise _job_error(
-                "model_conversion_required",
-                "this Python MLX architecture must be converted to MFQ before inference",
-            )
         if python_mlx_worker and self.backend != "metal":
             raise _job_error(
                 "unsupported_device",

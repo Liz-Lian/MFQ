@@ -234,6 +234,27 @@ def test_mxfp8_tiled_backward_matches_packed_reference(
     )
 
 
+@pytest.mark.parametrize(
+    "shape",
+    [(127, 128), (129, 256), (385, 384), (769, 512), (1024, 512)],
+)
+def test_mxfp8_single_row_backward_matches_packed_reference(
+    shape: tuple[int, int],
+):
+    tensor, dense = _mxfp8_shape(*shape, 3608 + shape[0])
+    weight = to_gpu_mx(tensor)
+    output_gradient = torch.randn(
+        1, tensor.shape[0], device="cuda", dtype=torch.float16
+    )
+    expected = output_gradient.float() @ torch.as_tensor(dense, device="cuda")
+    torch.testing.assert_close(
+        mx_backward_input(weight, output_gradient).float(),
+        expected,
+        rtol=0.006,
+        atol=0.03,
+    )
+
+
 def test_mxfp8_wide_backward_cuda_graph_replays():
     tensor, dense = _mxfp8_shape(257, 1024, 2608)
     weight = to_gpu_mx(tensor)

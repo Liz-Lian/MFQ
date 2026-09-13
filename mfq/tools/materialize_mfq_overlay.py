@@ -20,6 +20,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO
 
+from mfq.formats.compat import canonical_dtype
+
 _U32 = struct.Struct("<I")
 _U64 = struct.Struct("<Q")
 _MFE_HDR = struct.Struct("<4sIIII")
@@ -274,7 +276,9 @@ def read_mfq_index(path: str | Path) -> MfqIndex:
         if name in names:
             raise ValueError(f"duplicate MFQ tensor name: {name}")
         names.add(name)
-        records.append(MfqRecord(name, dtype, blob_offset, nbytes))
+        records.append(
+            MfqRecord(name, canonical_dtype(dtype), blob_offset, nbytes)
+        )
         blob_offset += nbytes
     if blob_offset != file_size:
         raise ValueError(
@@ -354,7 +358,7 @@ def _parse_moe_container(
                 serial_offset=serial_offset,
                 serial_nbytes=offset - serial_offset,
                 expert_ids=expert_ids,
-                dtype=dtype,
+                dtype=canonical_dtype(dtype),
                 runtime_offset=runtime_offset,
                 runtime_nbytes=int(runtime_nbytes),
                 payload_offset=payload_offset,
@@ -1175,7 +1179,7 @@ def _encode_file_table(
     parts.append(_U32.pack(len(records)))
     for record in records:
         parts.append(_encode_string(record.name))
-        parts.append(_encode_string(record.dtype))
+        parts.append(_encode_string(canonical_dtype(record.dtype)))
         parts.append(_U64.pack(record.nbytes))
     return b"".join(parts)
 

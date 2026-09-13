@@ -1,11 +1,10 @@
 #include "mlx_mxfp4_sq.h"
 
-#include "mlx_mxfp4_sq2.h"
-#include "mlx_mxfp4_sq3.h"
 #include "mfq/mxfp4_sq_blob.h"
 #include "mfq_format_compat.h"
 
 #include <algorithm>
+#include <cmath>
 #include <limits>
 #include <optional>
 #include <stdexcept>
@@ -22,9 +21,10 @@ using mlx::core::Dtype;
 using mlx::core::MathMode;
 using mlx::core::Shape;
 
-// Both profiles share one decoder.  The symbol width is read from the payload
-// header at execution time, so SQ2/SQ3 do not create separate pipeline
-// specializations.  The immutable palette catalog is one small shared input.
+// Every q profile shares one decoder.  The loader expands each two-bit q
+// descriptor and its variable-width symbol offset once; execution therefore
+// needs no profile-specific pipeline.  The immutable palette catalog is one
+// small shared input.
 constexpr const char* kSqHeader = R"METAL(
 inline uint mfq_sq_read_bits(
     device const uchar* stream,
@@ -42,15 +42,20 @@ inline uint mfq_sq_read_bits(
 }
 
 inline uint mfq_sq_block_tag(
-    device const uchar* symbols,
+    device const uchar* row_symbols,
     device const uchar* selectors,
-    uint block_index,
+    uint block,
+    uint selector_index,
     uint bits
 ) {
     device const uint* words = (device const uint*)(
-        symbols + block_index * bits * 4u);
+        row_symbols + block * bits * 4u);
     uint low = 0u;
-    if (bits == 2u) {
+    if (bits == 1u) {
+        uint word = words[0];
+        low = (popcount(word & 0x55555555u) & 1u)
+            | ((popcount(word & 0xAAAAAAAAu) & 1u) << 1u);
+    } else if (bits == 2u) {
         uint folded = words[0] ^ words[1];
         folded ^= folded >> 16u;
         folded ^= folded >> 8u;
@@ -75,14 +80,25 @@ inline uint mfq_sq_block_tag(
         low = (low_count & 1u) | ((high_count & 1u) << 1u);
     }
     uint explicit_high =
-        (uint(selectors[block_index >> 3u])
-            >> (block_index & 7u)) & 1u;
+        (uint(selectors[selector_index >> 3u])
+            >> (selector_index & 7u)) & 1u;
     return low | (explicit_high << 2u);
 }
 
 inline float mfq_sq_scale(uint exponent) {
     uint raw = exponent == 0u ? 0x00400000u : exponent << 23u;
     return as_type<float>(raw);
+}
+
+inline float mfq_sq_decode_native(uint nibble, uint exponent) {
+    constexpr float MAGNITUDES[8] = {
+        0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
+    };
+    float magnitude = MAGNITUDES[nibble & 7u];
+    if ((nibble & 8u) != 0u) {
+        magnitude = -magnitude;
+    }
+    return magnitude * mfq_sq_scale(exponent);
 }
 
 inline float mfq_sq_decode(
@@ -92,17 +108,10 @@ inline float mfq_sq_decode(
     uint exponent,
     uint bits
 ) {
-    constexpr float MAGNITUDES[8] = {
-        0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
-    };
-    uint catalog_offset = bits == 2u ? 0u : 128u;
+    uint catalog_offset = bits == 1u ? 0u : (bits == 2u ? 64u : 192u);
     uint nibble = uint(palette_catalog[
         catalog_offset + palette * (1u << bits) + symbol]);
-    float magnitude = MAGNITUDES[nibble & 7u];
-    if ((nibble & 8u) != 0u) {
-        magnitude = -magnitude;
-    }
-    return magnitude * mfq_sq_scale(exponent);
+    return mfq_sq_decode_native(nibble, exponent);
 }
 )METAL";
 
@@ -116,22 +125,36 @@ constexpr const char* kSqDequantize = R"METAL(
     device const uchar* selectors = blob + uint(SELECTORS_OFFSET);
     device const uchar* state_scales = blob + uint(SCALES_OFFSET);
     device const uchar* state_palettes = blob + uint(PALETTES_OFFSET);
-    uint bits = uint(blob[2]) - 48u;
     uint output = block_index / uint(BLOCKS);
+    uint block = block_index - output * uint(BLOCKS);
+    uint bits = uint(row_q[output]);
+    device const uchar* row_symbols =
+        symbols + row_symbol_byte_offsets[output];
+    uint auxiliary = row_auxiliary[output];
     uint state_value = 0u;
     if (lane == 0u) {
-        uint state = output * 8u
-            + mfq_sq_block_tag(symbols, selectors, block_index, bits);
-        state_value =
-            (mfq_sq_read_bits(state_palettes, state, 5u) << 8u)
-            | (uint(blob[5])
-                + mfq_sq_read_bits(state_scales, state, 2u));
+        if (bits == 4u) {
+            state_value = uint(
+                blob[uint(NATIVE_SCALES_OFFSET)
+                    + auxiliary * uint(BLOCKS) + block]);
+        } else {
+            uint selector_index = auxiliary * uint(BLOCKS) + block;
+            uint state = auxiliary * 8u + mfq_sq_block_tag(
+                row_symbols, selectors, block, selector_index, bits);
+            state_value =
+                (mfq_sq_read_bits(state_palettes, state, 5u) << 8u)
+                | (uint(MATRIX_SCALE_BASE)
+                    + mfq_sq_read_bits(state_scales, state, 2u));
+        }
     }
     state_value = simd_broadcast_first(state_value);
-    uint index = block_index * 32u + lane;
-    uint symbol = mfq_sq_read_bits(symbols, index, bits);
-    y[index] = T(mfq_sq_decode(
-        palette, state_value >> 8u, symbol, state_value & 255u, bits));
+    uint symbol = mfq_sq_read_bits(
+        row_symbols, block * 32u + lane, bits);
+    float decoded = bits == 4u
+        ? mfq_sq_decode_native(symbol, state_value)
+        : mfq_sq_decode(
+            palette, state_value >> 8u, symbol, state_value & 255u, bits);
+    y[block_index * 32u + lane] = T(decoded);
 )METAL";
 
 // One metadata-driven packed matrix kernel for every SQ profile and small M.
@@ -179,7 +202,6 @@ constexpr const char* kSqMatmul = R"METAL(
     device const uchar* selectors = blob + uint(SELECTORS_OFFSET);
     device const uchar* state_scales = blob + uint(SCALES_OFFSET);
     device const uchar* state_palettes = blob + uint(PALETTES_OFFSET);
-    uint bits = uint(blob[2]) - 48u;
 
     for (uint metadata = local_thread;
          metadata < OUTPUTS_PER_TG * 8u;
@@ -195,12 +217,19 @@ constexpr const char* kSqMatmul = R"METAL(
                 : 0u)
             : row_index;
         row = min(row, uint(OUT) - 1u);
-        uint state_index = row * 8u + state;
-        row_scales[metadata] = mfq_sq_scale(
-            uint(blob[5])
-            + mfq_sq_read_bits(state_scales, state_index, 2u));
-        row_palettes[metadata] = uchar(
-            mfq_sq_read_bits(state_palettes, state_index, 5u));
+        uint bits = uint(row_q[row]);
+        uint auxiliary = row_auxiliary[row];
+        if (bits == 4u) {
+            row_scales[metadata] = 1.0f;
+            row_palettes[metadata] = 0;
+        } else {
+            uint state_index = auxiliary * 8u + state;
+            row_scales[metadata] = mfq_sq_scale(
+                uint(MATRIX_SCALE_BASE)
+                + mfq_sq_read_bits(state_scales, state_index, 2u));
+            row_palettes[metadata] = uchar(
+                mfq_sq_read_bits(state_palettes, state_index, 5u));
+        }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -214,21 +243,74 @@ constexpr const char* kSqMatmul = R"METAL(
     for (uint block = k_lane;
          block < uint(BLOCKS);
          block += K_LANES_VALUE) {
-        uint block_index = output * uint(BLOCKS) + block;
-        uint tag = mfq_sq_block_tag(
-            symbols, selectors, block_index, bits);
+        uint bits = uint(row_q[output]);
+        uint auxiliary = row_auxiliary[output];
+        device const uchar* row_symbols =
+            symbols + row_symbol_byte_offsets[output];
+        uint tag = bits == 4u ? 0u : mfq_sq_block_tag(
+            row_symbols,
+            selectors,
+            block,
+            auxiliary * uint(BLOCKS) + block,
+            bits);
         uint cached_state = output_slot * 8u + tag;
-        float scale = row_scales[cached_state];
+        float scale = bits == 4u
+            ? mfq_sq_scale(uint(blob[uint(NATIVE_SCALES_OFFSET)
+                + auxiliary * uint(BLOCKS) + block]))
+            : row_scales[cached_state];
         uint palette_index = uint(row_palettes[cached_state]);
         uint column_base = block * 32u;
 
-        if (bits == 2u) {
+        if (bits == 1u) {
+            for (uint packed_index = 0u;
+                 packed_index < 4u;
+                 ++packed_index) {
+                uint column = column_base + packed_index * 8u;
+                uint packed = uint(row_symbols[block * 4u + packed_index]);
+                float4 weight0 = float4(
+                    mfq_sq_decode(
+                        palette, palette_index, packed & 1u, 127u, 1u),
+                    mfq_sq_decode(
+                        palette, palette_index, (packed >> 1u) & 1u, 127u, 1u),
+                    mfq_sq_decode(
+                        palette, palette_index, (packed >> 2u) & 1u, 127u, 1u),
+                    mfq_sq_decode(
+                        palette, palette_index, (packed >> 3u) & 1u, 127u, 1u))
+                    * scale;
+                float4 weight1 = float4(
+                    mfq_sq_decode(
+                        palette, palette_index, (packed >> 4u) & 1u, 127u, 1u),
+                    mfq_sq_decode(
+                        palette, palette_index, (packed >> 5u) & 1u, 127u, 1u),
+                    mfq_sq_decode(
+                        palette, palette_index, (packed >> 6u) & 1u, 127u, 1u),
+                    mfq_sq_decode(
+                        palette, palette_index, packed >> 7u, 127u, 1u))
+                    * scale;
+                for (uint local_row = 0u;
+                     local_row < uint(TILE_M);
+                     ++local_row) {
+                    uint row = min(first_row + local_row, uint(M) - 1u);
+                    uint input_row = uint(ROUTED) != 0u
+                        && uint(SHARED_INPUT) != 0u
+                        ? row / uint(ROUTES)
+                        : row;
+                    half4 activation0 = *(device const half4*)(
+                        x + input_row * uint(K) + column);
+                    half4 activation1 = *(device const half4*)(
+                        x + input_row * uint(K) + column + 4u);
+                    accumulators[local_row] +=
+                        dot(float4(activation0), weight0)
+                        + dot(float4(activation1), weight1);
+                }
+            }
+        } else if (bits == 2u) {
             for (uint packed_index = 0u;
                  packed_index < 8u;
                  ++packed_index) {
                 uint column = column_base + packed_index * 4u;
                 uint packed = uint(
-                    symbols[block_index * 8u + packed_index]);
+                    row_symbols[block * 8u + packed_index]);
                 float4 weight = float4(
                     mfq_sq_decode(
                         palette, palette_index, packed & 3u, 127u, 2u),
@@ -254,13 +336,13 @@ constexpr const char* kSqMatmul = R"METAL(
                         float4(activation), weight);
                 }
             }
-        } else {
+        } else if (bits == 3u) {
             for (uint group = 0u; group < 4u; ++group) {
                 uint column = column_base + group * 8u;
-                uint byte_offset = block_index * 12u + group * 3u;
-                uint packed = uint(symbols[byte_offset])
-                    | (uint(symbols[byte_offset + 1u]) << 8u)
-                    | (uint(symbols[byte_offset + 2u]) << 16u);
+                uint byte_offset = block * 12u + group * 3u;
+                uint packed = uint(row_symbols[byte_offset])
+                    | (uint(row_symbols[byte_offset + 1u]) << 8u)
+                    | (uint(row_symbols[byte_offset + 2u]) << 16u);
                 float4 weight0 = float4(
                     mfq_sq_decode(
                         palette, palette_index, packed & 7u, 127u, 3u),
@@ -300,12 +382,41 @@ constexpr const char* kSqMatmul = R"METAL(
                         + dot(float4(activation1), weight1);
                 }
             }
+        } else {
+            for (uint group = 0u; group < 8u; ++group) {
+                uint column = column_base + group * 4u;
+                uint byte_offset = block * 16u + group * 2u;
+                uint packed = uint(row_symbols[byte_offset])
+                    | (uint(row_symbols[byte_offset + 1u]) << 8u);
+                float4 weight = float4(
+                    mfq_sq_decode_native(packed & 15u, 127u),
+                    mfq_sq_decode_native((packed >> 4u) & 15u, 127u),
+                    mfq_sq_decode_native((packed >> 8u) & 15u, 127u),
+                    mfq_sq_decode_native(packed >> 12u, 127u)) * scale;
+                for (uint local_row = 0u;
+                     local_row < uint(TILE_M);
+                     ++local_row) {
+                    uint row = min(first_row + local_row, uint(M) - 1u);
+                    uint input_row = uint(ROUTED) != 0u
+                        && uint(SHARED_INPUT) != 0u
+                        ? row / uint(ROUTES)
+                        : row;
+                    half4 activation = *(device const half4*)(
+                        x + input_row * uint(K) + column);
+                    accumulators[local_row] += dot(
+                        float4(activation), weight);
+                }
+            }
         }
     }
 
     for (uint local_row = 0u;
          local_row < uint(TILE_M);
          ++local_row) {
+        if (K_LANES_VALUE >= 32u) {
+            accumulators[local_row] += simd_shuffle_down(
+                accumulators[local_row], 16u);
+        }
         if (K_LANES_VALUE >= 16u) {
             accumulators[local_row] += simd_shuffle_down(
                 accumulators[local_row], 8u);
@@ -327,12 +438,172 @@ constexpr const char* kSqMatmul = R"METAL(
     }
 )METAL";
 
+// Packed input-gradient kernel shared by every per-neuron SQ1..SQ4 mixture.
+// It stages one [64,32] weight tile directly from the variable-width stream
+// and multiplies an eight-row cotangent tile without materializing the full
+// dequantized matrix.
+constexpr const char* kSqBackwardMatrix = R"METAL(
+    constexpr uint BM = 8u;
+    constexpr uint BN = 64u;
+    constexpr uint BK = 32u;
+    constexpr uint BN_PAD = BN + 8u;
+    uint lane = thread_index_in_simdgroup;
+    uint simd_group = simdgroup_index_in_threadgroup;
+    uint local_thread = thread_index_in_threadgroup;
+    uint row_base = threadgroup_position_in_grid.y * BM;
+    uint block = threadgroup_position_in_grid.x;
+    uint column_base = block * BK;
+
+    device const uchar* symbols = blob + uint(SYMBOLS_OFFSET);
+    device const uchar* selectors = blob + uint(SELECTORS_OFFSET);
+    device const uchar* state_scales = blob + uint(SCALES_OFFSET);
+    device const uchar* state_palettes = blob + uint(PALETTES_OFFSET);
+
+    threadgroup half gradient_tile[BM * BN_PAD];
+    threadgroup half weight_tile[BN * BK];
+    threadgroup float cached_scales[BN];
+    threadgroup uchar cached_palettes[BN];
+    threadgroup uchar cached_bits[BN];
+    threadgroup uint cached_symbol_offsets[BN];
+
+    metal::simdgroup_matrix<float, 8, 8> result;
+    result.thread_elements()[0] = 0.0f;
+    result.thread_elements()[1] = 0.0f;
+    uint quadrant = lane / 4u;
+    uint fragment_row = (quadrant & 4u) + ((lane / 2u) & 3u);
+    uint fragment_col = (quadrant & 2u) * 2u + (lane & 1u) * 2u;
+    uint simd_col = simd_group * 8u;
+
+    for (uint chunk = 0u;
+         chunk < (uint(OUT) + BN - 1u) / BN;
+         ++chunk) {
+        uint output_base = chunk * BN;
+        for (uint index = local_thread;
+             index < BM * BN;
+             index += 128u) {
+            uint local_row = index / BN;
+            uint local_output = index - local_row * BN;
+            uint row = row_base + local_row;
+            uint output = output_base + local_output;
+            gradient_tile[local_row * BN_PAD + local_output] =
+                row < uint(M) && output < uint(OUT)
+                ? half(x[row * uint(OUT) + output])
+                : half(0.0f);
+        }
+
+        if (local_thread < BN) {
+            uint output = output_base + local_thread;
+            if (output < uint(OUT) && block < uint(BLOCKS)) {
+                uint bits = uint(row_q[output]);
+                uint auxiliary = row_auxiliary[output];
+                uint symbol_offset = row_symbol_byte_offsets[output];
+                device const uchar* row_symbols = symbols + symbol_offset;
+                cached_bits[local_thread] = uchar(bits);
+                cached_symbol_offsets[local_thread] = symbol_offset;
+                if (bits == 4u) {
+                    cached_scales[local_thread] = mfq_sq_scale(uint(
+                        blob[uint(NATIVE_SCALES_OFFSET)
+                            + auxiliary * uint(BLOCKS) + block]));
+                    cached_palettes[local_thread] = 0u;
+                } else {
+                    uint selector_index =
+                        auxiliary * uint(BLOCKS) + block;
+                    uint state = auxiliary * 8u + mfq_sq_block_tag(
+                        row_symbols,
+                        selectors,
+                        block,
+                        selector_index,
+                        bits);
+                    cached_scales[local_thread] = mfq_sq_scale(
+                        uint(MATRIX_SCALE_BASE)
+                        + mfq_sq_read_bits(state_scales, state, 2u));
+                    cached_palettes[local_thread] = uchar(
+                        mfq_sq_read_bits(state_palettes, state, 5u));
+                }
+            } else {
+                cached_scales[local_thread] = 0.0f;
+                cached_palettes[local_thread] = 0u;
+                cached_bits[local_thread] = 1u;
+                cached_symbol_offsets[local_thread] = 0u;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint task = local_thread;
+             task < BN * 8u;
+             task += 128u) {
+            uint local_output = task >> 3u;
+            uint vector = task & 7u;
+            uint output = output_base + local_output;
+            uint column = vector * 4u;
+            half4 decoded = half4(0.0h);
+            if (output < uint(OUT) && block < uint(BLOCKS)) {
+                uint bits = uint(cached_bits[local_output]);
+                uint palette_index = uint(cached_palettes[local_output]);
+                float scale = cached_scales[local_output];
+                device const uchar* row_symbols =
+                    symbols + cached_symbol_offsets[local_output];
+                float4 values;
+#pragma unroll
+                for (uint element = 0u; element < 4u; ++element) {
+                    uint symbol = mfq_sq_read_bits(
+                        row_symbols,
+                        block * 32u + column + element,
+                        bits);
+                    values[element] = (bits == 4u
+                        ? mfq_sq_decode_native(symbol, 127u)
+                        : mfq_sq_decode(
+                            palette,
+                            palette_index,
+                            symbol,
+                            127u,
+                            bits)) * scale;
+                }
+                decoded = half4(values);
+            }
+            *(threadgroup half4*)(
+                weight_tile + local_output * BK + column) = decoded;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint kk = 0u; kk < BN; kk += 8u) {
+            metal::simdgroup_matrix<half, 8, 8> a;
+            metal::simdgroup_matrix<half, 8, 8> b;
+            a.thread_elements()[0] = gradient_tile[
+                fragment_row * BN_PAD + kk + fragment_col];
+            a.thread_elements()[1] = gradient_tile[
+                fragment_row * BN_PAD + kk + fragment_col + 1u];
+            b.thread_elements()[0] = weight_tile[
+                (kk + fragment_row) * BK + simd_col + fragment_col];
+            b.thread_elements()[1] = weight_tile[
+                (kk + fragment_row) * BK + simd_col + fragment_col + 1u];
+            simdgroup_multiply_accumulate(result, a, b, result);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    uint row = row_base + fragment_row;
+    uint column = column_base + simd_col + fragment_col;
+    if (row < uint(M) && column < uint(K)) {
+        y[row * uint(K) + column] = T(result.thread_elements()[0]);
+    }
+    if (row < uint(M) && column + 1u < uint(K)) {
+        y[row * uint(K) + column + 1u] =
+            T(result.thread_elements()[1]);
+    }
+)METAL";
+
 const array& palette_catalog() {
     static const auto catalog = [] {
         std::vector<std::uint8_t> values;
         values.reserve(
+            kMxfp4Sq1PaletteNibbles.size() +
             kMxfp4Sq2PaletteNibbles.size() +
             kMxfp4Sq3PaletteNibbles.size());
+        values.insert(
+            values.end(),
+            kMxfp4Sq1PaletteNibbles.begin(),
+            kMxfp4Sq1PaletteNibbles.end());
         values.insert(
             values.end(),
             kMxfp4Sq2PaletteNibbles.begin(),
@@ -352,7 +623,13 @@ const mlx::core::fast::CustomKernelFunction& dequantize_kernel() {
         options.math_mode = MathMode::Fast;
         return mlx::core::fast::metal_kernel(
             "mfq_cpp_mxfp4_sq_dequantize",
-            {"blob", "palette"},
+            {
+                "blob",
+                "palette",
+                "row_q",
+                "row_symbol_byte_offsets",
+                "row_auxiliary",
+            },
             {"y"},
             kSqDequantize,
             kSqHeader,
@@ -369,7 +646,16 @@ const mlx::core::fast::CustomKernelFunction& matmul_kernel() {
         options.math_mode = MathMode::Fast;
         return mlx::core::fast::metal_kernel(
             "mfq_cpp_mxfp4_sq_matmul",
-            {"blob", "palette", "x", "expert_ids", "expert_map"},
+            {
+                "blob",
+                "palette",
+                "row_q",
+                "row_symbol_byte_offsets",
+                "row_auxiliary",
+                "x",
+                "expert_ids",
+                "expert_map",
+            },
             {"y"},
             kSqMatmul,
             kSqHeader,
@@ -380,13 +666,33 @@ const mlx::core::fast::CustomKernelFunction& matmul_kernel() {
     return kernel;
 }
 
+const mlx::core::fast::CustomKernelFunction& backward_matrix_kernel() {
+    static const auto kernel = [] {
+        CompileOptions options;
+        options.math_mode = MathMode::Fast;
+        return mlx::core::fast::metal_kernel(
+            "mfq_cpp_mxfp4_sq_backward_matrix",
+            {
+                "blob",
+                "palette",
+                "row_q",
+                "row_symbol_byte_offsets",
+                "row_auxiliary",
+                "x",
+            },
+            {"y"},
+            kSqBackwardMatrix,
+            kSqHeader,
+            true,
+            false,
+            options);
+    }();
+    return kernel;
+}
+
 std::vector<std::pair<std::string, mlx::core::fast::TemplateArg>>
 templates(const MlxMxfp4SqWeight& weight, Dtype dtype) {
-    const auto layout = mfq::sq::layout(
-        weight.bits(),
-        weight.output_size(),
-        weight.input_size(),
-        weight.matrix_scale_base());
+    const auto& layout = weight.wire_layout();
     const auto checked_int = [](std::size_t value, const char* name) {
         if (value > static_cast<std::size_t>(
                 std::numeric_limits<int>::max())) {
@@ -397,6 +703,7 @@ templates(const MlxMxfp4SqWeight& weight, Dtype dtype) {
     };
     return {
         {"T", dtype},
+        {"MATRIX_SCALE_BASE", layout.base},
         {"K", weight.input_size()},
         {"OUT", weight.output_size()},
         {"BLOCKS", weight.input_size() / 32},
@@ -414,6 +721,8 @@ templates(const MlxMxfp4SqWeight& weight, Dtype dtype) {
         {"SCALES_OFFSET", checked_int(layout.scales, "scale offset")},
         {"PALETTES_OFFSET", checked_int(
             layout.palettes, "palette offset")},
+        {"NATIVE_SCALES_OFFSET", checked_int(
+            layout.native_scales, "native-scale offset")},
     };
 }
 
@@ -425,15 +734,17 @@ bool is_mxfp4_sq_dtype(std::string_view dtype) noexcept {
 
 MlxMxfp4SqWeight::MlxMxfp4SqWeight(
     array blob,
-    int bits,
-    int input_size,
-    int output_size,
-    std::uint8_t matrix_scale_base)
+    array row_q,
+    array row_symbol_byte_offsets,
+    array row_auxiliary,
+    mfq::sq::Layout layout,
+    Mxfp4SqDescriptor descriptor)
     : blob_(std::move(blob)),
-      bits_(bits),
-      input_size_(input_size),
-      output_size_(output_size),
-      matrix_scale_base_(matrix_scale_base) {}
+      row_q_(std::move(row_q)),
+      row_symbol_byte_offsets_(std::move(row_symbol_byte_offsets)),
+      row_auxiliary_(std::move(row_auxiliary)),
+      layout_(std::move(layout)),
+      descriptor_(descriptor) {}
 
 MlxMxfp4SqWeight MlxMxfp4SqWeight::from_blob(
     const std::vector<std::uint8_t>& blob) {
@@ -447,12 +758,30 @@ MlxMxfp4SqWeight MlxMxfp4SqWeight::from_blob(
             std::numeric_limits<int>::max())) {
         throw std::runtime_error("MXFP4-SQ payload exceeds MLX limits");
     }
+    const auto rows = mfq::sq::row_metadata(blob.data(), layout);
+    Mxfp4SqDescriptor descriptor;
+    descriptor.format_version = layout.version;
+    descriptor.aggregate_bpw = static_cast<double>(
+        layout.bytes - 24) * 8.0 /
+        (static_cast<double>(layout.outputs) * layout.width);
+    std::array<std::size_t, 4> q_counts{};
+    for (const auto q : rows.q) {
+        ++q_counts[static_cast<std::size_t>(q - 1)];
+    }
+    for (const auto count : q_counts) {
+        if (count == 0) {
+            continue;
+        }
+        const double probability = static_cast<double>(count) / layout.outputs;
+        descriptor.distribution_entropy -= probability * std::log2(probability);
+    }
     return MlxMxfp4SqWeight(
         array(blob.begin(), Shape{static_cast<int>(blob.size())}),
-        layout.bits,
-        layout.width,
-        layout.outputs,
-        static_cast<std::uint8_t>(layout.base));
+        array(rows.q.begin(), Shape{layout.outputs}),
+        array(rows.symbol_byte_offsets.begin(), Shape{layout.outputs}),
+        array(rows.auxiliary_rows.begin(), Shape{layout.outputs}),
+        layout,
+        descriptor);
 }
 
 array MlxMxfp4SqWeight::dequantize(Dtype dtype) const {
@@ -461,8 +790,8 @@ array MlxMxfp4SqWeight::dequantize(Dtype dtype) const {
             "MXFP4-SQ dequantization requires float16 or float32");
     }
     const auto count =
-        static_cast<std::size_t>(input_size_) *
-        static_cast<std::size_t>(output_size_);
+        static_cast<std::size_t>(input_size()) *
+        static_cast<std::size_t>(output_size());
     if (count > static_cast<std::size_t>(
             std::numeric_limits<int>::max())) {
         throw std::runtime_error(
@@ -471,8 +800,14 @@ array MlxMxfp4SqWeight::dequantize(Dtype dtype) const {
     constexpr std::size_t threads = 256;
     const auto grid = (count + threads - 1) / threads * threads;
     auto outputs = dequantize_kernel()(
-        {blob_, palette_catalog()},
-        {Shape{output_size_, input_size_}},
+        {
+            blob_,
+            palette_catalog(),
+            row_q_,
+            row_symbol_byte_offsets_,
+            row_auxiliary_,
+        },
+        {Shape{output_size(), input_size()}},
         {dtype},
         {static_cast<int>(grid), 1, 1},
         {static_cast<int>(threads), 1, 1},
@@ -490,18 +825,18 @@ array MlxMxfp4SqWeight::embedding(
 }
 
 array MlxMxfp4SqWeight::matmul(const array& input) const {
-    if (input.ndim() == 0 || input.shape(-1) != input_size_) {
+    if (input.ndim() == 0 || input.shape(-1) != input_size()) {
         throw std::runtime_error(
             "MXFP4-SQ input width does not match packed weight");
     }
     const auto rows =
-        input.size() / static_cast<std::size_t>(input_size_);
+        input.size() / static_cast<std::size_t>(input_size());
     if (rows == 0 || rows > static_cast<std::size_t>(
             std::numeric_limits<int>::max())) {
         throw std::runtime_error("unsupported MXFP4-SQ input row count");
     }
     Shape output_shape = input.shape();
-    output_shape.back() = output_size_;
+    output_shape.back() = output_size();
     auto source = input;
     if (source.dtype() != mlx::core::float16 &&
         source.dtype() != mlx::core::float32) {
@@ -509,7 +844,7 @@ array MlxMxfp4SqWeight::matmul(const array& input) const {
     }
     source = mlx::core::reshape(
         source,
-        Shape{static_cast<int>(rows), input_size_});
+        Shape{static_cast<int>(rows), input_size()});
 
     if (rows > 48 || source.dtype() == mlx::core::float32) {
         auto dense = dequantize(source.dtype());
@@ -522,8 +857,16 @@ array MlxMxfp4SqWeight::matmul(const array& input) const {
     }
 
     const bool first_bucket = rows <= 6;
-    const int k_lanes = first_bucket && rows <= 3 ? 16 : 8;
-    const int simd_groups = first_bucket && rows <= 3 ? 4 : 2;
+    // A uniform profile can pack several output neurons into one SIMD group.
+    // With heterogeneous q, using the whole SIMD for one neuron prevents the
+    // q=1/2/3/4 decode arms from serializing each other lane-wise.
+    const bool mixed_q = !has_uniform_q();
+    const int k_lanes = mixed_q
+        ? 32
+        : (first_bucket && rows <= 3 ? 16 : 8);
+    const int simd_groups = mixed_q
+        ? 4
+        : (first_bucket && rows <= 3 ? 4 : 2);
     const int threads = simd_groups * 32;
     const int row_tiles = first_bucket
         ? 1
@@ -533,7 +876,7 @@ array MlxMxfp4SqWeight::matmul(const array& input) const {
     const int outputs_per_threadgroup =
         simd_groups * 32 / k_lanes;
     const int output_tiles =
-        (output_size_ + outputs_per_threadgroup - 1) /
+        (output_size() + outputs_per_threadgroup - 1) /
         outputs_per_threadgroup;
     auto arguments = templates(*this, source.dtype());
     arguments.emplace_back("M", static_cast<int>(rows));
@@ -544,19 +887,22 @@ array MlxMxfp4SqWeight::matmul(const array& input) const {
     arguments.emplace_back("ROUTES", 1);
     arguments.emplace_back("SHARED_INPUT", 0);
     arguments.emplace_back("EXPERT_MAP_SIZE", 1);
-    arguments.emplace_back("OUT_PER_EXPERT", output_size_);
-    arguments.emplace_back("LOGICAL_OUT", output_size_);
+    arguments.emplace_back("OUT_PER_EXPERT", output_size());
+    arguments.emplace_back("LOGICAL_OUT", output_size());
     const auto unused_ids = mlx::core::zeros(
         Shape{1}, mlx::core::int32);
     auto outputs = matmul_kernel()(
         {
             blob_,
             palette_catalog(),
+            row_q_,
+            row_symbol_byte_offsets_,
+            row_auxiliary_,
             std::move(source),
             unused_ids,
             unused_ids,
         },
-        {Shape{static_cast<int>(rows), output_size_}},
+        {Shape{static_cast<int>(rows), output_size()}},
         {input.dtype() == mlx::core::float32
             ? mlx::core::float32
             : mlx::core::float16},
@@ -576,7 +922,7 @@ array MlxMxfp4SqWeight::routed_matmul(
     const array& expert_ids,
     const array& expert_map,
     int out_per_expert) const {
-    if (out_per_expert <= 0 || output_size_ % out_per_expert != 0) {
+    if (out_per_expert <= 0 || output_size() % out_per_expert != 0) {
         throw std::invalid_argument(
             "MXFP4-SQ routed output width is inconsistent");
     }
@@ -589,10 +935,10 @@ array MlxMxfp4SqWeight::routed_matmul(
     const int tokens = expert_ids.shape(0);
     const int routes = expert_ids.shape(1);
     const bool shared_input = input.ndim() == 2 &&
-        input.shape(0) == tokens && input.shape(1) == input_size_;
+        input.shape(0) == tokens && input.shape(1) == input_size();
     if (!shared_input && (
         input.ndim() != 3 || input.shape(0) != tokens ||
-        input.shape(1) != routes || input.shape(2) != input_size_)) {
+        input.shape(1) != routes || input.shape(2) != input_size())) {
         throw std::invalid_argument(
             "MXFP4-SQ routed input must be [tokens,K] or "
             "[tokens,routes,K]");
@@ -614,10 +960,10 @@ array MlxMxfp4SqWeight::routed_matmul(
     auto ids = mlx::core::contiguous(expert_ids);
     auto map = mlx::core::contiguous(expert_map);
 
-    constexpr int kLanes = 8;
-    constexpr int kSimdGroups = 2;
-    constexpr int kThreads = kSimdGroups * 32;
-    constexpr int kOutputsPerThreadgroup =
+    const int kLanes = has_uniform_q() ? 8 : 32;
+    const int kSimdGroups = has_uniform_q() ? 2 : 4;
+    const int kThreads = kSimdGroups * 32;
+    const int kOutputsPerThreadgroup =
         kSimdGroups * 32 / kLanes;
     const int output_tiles =
         (out_per_expert + kOutputsPerThreadgroup - 1) /
@@ -634,7 +980,16 @@ array MlxMxfp4SqWeight::routed_matmul(
     arguments.emplace_back("OUT_PER_EXPERT", out_per_expert);
     arguments.emplace_back("LOGICAL_OUT", out_per_expert);
     auto outputs = matmul_kernel()(
-        {blob_, palette_catalog(), source, ids, map},
+        {
+            blob_,
+            palette_catalog(),
+            row_q_,
+            row_symbol_byte_offsets_,
+            row_auxiliary_,
+            source,
+            ids,
+            map,
+        },
         {Shape{static_cast<int>(route_count), out_per_expert}},
         {mlx::core::float16},
         {static_cast<int>(route_count) * kThreads, output_tiles, 1},
@@ -650,19 +1005,19 @@ array MlxMxfp4SqWeight::routed_matmul(
 array MlxMxfp4SqWeight::backward_input(
     const array& output_gradient) const {
     if (output_gradient.ndim() == 0 ||
-        output_gradient.shape(-1) != output_size_) {
+        output_gradient.shape(-1) != output_size()) {
         throw std::runtime_error(
             "MXFP4-SQ output-gradient width does not match packed weight");
     }
     Shape output_shape = output_gradient.shape();
-    output_shape.back() = input_size_;
+    output_shape.back() = input_size();
     auto source = output_gradient;
     if (source.dtype() != mlx::core::float16 &&
         source.dtype() != mlx::core::float32) {
         source = mlx::core::astype(source, mlx::core::float16);
     }
     const auto rows =
-        source.size() / static_cast<std::size_t>(output_size_);
+        source.size() / static_cast<std::size_t>(output_size());
     if (rows == 0 || rows > static_cast<std::size_t>(
             std::numeric_limits<int>::max())) {
         throw std::runtime_error(
@@ -670,7 +1025,33 @@ array MlxMxfp4SqWeight::backward_input(
     }
     source = mlx::core::reshape(
         source,
-        Shape{static_cast<int>(rows), output_size_});
+        Shape{static_cast<int>(rows), output_size()});
+    if (rows <= 8 && source.dtype() == mlx::core::float16) {
+        auto arguments = templates(*this, source.dtype());
+        arguments.emplace_back("M", static_cast<int>(rows));
+        auto outputs = backward_matrix_kernel()(
+            {
+                blob_,
+                palette_catalog(),
+                row_q_,
+                row_symbol_byte_offsets_,
+                row_auxiliary_,
+                source,
+            },
+            {Shape{static_cast<int>(rows), input_size()}},
+            {source.dtype()},
+            {(input_size() / 32) * 128,
+             (static_cast<int>(rows) + 7) / 8,
+             1},
+            {128, 1, 1},
+            std::move(arguments),
+            std::nullopt,
+            false,
+            {});
+        return mlx::core::reshape(
+            std::move(outputs.front()),
+            std::move(output_shape));
+    }
     auto result = mlx::core::matmul(
         source,
         dequantize(source.dtype()));

@@ -1,4 +1,4 @@
-#include "mlx_deepseek_v4_sparse.h"
+#include "mlx_dsa.h"
 #include "mlx_sparse_attention.h"
 #include "mfq_mfe_prefill_embedded.h"
 
@@ -9,7 +9,6 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
-#include <cstring>
 #include <initializer_list>
 #include <limits>
 #include <optional>
@@ -30,9 +29,9 @@ using Kernel = mlx::core::fast::CustomKernelFunction;
 using TemplateArgs = std::vector<
     std::pair<std::string, mlx::core::fast::TemplateArg>>;
 
-class Dsv4CacheWrite final : public mlx::core::UnaryPrimitive {
+class MlxCacheWrite final : public mlx::core::UnaryPrimitive {
 public:
-    explicit Dsv4CacheWrite(mlx::core::Stream stream)
+    explicit MlxCacheWrite(mlx::core::Stream stream)
         : UnaryPrimitive(stream) {}
 
     void eval_cpu(
@@ -91,22 +90,22 @@ public:
 
         const std::string kernel_name =
             cache.dtype() == mlx::core::float16
-                ? "mfq_dsv4_cache_write_f16"
+                ? "mfq_dsa_cache_write_f16"
                 : cache.dtype() == mlx::core::bfloat16
-                ? "mfq_dsv4_cache_write_bf16"
-                : "mfq_dsv4_cache_write_f32";
+                ? "mfq_dsa_cache_write_bf16"
+                : "mfq_dsa_cache_write_f32";
         auto& selected_stream = stream();
         auto& device = mlx::core::metal::device(
             selected_stream.device);
         auto* library = device.get_library(
-            "mfq_dsv4_cache_write",
+            "mfq_dsa_cache_write",
             [] {
                 return std::string(R"MFQ_METAL(
 #include <metal_stdlib>
 using namespace metal;
 
 template <typename T>
-kernel void mfq_dsv4_cache_write(
+kernel void mfq_dsa_cache_write(
     device T* cache [[buffer(0)]],
     device const T* values [[buffer(1)]],
     device const int* rows [[buffer(2)]],
@@ -129,15 +128,15 @@ kernel void mfq_dsv4_cache_write(
     }
 }
 
-template [[host_name("mfq_dsv4_cache_write_f16")]]
-kernel decltype(mfq_dsv4_cache_write<half>)
-    mfq_dsv4_cache_write<half>;
-template [[host_name("mfq_dsv4_cache_write_bf16")]]
-kernel decltype(mfq_dsv4_cache_write<bfloat>)
-    mfq_dsv4_cache_write<bfloat>;
-template [[host_name("mfq_dsv4_cache_write_f32")]]
-kernel decltype(mfq_dsv4_cache_write<float>)
-    mfq_dsv4_cache_write<float>;
+template [[host_name("mfq_dsa_cache_write_f16")]]
+kernel decltype(mfq_dsa_cache_write<half>)
+    mfq_dsa_cache_write<half>;
+template [[host_name("mfq_dsa_cache_write_bf16")]]
+kernel decltype(mfq_dsa_cache_write<bfloat>)
+    mfq_dsa_cache_write<bfloat>;
+template [[host_name("mfq_dsa_cache_write_f32")]]
+kernel decltype(mfq_dsa_cache_write<float>)
+    mfq_dsa_cache_write<float>;
 )MFQ_METAL");
             });
         auto* kernel = device.get_kernel(
@@ -167,7 +166,7 @@ kernel decltype(mfq_dsv4_cache_write<float>)
     }
 
     const char* name() const override {
-        return "Dsv4CacheWrite";
+        return "MlxCacheWrite";
     }
 
     bool is_equivalent(
@@ -182,12 +181,12 @@ kernel decltype(mfq_dsv4_cache_write<float>)
 };
 
 constexpr int kIndexerHeads = 64;
-constexpr int kV41IndexerHeads = 32;
+constexpr int kHalfIndexerHeads = 32;
 constexpr int kIndexerDimension = 128;
 constexpr int kAttentionHeads = 64;
 constexpr int kAttentionDimension = 512;
 
-#include "mlx_deepseek_v4_sparse_kernels.inc"
+#include "../kernels/mfq_sparse_attention_kernels.inc"
 
 Kernel make_kernel(
     const char* name,
@@ -210,7 +209,7 @@ Kernel make_kernel(
 
 const Kernel& fp4_sim_kernel() {
     static const auto kernel = make_kernel(
-        "mfq_cpp_dsv4_fp4_sim",
+        "mfq_cpp_dsa_fp4_sim",
         {"x"},
         {"out"},
         kFp4SimSource,
@@ -220,7 +219,7 @@ const Kernel& fp4_sim_kernel() {
 
 const Kernel& compress_kernel() {
     static const auto kernel = make_kernel(
-        "mfq_cpp_dsv4_compress",
+        "mfq_cpp_dsa_compress",
         {
             "kv",
             "gate",
@@ -241,7 +240,7 @@ const Kernel& compress_kernel() {
 
 const Kernel& decode_pool_step_kernel() {
     static const auto kernel = make_kernel(
-        "mfq_cpp_dsv4_decode_pool_step",
+        "mfq_cpp_dsa_decode_pool_step",
         {
             "kv_token",
             "gate_token",
@@ -271,7 +270,7 @@ const Kernel& decode_pool_step_kernel() {
 
 const Kernel& indexer_scores_kernel() {
     static const auto kernel = make_kernel(
-        "mfq_cpp_dsv4_indexer_scores",
+        "mfq_cpp_dsa_indexer_scores",
         {"q", "k", "weights", "params", "decode_params"},
         {"out"},
         kIndexerScoresSource);
@@ -280,7 +279,7 @@ const Kernel& indexer_scores_kernel() {
 
 const Kernel& indexer_decode_scores_kernel() {
     static const auto kernel = make_kernel(
-        "mfq_cpp_dsv4_indexer_decode_scores",
+        "mfq_cpp_dsa_indexer_decode_scores",
         {"q", "k", "weights", "params", "decode_params"},
         {"out"},
         kIndexerDecodeScoresSource);
@@ -289,7 +288,7 @@ const Kernel& indexer_decode_scores_kernel() {
 
 const Kernel& topk_kernel() {
     static const auto kernel = make_kernel(
-        "mfq_cpp_dsv4_topk512",
+        "mfq_cpp_dsa_topk512",
         {"x", "topk_params"},
         {"out"},
         kTopkSource,
@@ -299,7 +298,7 @@ const Kernel& topk_kernel() {
 
 const Kernel& prefill_plan_kernel() {
     static const auto kernel = make_kernel(
-        "mfq_cpp_dsv4_prefill_plan",
+        "mfq_cpp_dsa_prefill_plan",
         {"topk", "plan_params"},
         {"indices", "mask"},
         kPrefillPlanSource);
@@ -308,7 +307,7 @@ const Kernel& prefill_plan_kernel() {
 
 const Kernel& visible_prefill_plan_kernel() {
     static const auto kernel = make_kernel(
-        "mfq_cpp_dsv4_visible_prefill_plan",
+        "mfq_cpp_dsa_visible_prefill_plan",
         {"topk", "left", "right", "plan_params"},
         {"indices", "mask"},
         kVisiblePrefillPlanSource);
@@ -317,7 +316,7 @@ const Kernel& visible_prefill_plan_kernel() {
 
 const Kernel& decode_plan_kernel() {
     static const auto kernel = make_kernel(
-        "mfq_cpp_dsv4_decode_plan",
+        "mfq_cpp_dsa_decode_plan",
         {"topk", "seq_len"},
         {"indices", "mask"},
         kDecodePlanSource);
@@ -353,7 +352,7 @@ int checked_product(
              product >
                  std::numeric_limits<int>::max() / factor)) {
             throw std::invalid_argument(
-                std::string("DeepSeek-V4 ") + label +
+                std::string("DSA ") + label +
                 " exceeds MLX grid limits");
         }
         product *= factor;
@@ -364,7 +363,7 @@ int checked_product(
 void validate_eps(float eps) {
     if (!std::isfinite(eps) || eps <= 0.0f) {
         throw std::invalid_argument(
-            "DeepSeek-V4 compressor eps must be finite and positive");
+            "DSA compressor eps must be finite and positive");
     }
 }
 
@@ -376,7 +375,7 @@ void validate_table_pair(
         cosine.shape(1) < 32 ||
         sine.shape() != cosine.shape()) {
         throw std::invalid_argument(
-            "invalid DeepSeek-V4 rotary table shape");
+            "invalid DSA rotary table shape");
     }
 }
 
@@ -390,7 +389,7 @@ void validate_compressor_mode(
         (quant_mode == 1 && head_dim != 512) ||
         (quant_mode == 2 && head_dim != 128)) {
         throw std::invalid_argument(
-            "invalid DeepSeek-V4 compressor mode");
+            "invalid DSA compressor mode");
     }
 }
 
@@ -442,7 +441,7 @@ TemplateArgs decode_compressor_templates(
 
 } // namespace
 
-array dsv4_cache_write_inplace(
+array mlx_cache_write_inplace(
     const array& cache,
     const array& values,
     const array& rows) {
@@ -455,7 +454,7 @@ array dsv4_cache_write_inplace(
          cache.dtype() != mlx::core::bfloat16 &&
          cache.dtype() != mlx::core::float32)) {
         throw std::invalid_argument(
-            "DSV4 fixed cache must be row-contiguous f16/bf16/f32 [B,C,D]");
+            "DSA fixed cache must be row-contiguous f16/bf16/f32 [B,C,D]");
     }
     auto update_values = typed_contiguous(
         values,
@@ -472,18 +471,18 @@ array dsv4_cache_write_inplace(
             update_values.shape(1),
         }) {
         throw std::invalid_argument(
-            "DSV4 fixed cache update expects values [B,U,D] and rows [B,U]");
+            "DSA fixed cache update expects values [B,U,D] and rows [B,U]");
     }
     auto stream = mlx::core::default_stream(
         mlx::core::default_device());
     if (stream.device != mlx::core::Device::gpu) {
         throw std::invalid_argument(
-            "DSV4 fixed cache update requires the Metal device");
+            "DSA fixed cache update requires the Metal device");
     }
     return array(
         cache.shape(),
         cache.dtype(),
-        std::make_shared<Dsv4CacheWrite>(stream),
+        std::make_shared<MlxCacheWrite>(stream),
         std::vector<array>{
             cache,
             std::move(update_values),
@@ -491,7 +490,7 @@ array dsv4_cache_write_inplace(
         });
 }
 
-array dsv4_fp4_sim(const array& input) {
+array mlx_mxfp4_sim(const array& input) {
     auto source = typed_contiguous(
         input,
         mlx::core::float16);
@@ -499,13 +498,13 @@ array dsv4_fp4_sim(const array& input) {
         source.size() == 0 ||
         source.shape(-1) % 32 != 0) {
         throw std::invalid_argument(
-            "DSV4 FP4 simulation expects nonempty f16 [...,32*n]");
+            "DSA FP4 simulation expects nonempty f16 [...,32*n]");
     }
     if (source.size() >
         static_cast<std::size_t>(
             std::numeric_limits<int>::max())) {
         throw std::invalid_argument(
-            "DSV4 FP4 simulation input exceeds MLX grid limits");
+            "DSA FP4 simulation input exceeds MLX grid limits");
     }
     const int size = static_cast<int>(source.size());
     auto outputs = fp4_sim_kernel()(
@@ -521,7 +520,7 @@ array dsv4_fp4_sim(const array& input) {
     return std::move(outputs.front());
 }
 
-array dsv4_compress(
+array mlx_dsa_compress(
     const array& kv,
     const array& gate,
     const array& ape,
@@ -565,7 +564,7 @@ array dsv4_compress(
         head_dim * (overlap ? 2 : 1);
     if (source.ndim() != 4) {
         throw std::invalid_argument(
-            "invalid DSV4 compressor input");
+            "invalid DSA compressor input");
     }
     const int batch = source.shape(0);
     const int windows = source.shape(1);
@@ -578,7 +577,7 @@ array dsv4_compress(
         position_ids.size() !=
             static_cast<std::size_t>(batch) * windows) {
         throw std::invalid_argument(
-            "invalid DSV4 compressor input");
+            "invalid DSA compressor input");
     }
     validate_table_pair(cosine, sine);
 
@@ -613,7 +612,7 @@ array dsv4_compress(
             previous_kv.shape() != expected ||
             previous_gate.shape() != expected) {
             throw std::invalid_argument(
-                "invalid DSV4 overlap history");
+                "invalid DSA overlap history");
         }
     }
 
@@ -658,7 +657,7 @@ array dsv4_compress(
     return std::move(outputs.front());
 }
 
-MlxDsv4PoolStep dsv4_decode_pool_step(
+MlxDsaPoolStep mlx_dsa_decode_pool_step(
     const array& kv_token,
     const array& gate_token,
     const array& ape,
@@ -723,7 +722,7 @@ MlxDsv4PoolStep dsv4_decode_pool_step(
         lengths.size() !=
             static_cast<std::size_t>(batch)) {
         throw std::invalid_argument(
-            "invalid DSV4 decode pool step input");
+            "invalid DSA decode pool step input");
     }
     validate_table_pair(cosine, sine);
 
@@ -753,7 +752,7 @@ MlxDsv4PoolStep dsv4_decode_pool_step(
         if (previous_kv.shape() != previous_shape ||
             previous_gate.shape() != previous_shape) {
             throw std::invalid_argument(
-                "invalid DSV4 previous window state");
+                "invalid DSA previous window state");
         }
     } else if (
         prev_kv.has_value() != prev_gate.has_value()) {
@@ -829,7 +828,7 @@ MlxDsv4PoolStep dsv4_decode_pool_step(
     };
 }
 
-MlxDsv4PoolUpdate dsv4_decode_pool_update(
+MlxDsaPoolUpdate mlx_dsa_decode_pool_update(
     const array& kv_token,
     const array& gate_token,
     const array& ape,
@@ -849,7 +848,7 @@ MlxDsv4PoolUpdate dsv4_decode_pool_update(
     auto pool_values = typed_contiguous(
         pool,
         mlx::core::float16);
-    auto step = dsv4_decode_pool_step(
+    auto step = mlx_dsa_decode_pool_step(
         kv_token,
         gate_token,
         ape,
@@ -872,9 +871,9 @@ MlxDsv4PoolUpdate dsv4_decode_pool_update(
         pool_values.shape(1) <= 0 ||
         pool_values.shape(2) != head_dim) {
         throw std::invalid_argument(
-            "invalid DSV4 decode pool update input");
+            "invalid DSA decode pool update input");
     }
-    auto next_pool = dsv4_cache_write_inplace(
+    auto next_pool = mlx_cache_write_inplace(
         pool_values,
         step.emitted,
         mlx::core::reshape(
@@ -889,7 +888,7 @@ MlxDsv4PoolUpdate dsv4_decode_pool_update(
     };
 }
 
-array dsv4_indexer_scores_decode(
+array mlx_dsa_indexer_scores_decode(
     const array& q,
     const array& k,
     const array& weights,
@@ -910,7 +909,7 @@ array dsv4_indexer_scores_decode(
         head_weights.ndim() != 3 ||
         query.shape(1) != 1 ||
         (query.shape(2) != kIndexerHeads &&
-         query.shape(2) != kV41IndexerHeads) ||
+         query.shape(2) != kHalfIndexerHeads) ||
         query.shape(3) != kIndexerDimension ||
         query.shape(0) <= 0 ||
         key.shape(0) != query.shape(0) ||
@@ -924,7 +923,7 @@ array dsv4_indexer_scores_decode(
         score_count < -1 ||
         score_count > key.shape(1)) {
         throw std::invalid_argument(
-            "DSV4 decode indexer score shape mismatch");
+            "DSA decode indexer score shape mismatch");
     }
     const int batch = query.shape(0);
     const int heads = query.shape(2);
@@ -966,7 +965,7 @@ array dsv4_indexer_scores_decode(
             decode_params,
         },
         {Shape{batch, 1, key_capacity}},
-        {heads == kV41IndexerHeads
+        {heads == kHalfIndexerHeads
              ? mlx::core::float32
              : mlx::core::float16},
         {grid, 1, 1},
@@ -982,7 +981,7 @@ array dsv4_indexer_scores_decode(
     return std::move(outputs.front());
 }
 
-array dsv4_indexer_scores(
+array mlx_dsa_indexer_scores(
     const array& q,
     const array& k,
     const array& weights,
@@ -1003,7 +1002,7 @@ array dsv4_indexer_scores(
         query.shape(0) <= 0 ||
         query.shape(1) <= 0 ||
         (query.shape(2) != kIndexerHeads &&
-         query.shape(2) != kV41IndexerHeads) ||
+         query.shape(2) != kHalfIndexerHeads) ||
         query.shape(3) != kIndexerDimension ||
         key.shape(0) != query.shape(0) ||
         key.shape(1) <= 0 ||
@@ -1016,14 +1015,14 @@ array dsv4_indexer_scores(
         query_offset < 0 ||
         ratio <= 0) {
         throw std::invalid_argument(
-            "DSV4 indexer score shape mismatch");
+            "DSA indexer score shape mismatch");
     }
     const int batch = query.shape(0);
     const int queries = query.shape(1);
     const int heads = query.shape(2);
     const int keys = key.shape(1);
     if (queries == 1 && keys <= 1024) {
-        return dsv4_indexer_scores_decode(
+        return mlx_dsa_indexer_scores_decode(
             query,
             key,
             head_weights,
@@ -1055,7 +1054,7 @@ array dsv4_indexer_scores(
             decode_params,
         },
         {Shape{batch, queries, keys}},
-        {heads == kV41IndexerHeads
+        {heads == kHalfIndexerHeads
              ? mlx::core::float32
              : mlx::core::float16},
         {grid, 1, 1},
@@ -1073,7 +1072,7 @@ array dsv4_indexer_scores(
     return std::move(outputs.front());
 }
 
-array dsv4_topk512(
+array mlx_dsa_topk512(
     const array& scores,
     bool deterministic,
     int valid_keys) {
@@ -1088,7 +1087,7 @@ array dsv4_topk512(
         valid_keys < -1 ||
         valid_keys > source.shape(2)) {
         throw std::invalid_argument(
-            "DSV4 top-k expects f16 [B,M,K]");
+            "DSA top-k expects f16 [B,M,K]");
     }
     const int batch = source.shape(0);
     const int queries = source.shape(1);
@@ -1123,7 +1122,7 @@ array dsv4_topk512(
     return std::move(outputs.front());
 }
 
-std::pair<array, array> dsv4_build_prefill_plan(
+std::pair<array, array> mlx_dsa_build_prefill_plan(
     const array& topk,
     int query_offset,
     int local_history,
@@ -1142,14 +1141,15 @@ std::pair<array, array> dsv4_build_prefill_plan(
         ratio <= 0 ||
         window <= 0) {
         throw std::invalid_argument(
-            "invalid DSV4 prefill plan input");
+            "invalid DSA prefill plan input");
     }
     const int batch = selected_topk.shape(0);
     const int queries = selected_topk.shape(1);
     const int topk_count = selected_topk.shape(2);
-    if (queries > std::numeric_limits<int>::max() - local_history) {
+    if (queries > std::numeric_limits<int>::max() - local_history ||
+        queries > std::numeric_limits<int>::max() - query_offset) {
         throw std::invalid_argument(
-            "DSV4 prefill local width exceeds integer range");
+            "DSA prefill position exceeds integer range");
     }
     const int local_width = std::min(
         window,
@@ -1157,7 +1157,7 @@ std::pair<array, array> dsv4_build_prefill_plan(
     if (topk_count >
         std::numeric_limits<int>::max() - local_width - 31) {
         throw std::invalid_argument(
-            "DSV4 prefill plan width exceeds MLX limits");
+            "DSA prefill plan width exceeds MLX limits");
     }
     const int selected =
         ((local_width + topk_count + 31) / 32) * 32;
@@ -1194,7 +1194,7 @@ std::pair<array, array> dsv4_build_prefill_plan(
     };
 }
 
-std::pair<array, array> dsv4_build_prefill_plan_visible(
+std::pair<array, array> mlx_dsa_build_prefill_plan_visible(
     const array& topk,
     const array& left,
     const array& right,
@@ -1215,17 +1215,19 @@ std::pair<array, array> dsv4_build_prefill_plan_visible(
         local_history < 0 || pool_len < 0 || ratio <= 0 || window <= 0 ||
         max_image_tokens <= 0) {
         throw std::invalid_argument(
-            "invalid DSV4 visible prefill plan input");
+            "invalid DSA visible prefill plan input");
     }
     const int batch = selected_topk.shape(0);
     const int queries = selected_topk.shape(1);
     const int topk_count = selected_topk.shape(2);
-    if (max_image_tokens >
+    if (queries > std::numeric_limits<int>::max() - local_history ||
+        queries > std::numeric_limits<int>::max() - query_offset ||
+        max_image_tokens >
         std::numeric_limits<int>::max() - window ||
         topk_count > std::numeric_limits<int>::max() -
             window - max_image_tokens - 31) {
         throw std::invalid_argument(
-            "DSV4 visible prefill plan width exceeds MLX limits");
+            "DSA visible prefill plan width exceeds MLX limits");
     }
     const int local_width = std::min(
         local_history + queries, window + max_image_tokens);
@@ -1258,7 +1260,7 @@ std::pair<array, array> dsv4_build_prefill_plan_visible(
     return {std::move(outputs.at(0)), std::move(outputs.at(1))};
 }
 
-std::pair<array, array> dsv4_build_decode_plan(
+std::pair<array, array> mlx_dsa_build_decode_plan(
     const array& topk,
     const array& seq_len,
     int pool_len,
@@ -1280,14 +1282,14 @@ std::pair<array, array> dsv4_build_decode_plan(
         ratio <= 0 ||
         window <= 0) {
         throw std::invalid_argument(
-            "invalid DSV4 decode plan input");
+            "invalid DSA decode plan input");
     }
     const int batch = selected_topk.shape(0);
     const int topk_count = selected_topk.shape(2);
     if (topk_count >
         std::numeric_limits<int>::max() - window - 31) {
         throw std::invalid_argument(
-            "DSV4 decode plan width exceeds MLX limits");
+            "DSA decode plan width exceeds MLX limits");
     }
     const int selected =
         ((window + topk_count + 31) / 32) * 32;
@@ -1326,7 +1328,7 @@ std::pair<array, array> dsv4_build_decode_plan(
     };
 }
 
-array attention_dsv4_sparse(
+array mlx_dsa_sparse_attention(
     const array& q,
     const array& kv,
     const array& indices,
@@ -1344,7 +1346,31 @@ array attention_dsv4_sparse(
         scale);
 }
 
-array attention_dsv4_sparse_decode(
+array mlx_dsa_sparse_multi_attention(
+    const array& q,
+    const array& local_kv,
+    const array& pooled_kv,
+    int pool_len,
+    const array& topk,
+    const array& sinks,
+    int query_offset,
+    int ratio,
+    int window,
+    std::optional<float> scale) {
+    return mlx_sparse_circular_mla_attention(
+        q,
+        local_kv,
+        pooled_kv,
+        pool_len,
+        topk,
+        sinks,
+        query_offset,
+        ratio,
+        window,
+        scale);
+}
+
+array mlx_dsa_sparse_decode_attention(
     const array& q,
     const array& local_kv,
     const std::optional<array>& pooled_kv,

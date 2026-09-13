@@ -15,6 +15,8 @@ NVQ_DTYPE = "NVQ"
 NPQ_DTYPE = "NPQ"
 NEPQ_DTYPE = "NEPQ"
 MXFP4_SQ_DTYPE = "MXFP4-SQ"
+MXFP8_SQ_DTYPE = "MXFP8-SQ"
+FP8_128SQ_DTYPE = "FP8-128SQ"
 
 _LEGACY_NVQ_DTYPES = frozenset(
     {
@@ -112,16 +114,25 @@ def is_mxfp4_sq_dtype(dtype: str) -> bool:
     return canonical_dtype(dtype) == MXFP4_SQ_DTYPE
 
 
+def is_fp8_sq_dtype(dtype: str) -> bool:
+    """Return whether a dtype denotes either native-output FP8-SQ family."""
+
+    return canonical_dtype(dtype) in {MXFP8_SQ_DTYPE, FP8_128SQ_DTYPE}
+
+
 __all__ = [
     "MFE_DELTA_DTYPE",
     "MFE_DTYPE",
+    "FP8_128SQ_DTYPE",
     "MXFP4_SQ_DTYPE",
+    "MXFP8_SQ_DTYPE",
     "NEPQ_DTYPE",
     "NINT_DTYPE",
     "NPQ_DTYPE",
     "NVQ_DTYPE",
     "canonical_dtype",
     "is_legacy_nint_dtype",
+    "is_fp8_sq_dtype",
     "is_mfe_dtype",
     "is_mxfp4_sq_dtype",
     "is_nepq_dtype",

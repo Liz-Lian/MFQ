@@ -502,6 +502,142 @@ void test_hf_virtual_full_precision_container(
         "HF virtual container exposed a consumed scale");
 }
 
+void test_hf_schema_sidecar_is_architecture_independent(
+    const std::filesystem::path& root) {
+    const auto hf = root / "hf-future-model";
+    const auto assets = hf / ".mfq-assets";
+    std::filesystem::create_directories(assets / "hf");
+    {
+        std::ofstream stream(hf / "config.json", std::ios::binary);
+        stream << R"({"model_type":"future_model"})";
+    }
+    json header = {
+        {"upstream.embedding", {
+            {"dtype", "BF16"},
+            {"shape", {1}},
+            {"data_offsets", {0, 2}},
+        }},
+        {"upstream.codes", {
+            {"dtype", "I8"},
+            {"shape", {1, 16}},
+            {"data_offsets", {2, 18}},
+        }},
+        {"upstream.exponents", {
+            {"dtype", "F8_E8M0"},
+            {"shape", {1, 1}},
+            {"data_offsets", {18, 19}},
+        }},
+        {"upstream.unused", {
+            {"dtype", "U8"},
+            {"shape", {1}},
+            {"data_offsets", {19, 20}},
+        }},
+    };
+    auto header_text = header.dump();
+    while ((8 + header_text.size()) % 8 != 0) {
+        header_text.push_back(' ');
+    }
+    {
+        std::ofstream stream(hf / "model.safetensors", std::ios::binary);
+        write_u64_little(stream, header_text.size());
+        stream.write(
+            header_text.data(), static_cast<std::streamsize>(header_text.size()));
+        const std::array<unsigned char, 20> payload{
+            0x34, 0x12,
+            0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
+            0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f,
+            0x7f,
+            0xaa,
+        };
+        stream.write(
+            reinterpret_cast<const char*>(payload.data()),
+            static_cast<std::streamsize>(payload.size()));
+    }
+    {
+        std::ofstream stream(assets / "hf" / "source_tensor_map.json");
+        stream << R"({"schema":"mfq.hf-source-map","version":1,"canonical_to_source":{"model.token_embedding.weight":"upstream.embedding","model.block.0.mlp.gate.weight":"upstream.codes","model.block.0.mlp.gate.weight_scale":"upstream.exponents"}})";
+    }
+    {
+        std::ofstream stream(assets / "model_graph.json");
+        stream << R"({"schema_version":1,"architecture":"future_model","canonical_naming":{"namespace":"mfq.tensor","version":1,"component_roots":["model"]},"topology":{"text_layers":1,"vision_layers":0,"predictor_layers":0},"graph":{"kind":"causal_lm","backbone":"future_backbone"},"components":[{"kind":"text","tensor_root":"model","implementation":"future_backbone","policy":"decoder"}],"capabilities":["text"]})";
+    }
+
+    const mfq::metal::MfqContainer model(hf);
+    require(
+        model.contains("model.token_embedding.weight"),
+        "schema-generated HF source alias was not installed");
+    require(
+        model.model_graph().has_value() &&
+            model.model_graph()->backbone == "future_backbone",
+        "schema-generated HF graph was not installed");
+    const auto embedding = model.read("model.token_embedding.weight");
+    require(
+        embedding.size() == 14 && embedding[12] == 0x34 && embedding[13] == 0x12,
+        "schema-generated HF source alias did not preserve tensor bytes");
+    const auto mx = model.read("model.block.0.mlp.gate.weight");
+    require(
+        mx.size() == 73 && std::string(mx.begin(), mx.begin() + 4) == "MXT1" &&
+            mx[5] == 4 && mx[56] == 0x10 && mx.back() == 0x7f,
+        "canonical HF source map did not pair an arbitrarily named MX scale");
+    require(
+        !model.contains("model.block.0.mlp.gate.weight_scale"),
+        "consumed canonical MX scale leaked into the runtime tensor view");
+    require(
+        !model.contains("upstream.unused"),
+        "unmapped source-only tensor leaked into the canonical runtime view");
+}
+
+void test_hf_schema_requires_canonical_mx_scale_binding(
+    const std::filesystem::path& root) {
+    const auto hf = root / "hf-missing-canonical-mx-scale";
+    const auto assets = hf / ".mfq-assets" / "hf";
+    std::filesystem::create_directories(assets);
+    {
+        std::ofstream stream(hf / "config.json", std::ios::binary);
+        stream << R"({"model_type":"future_model"})";
+    }
+    json header = {
+        {"upstream.weight", {
+            {"dtype", "I8"},
+            {"shape", {1, 16}},
+            {"data_offsets", {0, 16}},
+        }},
+        {"upstream.scale", {
+            {"dtype", "F8_E8M0"},
+            {"shape", {1, 1}},
+            {"data_offsets", {16, 17}},
+        }},
+    };
+    auto header_text = header.dump();
+    while ((8 + header_text.size()) % 8 != 0) {
+        header_text.push_back(' ');
+    }
+    {
+        std::ofstream stream(hf / "model.safetensors", std::ios::binary);
+        write_u64_little(stream, header_text.size());
+        stream.write(
+            header_text.data(), static_cast<std::streamsize>(header_text.size()));
+        const std::array<unsigned char, 17> payload{
+            0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
+            0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f,
+            0x7f,
+        };
+        stream.write(
+            reinterpret_cast<const char*>(payload.data()),
+            static_cast<std::streamsize>(payload.size()));
+    }
+    {
+        std::ofstream stream(assets / "source_tensor_map.json");
+        stream << R"({"schema":"mfq.hf-source-map","version":1,"canonical_to_source":{"model.block.0.mlp.gate.weight":"upstream.weight"}})";
+    }
+
+    require_rejected(
+        [&] {
+            (void)mfq::metal::MfqContainer(hf);
+        },
+        "schema-backed HF MX tensor accepted an unmapped raw scale");
+}
+
 void test_hf_virtual_mxfp8_geometries(
     const std::filesystem::path& root) {
     const auto hf = root / "hf-mxfp8-geometries";
@@ -695,10 +831,35 @@ void test_hf_virtual_mfe_experts(
                     prepared.slot_for_expert()[0] >= 0,
                 "heterogeneous SSD expert inventory was not mapped");
     }
+    {
+        const mlx::core::array route_ids(
+            active.begin(), mlx::core::Shape{1, 1});
+        auto prepared = cache.prepare_routes(0, route_ids);
+        auto resident_ids = prepared.expert_ids();
+        resident_ids.eval();
+        require(resident_ids.shape() == route_ids.shape() &&
+                    resident_ids.data<std::int32_t>()[0] >= 0 &&
+                    prepared.weights().gate_up.weight().experts() == 8,
+                "shared SSD route preparation did not map the batch");
+    }
     const auto cache_stats = cache.stats();
-    require(cache_stats.loads == 2 && cache_stats.resident_experts == 2 &&
+    require(cache_stats.loads == 2 && cache_stats.hits == 1 &&
+                cache_stats.resident_experts == 2 &&
                 cache_stats.bytes_read == 2 * store.slot_bytes(),
             "canonical SSD expert cache accounting mismatch");
+
+    mfq::metal::MlxMoeSsdExpertCache bounded_overlap_cache(
+        model,
+        {"model.block.0", "predictor.stage.0"},
+        32,
+        32,
+        std::vector<std::size_t>{2, 1},
+        store.slot_bytes() * 8,
+        2,
+        true);
+    require(!bounded_overlap_cache.prefill_overlap_enabled() &&
+                bounded_overlap_cache.cache_slots() == 8,
+            "undersized SSD prefill buffers did not fall back to the LRU");
 }
 
 } // namespace
@@ -711,6 +872,10 @@ int main() {
         test_sharded_ranges_and_source_lifetime(
             root.path());
         test_hf_virtual_full_precision_container(
+            root.path());
+        test_hf_schema_sidecar_is_architecture_independent(
+            root.path());
+        test_hf_schema_requires_canonical_mx_scale_binding(
             root.path());
         test_hf_virtual_mxfp8_geometries(root.path());
         test_hf_virtual_mfe_experts(root.path());

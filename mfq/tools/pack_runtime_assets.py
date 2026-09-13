@@ -9,6 +9,7 @@ import struct
 import sys
 from pathlib import Path
 
+from mfq.architectures.tensor_schema import source_runtime_assets
 from mfq.formats.assets import (
     ASSET_DTYPE,
     ASSET_MANIFEST_KEY,
@@ -16,7 +17,6 @@ from mfq.formats.assets import (
     TOKENIZER_GGUF_ASSET,
     gguf_metadata_asset,
     is_asset_record,
-    minicpmo45_resampler_pos_embed_asset,
     model_config_asset,
     runtime_asset_manifest,
 )
@@ -112,12 +112,11 @@ def pack_runtime_assets(
     reader = GGUFReader(Path(tokenizer_gguf).resolve())
     tokenizer = gguf_metadata_asset(reader)
     del reader
-    assets = [config, tokenizer]
-    if (
-        str(config_json.get("model_type", "")).lower() == "minicpmo"
-        and str(config_json.get("version", "")) == "4.5"
-    ):
-        assets.append(minicpmo45_resampler_pos_embed_asset())
+    assets = [
+        config,
+        tokenizer,
+        *source_runtime_assets(Path(config_path).resolve().parent, config_json),
+    ]
     assets = tuple(assets)
 
     same_path = source_path == output

@@ -16,6 +16,7 @@ from pathlib import Path
 import numpy as np
 
 from mfq.calibration.artifact import ExpertPrecision
+from mfq.formats.compat import canonical_dtype
 from mfq.formats.header import FileHeader
 from mfq.formats.io import (
     _MFE_DELTA_MAGIC,
@@ -1305,7 +1306,7 @@ def _write_delta_blob(
                         importance=selected_importance,
                         importance_rows_per_entry=4096,
                     )
-                dtype = family.encode("ascii")
+                dtype = canonical_dtype(family).encode("ascii")
                 handle.write(
                     _MFE_POOL_HDR.pack(
                         len(experts),

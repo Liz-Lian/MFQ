@@ -1,6 +1,7 @@
 #pragma once
 
 #include "deepseek_v41_model.h"
+#include "mlx_grouped_linear.h"
 #include "mlx_moe.h"
 #include "mlx_ssd_expert_cache.h"
 #include "mlx_tensor.h"
@@ -14,6 +15,11 @@
 
 namespace mfq::metal {
 
+struct MlxDeepseekV41MoeResult {
+    mlx::core::array routed;
+    mlx::core::array shared;
+};
+
 // DeepSeek-V4.1 routed + shared expert block.  The architecture owns router
 // semantics; only the heterogeneous MFE projection primitive is shared.
 class MlxDeepseekV41Moe {
@@ -24,11 +30,14 @@ public:
         const std::string& prefix,
         bool predictor = false,
         std::shared_ptr<MlxMoeSsdExpertCache> ssd_expert_cache = nullptr,
+        std::shared_ptr<MlxMfeOffloadCache> mfe_offload_cache = nullptr,
         std::size_t expert_cache_layer = 0);
 
-    mlx::core::array forward(
+    MlxDeepseekV41MoeResult forward(
         const mlx::core::array& input,
         const std::optional<mlx::core::array>& image_mask = std::nullopt) const;
+
+    int recommended_prefill_chunk_size() const noexcept;
 
 private:
     MlxDeepseekV41Moe(
@@ -48,6 +57,10 @@ private:
         std::optional<MlxRoutedLinear> routed_gate_up,
         std::optional<MlxRoutedLinear> routed_down,
         std::shared_ptr<MlxMoeSsdExpertCache> ssd_expert_cache,
+        std::shared_ptr<MlxMfeOffloadCache> mfe_offload_cache,
+        std::string streamed_gate_up_name,
+        std::optional<std::string> streamed_up_name,
+        std::string streamed_down_name,
         std::size_t expert_cache_layer);
 
     int hidden_;
@@ -63,9 +76,15 @@ private:
     MlxLinear shared_gate_;
     MlxLinear shared_up_;
     MlxLinear shared_down_;
+    std::optional<MlxGroupedLinear> grouped_projections_;
+    std::optional<MlxGroupedLinear> grouped_shared_gate_up_;
     std::optional<MlxRoutedLinear> routed_gate_up_;
     std::optional<MlxRoutedLinear> routed_down_;
     std::shared_ptr<MlxMoeSsdExpertCache> ssd_expert_cache_;
+    std::shared_ptr<MlxMfeOffloadCache> mfe_offload_cache_;
+    std::string streamed_gate_up_name_;
+    std::optional<std::string> streamed_up_name_;
+    std::string streamed_down_name_;
     std::size_t expert_cache_layer_ = 0;
 };
 

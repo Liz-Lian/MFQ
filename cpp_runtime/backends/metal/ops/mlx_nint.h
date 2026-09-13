@@ -12,6 +12,12 @@ namespace mfq::metal {
 
 bool is_nint_dtype(std::string_view dtype) noexcept;
 
+struct NintDescriptor {
+    int format_version = 2;
+    double aggregate_bpw = 0.0;
+    double distribution_entropy = 0.0;
+};
+
 class MlxNintWeight {
 public:
     static MlxNintWeight from_blob(
@@ -67,6 +73,9 @@ public:
     int output_size() const noexcept {
         return output_size_;
     }
+    const NintDescriptor& descriptor() const noexcept {
+        return descriptor_;
+    }
     std::size_t packed_nbytes() const noexcept;
 
     // Read-only packed storage views used by fused/grouped Metal kernels.
@@ -92,6 +101,9 @@ public:
     const mlx::core::array& row_q_byte_offsets() const noexcept {
         return row_q_byte_offsets_;
     }
+    const mlx::core::array& row_metadata() const noexcept {
+        return row_metadata_;
+    }
     bool has_uniform_q_bits() const noexcept {
         return uniform_q_bits_;
     }
@@ -109,11 +121,13 @@ private:
         mlx::core::array neuron_min,
         mlx::core::array row_q_layout,
         mlx::core::array row_q_byte_offsets,
+        mlx::core::array row_metadata,
         int bits,
         int group_size,
         int groups,
         int input_size,
         int output_size,
+        NintDescriptor descriptor,
         bool uniform_q_bits);
 
     mlx::core::array q_packed_;
@@ -123,11 +137,16 @@ private:
     mlx::core::array neuron_min_;
     mlx::core::array row_q_layout_;
     mlx::core::array row_q_byte_offsets_;
+    // Runtime-only packed row descriptor: layout, byte offset, neuron scale,
+    // and neuron minimum. Dense kernels bind this single leaf instead of four
+    // independent MLX arrays; the canonical wire representation is unchanged.
+    mlx::core::array row_metadata_;
     int bits_ = 0;
     int group_size_ = 0;
     int groups_ = 0;
     int input_size_ = 0;
     int output_size_ = 0;
+    NintDescriptor descriptor_;
     bool uniform_q_bits_ = false;
 };
 

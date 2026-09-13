@@ -197,7 +197,7 @@ def _dense_vector(model: MlxNintModel, name: str) -> mx.array:
     return mx.contiguous(value.astype(mx.float32))
 
 
-def _nint_moe(model: MlxNintModel, name: str) -> MfeTensor:
+def _mfe_tensor(model: MlxNintModel, name: str) -> MfeTensor:
     if name not in model.tensors:
         raise KeyError(f"tensor {name!r} is not present in the Gemma4 model")
     value = model.tensors[name]
@@ -237,11 +237,11 @@ class MlxGemma4MoE:
         layer: int,
         prefix: str,
     ) -> None:
-        gate_up = _nint_moe(
+        gate_up = _mfe_tensor(
             model,
             names.expert(names.expert_gate_up, layer),
         )
-        down = _nint_moe(
+        down = _mfe_tensor(
             model,
             names.expert(names.expert_down, layer),
         )

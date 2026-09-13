@@ -229,7 +229,7 @@ def test_adaptive_nint_group_reuses_unified_nint_kernel():
         [4, 5, 6, 8, 4, 5, 6, 8, 4], dtype=np.uint8
     )
     group = MlxLinearGroup(tensors)
-    assert not group.uses_grouped_kernel
+    assert group.uses_grouped_kernel
 
     source = rng.normal(0, 0.1, size=(3, width)).astype(np.float16)
     actual = tuple(_array(item) for item in group(source))
@@ -241,6 +241,58 @@ def test_adaptive_nint_group_reuses_unified_nint_kernel():
             rtol=4e-3,
             atol=4e-3,
         )
+
+
+@pytest.mark.parametrize("rows", [1, 2, 6])
+def test_nint_qkv_uses_metadata_grouped_dispatch(rows: int):
+    rng = np.random.default_rng(20260827 + rows)
+    width = 96
+    tensors = tuple(
+        quantize(
+            rng.normal(0, 0.1, size=(out, width)).astype(np.float32),
+            NintSpec(bits, 24, 6),
+        )
+        for bits, out in ((3, 7), (5, 9), (8, 11))
+    )
+    group = MlxLinearGroup(tensors)
+    assert group.uses_grouped_kernel
+    source = rng.normal(0, 0.1, size=(rows, width)).astype(np.float16)
+    actual = tuple(_array(item) for item in group(source))
+    for result, tensor in zip(actual, tensors, strict=True):
+        expected = source.astype(np.float32) @ dequantize(tensor).T
+        np.testing.assert_allclose(
+            result,
+            expected.astype(np.float16),
+            rtol=4e-3,
+            atol=4e-3,
+        )
+
+
+@pytest.mark.parametrize("rows", [1, 2, 3, 4, 5, 6])
+def test_nint_gate_up_fuses_small_m_swiglu(rows: int):
+    rng = np.random.default_rng(20260840 + rows)
+    width = 96
+    gate = quantize(
+        rng.normal(0, 0.1, size=(13, width)).astype(np.float32),
+        NintSpec(3, 24, 6),
+    )
+    up = quantize(
+        rng.normal(0, 0.1, size=(13, width)).astype(np.float32),
+        NintSpec(6, 24, 6),
+    )
+    group = MlxLinearGroup((gate, up))
+    assert group.uses_grouped_kernel
+    source = rng.normal(0, 0.1, size=(rows, width)).astype(np.float16)
+    actual = _array(group.forward_swiglu(source))
+    gate_value = source.astype(np.float32) @ dequantize(gate).T
+    up_value = source.astype(np.float32) @ dequantize(up).T
+    expected = gate_value / (1.0 + np.exp(-gate_value)) * up_value
+    np.testing.assert_allclose(
+        actual,
+        expected.astype(np.float16),
+        rtol=5e-3,
+        atol=5e-3,
+    )
 
 
 def test_grouped_linear_mixes_extended_jsc_index_widths():

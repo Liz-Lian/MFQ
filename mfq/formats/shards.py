@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Protocol
 
 from mfq.formats.assets import is_asset_record
+from mfq.formats.compat import canonical_dtype
 from mfq.formats.header import MFQ_MAGIC, FileHeader
 
 SPLIT_NO_KEY = "split.no"
@@ -225,7 +226,7 @@ def _write_header_and_table(
     output.write(_u32(len(records)))
     for record in records:
         name = record.name.encode("utf-8")
-        dtype = record.dtype.encode("utf-8")
+        dtype = canonical_dtype(record.dtype).encode("utf-8")
         output.write(_u32(len(name)))
         output.write(name)
         output.write(_u32(len(dtype)))

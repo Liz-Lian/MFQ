@@ -169,15 +169,24 @@ string(REPLACE
     ""
     MFQ_MFE_PREFILL_SOURCE
     "${MFQ_MFE_PREFILL_SOURCE}")
-set(_MFQ_DSV4_SPARSE_PREFILL_METAL
-    "${MFQ_METAL_ROOT}/kernels/mfq_dsv4_sparse_prefill.metal")
-file(READ "${_MFQ_DSV4_SPARSE_PREFILL_METAL}"
-    MFQ_DSV4_SPARSE_PREFILL_SOURCE)
+set(_MFQ_NINT_PREFILL_METAL
+    "${MFQ_METAL_ROOT}/kernels/mfq_nint_prefill.metal")
+file(READ "${_MFQ_NINT_PREFILL_METAL}"
+    MFQ_NINT_PREFILL_SOURCE)
+string(REPLACE
+    "#include \"mlx/backend/metal/kernels/steel/gemm/gemm.h\""
+    ""
+    MFQ_NINT_PREFILL_SOURCE
+    "${MFQ_NINT_PREFILL_SOURCE}")
+set(_MFQ_DSA_SPARSE_PREFILL_METAL
+    "${MFQ_METAL_ROOT}/kernels/mfq_dsa_sparse_prefill.metal")
+file(READ "${_MFQ_DSA_SPARSE_PREFILL_METAL}"
+    MFQ_DSA_SPARSE_PREFILL_SOURCE)
 string(REPLACE
     "#include \"mlx/backend/metal/kernels/steel/attn/attn.h\""
     ""
-    MFQ_DSV4_SPARSE_PREFILL_SOURCE
-    "${MFQ_DSV4_SPARSE_PREFILL_SOURCE}")
+    MFQ_DSA_SPARSE_PREFILL_SOURCE
+    "${MFQ_DSA_SPARSE_PREFILL_SOURCE}")
 set(_MFQ_SPARSE_BLOCK_GQA_METAL
     "${MFQ_METAL_ROOT}/kernels/mfq_sparse_block_gqa.metal")
 file(READ "${_MFQ_SPARSE_BLOCK_GQA_METAL}"
@@ -189,7 +198,8 @@ string(REPLACE
     "${MFQ_SPARSE_BLOCK_GQA_SOURCE}")
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
     "${_MFQ_MFE_PREFILL_METAL}"
-    "${_MFQ_DSV4_SPARSE_PREFILL_METAL}"
+    "${_MFQ_NINT_PREFILL_METAL}"
+    "${_MFQ_DSA_SPARSE_PREFILL_METAL}"
     "${_MFQ_SPARSE_BLOCK_GQA_METAL}"
     "${MFQ_MLX_ROOT}/include/mlx/backend/metal/kernels/steel/attn/attn.h"
     "${MFQ_MLX_ROOT}/include/mlx/backend/metal/kernels/steel/gemm/mma.h"
@@ -200,20 +210,17 @@ configure_file(
     @ONLY)
 
 add_library(mfq-metal-runtime STATIC
-    storage/deepseek_v41_engram_store.cpp
     storage/hf_safetensors_store.cpp
     storage/mfq_container.cpp
     storage/mfe_expert_store.cpp
+    storage/mlx_mxfp8_row_store.cpp
     storage/mlx_tensor_schema.cpp
     storage/compat/mlx_legacy_tensor_compat.cpp
     runtime/mlx_axial_patch_vision.cpp
     runtime/mlx_grid_vision.cpp
-    runtime/mlx_hf_tensor.cpp
     runtime/mlx_mtp.cpp
     runtime/mlx_multimodal.cpp
     runtime/mlx_sampling.cpp
-    runtime/mlx_deepseek_v4_hf_ssd_expert_arena.cpp
-    runtime/mlx_deepseek_v4_hf_ssd_expert_cache.cpp
     runtime/mlx_ssd_expert_arena.cpp
     runtime/mlx_ssd_expert_cache.cpp
     runtime/mlx_tensor.cpp
@@ -222,6 +229,7 @@ add_library(mfq-metal-runtime STATIC
     ops/mlx_linear_attention.cpp
     ops/mlx_moe.cpp
     ops/mlx_moe_ops.cpp
+    ops/mlx_fp8_sq.cpp
     ops/mlx_mx.cpp
     ops/mlx_mxfp4_sq.cpp
     ops/mlx_nint.cpp
@@ -236,9 +244,8 @@ add_library(mfq-metal-runtime STATIC
     models/deepseek_v4/mlx_deepseek_v4_dspark.cpp
     models/deepseek_v4/mlx_deepseek_v4_hc.cpp
     models/deepseek_v4/mlx_deepseek_v4_moe.cpp
-    models/deepseek_v4/mlx_deepseek_v4_sparse.cpp
+    ops/mlx_dsa.cpp
     models/deepseek_v4/mlx_deepseek_v4_vision.cpp
-    models/deepseek_v4/mlx_deepseek_v41_engram.cpp
     models/deepseek_v41/mlx_deepseek_v41_attention.cpp
     models/deepseek_v41/mlx_deepseek_v41_causal_lm.cpp
     models/deepseek_v41/mlx_deepseek_v41_dspark.cpp
@@ -411,6 +418,18 @@ set_target_properties(mfq-metal-mx-test PROPERTIES
     BUILD_RPATH "${MFQ_MLX_ROOT}/lib"
 )
 add_test(NAME mfq-metal-mx-test COMMAND mfq-metal-mx-test)
+
+add_executable(mfq-metal-fp8-sq-test
+    tests/mlx_fp8_sq_test.cpp
+)
+target_link_libraries(mfq-metal-fp8-sq-test PRIVATE
+    mfq-metal-runtime
+)
+target_compile_features(mfq-metal-fp8-sq-test PRIVATE cxx_std_20)
+set_target_properties(mfq-metal-fp8-sq-test PROPERTIES
+    BUILD_RPATH "${MFQ_MLX_ROOT}/lib"
+)
+add_test(NAME mfq-metal-fp8-sq-test COMMAND mfq-metal-fp8-sq-test)
 
 add_executable(mfq-metal-mxfp4-sq2-test
     tests/mlx_mxfp4_sq2_test.cpp
@@ -636,27 +655,25 @@ add_test(
     COMMAND mfq-metal-deepseek-v4-model-test
 )
 
-add_executable(mfq-metal-deepseek-v41-engram-store-test
-    tests/deepseek_v41_engram_store_test.cpp
-)
-target_link_libraries(
-    mfq-metal-deepseek-v41-engram-store-test PRIVATE
-    mfq-metal-runtime
-)
-target_compile_features(
-    mfq-metal-deepseek-v41-engram-store-test PRIVATE cxx_std_20)
-set_target_properties(
-    mfq-metal-deepseek-v41-engram-store-test PROPERTIES
-    BUILD_RPATH "${MFQ_MLX_ROOT}/lib"
-)
-add_test(
-    NAME mfq-metal-deepseek-v41-engram-store-test
-    COMMAND mfq-metal-deepseek-v41-engram-store-test
-)
-
 add_executable(mfq-metal-hf-safetensors-store-test
     storage/hf_safetensors_store.cpp
     tests/hf_safetensors_store_test.cpp
+)
+
+add_executable(mfq-metal-mxfp8-row-store-test
+    tests/mlx_mxfp8_row_store_test.cpp
+)
+target_link_libraries(mfq-metal-mxfp8-row-store-test PRIVATE
+    mfq-metal-runtime
+)
+target_compile_features(
+    mfq-metal-mxfp8-row-store-test PRIVATE cxx_std_20)
+set_target_properties(mfq-metal-mxfp8-row-store-test PROPERTIES
+    BUILD_RPATH "${MFQ_MLX_ROOT}/lib"
+)
+add_test(
+    NAME mfq-metal-mxfp8-row-store-test
+    COMMAND mfq-metal-mxfp8-row-store-test
 )
 target_include_directories(mfq-metal-hf-safetensors-store-test PRIVATE
     ${MFQ_METAL_ROOT}/storage

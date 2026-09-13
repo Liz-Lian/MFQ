@@ -18,6 +18,11 @@ import re
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from mfq.formats.assets import RuntimeAsset
 
 CANONICAL_TENSOR_SCHEMA_VERSION = 1
 CANONICAL_TENSOR_NAMESPACE = "mfq.tensor"
@@ -170,6 +175,10 @@ SourceMapper = Callable[
     [str, GraphTopology, Mapping[str, object]],
     TensorNameMapping | None,
 ]
+SourceAssetBuilder = Callable[
+    [Path, Mapping[str, object]],
+    Sequence["RuntimeAsset"],
+]
 
 
 @dataclass(frozen=True)
@@ -193,6 +202,7 @@ class TensorSchemaRegistration:
     source_mapper: SourceMapper
     backbone: str = ""
     component_specs: tuple[GraphComponentSpec, ...] = ()
+    source_asset_builder: SourceAssetBuilder | None = None
 
     def __post_init__(self) -> None:
         if not self.backbone:
@@ -240,7 +250,7 @@ def topology_from_config(config: Mapping[str, object]) -> GraphTopology:
         or 0
     )
     model_type = str(text.get("model_type", config.get("model_type", ""))).lower()
-    if model_type.startswith("deepseek_v4"):
+    if model_type in {"deepseek_v4", "deepseek_v41_text"}:
         target_layers = text.get("dspark_target_layer_ids", ())
         compress_ratios = text.get("compress_ratios", ())
         structural = [int(text.get("n_mtp_layers", 0) or 0)]
@@ -309,6 +319,83 @@ def graph_spec_for_plan(
         components=components,
         component_specs=registration.component_specs,
     )
+
+
+def graph_spec_for_source_names(
+    config: Mapping[str, object],
+    source_names: Sequence[str],
+) -> ModelGraphSpec | None:
+    """Build a runtime graph directly from one registered source checkpoint.
+
+    Direct loading is a container capability, not a second architecture
+    capability.  The same source-name mapping used by import/quantization is
+    therefore the sole authority for normalizing an HF directory before the
+    runtime graph is selected.
+    """
+
+    if tensor_schema_for_config(config) is None:
+        return None
+    canonical_names = []
+    for name in source_names:
+        mapped = map_source_tensor_name(name, config)
+        canonical_names.append(
+            mapped.canonical_name if mapped is not None else name
+        )
+    return graph_spec_for_plan(config, canonical_names)
+
+
+def source_runtime_assets(
+    root: str | Path,
+    config: Mapping[str, object],
+) -> tuple["RuntimeAsset", ...]:
+    """Build optional source-derived assets through architecture registration.
+
+    The storage/direct-load path only invokes this hook. Architectures that
+    need no generated constants gain direct loading from their existing
+    canonical schema with no additional loader code.
+    """
+
+    registration = tensor_schema_for_config(config)
+    if registration is None or registration.source_asset_builder is None:
+        return ()
+    return tuple(registration.source_asset_builder(Path(root), config))
+
+
+def canonical_source_tensor_map(
+    config: Mapping[str, object],
+    source_names: Sequence[str],
+) -> dict[str, str]:
+    """Return the canonical container view of a source checkpoint.
+
+    This is the shared direct-load/import boundary. Architecture registration
+    supplies tensor semantics once; every storage backend receives the same
+    canonical-to-source map without adding an architecture-specific loader.
+    A source tensor that is already canonical wins over any compatibility
+    spelling for the same tensor.
+    """
+
+    mapped: list[tuple[str, str]] = []
+    for source_name in sorted(set(source_names)):
+        resolved = map_source_tensor_name(source_name, config)
+        if resolved is not None:
+            mapped.append((resolved.canonical_name, source_name))
+
+    identities = {
+        canonical: source
+        for canonical, source in mapped
+        if canonical == source
+    }
+    result = dict(identities)
+    for canonical, source in mapped:
+        if canonical in identities or canonical == source:
+            continue
+        previous = result.setdefault(canonical, source)
+        if previous != source:
+            raise ValueError(
+                "source tensor names collide after canonicalization: "
+                f"{previous!r}, {source!r} -> {canonical!r}"
+            )
+    return result
 
 
 def map_source_tensor_name(
@@ -1303,8 +1390,6 @@ _DEEPSEEK_BLOCK_SUFFIXES: dict[str, str] = {
     "attn.compressor.norm.weight": "attention.compressor.norm.weight",
     "attn.indexer.wq_b.weight": "attention.indexer.query.weight",
     "attn.indexer.wq_b.scale": "attention.indexer.query.weight_scale",
-    "attn.indexer.wk.weight": "attention.indexer.key.weight",
-    "attn.indexer.k_norm.weight": "attention.indexer.key_norm.weight",
     "attn.indexer.weights_proj.weight": "attention.indexer.score.weight",
     "attn.indexer.compressor.wkv.weight": (
         "attention.indexer.compressor.key_value.weight"
@@ -1339,15 +1424,6 @@ def _deepseek_block_suffix(source_suffix: str) -> str | None:
         projection = {"1": "gate", "2": "down", "3": "up"}[match.group(1)]
         leaf = "weight" if match.group(2) == "weight" else "weight_scale"
         return f"mlp.shared_expert.{projection}.{leaf}"
-    match = re.match(r"^engram\.(embed|wkv)\.(weight|scale)$", source_suffix)
-    if match is not None:
-        tensor = "embedding" if match.group(1) == "embed" else "key_value"
-        leaf = "weight" if match.group(2) == "weight" else "weight_scale"
-        return f"engram.{tensor}.{leaf}"
-    if source_suffix == "engram.q_weight":
-        return "engram.query.weight"
-    if source_suffix == "engram.k_weight":
-        return "engram.key.weight"
     return None
 
 
@@ -1596,8 +1672,6 @@ def _deepseek_v4_source_mapper(
         "confidence_head.proj.weight": "confidence.projection.weight",
         "markov_head.markov_w1.weight": "markov.input.weight",
         "markov_head.markov_w2.weight": "markov.output.weight",
-        "markov_head.embed.weight": "markov.embedding.weight",
-        "markov_head.head.weight": "markov.output.weight",
     }
     suffix = predictor_suffixes.get(source_suffix)
     return (
@@ -1768,6 +1842,31 @@ def _gemma4_source_mapper(
     )
 
 
+def _minicpmo_source_assets(
+    _root: Path,
+    _config: Mapping[str, object],
+) -> Sequence["RuntimeAsset"]:
+    from mfq.formats.assets import minicpmo45_resampler_pos_embed_asset
+
+    return (minicpmo45_resampler_pos_embed_asset(),)
+
+
+def _deepseek_v41_source_assets(
+    root: Path,
+    config: Mapping[str, object],
+) -> Sequence["RuntimeAsset"]:
+    from mfq.formats.assets import deepseek_v41_engram_asset
+
+    raw_text = config.get("text_config", config)
+    text = raw_text if isinstance(raw_text, Mapping) else {}
+    layer_ids = text.get("engram_layer_ids", ())
+    if not isinstance(layer_ids, Sequence) or isinstance(layer_ids, (str, bytes)):
+        return ()
+    if not layer_ids:
+        return ()
+    return (deepseek_v41_engram_asset(root / "tokenizer.json", dict(text)),)
+
+
 register_tensor_schema(
     TensorSchemaRegistration(
         architecture="qwen3_5",
@@ -1797,6 +1896,7 @@ register_tensor_schema(
         architecture="deepseek_v41",
         aliases=("deepseek_v41_text", "deepseek_v41_vision"),
         source_mapper=_deepseek_v41_source_mapper,
+        source_asset_builder=_deepseek_v41_source_assets,
         component_specs=(
             GraphComponentSpec(
                 TensorComponent.VISION,
@@ -1846,6 +1946,7 @@ register_tensor_schema(
         aliases=("minicpmo45", "minicpmo_4_5"),
         source_mapper=_minicpmo_source_mapper,
         backbone="minicpmo45",
+        source_asset_builder=_minicpmo_source_assets,
         component_specs=(
             GraphComponentSpec(
                 TensorComponent.VISION,
@@ -1906,11 +2007,14 @@ __all__ = [
     "TensorComponent",
     "TensorNameMapping",
     "TensorSchemaRegistration",
+    "canonical_source_tensor_map",
     "graph_spec_for_plan",
+    "graph_spec_for_source_names",
     "map_source_tensor_name",
     "model_block",
     "predictor_block",
     "register_tensor_schema",
+    "source_runtime_assets",
     "tensor_schema_for_config",
     "topology_from_config",
     "vision_block",

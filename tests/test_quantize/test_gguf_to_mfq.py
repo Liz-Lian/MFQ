@@ -70,7 +70,7 @@ from mfq.tools.quantize_gguf_to_mfq import (
     _train_or_load_tensor_codebook,
     _write_nvq_blob,
 )
-from mfq.tools.quantize_hf_to_mfq import _nint_moe_blob_nbytes
+from mfq.tools.quantize_hf_to_mfq import _mfe_nint_blob_nbytes
 
 
 def _tensor(name, values, qtype, quantize):
@@ -697,7 +697,7 @@ def test_gguf_plan_accepts_expertwise_precision_scheme():
     applied = _apply_expert_scheme([base], scheme)[0]
     assert applied.target_dtype == "MFE"
     assert applied.expert_specs == specs
-    assert _estimate_blob_bytes(applied) == _nint_moe_blob_nbytes(shape, specs)
+    assert _estimate_blob_bytes(applied) == _mfe_nint_blob_nbytes(shape, specs)
 
 
 @pytest.mark.parametrize(

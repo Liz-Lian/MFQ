@@ -6,6 +6,7 @@
 #include "mlx_linear_attention.h"
 #include "mlx_moe.h"
 #include "mlx_moe_ops.h"
+#include "mfe_expert_store.h"
 #include "mlx_sparse_attention.h"
 #include "mlx_tensor.h"
 #include "mlx_transformer.h"
@@ -424,18 +425,65 @@ public:
     static Qwen4Moe load(
         const MfqContainer& model,
         const Qwen4Config& config,
-        const std::string& prefix) {
+        const std::string& prefix,
+        std::shared_ptr<MlxMoeSsdExpertCache> ssd_expert_cache = nullptr,
+        std::shared_ptr<MlxMfeOffloadCache> mfe_offload_cache = nullptr,
+        std::size_t expert_cache_layer = 0) {
+        const auto expert_prefix = prefix + ".experts.";
+        const bool split_gate_up = model.contains(
+            expert_prefix + "gate.weight");
+        const auto gate_name = split_gate_up
+            ? expert_prefix + "gate.weight"
+            : expert_prefix + "gate_up.weight";
+        const auto up_name = split_gate_up
+            ? std::optional<std::string>(expert_prefix + "up.weight")
+            : std::nullopt;
+    const auto down_name = expert_prefix + "down.weight";
+    if (mfe_offload_cache &&
+        (!mfe_offload_cache->can_group_mfe(gate_name)
+         || (up_name && !mfe_offload_cache->can_group_mfe(*up_name))
+         || !mfe_offload_cache->can_group_mfe(down_name))) {
+            // A requested offload policy is projection-selective. Unsupported
+            // records remain on the ordinary eager path; other layers still
+            // page through the same shared cache.
+            mfe_offload_cache.reset();
+        }
+        std::optional<Qwen4RoutedWeight> gate_up;
+        std::optional<Qwen4RoutedWeight> down;
+        if (!ssd_expert_cache && !mfe_offload_cache) {
+            gate_up.emplace(Qwen4RoutedWeight::load_gate_up(model, prefix));
+            down.emplace(Qwen4RoutedWeight::load(
+                model, prefix + ".experts.down.weight"));
+        }
         return Qwen4Moe(
             config,
-            Qwen4RoutedWeight::load_gate_up(model, prefix),
-            Qwen4RoutedWeight::load(
-                model, prefix + ".experts.down.weight"),
+            std::move(gate_up),
+            std::move(down),
             MlxLinear::load(model, prefix + ".router.weight"),
             DenseFfn::load(model, prefix + ".shared_expert"),
-            MlxLinear::load(model, prefix + ".shared_expert.router.weight"));
+            MlxLinear::load(model, prefix + ".shared_expert.router.weight"),
+            std::move(ssd_expert_cache),
+            std::move(mfe_offload_cache),
+            gate_name,
+            up_name,
+            down_name,
+            expert_cache_layer);
     }
 
-    array operator()(const array& value) const {
+    std::optional<MlxSsdPrefetchedExpertLayer> prefetch_routed(
+        std::size_t rows) const {
+        constexpr std::size_t kFullLayerPrefetchRows = 512;
+        if (ssd_expert_cache_ && rows >= kFullLayerPrefetchRows &&
+            ssd_expert_cache_->prefill_overlap_enabled()) {
+            return ssd_expert_cache_->prefetch_layer(
+                expert_cache_layer_);
+        }
+        return std::nullopt;
+    }
+
+    array operator()(
+        const array& value,
+        MlxSsdPrefetchedExpertLayer* prefetched = nullptr) const {
         auto source = mlx::core::reshape(
             value.dtype() == mlx::core::float16
                 ? value : mlx::core::astype(value, mlx::core::float16),
@@ -464,9 +512,103 @@ public:
                 static_cast<std::size_t>(tokens)
                     * static_cast<std::size_t>(routes.ids.shape(1)),
                 "Qwen4 routed row count");
+            if (prefetched != nullptr) {
+                if (!ssd_expert_cache_ ||
+                    prefetched->layer() != expert_cache_layer_) {
+                    throw std::invalid_argument(
+                        "Qwen4 SSD prefetch layer mismatch");
+                }
+                const auto& weights = prefetched->wait();
+                auto intermediate = weights.gate_up.swiglu(
+                    source, routes.ids, 0.0f);
+                if (detail::component_profile_active()) {
+                    detail::profile_eval(
+                        "qwen4.moe.routed_gate_up",
+                        intermediate);
+                }
+                auto output = weights.down(intermediate, routes.ids);
+                if (detail::component_profile_active()) {
+                    detail::profile_eval(
+                        "qwen4.moe.routed_down", output);
+                }
+                return output;
+            }
+            if (ssd_expert_cache_) {
+                auto prepared = ssd_expert_cache_->prepare_routes(
+                    expert_cache_layer_, routes.ids);
+                auto intermediate =
+                    prepared.weights().gate_up.swiglu(
+                        source, prepared.expert_ids(), 0.0f);
+                if (detail::component_profile_active()) {
+                    detail::profile_eval(
+                        "qwen4.moe.routed_gate_up",
+                        intermediate);
+                }
+                auto output = prepared.weights().down(
+                    intermediate, prepared.expert_ids());
+                if (detail::component_profile_active()) {
+                    detail::profile_eval(
+                        "qwen4.moe.routed_down", output);
+                }
+                return output;
+            }
+            if (mfe_offload_cache_) {
+                auto global_ids = mlx::core::contiguous(
+                    mlx::core::astype(routes.ids, mlx::core::int32));
+                global_ids.eval();
+                std::vector<std::int32_t> active;
+                active.reserve(static_cast<std::size_t>(global_ids.size()));
+                std::vector<std::uint8_t> seen(
+                    static_cast<std::size_t>(config_.num_experts), 0);
+                const auto* ids = global_ids.data<std::int32_t>();
+                for (std::size_t index = 0; index < global_ids.size(); ++index) {
+                    const auto expert = ids[index];
+                    if (expert < 0 || expert >= config_.num_experts) {
+                        throw std::runtime_error(
+                            "Qwen4 routed expert ID is out of range");
+                    }
+                    if (seen[static_cast<std::size_t>(expert)] == 0) {
+                        seen[static_cast<std::size_t>(expert)] = 1;
+                        active.push_back(expert);
+                    }
+                }
+                std::vector<std::int32_t> global_to_local(
+                    static_cast<std::size_t>(config_.num_experts), -1);
+                for (std::size_t local = 0; local < active.size(); ++local) {
+                    global_to_local[static_cast<std::size_t>(active[local])] =
+                        static_cast<std::int32_t>(local);
+                }
+                auto local_ids = mlx::core::take(
+                    array(
+                        global_to_local.begin(),
+                        Shape{static_cast<int>(config_.num_experts)}),
+                    global_ids);
+                auto gate = mfe_offload_cache_->grouped_mfe(
+                    gate_name_, active);
+                auto gate_up = up_name_.has_value()
+                    ? MlxMfeWeight::concatenate_projections({
+                          std::move(gate),
+                          mfe_offload_cache_->grouped_mfe(*up_name_, active),
+                      })
+                    : std::move(gate);
+                auto down = mfe_offload_cache_->grouped_mfe(
+                    down_name_, active);
+                auto intermediate = gate_up.routed_swiglu(
+                    source, local_ids);
+                if (detail::component_profile_active()) {
+                    detail::profile_eval(
+                        "qwen4.moe.routed_gate_up", intermediate);
+                }
+                auto output = down.routed_matmul(intermediate, local_ids);
+                if (detail::component_profile_active()) {
+                    detail::profile_eval(
+                        "qwen4.moe.routed_down", output);
+                }
+                return output;
+            }
             if (tokens >= 32
-                && gate_up_.supports_grouped_mmq()
-                && down_.supports_grouped_mmq()) {
+                && gate_up_->supports_grouped_mmq()
+                && down_->supports_grouped_mmq()) {
                 // Gate/up and down use the same routing. Keep rows in expert
                 // order between both packed MMQs so sorting and the large
                 // intermediate permutation happen only once; each projection
@@ -479,26 +621,26 @@ public:
                                 Shape{route_count})),
                         mlx::core::int32));
                 const int gate_block_rows =
-                    gate_up_.recommended_grouped_mmq_block_rows(
+                    gate_up_->recommended_grouped_mmq_block_rows(
                         route_count,
                         true);
                 const int down_block_rows =
-                    down_.recommended_grouped_mmq_block_rows(
+                    down_->recommended_grouped_mmq_block_rows(
                         route_count,
                         false);
-                auto gate_plan = gate_up_.build_grouped_mmq_plan(
+                auto gate_plan = gate_up_->build_grouped_mmq_plan(
                     routes.ids,
                     route_order,
                     gate_block_rows);
                 std::optional<mfq::metal::MlxGroupedMmqPlan> down_plan;
                 if (down_block_rows != gate_block_rows) {
                     down_plan.emplace(
-                        down_.build_grouped_mmq_plan(
+                        down_->build_grouped_mmq_plan(
                             routes.ids,
                             route_order,
                             down_block_rows));
                 }
-                auto intermediate = gate_up_.routed_matmul_sorted(
+                auto intermediate = gate_up_->routed_matmul_sorted(
                     source,
                     routes.ids,
                     route_order,
@@ -511,7 +653,7 @@ public:
                         "qwen4.moe.routed_gate_up",
                         intermediate);
                 }
-                auto sorted = down_.routed_matmul_sorted(
+                auto sorted = down_->routed_matmul_sorted(
                     intermediate,
                     routes.ids,
                     route_order,
@@ -529,7 +671,7 @@ public:
                 pairs_are_sorted = true;
                 return sorted;
             }
-            auto intermediate = gate_up_.routed_swiglu(
+            auto intermediate = gate_up_->routed_swiglu(
                 source,
                 routes.ids);
             if (detail::component_profile_active()) {
@@ -537,7 +679,7 @@ public:
                     "qwen4.moe.routed_gate_up",
                     intermediate);
             }
-            auto output = down_.routed_matmul(intermediate, routes.ids);
+            auto output = down_->routed_matmul(intermediate, routes.ids);
             if (detail::component_profile_active()) {
                 detail::profile_eval("qwen4.moe.routed_down", output);
             }
@@ -572,35 +714,62 @@ public:
 private:
     Qwen4Moe(
         Qwen4Config config,
-        Qwen4RoutedWeight gate_up,
-        Qwen4RoutedWeight down,
+        std::optional<Qwen4RoutedWeight> gate_up,
+        std::optional<Qwen4RoutedWeight> down,
         MlxLinear router,
         DenseFfn shared,
-        MlxLinear shared_gate)
+        MlxLinear shared_gate,
+        std::shared_ptr<MlxMoeSsdExpertCache> ssd_expert_cache,
+        std::shared_ptr<MlxMfeOffloadCache> mfe_offload_cache,
+        std::string gate_name,
+        std::optional<std::string> up_name,
+        std::string down_name,
+        std::size_t expert_cache_layer)
         : config_(std::move(config)),
           gate_up_(std::move(gate_up)),
           down_(std::move(down)),
           router_(std::move(router)),
           shared_(std::move(shared)),
-          shared_gate_(std::move(shared_gate)) {
-        if (gate_up_.experts() != config_.num_experts ||
-            down_.experts() != config_.num_experts ||
-            gate_up_.neuron_len() != config_.hidden_size ||
-            (gate_up_.projections() != 1 && gate_up_.projections() != 2) ||
-            gate_up_.out_per_expert() * gate_up_.projections() !=
+          shared_gate_(std::move(shared_gate)),
+          ssd_expert_cache_(std::move(ssd_expert_cache)),
+          mfe_offload_cache_(std::move(mfe_offload_cache)),
+          gate_name_(std::move(gate_name)),
+          up_name_(std::move(up_name)),
+          down_name_(std::move(down_name)),
+          expert_cache_layer_(expert_cache_layer) {
+        const bool cached = static_cast<bool>(ssd_expert_cache_)
+            || static_cast<bool>(mfe_offload_cache_);
+        if (gate_up_.has_value() != down_.has_value() ||
+            gate_up_.has_value() == cached
+            || (ssd_expert_cache_ && mfe_offload_cache_)) {
+            throw std::runtime_error(
+                "Qwen4 routed expert backing is inconsistent");
+        }
+        if (gate_up_ && (
+            gate_up_->experts() != config_.num_experts ||
+            down_->experts() != config_.num_experts ||
+            gate_up_->neuron_len() != config_.hidden_size ||
+            (gate_up_->projections() != 1 && gate_up_->projections() != 2) ||
+            gate_up_->out_per_expert() * gate_up_->projections() !=
                 2 * config_.moe_intermediate_size ||
-            down_.neuron_len() != config_.moe_intermediate_size ||
-            down_.out_per_expert() != config_.hidden_size) {
+            down_->neuron_len() != config_.moe_intermediate_size ||
+            down_->out_per_expert() != config_.hidden_size)) {
             throw std::runtime_error("Qwen4 routed expert geometry disagrees");
         }
     }
 
     Qwen4Config config_;
-    Qwen4RoutedWeight gate_up_;
-    Qwen4RoutedWeight down_;
+    std::optional<Qwen4RoutedWeight> gate_up_;
+    std::optional<Qwen4RoutedWeight> down_;
     MlxLinear router_;
     DenseFfn shared_;
     MlxLinear shared_gate_;
+    std::shared_ptr<MlxMoeSsdExpertCache> ssd_expert_cache_;
+    std::shared_ptr<MlxMfeOffloadCache> mfe_offload_cache_;
+    std::string gate_name_;
+    std::optional<std::string> up_name_;
+    std::string down_name_;
+    std::size_t expert_cache_layer_ = 0;
 };
 
 class Qwen4NgramEmbedding {
@@ -1787,7 +1956,9 @@ public:
         const MfqContainer& model,
         const Qwen4Config& config,
         std::size_t index,
-        int maximum) {
+        int maximum,
+        std::shared_ptr<MlxMoeSsdExpertCache> ssd_expert_cache = nullptr,
+        std::shared_ptr<MlxMfeOffloadCache> mfe_offload_cache = nullptr) {
         const auto prefix =
             "model.block." + std::to_string(index);
         std::unique_ptr<Qwen4Attention> attention;
@@ -1813,7 +1984,13 @@ public:
             GatedResidual::load(
                 model, config, prefix + ".mlp.mhc.pre"),
             std::move(attention),
-            Qwen4Moe::load(model, config, prefix + ".mlp"),
+            Qwen4Moe::load(
+                model,
+                config,
+                prefix + ".mlp",
+                std::move(ssd_expert_cache),
+                std::move(mfe_offload_cache),
+                index),
             std::move(ple));
     }
 
@@ -1821,7 +1998,10 @@ public:
         const MfqContainer& model,
         const Qwen4Config& config,
         std::size_t index,
-        int maximum) {
+        int maximum,
+        std::shared_ptr<MlxMoeSsdExpertCache> ssd_expert_cache = nullptr,
+        std::shared_ptr<MlxMfeOffloadCache> mfe_offload_cache = nullptr,
+        std::size_t expert_cache_layer_base = 0) {
         const auto prefix =
             "predictor.block." + std::to_string(index);
         return Qwen4Layer(
@@ -1831,7 +2011,13 @@ public:
                 model, config, prefix + ".mlp.mhc.pre"),
             Qwen4Qsa::load(
                 model, config, prefix + ".attention", maximum),
-            Qwen4Moe::load(model, config, prefix + ".mlp"),
+            Qwen4Moe::load(
+                model,
+                config,
+                prefix + ".mlp",
+                std::move(ssd_expert_cache),
+                std::move(mfe_offload_cache),
+                expert_cache_layer_base + index),
             nullptr);
     }
 
@@ -1863,13 +2049,19 @@ public:
         attention_->trim_cache_to(position);
     }
 
+    std::optional<MlxSsdPrefetchedExpertLayer> prefetch_routed(
+        std::size_t rows) const {
+        return moe_.prefetch_routed(rows);
+    }
+
     array forward(
         array hidden_streams,
         const array& token_ids,
         const array& positions_current,
         const array& positions_full,
         bool use_cache,
-        int speculative_confirmed = 0) {
+        int speculative_confirmed = 0,
+        MlxSsdPrefetchedExpertLayer* prefetched = nullptr) {
         if (ple_) {
             hidden_streams = hidden_streams +
                 ple_->forward(
@@ -1896,7 +2088,7 @@ public:
             hidden_streams);
         auto ffn_values = ffn_gr_.pre(hidden_streams);
         detail::profile_eval("qwen4.ffn_mhc_pre", ffn_values.branch);
-        branch = moe_(ffn_values.branch);
+        branch = moe_(ffn_values.branch, prefetched);
         detail::profile_eval("qwen4.moe", branch);
         auto output = ffn_gr_.post(branch, ffn_values);
         detail::profile_eval("qwen4.ffn_mhc_post", output);
@@ -1933,7 +2125,10 @@ public:
     static std::optional<Qwen4Mtp> load_if_present(
         const MfqContainer& model,
         const Qwen4Config& config,
-        int maximum) {
+        int maximum,
+        std::shared_ptr<MlxMoeSsdExpertCache> ssd_expert_cache = nullptr,
+        std::shared_ptr<MlxMfeOffloadCache> mfe_offload_cache = nullptr,
+        std::size_t expert_cache_layer_base = 0) {
         bool any = false;
         for (const auto& [name, _] : model.records()) {
             if (name.rfind("predictor.", 0) == 0) {
@@ -1963,7 +2158,10 @@ public:
                 model,
                 config,
                 static_cast<std::size_t>(index),
-                maximum));
+                maximum,
+                ssd_expert_cache,
+                mfe_offload_cache,
+                expert_cache_layer_base));
         }
         return Qwen4Mtp(
             config,
@@ -2278,7 +2476,8 @@ Qwen4Config Qwen4Config::from_mfq(const MfqContainer& model) {
 struct MlxQwen4CausalLm::Impl {
     static std::unique_ptr<Impl> load(
         const MfqContainer& model,
-        int requested_context) {
+        int requested_context,
+        std::optional<std::size_t> expert_cache_bytes) {
         const auto graph = effective_model_graph(model);
         if (graph.graph_kind != "causal_lm" ||
             graph.backbone != "qwen4_exp" ||
@@ -2287,6 +2486,13 @@ struct MlxQwen4CausalLm::Impl {
                 "model graph does not describe a Qwen4-Exp causal runtime");
         }
         auto config = Qwen4Config::from_mfq(model);
+        const auto* predictor = graph.component("predictor");
+        if (predictor != nullptr &&
+            (predictor->implementation != "next_token_prediction" ||
+             predictor->tensor_root != "predictor")) {
+            throw std::runtime_error(
+                "model graph declares an unsupported Qwen4 predictor");
+        }
         const int maximum = std::min(
             checked_int(config.max_position_embeddings, "context"),
             requested_context);
@@ -2296,23 +2502,65 @@ struct MlxQwen4CausalLm::Impl {
         if (!config.tie_word_embeddings && model.contains("model.output.weight")) {
             output.emplace(MlxLinear::load(model, "model.output.weight"));
         }
+        std::shared_ptr<MlxMoeSsdExpertCache> ssd_expert_cache;
+        std::shared_ptr<MlxMfeOffloadCache> mfe_offload_cache;
+        if (expert_cache_bytes.has_value() && *expert_cache_bytes > 0) {
+            std::vector<std::string> prefixes;
+            prefixes.reserve(static_cast<std::size_t>(
+                config.num_hidden_layers + config.mtp_num_hidden_layers));
+            for (std::int64_t index = 0;
+                 index < config.num_hidden_layers; ++index) {
+                prefixes.push_back(
+                    "model.block." + std::to_string(index));
+            }
+            if (predictor != nullptr) {
+                for (std::int64_t index = 0;
+                     index < config.mtp_num_hidden_layers; ++index) {
+                    prefixes.push_back(
+                        "predictor.block." + std::to_string(index));
+                }
+            }
+            constexpr std::size_t prefill_buffers_minimum =
+                std::size_t{7} << 30;
+            try {
+                ssd_expert_cache = std::make_shared<MlxMoeSsdExpertCache>(
+                    model,
+                    prefixes,
+                    static_cast<std::size_t>(config.hidden_size),
+                    static_cast<std::size_t>(config.moe_intermediate_size),
+                    static_cast<std::size_t>(config.num_experts),
+                    *expert_cache_bytes,
+                    8,
+                    *expert_cache_bytes >= prefill_buffers_minimum);
+            } catch (const MlxMfeMxfp4Unsupported&) {
+                mfe_offload_cache = std::make_shared<MlxMfeOffloadCache>(
+                    model,
+                    *expert_cache_bytes,
+                    static_cast<int>(config.num_experts));
+            }
+        }
         std::vector<Qwen4Layer> layers;
         layers.reserve(static_cast<std::size_t>(config.num_hidden_layers));
         for (std::size_t index = 0;
              index < static_cast<std::size_t>(config.num_hidden_layers);
              ++index) {
-            layers.push_back(Qwen4Layer::load(model, config, index, maximum));
+            layers.push_back(Qwen4Layer::load(
+                model,
+                config,
+                index,
+                maximum,
+                ssd_expert_cache,
+                mfe_offload_cache));
         }
         auto mixer = GatedResidual::load(
             model, config, "model.mhc.pre", false);
-        auto mtp = Qwen4Mtp::load_if_present(model, config, maximum);
-        const auto* predictor = graph.component("predictor");
-        if (predictor != nullptr &&
-            (predictor->implementation != "next_token_prediction" ||
-             predictor->tensor_root != "predictor")) {
-            throw std::runtime_error(
-                "model graph declares an unsupported Qwen4 predictor");
-        }
+        auto mtp = Qwen4Mtp::load_if_present(
+            model,
+            config,
+            maximum,
+            ssd_expert_cache,
+            mfe_offload_cache,
+            static_cast<std::size_t>(config.num_hidden_layers));
         if ((predictor != nullptr) != mtp.has_value()) {
             throw std::runtime_error(
                 predictor != nullptr
@@ -2331,7 +2579,9 @@ struct MlxQwen4CausalLm::Impl {
             std::move(output),
             std::move(layers),
             std::move(mixer),
-            std::move(mtp)));
+            std::move(mtp),
+            std::move(ssd_expert_cache),
+            std::move(mfe_offload_cache)));
     }
 
     std::pair<array, array> forward_with_hidden(
@@ -2380,14 +2630,38 @@ struct MlxQwen4CausalLm::Impl {
             start, start + tokens, 1, mlx::core::int32);
         auto full_positions = mlx::core::arange(
             0, start + tokens, 1, mlx::core::int32);
-        for (auto& layer : layers) {
-            streams = layer.forward(
+        const bool bounded_prefill = tokens > 1;
+        const auto rows = static_cast<std::size_t>(batch) *
+            static_cast<std::size_t>(tokens);
+        std::array<
+            std::optional<MlxSsdPrefetchedExpertLayer>,
+            2> routed_pipeline;
+        if (bounded_prefill && !layers.empty()) {
+            routed_pipeline[0] = layers[0].prefetch_routed(rows);
+            if (routed_pipeline[0].has_value() && layers.size() > 1) {
+                routed_pipeline[1] = layers[1].prefetch_routed(rows);
+            }
+        }
+        for (std::size_t index = 0; index < layers.size(); ++index) {
+            auto* prefetched = routed_pipeline[index % 2].has_value()
+                ? &*routed_pipeline[index % 2]
+                : nullptr;
+            streams = layers[index].forward(
                 std::move(streams),
                 ids,
                 current_positions,
                 full_positions,
                 use_cache,
-                speculative_confirmed);
+                speculative_confirmed,
+                prefetched);
+            if (prefetched != nullptr) {
+                detail::eval_with_timing(streams);
+                routed_pipeline[index % 2].reset();
+                if (index + 2 < layers.size()) {
+                    routed_pipeline[index % 2] =
+                        layers[index + 2].prefetch_routed(rows);
+                }
+            }
         }
         auto output_hidden = mixer.mix(streams);
         if (last_token_only && tokens > 1) {
@@ -2469,14 +2743,18 @@ private:
         std::optional<MlxLinear> selected_output,
         std::vector<Qwen4Layer> selected_layers,
         GatedResidual selected_mixer,
-        std::optional<Qwen4Mtp> selected_mtp)
+        std::optional<Qwen4Mtp> selected_mtp,
+        std::shared_ptr<MlxMoeSsdExpertCache> selected_ssd_expert_cache,
+        std::shared_ptr<MlxMfeOffloadCache> selected_mfe_offload_cache)
         : config(std::move(selected_config)),
           maximum(selected_maximum),
           embedding(std::move(selected_embedding)),
           output(std::move(selected_output)),
           layers(std::move(selected_layers)),
           mixer(std::move(selected_mixer)),
-          mtp(std::move(selected_mtp)) {}
+          mtp(std::move(selected_mtp)),
+          ssd_expert_cache(std::move(selected_ssd_expert_cache)),
+          mfe_offload_cache(std::move(selected_mfe_offload_cache)) {}
 
 public:
     Qwen4Config config;
@@ -2486,6 +2764,8 @@ public:
     std::vector<Qwen4Layer> layers;
     GatedResidual mixer;
     std::optional<Qwen4Mtp> mtp;
+    std::shared_ptr<MlxMoeSsdExpertCache> ssd_expert_cache;
+    std::shared_ptr<MlxMfeOffloadCache> mfe_offload_cache;
     MlxMtpGenerationStats last_mtp_stats;
     int cache_batch = 0;
     int cache_position = 0;
@@ -2501,11 +2781,13 @@ MlxQwen4CausalLm& MlxQwen4CausalLm::operator=(MlxQwen4CausalLm&&) noexcept = def
 
 MlxQwen4CausalLm MlxQwen4CausalLm::load(
     const MfqContainer& model,
-    int max_context) {
+    int max_context,
+    std::optional<std::size_t> expert_cache_bytes) {
     if (max_context <= 0) {
         throw std::invalid_argument("Qwen4 max_context must be positive");
     }
-    return MlxQwen4CausalLm(Impl::load(model, max_context));
+    return MlxQwen4CausalLm(Impl::load(
+        model, max_context, expert_cache_bytes));
 }
 
 array MlxQwen4CausalLm::forward(
@@ -2646,33 +2928,11 @@ std::int32_t MlxQwen4CausalLm::generate(
                             true).sample_hidden;
                     });
             }
-            MlxSampler first_sampler(sampling);
-            auto sampled = counts
-                ? first_sampler.sample(logits, *counts)
-                : first_sampler.sample(logits);
-            sampled.eval();
-            const auto first = sampled.data<std::int32_t>()[0];
-            if (first < 0 || first >= vocab) {
-                throw std::runtime_error(
-                    "Qwen4 MTP sampler returned an invalid first token");
-            }
-            const array first_id(
-                {first}, Shape{1, 1}, mlx::core::int32);
-            if (counts) {
-                *counts = sample_token_counts_add(*counts, first_id);
-            }
-            const bool delivered = !callback || callback(first);
-            const bool first_is_eos =
-                impl_->config.eos_token_id > 0 &&
-                first == impl_->config.eos_token_id;
-            if (!delivered || first_is_eos || limit == 1) {
-                return 1;
-            }
-
-            // Complete the teacher-forced prompt seam. The common engine's
-            // first history fold starts at hidden(first), so the predictor
-            // cache must already contain (hidden(prompt[-1]), first).
-            auto prompt_last_hidden = mlx::core::slice(
+            // The common engine owns the first sampled token as well as every
+            // later speculative cycle.  The adapter supplies only the final
+            // prompt hidden row; pairing it with the engine's pending token
+            // completes the teacher-forced predictor seam.
+            auto initial_hidden = mlx::core::slice(
                 *prefill_hidden,
                 Shape{0, prompt_ids.shape(1) - 1, 0},
                 Shape{
@@ -2681,21 +2941,8 @@ std::int32_t MlxQwen4CausalLm::generate(
                     static_cast<int>(
                         impl_->config.hc_count * impl_->config.hidden_size),
                 });
-            auto seam = impl_->mtp->forward(
-                prompt_last_hidden,
-                first_id,
-                impl_->embedding,
-                true);
-            mlx::core::async_eval(
-                std::vector<array>{std::move(seam.sample_hidden)});
             int predictor_history_position =
                 impl_->mtp->cache_position();
-
-            auto first_target = impl_->forward_with_hidden(
-                first_id, true, false);
-            auto next_logits = mlx_last_token_logits(
-                first_target.first, vocab);
-            auto initial_hidden = std::move(first_target.second);
 
             MlxMtpEngineCallbacks mtp_callbacks;
             mtp_callbacks.target_cache_position = [&] {
@@ -2709,8 +2956,7 @@ std::int32_t MlxQwen4CausalLm::generate(
                     std::vector<std::int32_t> next_ids{
                         context.pending_token};
                     if (!context.initial) {
-                        if (context.verified_hidden == nullptr ||
-                            context.next_token_ids.empty()) {
+                        if (context.next_token_ids.empty()) {
                             throw std::runtime_error(
                                 "Qwen4 MTP verified history is unavailable");
                         }
@@ -2720,16 +2966,12 @@ std::int32_t MlxQwen4CausalLm::generate(
                             throw std::runtime_error(
                                 "Qwen4 MTP shifted history is inconsistent");
                         }
-                        hidden_rows = mlx::core::slice(
-                            *context.verified_hidden,
-                            Shape{0, 0, 0},
-                            Shape{
-                                1,
-                                committed,
-                                static_cast<int>(
-                                    impl_->config.hc_count *
-                                    impl_->config.hidden_size),
-                            });
+                        hidden_rows = mlx_mtp_committed_hidden(
+                            context,
+                            1,
+                            static_cast<int>(
+                                impl_->config.hc_count *
+                                impl_->config.hidden_size));
                         next_ids.assign(
                             context.next_token_ids.begin(),
                             context.next_token_ids.end());
@@ -2792,17 +3034,8 @@ std::int32_t MlxQwen4CausalLm::generate(
                 [&](std::int32_t pending_token,
                     const array& draft_tokens,
                     int draft_count) {
-                    const array pending_id(
-                        {pending_token}, Shape{1}, mlx::core::int32);
-                    auto verify_ids = mlx::core::reshape(
-                        mlx::core::concatenate(
-                            {
-                                pending_id,
-                                mlx::core::reshape(
-                                    draft_tokens, Shape{draft_count}),
-                            },
-                            0),
-                        Shape{1, draft_count + 1});
+                    auto verify_ids = mlx_mtp_verification_ids(
+                        pending_token, draft_tokens, draft_count);
                     auto verified = impl_->forward_with_hidden(
                         verify_ids,
                         true,
@@ -2825,34 +3058,25 @@ std::int32_t MlxQwen4CausalLm::generate(
                             accepted_drafts, draft_count);
                     }
                 };
-            mtp_callbacks.plain_decode =
-                [&](std::int32_t pending_token) {
-                    const array ids(
-                        {pending_token}, Shape{1, 1}, mlx::core::int32);
-                    return mlx_last_token_logits(
-                        impl_->forward(ids, true), vocab);
-                };
-
             const std::array<std::int64_t, 1> eos{
                 impl_->config.eos_token_id};
-            const auto remainder = run_mlx_mtp_generation(
+            return run_mlx_mtp_generation(
                 MlxMtpEngineRequest{
                     vocab,
-                    limit - 1,
+                    limit,
                     impl_->maximum,
                     kQwen4MtpMaximumDraftDepth,
-                    std::move(next_logits),
+                    std::move(logits),
                     sampling,
                     std::move(counts),
                     impl_->config.eos_token_id > 0
                         ? std::span<const std::int64_t>(eos)
                         : std::span<const std::int64_t>{},
                     callback,
-                    sampling.greedy() ? 0u : 1u,
+                    0u,
                 },
                 mtp_callbacks,
                 impl_->last_mtp_stats);
-            return 1 + remainder;
         } catch (...) {
             try {
                 impl_->reset(1);
@@ -2929,6 +3153,46 @@ bool MlxQwen4CausalLm::supports_mtp() const noexcept {
 const MlxMtpGenerationStats&
 MlxQwen4CausalLm::last_mtp_stats() const noexcept {
     return impl_->last_mtp_stats;
+}
+
+std::size_t MlxQwen4CausalLm::expert_cache_limit_bytes() const noexcept {
+    if (impl_->ssd_expert_cache) {
+        return impl_->ssd_expert_cache->cache_limit_bytes();
+    }
+    return impl_->mfe_offload_cache
+        ? impl_->mfe_offload_cache->cache_limit_bytes()
+        : 0;
+}
+
+std::optional<MlxSsdExpertCacheStats>
+MlxQwen4CausalLm::ssd_expert_cache_stats() const {
+    if (impl_->ssd_expert_cache) {
+        return impl_->ssd_expert_cache->stats();
+    }
+    if (!impl_->mfe_offload_cache) {
+        return std::nullopt;
+    }
+    MlxSsdExpertCacheStats stats;
+    stats.resident_experts =
+        impl_->mfe_offload_cache->cached_expert_count();
+    stats.resident_bytes =
+        impl_->mfe_offload_cache->resident_packed_bytes();
+    return stats;
+}
+
+void MlxQwen4CausalLm::prewarm_ssd_expert_arena() {
+    if (impl_->ssd_expert_cache) {
+        impl_->ssd_expert_cache->prewarm_metal();
+    }
+}
+
+void MlxQwen4CausalLm::clear_expert_cache() {
+    if (impl_->ssd_expert_cache) {
+        impl_->ssd_expert_cache->clear();
+    }
+    if (impl_->mfe_offload_cache) {
+        impl_->mfe_offload_cache->clear();
+    }
 }
 
 MlxQwen4TextSessionState MlxQwen4CausalLm::capture_text_session_state(

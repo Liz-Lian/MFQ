@@ -85,7 +85,24 @@ def nint_backward_input(
     weight: dict,
     output_gradient: torch.Tensor,
 ) -> torch.Tensor:
-    gradient = output_gradient.reshape(-1, output_gradient.shape[-1]).contiguous()
+    gradient = (
+        output_gradient.reshape(-1, output_gradient.shape[-1])
+        .contiguous()
+        .to(torch.float16)
+    )
+    if int(gradient.shape[0]) <= 8:
+        return ext().nint_backward_input_cuda(
+            weight["q_packed"],
+            weight["row_q_bits"],
+            weight["row_q_bit_offsets"],
+            weight["sub_scale"],
+            weight["sub_min"],
+            weight["neuron_scale"],
+            weight["neuron_min"],
+            gradient,
+            int(weight["neuron_len"]),
+            int(weight["gs"]),
+        )
     dense = ext().nint_decode_cuda(
         weight["q_packed"],
         weight["row_q_bits"],
@@ -97,7 +114,7 @@ def nint_backward_input(
         int(weight["neuron_len"]),
         int(weight["gs"]),
     )
-    return gradient.to(torch.float16) @ dense
+    return gradient @ dense
 
 
 class _NintMatmulAutograd(torch.autograd.Function):
@@ -137,7 +154,7 @@ def nint_matmul_input_mul(
     gate: torch.Tensor,
     activation: str,
 ) -> torch.Tensor:
-    """Apply an input gate and reuse the common NINT matmul path."""
+    """Apply an input gate inside the common NINT activation quantizer."""
 
     if x.shape != gate.shape:
         raise ValueError(
@@ -145,12 +162,45 @@ def nint_matmul_input_mul(
             f"{tuple(gate.shape)}"
         )
     if activation == "sigmoid":
-        value = x * torch.sigmoid(gate)
+        activation_mode = 1
     elif activation == "silu":
-        value = x * torch.nn.functional.silu(gate)
+        activation_mode = 2
     else:
         raise ValueError(f"unsupported activation {activation!r}")
-    return nint_matmul(weight, value)
+    if torch.is_grad_enabled() and (x.requires_grad or gate.requires_grad):
+        value = (
+            x * torch.sigmoid(gate)
+            if activation_mode == 1
+            else x * torch.nn.functional.silu(gate)
+        )
+        return nint_matmul(weight, value)
+
+    source = _prepare(weight, x)
+    gate_source = _prepare(weight, gate)
+    rows = int(source.shape[0])
+    if rows <= 8:
+        qx, xscale = _workspace(weight, source)
+        return ext().nint_matmul_input_mul_ws_cuda(
+            weight["q_packed"],
+            weight["row_q_bits"],
+            weight["row_q_bit_offsets"],
+            weight["sub_scale"],
+            weight["sub_min"],
+            weight["neuron_scale"],
+            weight["neuron_min"],
+            source,
+            gate_source,
+            activation_mode,
+            int(weight["gs"]),
+            qx,
+            xscale,
+        )
+    value = (
+        source * torch.sigmoid(gate_source)
+        if activation_mode == 1
+        else source * torch.nn.functional.silu(gate_source)
+    )
+    return _nint_matmul_forward(weight, value)
 
 
 __all__ = [

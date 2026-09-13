@@ -73,6 +73,67 @@ def _fixture(dtype: str, *, out: int = 5) -> tuple[MxTensor, np.ndarray]:
     return MxTensor(dtype, (out, width), values, scales), dense
 
 
+def _mxfp8_geometry_fixture(
+    scale_row_block: int,
+    scale_column_block: int,
+) -> tuple[MxTensor, np.ndarray]:
+    out, width = (35, 128) if scale_row_block != 1 else (5, 96)
+    rng = np.random.default_rng(980 + scale_row_block + scale_column_block)
+    values = rng.integers(0, 255, size=(out, width), dtype=np.uint8)
+    values[(values & 127) == 127] = 126
+    scale_shape = (
+        (out + scale_row_block - 1) // scale_row_block,
+        width // scale_column_block,
+    )
+    scales = rng.integers(124, 130, size=scale_shape, dtype=np.uint8)
+    expanded_scales = np.repeat(
+        np.repeat(_e8m0(scales), scale_row_block, axis=0),
+        scale_column_block,
+        axis=1,
+    )[:out, :width]
+    dense = _fp8(values) * expanded_scales
+    return MxTensor("MXFP8", (out, width), values, scales), dense
+
+
+@pytest.mark.parametrize("scale_row_block,scale_column_block", [(32, 32), (1, 32)])
+def test_mxfp8_native_scale_geometries_decode_matmul_and_backward(
+    scale_row_block: int,
+    scale_column_block: int,
+):
+    tensor, dense = _mxfp8_geometry_fixture(
+        scale_row_block,
+        scale_column_block,
+    )
+    weight = MetalMxWeight.from_tensor(tensor)
+    assert weight.scale_row_block == scale_row_block
+    assert weight.scale_column_block == scale_column_block
+
+    np.testing.assert_allclose(
+        _array(mx_dequantize(weight, dtype=mx.float32)),
+        dense,
+        rtol=0,
+        atol=0,
+    )
+    source = np.random.default_rng(2201).normal(
+        0.0, 0.03, size=(3, tensor.shape[1])
+    ).astype(np.float32)
+    np.testing.assert_allclose(
+        _array(mx_matmul(weight, source)),
+        source @ dense.T,
+        rtol=3e-5,
+        atol=3e-5,
+    )
+    gradient = np.random.default_rng(2202).normal(
+        0.0, 0.03, size=(3, tensor.shape[0])
+    ).astype(np.float32)
+    np.testing.assert_allclose(
+        _array(mx_backward_input(weight, gradient)),
+        gradient @ dense,
+        rtol=3e-5,
+        atol=3e-5,
+    )
+
+
 @pytest.mark.parametrize("dtype", ["MXFP4", "MXFP8"])
 @pytest.mark.parametrize("rows", [1, 7, 64])
 def test_mx_packed_gemv_mmq_and_large_gemm(dtype: str, rows: int):

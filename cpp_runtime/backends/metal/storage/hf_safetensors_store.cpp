@@ -574,7 +574,7 @@ MlxNativeMxfp4ExpertStore::MlxNativeMxfp4ExpertStore(
         for (std::size_t part = 0; part < kParts; ++part) {
             if (expert.parts[part]->nbytes != first.parts[part]->nbytes) {
                 throw std::runtime_error(
-                    "DeepSeek-V4 expert tensors have inconsistent sizes");
+                    "native MXFP4 expert tensors have inconsistent sizes");
             }
         }
     }

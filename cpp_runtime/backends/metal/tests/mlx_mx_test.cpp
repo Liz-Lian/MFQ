@@ -1,7 +1,7 @@
 #include "mlx_mx.h"
 #include "mlx_grouped_linear.h"
 #include "mlx_nint8_zero.h"
-#include "mlx_deepseek_v4_attention.h"
+#include "mlx_transformer.h"
 
 #include <chrono>
 #include <cmath>
@@ -29,6 +29,16 @@ void require(bool condition, const std::string& message) {
     }
 }
 
+template <typename Function>
+void require_invalid(Function&& function, const std::string& message) {
+    try {
+        function();
+    } catch (const std::invalid_argument&) {
+        return;
+    }
+    throw std::runtime_error(message);
+}
+
 std::vector<std::uint8_t> make_blob(int bits, int outputs, int inputs) {
     std::vector<std::uint8_t> blob{'M', 'X', 'T', '1'};
     append<std::uint8_t>(blob, 1);
@@ -47,6 +57,32 @@ std::vector<std::uint8_t> make_blob(int bits, int outputs, int inputs) {
         bits == 4 ? outputs : (outputs + 127) / 128) *
         static_cast<std::size_t>(bits == 4 ? inputs / 32 : inputs / 128);
     blob.insert(blob.end(), scales, 127);
+    return blob;
+}
+
+std::vector<std::uint8_t> make_mxfp8_geometry_blob(
+    int outputs,
+    int inputs,
+    int scale_rows,
+    int scale_columns) {
+    std::vector<std::uint8_t> blob{'M', 'X', 'T', '1'};
+    append<std::uint8_t>(blob, 1);
+    append<std::uint8_t>(blob, 8);
+    append<std::uint16_t>(blob, 0);
+    append<std::uint64_t>(blob, outputs);
+    append<std::uint64_t>(blob, inputs);
+    append<std::uint64_t>(blob, outputs);
+    append<std::uint64_t>(blob, inputs);
+    append<std::uint64_t>(blob, scale_rows);
+    append<std::uint64_t>(blob, scale_columns);
+    blob.insert(
+        blob.end(),
+        static_cast<std::size_t>(outputs) * inputs,
+        0x38);
+    blob.insert(
+        blob.end(),
+        static_cast<std::size_t>(scale_rows) * scale_columns,
+        127);
     return blob;
 }
 
@@ -117,6 +153,126 @@ mfq::metal::MlxMxWeight make_patterned_block32_mxfp8_weight(
         array(scales.begin(), Shape{scale_rows, scale_columns}),
         inputs,
         outputs);
+}
+
+void test_from_arrays_shape_contract() {
+    using namespace mlx::core;
+    std::vector<std::uint8_t> mxfp4_values(3 * 32, 0x22);
+    std::vector<std::uint8_t> mxfp4_scales(3 * 2, 127);
+    const auto exact_mxfp4 = mfq::metal::MlxMxWeight::from_arrays(
+        "MXFP4",
+        array(mxfp4_values.begin(), Shape{3, 32}),
+        array(mxfp4_scales.begin(), Shape{3, 2}),
+        64,
+        3);
+    const auto flat_mxfp4 = mfq::metal::MlxMxWeight::from_arrays(
+        "MXFP4",
+        array(mxfp4_values.begin(), Shape{96}),
+        array(mxfp4_scales.begin(), Shape{6}),
+        64,
+        3);
+    require(
+        exact_mxfp4.input_size() == flat_mxfp4.input_size() &&
+            exact_mxfp4.output_size() == flat_mxfp4.output_size(),
+        "flat MXFP4 storage did not preserve its logical geometry");
+    require_invalid(
+        [&] {
+            (void)mfq::metal::MlxMxWeight::from_arrays(
+                "MXFP4",
+                array(mxfp4_values.begin(), Shape{32, 3}),
+                array(mxfp4_scales.begin(), Shape{3, 2}),
+                64,
+                3);
+        },
+        "transposed MXFP4 values were accepted");
+    require_invalid(
+        [&] {
+            (void)mfq::metal::MlxMxWeight::from_arrays(
+                "MXFP4",
+                array(mxfp4_values.begin(), Shape{3, 32}),
+                array(mxfp4_scales.begin(), Shape{2, 3}),
+                64,
+                3);
+        },
+        "transposed MXFP4 scales were accepted");
+    require_invalid(
+        [&] {
+            (void)mfq::metal::MlxMxWeight::from_arrays(
+                "MXFP4",
+                array(mxfp4_values.begin(), Shape{96}),
+                array(mxfp4_scales.begin(), Shape{3, 2}),
+                64,
+                3);
+        },
+        "partially flat MXFP4 storage was accepted");
+
+    std::vector<std::uint8_t> mxfp8_values(33 * 64, 0x38);
+    std::vector<std::uint8_t> mxfp8_scales(4, 127);
+    const auto exact_block32 = mfq::metal::MlxMxWeight::from_arrays(
+        "MXFP8",
+        array(mxfp8_values.begin(), Shape{33, 64}),
+        array(mxfp8_scales.begin(), Shape{2, 2}),
+        64,
+        33);
+    const auto flat_block32 = mfq::metal::MlxMxWeight::from_arrays(
+        "MXFP8",
+        array(mxfp8_values.begin(), Shape{33 * 64}),
+        array(mxfp8_scales.begin(), Shape{4}),
+        64,
+        33);
+    require(
+        exact_block32.scale_row_block_size() == 32 &&
+            exact_block32.scale_column_block_size() == 32 &&
+            flat_block32.scale_row_block_size() == 32 &&
+            flat_block32.scale_column_block_size() == 32,
+        "block-32 MXFP8 storage geometry was not retained");
+    require_invalid(
+        [&] {
+            (void)mfq::metal::MlxMxWeight::from_arrays(
+                "MXFP8",
+                array(mxfp8_values.begin(), Shape{64, 33}),
+                array(mxfp8_scales.begin(), Shape{2, 2}),
+                64,
+                33);
+        },
+        "transposed MXFP8 values were accepted");
+
+    std::vector<std::uint8_t> block128_values(129 * 256, 0x38);
+    std::vector<std::uint8_t> block128_scales(4, 127);
+    const auto exact_block128 = mfq::metal::MlxMxWeight::from_arrays(
+        "MXFP8",
+        array(block128_values.begin(), Shape{129, 256}),
+        array(block128_scales.begin(), Shape{2, 2}),
+        256,
+        129);
+    require(
+        exact_block128.scale_row_block_size() == 128 &&
+            exact_block128.scale_column_block_size() == 128,
+        "block-128 MXFP8 storage geometry was not retained");
+
+    std::vector<std::uint8_t> row1x32_values(3 * 64, 0x38);
+    std::vector<std::uint8_t> row1x32_scales(3 * 2, 127);
+    const auto exact_row1x32 = mfq::metal::MlxMxWeight::from_arrays(
+        "MXFP8",
+        array(row1x32_values.begin(), Shape{3, 64}),
+        array(row1x32_scales.begin(), Shape{3, 2}),
+        64,
+        3);
+    require(
+        exact_row1x32.scale_row_block_size() == 1 &&
+            exact_row1x32.scale_column_block_size() == 32,
+        "row-1 x column-32 MXFP8 storage geometry was not retained");
+
+    const auto blob_block32 = mfq::metal::MlxMxWeight::from_blob(
+        "MXFP8", make_mxfp8_geometry_blob(33, 64, 2, 2));
+    const auto blob_row1x32 = mfq::metal::MlxMxWeight::from_blob(
+        "MXFP8", make_mxfp8_geometry_blob(3, 64, 3, 2));
+    require(
+        blob_block32.scale_row_block_size() == 32 &&
+            blob_block32.scale_column_block_size() == 32 &&
+            blob_row1x32.scale_row_block_size() == 1 &&
+            blob_row1x32.scale_column_block_size() == 32,
+        "MXFP8 blob geometry was not retained");
 }
 
 std::vector<std::uint8_t> make_q8_blob(int outputs, int inputs) {
@@ -696,7 +852,7 @@ mlx::core::array block32_inverse_rope_reference(
         concatenate(
             {
                 std::move(prefix),
-                mfq::metal::deepseek_v4_rope_adjacent(
+                mfq::metal::mlx_rope_adjacent(
                     rotary_values,
                     cosine,
                     sine,
@@ -932,6 +1088,70 @@ void test_grouped_row_mxfp8_prefill() {
     }
 }
 
+void test_grouped_row_block32_mxfp8_batched_qmm() {
+    using namespace mlx::core;
+    constexpr int groups = 2;
+    constexpr int outputs_per_group = 32;
+    constexpr int inputs = 128;
+    constexpr int tokens = 17;
+    const auto weight = make_patterned_block32_mxfp8_weight(
+        groups * outputs_per_group,
+        inputs,
+        41);
+    std::vector<float> values(
+        static_cast<std::size_t>(tokens) * groups * inputs);
+    for (std::size_t index = 0; index < values.size(); ++index) {
+        values[index] = static_cast<float>(
+            static_cast<int>((index * 13 + 7) % 47) - 23) / 96.0f;
+    }
+    auto packed = reshape(
+        view(weight.packed_values(), uint32),
+        Shape{groups * outputs_per_group, inputs / 4});
+    auto expanded_scales = repeat(weight.block_scales(), 32, 0);
+    for (const auto dtype : {float16, float32}) {
+        auto input = astype(
+            array(values.begin(), Shape{1, tokens, groups, inputs}),
+            dtype);
+        auto actual = contiguous(weight.grouped_row_matmul(input, groups));
+        std::vector<array> pieces;
+        pieces.reserve(groups);
+        for (int group = 0; group < groups; ++group) {
+            pieces.push_back(quantized_matmul(
+                take(input, group, input.ndim() - 2),
+                slice(
+                    packed,
+                    Shape{group * outputs_per_group, 0},
+                    Shape{
+                        (group + 1) * outputs_per_group,
+                        inputs / 4,
+                    }),
+                slice(
+                    expanded_scales,
+                    Shape{group * outputs_per_group, 0},
+                    Shape{
+                        (group + 1) * outputs_per_group,
+                        inputs / 32,
+                    }),
+                std::nullopt,
+                true,
+                32,
+                8,
+                "mxfp8"));
+        }
+        auto reference = contiguous(stack(pieces, input.ndim() - 2));
+        eval(actual, reference);
+        require(
+            actual.shape() == reference.shape(),
+            "block32 MXFP8 batched grouped-row shape mismatch");
+        require(
+            std::memcmp(
+                actual.data<std::uint8_t>(),
+                reference.data<std::uint8_t>(),
+                actual.nbytes()) == 0,
+            "block32 MXFP8 batched grouped-row differs from serial QMM");
+    }
+}
+
 void test_grouped_row_mxfp8_verify() {
     using namespace mlx::core;
     constexpr int groups = 2;
@@ -1064,6 +1284,7 @@ void test_grouped_mxfp8_small_m_matches_decode() {
 
 int main() {
     try {
+        test_from_arrays_shape_contract();
         test_matmul("MXFP4", 96, 1);
         for (int rows = 2; rows <= 6; ++rows) {
             test_matmul("MXFP4", 96, rows, true);
@@ -1092,6 +1313,7 @@ int main() {
         test_grouped_block32_mxfp8_inverse_rope_matches_native_qmv();
         benchmark_v41_block32_mxfp8_inverse_rope();
         test_grouped_row_mxfp8_prefill();
+        test_grouped_row_block32_mxfp8_batched_qmm();
         test_grouped_row_mxfp8_verify();
         test_grouped_mxfp8_small_m_matches_decode();
         std::cout << "MFQ MXFP4/MXFP8 Metal GEMV/MMQ/GEMM/grouped/embedding passed\n";

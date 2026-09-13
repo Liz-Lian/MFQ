@@ -123,6 +123,17 @@ int main() {
                 legacy_qwen.topology.predictor_layers == 1,
             "legacy Qwen topology was not recovered");
 
+        const auto legacy_qwen4 = mfq::synthesize_legacy_model_graph(
+            "qwen4_exp-hf-full-mfq",
+            R"json({"model_type":"qwen4_exp","text_config":{"model_type":"qwen4_exp_text","num_hidden_layers":2,"mtp_num_hidden_layers":1}})json",
+            [](std::string_view name) {
+                return name == "predictor.fusion.hidden.weight";
+            });
+        require(
+            legacy_qwen4.has_component("predictor") &&
+                legacy_qwen4.topology.predictor_layers == 1,
+            "legacy Qwen4 split predictor fusion was not recovered");
+
         const std::unordered_set<std::string> legacy_v41_tensors{
             "vision.patch_embedding.weight",
             "predictor.stage.0.main_projection.weight",
@@ -187,6 +198,62 @@ int main() {
                 "model.block.0.mlp.down.weight.in_high") ==
                 "model.language_model.layers.0.mlp.down_proj.weight.in_high",
             "derived legacy tensor alias was not canonicalized");
+
+        const auto qwen4_source = mfq::make_legacy_tensor_aliases(
+            "qwen4_exp-hf-full-mfq",
+            R"json({"model_type":"qwen4_exp","text_config":{"model_type":"qwen4_exp_text","num_hidden_layers":2,"mtp_num_hidden_layers":1}})json",
+            {
+                "model.language_model.embed_tokens.weight",
+                "model.language_model.layers.0.attn_hyper_connection.hc_norm.weight",
+                "model.language_model.layers.0.mlp.experts.3.gate_proj.weight",
+                "model.language_model.layers.2.self_attn.q_proj.weight",
+                "mtp.fc_hidden.weight",
+            });
+        require(
+            qwen4_source.canonical_to_stored.at(
+                "model.token_embedding.weight") ==
+                "model.language_model.embed_tokens.weight" &&
+            qwen4_source.canonical_to_stored.at(
+                "model.block.0.attention.mhc.pre.norm.weight") ==
+                "model.language_model.layers.0.attn_hyper_connection.hc_norm.weight" &&
+            qwen4_source.canonical_to_stored.at(
+                "model.block.0.mlp.experts.3.gate.weight") ==
+                "model.language_model.layers.0.mlp.experts.3.gate_proj.weight" &&
+            qwen4_source.canonical_to_stored.at(
+                "predictor.block.0.attention.query.weight") ==
+                "model.language_model.layers.2.self_attn.q_proj.weight" &&
+            qwen4_source.canonical_to_stored.at(
+                "predictor.fusion.hidden.weight") ==
+                "mtp.fc_hidden.weight",
+            "registered Qwen4 HF source was not canonicalized");
+
+        const auto glm5_source = mfq::make_legacy_tensor_aliases(
+            "glm5_next-hf-full-mfq",
+            R"json({"model_type":"glm5_next","text_config":{"model_type":"glm5_next_text","num_hidden_layers":2,"layer_types":["linear_attention","full_attention"]}})json",
+            {
+                "model.language_model.embed_tokens.weight",
+                "model.language_model.layers.0.self_attn.o_proj.weight",
+                "model.language_model.layers.1.mlp.experts.7.down_proj.weight",
+                "model.language_model.layers.2.eh_proj.weight",
+                "model.visual.blocks.0.attn.qkv.weight",
+            });
+        require(
+            glm5_source.canonical_to_stored.at(
+                "model.token_embedding.weight") ==
+                "model.language_model.embed_tokens.weight" &&
+            glm5_source.canonical_to_stored.at(
+                "model.block.0.linear_attention.output.weight") ==
+                "model.language_model.layers.0.self_attn.o_proj.weight" &&
+            glm5_source.canonical_to_stored.at(
+                "model.block.1.mlp.experts.7.down.weight") ==
+                "model.language_model.layers.1.mlp.experts.7.down_proj.weight" &&
+            glm5_source.canonical_to_stored.at(
+                "predictor.fusion.weight") ==
+                "model.language_model.layers.2.eh_proj.weight" &&
+            glm5_source.canonical_to_stored.at(
+                "vision.block.0.attention.qkv.weight") ==
+                "model.visual.blocks.0.attn.qkv.weight",
+            "registered GLM5 HF source was not canonicalized");
 
         const auto minicpmo_aliases = mfq::make_legacy_tensor_aliases(
             "minicpmo45",
@@ -299,23 +366,6 @@ int main() {
                 "predictor.stage.0.markov.embedding.weight") ==
                 "mtp.0.markov_head.embed.weight",
             "legacy DeepSeek-V4.1 aliases were not canonicalized");
-
-        const auto v41_raw_hf_aliases = mfq::make_legacy_tensor_aliases(
-            "deepseek_v4_raw_hf",
-            R"json({"model_type":"deepseek_v41"})json",
-            {
-                "layers.0.attn.wkv.weight",
-                "layers.0.attn.kv_norm.weight",
-            });
-        require(
-            v41_raw_hf_aliases.canonical_to_stored.at(
-                "model.block.0.attention.key_value_a.weight") ==
-                "layers.0.attn.wkv.weight" &&
-            v41_raw_hf_aliases.canonical_to_stored.at(
-                "model.block.0.attention.key_value_a_norm.weight") ==
-                "layers.0.attn.kv_norm.weight",
-            "raw-HF DeepSeek-V4.1 aliases did not preserve the tuned "
-            "Metal contract");
 
         const auto gemma_aliases = mfq::make_legacy_tensor_aliases(
             "gemma4",

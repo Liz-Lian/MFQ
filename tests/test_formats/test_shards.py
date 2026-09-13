@@ -243,6 +243,36 @@ def test_streaming_blob_writer_matches_staged_bytes_and_consumes_inputs(
             expected_records.append(MODEL_CONFIG_ASSET)
         assert list(store.records) == expected_records
         assert store.read_blob(MODEL_CONFIG_ASSET) == asset_data
+        assert store.records["weight.1"].stored_dtype == "NINT"
+
+
+def test_blob_writer_canonicalizes_legacy_format_names(tmp_path: Path) -> None:
+    aliases = {
+        "NINT4": "NINT",
+        "NINTM": "MFE",
+        "NINTMD": "MFED",
+        "NVQ2J-XL": "NVQ",
+        "NPQ0-S": "NPQ",
+        "NEPQ1-A": "NEPQ",
+        "MXFP4-SQ2": "MXFP4-SQ",
+    }
+    root = tmp_path / "blobs"
+    root.mkdir()
+    records = [
+        _blob_record(root, f"weight.{index}", source, bytes([index]))
+        for index, source in enumerate(aliases)
+    ]
+    output = tmp_path / "canonical.mfq"
+    write_blob_record_shards(
+        output,
+        FileHeader(version=2, model_arch="canonical-writer"),
+        records,
+    )
+
+    with open_mmap(output) as store:
+        assert [record.stored_dtype for record in store.records.values()] == list(
+            aliases.values()
+        )
 
 
 def test_streaming_blob_writer_preserves_source_and_cleans_up_after_copy_failure(

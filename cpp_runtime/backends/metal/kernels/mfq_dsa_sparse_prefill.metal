@@ -8,7 +8,7 @@ using namespace mlx::steel;
 #define STEEL_PRAGMA_UNROLL _Pragma("clang loop unroll(full)")
 #endif
 
-struct MfqDsv4SparseParams {
+struct MfqDsaSparseParams {
     int batch;
     int queries;
     int keys;
@@ -20,7 +20,7 @@ struct MfqDsv4SparseParams {
 // model introduced by oMLX's DeepSeek-V4 Metal kernel (Apache-2.0,
 // Copyright © 2026 OpenAI): the kernel derives causal local and compressed
 // pool visibility instead of consuming a materialized concat/index/mask plan.
-struct MfqDsv4CircularSparseParams {
+struct MfqDsaCircularSparseParams {
     int batch;
     int queries;
     int local_length;
@@ -70,14 +70,14 @@ struct MfqSparseDivOp {
 
 template <typename T, int BK, int DC, int H, int D, int WM>
 [[kernel, max_total_threads_per_threadgroup(WM * 32)]]
-void mfq_dsv4_sparse_prefill(
+void mfq_dsa_sparse_prefill(
     const device T* q [[buffer(0)]],
     const device T* kv [[buffer(1)]],
     const device int* indices [[buffer(2)]],
     const device T* mask [[buffer(3)]],
     const device T* sinks [[buffer(4)]],
     device T* output [[buffer(5)]],
-    constant MfqDsv4SparseParams& params [[buffer(6)]],
+    constant MfqDsaSparseParams& params [[buffer(6)]],
     uint simd_lane_id [[thread_index_in_simdgroup]],
     uint simd_group_id [[simdgroup_index_in_threadgroup]],
     uint3 tid [[threadgroup_position_in_grid]]) {
@@ -288,20 +288,20 @@ void mfq_dsv4_sparse_prefill(
     Otile.template store<T, 1, 1>(output_base, D);
 }
 
-template [[host_name("mfq_dsv4_sparse_prefill_f16_bk256_dc32")]]
-[[kernel]] decltype(mfq_dsv4_sparse_prefill<half, 256, 32, 64, 512, 8>)
-    mfq_dsv4_sparse_prefill<half, 256, 32, 64, 512, 8>;
+template [[host_name("mfq_dsa_sparse_prefill_f16_bk256_dc32")]]
+[[kernel]] decltype(mfq_dsa_sparse_prefill<half, 256, 32, 64, 512, 8>)
+    mfq_dsa_sparse_prefill<half, 256, 32, 64, 512, 8>;
 
 template <typename T, int BK, int DC, int H, int D, int WM>
 [[kernel, max_total_threads_per_threadgroup(WM * 32)]]
-void mfq_dsv4_sparse_circular(
+void mfq_dsa_sparse_circular(
     const device T* q [[buffer(0)]],
     const device T* local_kv [[buffer(1)]],
     const device T* pooled_kv [[buffer(2)]],
     const device int* topk [[buffer(3)]],
     const device T* sinks [[buffer(4)]],
     device T* output [[buffer(5)]],
-    constant MfqDsv4CircularSparseParams& params [[buffer(6)]],
+    constant MfqDsaCircularSparseParams& params [[buffer(6)]],
     uint simd_lane_id [[thread_index_in_simdgroup]],
     uint simd_group_id [[simdgroup_index_in_threadgroup]],
     uint3 tid [[threadgroup_position_in_grid]]) {
@@ -545,7 +545,7 @@ void mfq_dsv4_sparse_circular(
     Otile.template store<T, 1, 1>(output_base, D);
 }
 
-template [[host_name("mfq_dsv4_sparse_circular_f16_bk256_dc32")]]
+template [[host_name("mfq_dsa_sparse_circular_f16_bk256_dc32")]]
 [[kernel]] decltype(
-    mfq_dsv4_sparse_circular<half, 256, 32, 64, 512, 8>)
-    mfq_dsv4_sparse_circular<half, 256, 32, 64, 512, 8>;
+    mfq_dsa_sparse_circular<half, 256, 32, 64, 512, 8>)
+    mfq_dsa_sparse_circular<half, 256, 32, 64, 512, 8>;

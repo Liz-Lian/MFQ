@@ -112,6 +112,32 @@ private:
     friend class MlxMoeSsdExpertCache;
 };
 
+// One architecture-neutral host-resolved route batch. The cache owns the
+// global-expert to arena-slot mapping; model code consumes only the remapped
+// IDs and the common routed projections.
+class MlxSsdPreparedRoutes {
+public:
+    MlxSsdPreparedRoutes(MlxSsdPreparedRoutes&&) noexcept;
+    MlxSsdPreparedRoutes& operator=(MlxSsdPreparedRoutes&&) noexcept;
+    ~MlxSsdPreparedRoutes();
+
+    MlxSsdPreparedRoutes(const MlxSsdPreparedRoutes&) = delete;
+    MlxSsdPreparedRoutes& operator=(const MlxSsdPreparedRoutes&) = delete;
+
+    const MlxSsdExpertWeights& weights() const noexcept;
+    const mlx::core::array& expert_ids() const noexcept;
+
+private:
+    MlxSsdPreparedRoutes(
+        MlxSsdPreparedExperts experts,
+        mlx::core::array expert_ids);
+
+    MlxSsdPreparedExperts experts_;
+    mlx::core::array expert_ids_;
+
+    friend class MlxMoeSsdExpertCache;
+};
+
 // Immutable resident page-table view for one routed-expert layer. While this
 // handle is alive, cache slots present in the table cannot be evicted or
 // reused. Readiness is represented explicitly and a missing expert maps to
@@ -200,6 +226,10 @@ public:
             const MlxSsdExpertWeights&,
             std::span<const std::int32_t> pending_experts,
             std::span<const std::int32_t> slot_for_expert)> gate_up_ready = {});
+
+    MlxSsdPreparedRoutes prepare_routes(
+        std::size_t layer,
+        const mlx::core::array& expert_ids);
 
     // Freeze the current resident mapping for a layer and expose it as device
     // arrays. This is the decode fast path: routing IDs can be remapped to

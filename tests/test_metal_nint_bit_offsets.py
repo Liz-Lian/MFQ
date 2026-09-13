@@ -94,24 +94,12 @@ def _wrapped_old_address(value_index: int, bits: int) -> tuple[int, int]:
     return bit_index >> 3, bit_index & 7
 
 
-@pytest.mark.parametrize(
-    ("path", "helper"),
-    [
-        (_CPP_GROUPED, "mfq_grouped_nint_read_bits"),
-    ],
-)
-def test_all_nint_metal_helpers_use_overflow_safe_address(
-    path: Path,
-    helper: str,
-):
-    """Lock all three production helpers to the overflow-safe decomposition."""
-
-    body = _function_body(path.read_text(), helper)
-    assert _ADDRESS_PATTERN.search(body)
-    assert not re.search(
-        r"uint\s+(?:bit_index|bit_offset)\s*=\s*value_index\s*\*\s*bits",
-        body,
-    )
+def test_grouped_nint_uses_only_the_metadata_row_address_helper():
+    source = _CPP_GROUPED.read_text()
+    body = _function_body(source, "mfq_grouped_nint_read_row_value4")
+    assert _ROW_ADDRESS_PATTERN.search(body)
+    assert "mfq_grouped_nint_read_bits" not in source
+    assert "mfq_grouped_nint_read_value" not in source
 
 
 @pytest.mark.parametrize("path", [_PYTHON_NINT, _CPP_NINT])
@@ -160,7 +148,7 @@ def test_no_metal_packed_index_multiplies_bits_before_reducing(path: Path):
 @pytest.mark.parametrize(
     ("path", "minimum_safe_addresses"),
     [
-        (_CPP_GROUPED, 2),
+        (_CPP_GROUPED, 1),
         (_PYTHON_MOE, 1),
         (_CPP_MOE, 1),
         (_PYTHON_VQ, 2),

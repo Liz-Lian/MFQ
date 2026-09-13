@@ -1,7 +1,6 @@
 #pragma once
 
 #include "deepseek_v4_model.h"
-#include "mlx_hf_tensor.h"
 #include "mlx_tensor.h"
 #include "mlx_transformer.h"
 
@@ -55,10 +54,6 @@ public:
     static MlxDeepseekV4Vision load(
         const MfqContainer& model,
         const DeepseekV4Config& config);
-    static MlxDeepseekV4Vision load(
-        const MlxHfTensorStore& model,
-        const DeepseekV4Config& config);
-
     MlxDeepseekV4Vision(
         DeepseekV4Config config,
         MlxDeepseekV4Affine patch_embedding,

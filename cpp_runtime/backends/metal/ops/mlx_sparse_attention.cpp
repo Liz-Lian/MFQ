@@ -1,6 +1,7 @@
 #include "mlx_sparse_attention.h"
 
 #include "mfq_mfe_prefill_embedded.h"
+#include "mlx_platform.h"
 
 #include <mlx/backend/metal/device.h>
 #include <mlx/primitives.h>
@@ -8,6 +9,8 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <initializer_list>
 #include <limits>
 #include <memory>
@@ -28,16 +31,14 @@ using Kernel = mlx::core::fast::CustomKernelFunction;
 using TemplateArgs = std::vector<
     std::pair<std::string, mlx::core::fast::TemplateArg>>;
 
-// Transitional source bundle: cache/index preparation remains owned by the
-// DSV4 adapter, while every sparse-attention execution kernel is dispatched
-// from this model-neutral operator layer.
-#include "../models/deepseek_v4/mlx_deepseek_v4_sparse_kernels.inc"
+#include "../kernels/mfq_sparse_attention_kernels.inc"
 
 Kernel make_sparse_kernel(
     const char* name,
     std::vector<std::string> inputs,
     std::vector<std::string> outputs,
-    const char* source) {
+    const char* source,
+    const char* header = "") {
     CompileOptions options;
     options.math_mode = MathMode::Fast;
     return mlx::core::fast::metal_kernel(
@@ -45,10 +46,20 @@ Kernel make_sparse_kernel(
         std::move(inputs),
         std::move(outputs),
         source,
-        "",
+        header,
         true,
         false,
         options);
+}
+
+const Kernel& deepselect_topk512_kernel() {
+    static const auto kernel = make_sparse_kernel(
+        "mfq_cpp_deepselect_topk512",
+        {"x", "valid_keys", "topk_params"},
+        {"out"},
+        kDeepSelectTopkSource,
+        kDeepSelectTopkHeader);
+    return kernel;
 }
 
 const Kernel& sparse_selected_mla_short_kernel() {
@@ -233,7 +244,7 @@ public:
                 std::string source;
                 source.reserve(
                     sizeof(detail::kSteelAttentionSource)
-                    + sizeof(detail::kDsv4SparsePrefillSource)
+                    + sizeof(detail::kDsaSparsePrefillSource)
                     + sizeof(detail::kSparseBlockGqaSource)
                     + 192);
                 source += "#include <metal_stdlib>\n";
@@ -242,7 +253,7 @@ public:
                 source += "using namespace metal;\n";
                 source += "using bfloat16_t = bfloat;\n";
                 source += detail::kSteelAttentionSource;
-                source += detail::kDsv4SparsePrefillSource;
+                source += detail::kDsaSparsePrefillSource;
                 source += detail::kSparseBlockGqaSource;
                 return source;
             });
@@ -330,7 +341,7 @@ public:
                 std::string source;
                 source.reserve(
                     sizeof(detail::kSteelAttentionSource)
-                    + sizeof(detail::kDsv4SparsePrefillSource)
+                    + sizeof(detail::kDsaSparsePrefillSource)
                     + sizeof(detail::kSparseBlockGqaSource)
                     + 192);
                 source += "#include <metal_stdlib>\n";
@@ -339,12 +350,12 @@ public:
                 source += "using namespace metal;\n";
                 source += "using bfloat16_t = bfloat;\n";
                 source += detail::kSteelAttentionSource;
-                source += detail::kDsv4SparsePrefillSource;
+                source += detail::kDsaSparsePrefillSource;
                 source += detail::kSparseBlockGqaSource;
                 return source;
             });
         auto* kernel = device.get_kernel(
-            "mfq_dsv4_sparse_prefill_f16_bk256_dc32",
+            "mfq_dsa_sparse_prefill_f16_bk256_dc32",
             library);
         auto& encoder =
             mlx::core::metal::get_command_encoder(selected_stream);
@@ -422,7 +433,7 @@ public:
                 std::string source;
                 source.reserve(
                     sizeof(detail::kSteelAttentionSource)
-                    + sizeof(detail::kDsv4SparsePrefillSource)
+                    + sizeof(detail::kDsaSparsePrefillSource)
                     + sizeof(detail::kSparseBlockGqaSource)
                     + 192);
                 source += "#include <metal_stdlib>\n";
@@ -431,12 +442,12 @@ public:
                 source += "using namespace metal;\n";
                 source += "using bfloat16_t = bfloat;\n";
                 source += detail::kSteelAttentionSource;
-                source += detail::kDsv4SparsePrefillSource;
+                source += detail::kDsaSparsePrefillSource;
                 source += detail::kSparseBlockGqaSource;
                 return source;
             });
         auto* kernel = device.get_kernel(
-            "mfq_dsv4_sparse_circular_f16_bk256_dc32",
+            "mfq_dsa_sparse_circular_f16_bk256_dc32",
             library);
         auto& encoder =
             mlx::core::metal::get_command_encoder(selected_stream);
@@ -488,6 +499,60 @@ private:
 };
 
 } // namespace
+
+bool mlx_deepselect_topk512_preferred(int width, int rows) noexcept {
+    const bool favorable_shape =
+        (width >= 16384 && rows >= 64) ||
+        (width >= 8192 && rows >= 128);
+    if (!favorable_shape) {
+        return false;
+    }
+    if (const auto* requested = std::getenv(
+            "MFQ_METAL_DEEPSELECT")) {
+        return std::strcmp(requested, "0") != 0 &&
+            std::strcmp(requested, "false") != 0 &&
+            std::strcmp(requested, "off") != 0;
+    }
+    return mlx_apple_chip_is("Apple M3 Ultra");
+}
+
+array mlx_deepselect_topk512(
+    const array& scores,
+    const std::optional<array>& valid_keys) {
+    auto source = typed_contiguous(scores, mlx::core::float32);
+    if (source.ndim() != 3 || source.shape(0) <= 0 ||
+        source.shape(1) <= 0 || source.shape(2) < 512) {
+        throw std::invalid_argument(
+            "DeepSelect top-k expects f32 [B,M,K>=512]");
+    }
+    const int batch = source.shape(0);
+    const int queries = source.shape(1);
+    const int keys = source.shape(2);
+    array counts = valid_keys.has_value()
+        ? typed_contiguous(*valid_keys, mlx::core::int32)
+        : mlx::core::full(
+              Shape{batch, queries}, keys, mlx::core::int32);
+    if (counts.shape() != Shape{batch, queries}) {
+        throw std::invalid_argument(
+            "DeepSelect valid-key counts must be [B,M]");
+    }
+    const int rows = checked_grid_product(
+        {batch, queries}, "DeepSelect top-k row count");
+    const int grid = checked_grid_product(
+        {rows, 1024}, "DeepSelect top-k grid");
+    const array topk_params({keys}, mlx::core::int32);
+    auto outputs = deepselect_topk512_kernel()(
+        {source, counts, topk_params},
+        {Shape{batch, queries, 512}},
+        {mlx::core::int32},
+        {grid, 1, 1},
+        {1024, 1, 1},
+        {},
+        std::nullopt,
+        false,
+        {});
+    return std::move(outputs.front());
+}
 
 array mlx_sparse_block_gqa_attention(
     const array& query,

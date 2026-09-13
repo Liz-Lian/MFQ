@@ -10,23 +10,27 @@ import struct
 from pathlib import Path
 from typing import Any
 
+from mfq.architectures.tensor_schema import (
+    canonical_source_tensor_map,
+    graph_spec_for_source_names,
+    source_runtime_assets,
+)
 from mfq.formats.assets import (
+    ASSET_PREFIX,
     HF_CHAT_TEMPLATE_ASSET,
     HF_GENERATION_CONFIG_ASSET,
     HF_TOKENIZER_CONFIG_ASSET,
     HF_TOKENIZER_JSON_ASSET,
     MODEL_CONFIG_ASSET,
     TOKENIZER_GGUF_ASSET,
-    minicpmo45_resampler_pos_embed_asset,
+    hf_source_map_asset,
+    model_graph_asset,
 )
 from mfq.formats.io import open_mmap
 
 
 class HfTokenizerError(RuntimeError):
     pass
-
-
-DEEPSEEK_V41_CHAT_TEMPLATE = r"""{{ bos_token }}{%- set thinking = enable_thinking | default(true) -%}{%- set effort = reasoning_effort | default('high') -%}{%- if thinking -%}<｜System｜>Reasoning Effort: {%- if effort == 'low' -%}25{%- elif effort == 'xhigh' -%}75{%- elif effort == 'max' -%}100{%- elif effort is number -%}{{ effort }}{%- else -%}50{%- endif -%} (range 1-100, the higher the value, the more thorough the reasoning)\n\n{%- endif -%}{%- for message in messages -%}{%- if message.role == 'system' -%}{%- if not loop.first or not thinking -%}<｜System｜>{%- endif -%}{{ message.content or '' }}{%- elif message.role == 'user' -%}<｜User｜>{%- if message.content is string -%}{{ message.content }}{%- else -%}{%- for block in message.content -%}{%- if block.type == 'text' -%}{{ block.text }}{%- elif block.type in ['image', 'image_url'] -%}<｜deepseek_image｜>{%- endif -%}{%- endfor -%}{%- endif -%}{%- elif message.role == 'tool' -%}<｜User｜><tool_result>{{ message.content or '' }}</tool_result>{%- elif message.role == 'assistant' -%}{%- if message.reasoning_content is defined and message.reasoning_content -%}{{ message.reasoning_content }}</think>{%- endif -%}{{ message.content or '' }}{%- if message.tool_calls is defined and message.tool_calls -%}\n\n<｜DSML｜ calls>\n{%- for call in message.tool_calls -%}<｜DSML｜ invoke name=\"{{ call.function.name }}\">\n<｜DSML｜ parameter name=\"arguments\" string=\"false\">{{ call.function.arguments | tojson }}</｜DSML｜ parameter>\n</｜DSML｜ invoke>{%- endfor -%}\n</｜DSML｜ calls>{%- endif -%}{{ eos_token }}{%- endif -%}{%- endfor -%}{%- if add_generation_prompt -%}<｜Assistant｜>{%- if thinking -%}<think>{%- else -%}</think>{%- endif -%}{%- endif -%}"""
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -37,6 +41,59 @@ def _read_json(path: Path) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise HfTokenizerError(f"invalid {path.name}")
     return value
+
+
+def _safetensors_header(path: Path) -> dict[str, Any]:
+    try:
+        with path.open("rb") as stream:
+            raw_size = stream.read(8)
+            if len(raw_size) != 8:
+                raise HfTokenizerError(f"truncated Safetensors header: {path.name}")
+            size = struct.unpack("<Q", raw_size)[0]
+            value = json.loads(stream.read(size))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise HfTokenizerError(f"cannot read Safetensors header: {path.name}") from error
+    if not isinstance(value, dict):
+        raise HfTokenizerError(f"invalid Safetensors header: {path.name}")
+    return value
+
+
+def _hf_runtime_tensor_names(root: Path) -> tuple[str, ...]:
+    index_path = root / "model.safetensors.index.json"
+    expected: dict[str, str] | None = None
+    if index_path.is_file():
+        index = _read_json(index_path)
+        weight_map = index.get("weight_map")
+        if not isinstance(weight_map, dict) or not weight_map or not all(
+            isinstance(name, str) and isinstance(shard, str)
+            for name, shard in weight_map.items()
+        ):
+            raise HfTokenizerError("invalid model.safetensors.index.json")
+        expected = dict(weight_map)
+        shards = tuple(root / name for name in sorted(set(expected.values())))
+    else:
+        shards = tuple(sorted(root.glob("*.safetensors")))
+    if not shards or any(not path.is_file() for path in shards):
+        raise HfTokenizerError("HF checkpoint is missing Safetensors shards")
+
+    tensor_dtypes: dict[str, str] = {}
+    for shard in shards:
+        for name, entry in _safetensors_header(shard).items():
+            if name == "__metadata__":
+                continue
+            if expected is not None and expected.get(name) != shard.relative_to(root).as_posix():
+                continue
+            if not isinstance(entry, dict) or not isinstance(entry.get("dtype"), str):
+                raise HfTokenizerError(f"invalid Safetensors tensor: {name}")
+            if name in tensor_dtypes:
+                raise HfTokenizerError(f"duplicate Safetensors tensor: {name}")
+            tensor_dtypes[name] = entry["dtype"]
+    if expected is not None and set(expected) != set(tensor_dtypes):
+        raise HfTokenizerError("Safetensors index references missing tensors")
+    # E8M0 records are folded into their MX weight at execution time, but they
+    # remain in this physical-source map so the container can pair them by
+    # canonical semantics instead of guessing an upstream naming convention.
+    return tuple(sorted(tensor_dtypes))
 
 
 def _token_content(value: object) -> str | None:
@@ -88,7 +145,7 @@ def _special_id(
 
 def _fingerprint_payloads(payloads: tuple[tuple[str, bytes], ...]) -> str:
     digest = hashlib.sha256()
-    digest.update(b"mfq-hf-tokenizer-gguf-v3\0")
+    digest.update(b"mfq-hf-tokenizer-gguf-v2\0")
     for name, payload in payloads:
         digest.update(name.encode("utf-8"))
         digest.update(payload)
@@ -146,13 +203,6 @@ def _write_tokenizer_gguf(
     model_type = config.get("model_type")
     if not isinstance(model_type, str) or not model_type:
         raise HfTokenizerError("HF config.json has no model_type")
-    if (
-        model_type.startswith("deepseek_v41")
-        and not isinstance(tokenizer_config.get("chat_template"), (str, list))
-    ):
-        tokenizer_config = dict(tokenizer_config)
-        tokenizer_config["chat_template"] = DEEPSEEK_V41_CHAT_TEMPLATE
-
     model = tokenizer.get("model")
     if not isinstance(model, dict) or model.get("type") != "BPE":
         raise HfTokenizerError("only HF BPE tokenizers are supported by the native runtime")
@@ -384,15 +434,12 @@ def native_hf_asset_environment(
     model_directory: str | Path,
     cache_directory: str | Path | None = None,
 ) -> dict[str, str]:
-    """Materialize deterministic non-weight constants omitted by HF checkpoints."""
+    """Expose generated constants through the generic runtime-asset directory."""
 
     root = Path(model_directory).expanduser().resolve()
     if not root.is_dir():
         return {}
     config = _read_json(root / "config.json")
-    model_type = config.get("model_type")
-    if not isinstance(model_type, str):
-        return {}
     cache_root = (
         Path(cache_directory).expanduser().resolve()
         if cache_directory is not None
@@ -400,191 +447,56 @@ def native_hf_asset_environment(
         .expanduser()
         .resolve()
     )
-    cache_root.mkdir(parents=True, exist_ok=True)
-    if model_type.startswith("minicpmo"):
-        output = cache_root / "minicpmo45-resampler-pos-embed-v1.bf16"
-        if not output.is_file():
-            asset = minicpmo45_resampler_pos_embed_asset()
-            temporary = output.with_name(
-                f".{output.name}.{os.getpid()}.{secrets.token_hex(4)}.tmp"
-            )
-            try:
-                temporary.write_bytes(asset.data)
-                os.replace(temporary, output)
-            finally:
-                temporary.unlink(missing_ok=True)
-        return {"MFQ_MINICPMO45_RESAMPLER_POSITION_ASSET": str(output)}
-    if not model_type.startswith("deepseek_v41"):
+    try:
+        source_names = _hf_runtime_tensor_names(root)
+        graph = graph_spec_for_source_names(config, source_names)
+        if graph is None:
+            return {}
+        assets = [
+            hf_source_map_asset(
+                canonical_source_tensor_map(config, source_names)
+            ),
+            model_graph_asset(graph.as_dict()),
+        ]
+    except (OSError, TypeError, ValueError, KeyError) as error:
+        raise HfTokenizerError(
+            "cannot build the native HF canonical source view"
+        ) from error
+    try:
+        assets.extend(source_runtime_assets(root, config))
+    except (OSError, KeyError, TypeError, ValueError, RuntimeError) as error:
+        raise HfTokenizerError(
+            "cannot build architecture runtime assets from the source checkpoint"
+        ) from error
+    if not assets:
         return {}
 
-    text_config = config.get("text_config")
-    if not isinstance(text_config, dict) or not text_config.get("engram_layer_ids"):
-        return {}
-    tokenizer_path = root / "tokenizer.json"
     fingerprint_hash = hashlib.sha256()
-    fingerprint_hash.update(tokenizer_path.read_bytes())
-    fingerprint_hash.update(
-        json.dumps(
-            {
-                name: text_config.get(name)
-                for name in (
-                    "engram_layer_ids",
-                    "engram_num_embeddings",
-                    "engram_max_ngram_size",
-                    "engram_vocab_size",
-                    "engram_n_heads",
-                    "engram_head_dim",
-                    "engram_pad_token_id",
-                    "engram_compressed_vocab_size",
-                )
-            },
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8")
-    )
-    fingerprint = fingerprint_hash.hexdigest()[:20]
-    output = cache_root / f"deepseek-v41-engram-layout-v2-{fingerprint}.bin"
-    if not output.is_file():
-        try:
-            from tokenizers import Regex, Tokenizer, normalizers
-        except ModuleNotFoundError as error:
-            raise HfTokenizerError(
-                "DeepSeek-V4.1 Engram requires the lightweight 'tokenizers' package"
-            ) from error
-        tokenizer = Tokenizer.from_file(str(tokenizer_path))
-        normalizer = normalizers.Sequence(
-            [
-                normalizers.NFKC(),
-                normalizers.NFD(),
-                normalizers.StripAccents(),
-                normalizers.Lowercase(),
-                normalizers.Replace(Regex(r"[ \t\r\n]+"), " "),
-                normalizers.Replace(Regex(r"^ $"), "\ue000"),
-                normalizers.Strip(),
-                normalizers.Replace("\ue000", " "),
-            ]
-        )
-        vocabulary_size = tokenizer.get_vocab_size(with_added_tokens=True)
-        lookup: list[int] = [0] * vocabulary_size
-        keys: dict[str, int] = {}
-        for token_id in range(vocabulary_size):
-            decoded = tokenizer.decode([token_id], skip_special_tokens=False)
-            raw = tokenizer.id_to_token(token_id)
-            if raw is None:
-                raise HfTokenizerError(
-                    f"DeepSeek-V4.1 tokenizer has no token for id {token_id}"
-                )
-            key = raw if "\ufffd" in decoded else normalizer.normalize_str(decoded)
-            if not key:
-                key = decoded
-            lookup[token_id] = keys.setdefault(key, len(keys))
-        expected = text_config.get("engram_compressed_vocab_size")
-        if isinstance(expected, int) and len(keys) != expected:
-            raise HfTokenizerError(
-                "DeepSeek-V4.1 Engram compressed vocabulary mismatch: "
-                f"expected {expected}, generated {len(keys)}"
-            )
-        layer_ids = text_config.get("engram_layer_ids")
-        table_rows = text_config.get("engram_num_embeddings")
-        max_ngram_size = text_config.get("engram_max_ngram_size")
-        hash_vocab_size = text_config.get("engram_vocab_size")
-        n_heads = text_config.get("engram_n_heads")
-        if (
-            not isinstance(layer_ids, list)
-            or not layer_ids
-            or not all(isinstance(value, int) and value >= 0 for value in layer_ids)
-            or not isinstance(table_rows, list)
-            or len(table_rows) != len(layer_ids)
-            or not all(isinstance(value, int) and value > 0 for value in table_rows)
-            or not isinstance(max_ngram_size, int)
-            or max_ngram_size < 2
-            or not isinstance(hash_vocab_size, int)
-            or hash_vocab_size <= 0
-            or not isinstance(n_heads, int)
-            or n_heads <= 0
-        ):
-            raise HfTokenizerError("DeepSeek-V4.1 Engram layout is incomplete")
-
-        # These constants are part of the trained hash-table layout. Keep their
-        # generation beside the tokenizer map so the native worker has no
-        # NumPy/SymPy dependency and cannot silently choose a different RNG.
-        import numpy as np
-
-        max_long = np.iinfo(np.int64).max
-        multiplier_bound = max(1, (int(max_long) // len(keys)) // 2)
-        multipliers: list[int] = []
-        for layer_id in layer_ids:
-            generator = np.random.default_rng(10007 * layer_id)
-            values = generator.integers(
-                low=0,
-                high=multiplier_bound,
-                size=max_ngram_size,
-                dtype=np.int64,
-            )
-            multipliers.extend(int(value * np.int64(2) + np.int64(1)) for value in values)
-
-        def is_prime(value: int) -> bool:
-            if value < 2:
-                return False
-            if value % 2 == 0:
-                return value == 2
-            divisor = 3
-            while divisor * divisor <= value:
-                if value % divisor == 0:
-                    return False
-                divisor += 2
-            return True
-
-        seen_primes: set[int] = set()
-        primes: list[int] = []
-        for table_index, _layer_id in enumerate(layer_ids):
-            table_primes: list[int] = []
-            for _ngram in range(max_ngram_size - 1):
-                current = hash_vocab_size - 1
-                for _head in range(n_heads):
-                    current += 1
-                    while not is_prime(current) or current in seen_primes:
-                        current += 1
-                    seen_primes.add(current)
-                    table_primes.append(current)
-            if sum(table_primes) != table_rows[table_index]:
-                raise HfTokenizerError(
-                    "DeepSeek-V4.1 Engram table rows do not match its prime layout"
-                )
-            primes.extend(table_primes)
-
-        payload = b"".join(
-            (
-                struct.pack(
-                    "<4sIIIIII",
-                    b"D41T",
-                    2,
-                    len(lookup),
-                    len(keys),
-                    len(layer_ids),
-                    max_ngram_size,
-                    n_heads,
-                ),
-                struct.pack(f"<{len(lookup)}I", *lookup),
-                struct.pack(f"<{len(layer_ids)}i", *layer_ids),
-                struct.pack(f"<{len(multipliers)}q", *multipliers),
-                struct.pack(f"<{len(primes)}I", *primes),
-            )
-        )
+    for asset in assets:
+        fingerprint_hash.update(asset.name.encode("utf-8"))
+        fingerprint_hash.update(asset.data)
+    asset_root = cache_root / fingerprint_hash.hexdigest()[:20]
+    for asset in assets:
+        relative = asset.name.removeprefix(ASSET_PREFIX)
+        if not relative or relative == asset.name:
+            raise HfTokenizerError("runtime asset is outside the reserved namespace")
+        output = asset_root / relative
+        output.parent.mkdir(parents=True, exist_ok=True)
+        if output.is_file() and output.read_bytes() == asset.data:
+            continue
         temporary = output.with_name(
             f".{output.name}.{os.getpid()}.{secrets.token_hex(4)}.tmp"
         )
         try:
-            temporary.write_bytes(payload)
+            temporary.write_bytes(asset.data)
             os.replace(temporary, output)
         finally:
             temporary.unlink(missing_ok=True)
-    return {"MFQ_DEEPSEEK_V41_ENGRAM_TOKEN_MAP": str(output)}
+    return {"MFQ_RUNTIME_ASSET_DIRECTORY": str(asset_root)}
 
 
 __all__ = [
     "HfTokenizerError",
-    "DEEPSEEK_V41_CHAT_TEMPLATE",
     "ensure_hf_tokenizer_gguf",
     "ensure_mfq_tokenizer_gguf",
     "native_hf_asset_environment",

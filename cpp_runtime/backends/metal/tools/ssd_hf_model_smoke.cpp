@@ -1,5 +1,6 @@
 #include "mlx_deepseek_v4_causal_lm.h"
 #include "mlx_eval_timing.h"
+#include "mfq_container.h"
 
 #include <mlx/mlx.h>
 
@@ -17,6 +18,7 @@
 
 int main(int argc, char** argv) {
     using mfq::metal::MlxDeepseekV4CausalLm;
+    using mfq::metal::MfqContainer;
     using mlx::core::Shape;
     using mlx::core::array;
 
@@ -38,12 +40,11 @@ int main(int argc, char** argv) {
             throw std::invalid_argument("STEPS must be positive");
         }
         const auto load_begin = std::chrono::steady_clock::now();
-        auto model = MlxDeepseekV4CausalLm::load_hf(
-            root,
+        const MfqContainer source(root);
+        auto model = MlxDeepseekV4CausalLm::load(
+            source,
             std::max(128, steps + 1),
-            cache_mib * 1024ull * 1024ull,
-            8,
-            false);
+            cache_mib * 1024ull * 1024ull);
         const auto load_seconds = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - load_begin).count();
         std::int32_t current = token;

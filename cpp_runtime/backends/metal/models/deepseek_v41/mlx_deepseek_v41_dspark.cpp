@@ -1,9 +1,11 @@
 #include "mlx_deepseek_v41_dspark.h"
 
+#include "mlx_detached_copy.h"
 #include "mlx_deepseek_v41_attention.h"
-#include "mlx_deepseek_v4_attention.h"
-#include "mlx_deepseek_v4_sparse.h"
+#include "mlx_dsa.h"
+#include "mlx_mx.h"
 #include "mlx_sampling.h"
+#include "mlx_sparse_attention.h"
 #include "mlx_transformer.h"
 
 #include <algorithm>
@@ -82,7 +84,7 @@ array tail_rope(
             "invalid DeepSeek-V4.1 DSpark rotary width");
     }
     auto tail = slice_axis(input, -1, width - rotary, width);
-    tail = deepseek_v4_rope_adjacent(
+    tail = mlx_rope_adjacent(
         tail, cosine, sine, inverse);
     if (rotary == width) return tail;
     return mlx::core::concatenate(
@@ -117,7 +119,7 @@ array full_attention(
         indices = mlx::core::broadcast_to(
             mlx::core::reshape(indices, Shape{1, 1, selected}),
             Shape{batch, queries, selected});
-        return attention_dsv4_sparse(
+        return mlx_sparse_selected_mla_attention(
             mlx::core::transpose(query, {0, 2, 1, 3}),
             keys,
             indices,
@@ -257,8 +259,38 @@ int MlxDeepseekV41DSparkState::window() const noexcept {
     return rings_.empty() ? 0 : rings_.front().shape(1);
 }
 
+std::size_t MlxDeepseekV41DSparkState::nbytes() const noexcept {
+    std::size_t bytes = 0;
+    for (const auto& ring : rings_) bytes += ring.nbytes();
+    return bytes;
+}
+
 const array& MlxDeepseekV41DSparkState::ring(std::size_t stage) const {
     return rings_.at(stage);
+}
+
+MlxDeepseekV41DSparkState MlxDeepseekV41DSparkState::snapshot() const {
+    std::vector<array> rings;
+    rings.reserve(rings_.size());
+    for (const auto& ring : rings_) rings.push_back(detached_copy(ring));
+    return MlxDeepseekV41DSparkState(std::move(rings), position_);
+}
+
+void MlxDeepseekV41DSparkState::restore_snapshot(
+    MlxDeepseekV41DSparkState snapshot) {
+    if (rings_.size() != snapshot.rings_.size()) {
+        throw std::invalid_argument(
+            "DeepSeek-V4.1 DSpark snapshot stage mismatch");
+    }
+    for (std::size_t index = 0; index < rings_.size(); ++index) {
+        if (rings_[index].shape() != snapshot.rings_[index].shape() ||
+            rings_[index].dtype() != snapshot.rings_[index].dtype()) {
+            throw std::invalid_argument(
+                "DeepSeek-V4.1 DSpark snapshot geometry mismatch");
+        }
+    }
+    rings_ = std::move(snapshot.rings_);
+    position_ = snapshot.position_;
 }
 
 struct MlxDeepseekV41DSpark::Impl {
@@ -402,7 +434,7 @@ struct MlxDeepseekV41DSpark::Impl {
         auto cosine = mlx::core::take(rope.first, positions, 0);
         auto sine = mlx::core::take(rope.second, positions, 0);
         key_value = tail_rope(key_value, rotary, cosine, sine);
-        key_value = deepseek_v41_mxfp8_e4m3_sim(key_value);
+        key_value = mlx_mxfp8_sim(key_value);
         const int retained = std::min(tokens, window);
         if (retained != tokens) {
             key_value = slice_axis(
@@ -417,7 +449,7 @@ struct MlxDeepseekV41DSpark::Impl {
                     array(window, mlx::core::int32)),
                 Shape{1, retained}),
             Shape{batch, retained});
-        return dsv4_cache_write_inplace(
+        return mlx_cache_write_inplace(
             ring,
             mlx::core::astype(key_value, ring.dtype()),
             rows);
@@ -450,7 +482,7 @@ struct MlxDeepseekV41DSpark::Impl {
         auto sine = mlx::core::take(rope.second, positions, 0);
         query = tail_rope(query, rotary, cosine, sine);
         key_value = tail_rope(key_value, rotary, cosine, sine);
-        key_value = deepseek_v41_mxfp8_e4m3_sim(key_value);
+        key_value = mlx_mxfp8_sim(key_value);
         const int active = std::min(position, ring.shape(1));
         if (active <= 0) {
             throw std::runtime_error(
@@ -493,8 +525,10 @@ struct MlxDeepseekV41DSpark::Impl {
         residual = result;
         auto ffn_mix = stage.ffn_mhc.collapse(
             residual, attention_mix.next_pre);
-        result = stage.ffn_mhc.expand(
-            stage.moe.forward(ffn_mix.branch),
+        auto ffn_branches = stage.moe.forward(ffn_mix.branch);
+        result = stage.ffn_mhc.expand_sum(
+            ffn_branches.routed,
+            ffn_branches.shared,
             residual,
             ffn_mix.expansion);
         return {std::move(result), std::move(ffn_mix.next_pre)};
@@ -509,6 +543,7 @@ MlxDeepseekV41DSpark::load_if_present(
     const MlxLinear& output,
     int max_context,
     std::shared_ptr<MlxMoeSsdExpertCache> ssd_expert_cache,
+    std::shared_ptr<MlxMfeOffloadCache> mfe_offload_cache,
     std::size_t expert_layer_base) {
     const bool root = model.contains(
         "predictor.stage.0.main_projection.weight");
@@ -551,13 +586,13 @@ MlxDeepseekV41DSpark::load_if_present(
                 root_prefix + ".mlp",
                 true,
                 ssd_expert_cache,
+                mfe_offload_cache,
                 expert_layer_base + static_cast<std::size_t>(stage)),
             static_cast<float>(config.rms_eps));
     }
     const auto first = std::string("predictor.stage.0");
     const auto last = "predictor.stage." +
         std::to_string(config.n_mtp_layers - 1);
-    DeepseekV4RopeScaling no_scaling;
     return MlxDeepseekV41DSpark(std::make_shared<Impl>(
         config,
         embedding,
@@ -571,11 +606,10 @@ MlxDeepseekV41DSpark::load_if_present(
         MlxLinear(dense_float(
             model, last + ".confidence.projection.weight")),
         max_context,
-        deepseek_v4_yarn_tables(
+        mlx_yarn_tables(
             checked_int(config.rope_head_dim, "rotary width"),
             max_context,
-            static_cast<float>(config.rope_theta),
-            no_scaling)));
+            static_cast<float>(config.rope_theta))));
 }
 
 MlxDeepseekV41DSpark::MlxDeepseekV41DSpark(
@@ -636,23 +670,28 @@ void MlxDeepseekV41DSpark::append_context(
     state.position_ += source.shape(1);
 }
 
-MlxDeepseekV41DSparkDraft MlxDeepseekV41DSpark::draft(
+std::optional<MlxDeepseekV41DSparkDraft>
+MlxDeepseekV41DSpark::draft_impl(
     const array& anchor_ids,
     MlxDeepseekV41DSparkState& state,
     const MlxMtpTokenSelector& select_token,
-    int width) const {
+    int width,
+    bool collect_diagnostics) const {
     auto anchors = anchor_ids.dtype() == mlx::core::int32
         ? anchor_ids
         : mlx::core::astype(anchor_ids, mlx::core::int32);
     anchors = mlx::core::contiguous(anchors);
     const int requested = width == 0 ? block_size() : width;
-    const int physical_width = std::min(
+    const int available_width = std::min(
         block_size(), impl_->maximum_context - state.position_);
+    // V4.1 DSpark supports variable physical proposal width. Do not evaluate
+    // unused attention, MoE, or LM-head rows after adaptive depth shrinks.
+    const int physical_width = std::min(requested, available_width);
     const int hidden_size = checked_int(
         impl_->config.hidden, "hidden size");
     if (anchors.ndim() != 2 || anchors.shape(0) != state.batch() ||
         anchors.shape(1) != 1 || requested <= 0 ||
-        requested > block_size() || requested > physical_width ||
+        requested > block_size() || requested > available_width ||
         state.position_ <= 0 || state.stages() != impl_->stages.size()) {
         throw std::invalid_argument(
             "invalid DeepSeek-V4.1 DSpark draft input");
@@ -716,10 +755,15 @@ MlxDeepseekV41DSparkDraft MlxDeepseekV41DSpark::draft(
             next = mlx::core::reshape(
                 next, Shape{state.batch(), 1});
         }
-        tokens.push_back(next);
-        logits.push_back(std::move(row));
-        markov_embeddings.push_back(std::move(markov));
-        previous = tokens.back();
+        if (collect_diagnostics) {
+            tokens.push_back(next);
+            logits.push_back(std::move(row));
+            markov_embeddings.push_back(std::move(markov));
+        }
+        previous = std::move(next);
+    }
+    if (!collect_diagnostics) {
+        return std::nullopt;
     }
     auto returned_hidden = requested == physical_width
         ? head_hidden
@@ -730,11 +774,30 @@ MlxDeepseekV41DSparkDraft MlxDeepseekV41DSpark::draft(
             mlx::core::concatenate(markov_embeddings, 1),
         },
         -1));
-    return {
+    return MlxDeepseekV41DSparkDraft{
         mlx::core::concatenate(tokens, 1),
         mlx::core::concatenate(logits, 1),
         mlx::core::reshape(confidence, Shape{state.batch(), requested}),
     };
+}
+
+MlxDeepseekV41DSparkDraft MlxDeepseekV41DSpark::draft(
+    const array& anchor_ids,
+    MlxDeepseekV41DSparkState& state,
+    const MlxMtpTokenSelector& select_token,
+    int width) const {
+    auto result = draft_impl(
+        anchor_ids, state, select_token, width, true);
+    return std::move(*result);
+}
+
+void MlxDeepseekV41DSpark::propose(
+    const array& anchor_ids,
+    MlxDeepseekV41DSparkState& state,
+    const MlxMtpTokenSelector& select_token,
+    int width) const {
+    (void)draft_impl(
+        anchor_ids, state, select_token, width, false);
 }
 
 MlxDeepseekV41DSparkDraft MlxDeepseekV41DSpark::draft_greedy(

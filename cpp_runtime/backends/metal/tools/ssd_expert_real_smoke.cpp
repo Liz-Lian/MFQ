@@ -1,5 +1,4 @@
-#include "hf_safetensors_store.h"
-#include "mlx_hf_tensor.h"
+#include "mfe_expert_store.h"
 #include "mlx_ssd_expert_arena.h"
 #include "mlx_ssd_expert_cache.h"
 #include "mlx_moe_ops.h"
@@ -77,7 +76,6 @@ int main(int argc, char** argv) {
         if (layer < 0 || layer >= 43 || expert < 0 || expert >= 256) {
             throw std::runtime_error("layer/expert is out of range");
         }
-        mfq::metal::MlxHfTensorStore hf_model(argv[1]);
         mfq::metal::MfqContainer model(argv[1]);
         std::vector<std::string> layer_prefixes;
         layer_prefixes.reserve(43);
@@ -85,17 +83,14 @@ int main(int argc, char** argv) {
             layer_prefixes.push_back(
                 "model.block." + std::to_string(index));
         }
-        mfq::metal::MlxNativeMxfp4ExpertStore store(
-            hf_model.shared_checkpoint(),
+        mfq::metal::MlxMfeMxfp4ExpertStore store(
+            model,
             layer_prefixes,
-            256,
+            std::vector<std::size_t>(43, 256),
             4096,
-            2048,
-            [&hf_model](std::string_view canonical) {
-                return hf_model.stored_name(canonical);
-            });
+            2048);
         mfq::metal::MlxMxfp4SsdExpertArena arena(1, 4096, 2048);
-        store.checkpoint().drop_file_cache();
+        model.drop_source_file_cache();
         const auto begin = std::chrono::steady_clock::now();
         const auto stats = store.load_scatter(
             static_cast<std::size_t>(layer),

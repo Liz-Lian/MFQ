@@ -1,6 +1,7 @@
 from pathlib import Path
 
 from mfq.server.capabilities import capabilities_for_architecture
+from mfq.server.output_protocols import output_protocol_for_architecture
 
 ROOT = Path(__file__).resolve().parents[1]
 SERVER = (ROOT / "cpp_runtime" / "server" / "src" / "server.cpp").read_text(encoding="utf-8")
@@ -103,6 +104,38 @@ def test_unknown_architecture_keeps_text_and_a_stable_family_key() -> None:
     assert profile.architecture_family == "future_model_2"
     assert profile.features.text is True
     assert profile.source == "architecture-registry:future_model_2"
+
+
+def test_generated_output_protocol_is_resolved_by_the_registry() -> None:
+    for model_type in (
+        "deepseek_v4",
+        "deepseek_v41_vision",
+        "DeepSeek-V4-Flash",
+    ):
+        protocol = output_protocol_for_architecture(model_type)
+        assert protocol.reasoning_format == "none"
+        assert protocol.create_reasoning_parser() is not None
+        assert protocol.create_tool_call_parser({}) is not None
+        assert protocol.tool_call_protocol_name == "dsml"
+
+    for model_type in (
+        "qwen3_5",
+        "Qwen3.6-27B",
+        "Qwen3.8-27B",
+        "qwen4_exp",
+    ):
+        protocol = output_protocol_for_architecture(model_type)
+        assert protocol.reasoning_format == "auto"
+        assert protocol.create_reasoning_parser() is not None
+        assert protocol.create_tool_call_parser({}) is not None
+        assert protocol.tool_call_protocol_name == "qwen_xml"
+
+    for model_type in ("glm5_next", "GLM-5.3-Flash"):
+        protocol = output_protocol_for_architecture(model_type)
+        assert protocol.reasoning_format == "auto"
+        assert protocol.create_reasoning_parser() is not None
+        assert protocol.create_tool_call_parser({}) is not None
+        assert protocol.tool_call_protocol_name == "glm_xml"
 
 
 def test_cpp_server_publishes_the_same_architecture_capability_contract() -> None:

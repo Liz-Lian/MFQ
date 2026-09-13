@@ -17,16 +17,16 @@ public:
         std::span<const std::uint8_t> blob);
 
     mlx::core::array matmul(const mlx::core::array& input) const;
-    // DeepSeek-V4 O-LoRA diagonal grouped projection:
+    // Diagonal grouped projection:
     // input [..., group_count, K] ->
     // output [..., group_count, OUT/group_count].
     // Each output block consumes only the matching input group.
     mlx::core::array grouped_row_matmul(
         const mlx::core::array& input,
         int group_count) const;
-    // DeepSeek-V4 decode specialization. The attention output is still in
-    // RoPE space; apply the inverse adjacent-pair RoPE while consuming the
-    // grouped input so no standalone de-rotation tensor is materialized.
+    // Decode specialization for inputs that remain in adjacent-pair RoPE
+    // space. Apply the inverse rotation while consuming the grouped input so
+    // no standalone de-rotation tensor is materialized.
     mlx::core::array grouped_row_matmul_inverse_rope(
         const mlx::core::array& input,
         int group_count,

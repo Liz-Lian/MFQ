@@ -18,8 +18,12 @@ inline constexpr char kMfePrefillSource[] = R"MFQ_MFE(
 @MFQ_MFE_PREFILL_SOURCE@
 )MFQ_MFE";
 
-inline constexpr char kDsv4SparsePrefillSource[] = R"MFQ_SPARSE(
-@MFQ_DSV4_SPARSE_PREFILL_SOURCE@
+inline constexpr char kNintPrefillSource[] = R"MFQ_NINT_PREFILL(
+@MFQ_NINT_PREFILL_SOURCE@
+)MFQ_NINT_PREFILL";
+
+inline constexpr char kDsaSparsePrefillSource[] = R"MFQ_SPARSE(
+@MFQ_DSA_SPARSE_PREFILL_SOURCE@
 )MFQ_SPARSE";
 
 inline constexpr char kSparseBlockGqaSource[] = R"MFQ_BLOCK_GQA(

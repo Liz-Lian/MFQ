@@ -161,8 +161,11 @@ MfqModelGraph synthesize_legacy_model_graph(
         text, "mtp_num_hidden_layers",
         integer_value(text, "num_nextn_predict_layers", 0));
     bool has_predictor = contains_tensor("predictor.fusion.weight") ||
+        contains_tensor("predictor.fusion.embedding.weight") ||
+        contains_tensor("predictor.fusion.hidden.weight") ||
         contains_tensor("mtp.fc.weight") ||
-        contains_tensor("mtp.fc_embedding.weight");
+        contains_tensor("mtp.fc_embedding.weight") ||
+        contains_tensor("mtp.fc_hidden.weight");
     if (family == "glm5_next" && predictor_layers > 0) {
         const auto prefix = "model.language_model.layers." +
             std::to_string(graph.topology.text_layers) + ".eh_proj.weight";
@@ -183,9 +186,10 @@ MfqModelGraph synthesize_legacy_model_graph(
                 "vision", "vision", "deepseek_v4_vision",
                 "deepseek_v4_vision.v1", "deepseek_v4_positions");
         }
-        if (contains_tensor("predictor.stage.0.main_proj.weight") ||
+        if (contains_tensor("predictor.stage.0.main_projection.weight") ||
             contains_tensor("mtp.0.main_proj.weight")) {
-            graph.topology.predictor_layers = 1;
+            graph.topology.predictor_layers = std::max<std::int64_t>(
+                1, predictor_layers);
             add_optional("predictor", "predictor", "dspark");
         }
     }

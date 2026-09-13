@@ -6,6 +6,7 @@
 #include <cctype>
 #include <cstdint>
 #include <optional>
+#include <regex>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -51,6 +52,36 @@ bool qwen35_family(
             starts_with(value, "qwen35") ||
             starts_with(value, "qwen3_6") ||
             starts_with(value, "qwen3_8");
+    };
+    return matches(stored) || matches(config_type) || matches(text_type);
+}
+
+bool qwen4_family(
+        std::string_view architecture,
+        const json& config) {
+    const auto stored = identity(architecture);
+    const auto config_type = identity(config.value("model_type", std::string{}));
+    const json* text = &config;
+    const auto found = config.find("text_config");
+    if (found != config.end() && found->is_object()) text = &*found;
+    const auto text_type = identity(text->value("model_type", std::string{}));
+    const auto matches = [](std::string_view value) {
+        return starts_with(value, "qwen4_exp");
+    };
+    return matches(stored) || matches(config_type) || matches(text_type);
+}
+
+bool glm5_family(
+        std::string_view architecture,
+        const json& config) {
+    const auto stored = identity(architecture);
+    const auto config_type = identity(config.value("model_type", std::string{}));
+    const json* text = &config;
+    const auto found = config.find("text_config");
+    if (found != config.end() && found->is_object()) text = &*found;
+    const auto text_type = identity(text->value("model_type", std::string{}));
+    const auto matches = [](std::string_view value) {
+        return starts_with(value, "glm5_next");
     };
     return matches(stored) || matches(config_type) || matches(text_type);
 }
@@ -269,6 +300,324 @@ void add_qwen_hf_aliases(
             add(canonical + std::string(canonical_suffix),
                 stored + std::string(stored_suffix));
         }
+    }
+}
+
+void add_qwen4_hf_aliases(
+        MfqLegacyTensorAliases& result,
+        const json& config,
+        const std::unordered_set<std::string>& names) {
+    // Qwen3.5 and Qwen4 share the ordinary text/vision vocabulary. Add the
+    // common aliases first, then the Qwen4-only HC, QSA, PLE and expert names.
+    add_qwen_hf_aliases(result, config, names);
+    const auto add = [&](std::string canonical, std::string stored) {
+        add_alias(result, names, std::move(canonical), std::move(stored));
+    };
+    static const std::unordered_map<std::string_view, std::string_view> roots{
+        {"model.token_embedding.weight", "model.language_model.embed_tokens.weight"},
+        {"model.runtime.hash_metadata", "model.language_model.runtime_hash_metadata"},
+        {"model.output.weight", "lm_head.weight"},
+        {"model.mhc.pre.norm.weight", "model.language_model.hyper_connection_mixer.hc_norm.weight"},
+        {"model.mhc.pre.down.weight", "model.language_model.hyper_connection_mixer.input_mix_weight_down.weight"},
+        {"model.mhc.pre.up.weight", "model.language_model.hyper_connection_mixer.input_mix_weight_up.weight"},
+        {"predictor.embedding_norm.weight", "mtp.pre_fc_norm_embedding.weight"},
+        {"predictor.hidden_norm.weight", "mtp.pre_fc_norm_hidden.weight"},
+        {"predictor.fusion.embedding.weight", "mtp.fc_embedding.weight"},
+        {"predictor.fusion.hidden.weight", "mtp.fc_hidden.weight"},
+        {"predictor.mhc.pre.norm.weight", "mtp.hyper_connection_mixer.hc_norm.weight"},
+        {"predictor.mhc.pre.down.weight", "mtp.hyper_connection_mixer.input_mix_weight_down.weight"},
+        {"predictor.mhc.pre.up.weight", "mtp.hyper_connection_mixer.input_mix_weight_up.weight"},
+    };
+    for (const auto& [canonical, stored] : roots) {
+        add(std::string(canonical), std::string(stored));
+    }
+
+    static const std::unordered_map<std::string_view, std::string_view> suffixes{
+        {"attention.mhc.pre.norm.weight", "attn_hyper_connection.hc_norm.weight"},
+        {"attention.mhc.pre.down.weight", "attn_hyper_connection.input_mix_weight_down.weight"},
+        {"attention.mhc.pre.up.weight", "attn_hyper_connection.input_mix_weight_up.weight"},
+        {"attention.mhc.post.inject.weight", "attn_hyper_connection.block_inject_weight.weight"},
+        {"mlp.mhc.pre.norm.weight", "mlp_hyper_connection.hc_norm.weight"},
+        {"mlp.mhc.pre.down.weight", "mlp_hyper_connection.input_mix_weight_down.weight"},
+        {"mlp.mhc.pre.up.weight", "mlp_hyper_connection.input_mix_weight_up.weight"},
+        {"mlp.mhc.post.inject.weight", "mlp_hyper_connection.block_inject_weight.weight"},
+        {"linear_attention.qkv.weight", "linear_attn.in_proj_qkv.weight"},
+        {"linear_attention.gate.weight", "linear_attn.in_proj_z.weight"},
+        {"linear_attention.alpha.weight", "linear_attn.in_proj_a.weight"},
+        {"linear_attention.beta.weight", "linear_attn.in_proj_b.weight"},
+        {"linear_attention.conv.weight", "linear_attn.conv1d.weight"},
+        {"linear_attention.dt_bias", "linear_attn.dt_bias"},
+        {"linear_attention.a", "linear_attn.A_log"},
+        {"linear_attention.norm.weight", "linear_attn.norm.weight"},
+        {"linear_attention.output.weight", "linear_attn.out_proj.weight"},
+        {"attention.query.weight", "self_attn.q_proj.weight"},
+        {"attention.key.weight", "self_attn.k_proj.weight"},
+        {"attention.value.weight", "self_attn.v_proj.weight"},
+        {"attention.output.weight", "self_attn.o_proj.weight"},
+        {"attention.query_norm.weight", "self_attn.q_norm.weight"},
+        {"attention.key_norm.weight", "self_attn.k_norm.weight"},
+        {"attention.indexer.query_key.weight", "self_attn.indexer.index_qk_proj.weight"},
+        {"attention.indexer.query_norm.weight", "self_attn.indexer.q_layernorm.weight"},
+        {"attention.indexer.key_norm.weight", "self_attn.indexer.k_layernorm.weight"},
+        {"mlp.router.weight", "mlp.gate.weight"},
+        {"mlp.experts.gate_up.weight", "mlp.experts.gate_up_proj"},
+        {"mlp.experts.down.weight", "mlp.experts.down_proj"},
+        {"mlp.shared_expert.gate.weight", "mlp.shared_expert.gate_proj.weight"},
+        {"mlp.shared_expert.up.weight", "mlp.shared_expert.up_proj.weight"},
+        {"mlp.shared_expert.down.weight", "mlp.shared_expert.down_proj.weight"},
+        {"mlp.shared_expert.router.weight", "mlp.shared_expert_gate.weight"},
+        {"position_embedding.key.weight", "ple.key_proj.weight"},
+        {"position_embedding.value.weight", "ple.value_proj.weight"},
+        {"position_embedding.key_norm.weight", "ple.norm_key.weight"},
+        {"position_embedding.query_norm.weight", "ple.norm_query.weight"},
+        {"position_embedding.conv_norm.weight", "ple.norm_conv.weight"},
+        {"position_embedding.conv.weight", "ple.conv1d.weight"},
+        {"position_embedding.ngram.layer_multipliers", "ple.ple_embedding.layer_multipliers"},
+        {"position_embedding.ngram.head_offsets", "ple.ple_embedding.ngram_heads_offsets"},
+        {"position_embedding.ngram.head_vocab_sizes", "ple.ple_embedding.ngram_heads_vocab_sizes"},
+        {"position_embedding.ngram.weight_scale", "ple.ple_embedding.ngram_embedding.weight_scale"},
+    };
+    const auto text_layers = config_integer(config, "num_hidden_layers");
+    static const std::regex text_layer(
+        R"(^model\.language_model\.layers\.([0-9]+)\.(.+)$)");
+    static const std::regex predictor_layer(
+        R"(^mtp\.layers\.([0-9]+)\.(.+)$)");
+    static const std::regex expert(
+        R"(^((model\.language_model|mtp)\.layers\.([0-9]+)\.mlp\.experts)\.([0-9]+)\.(gate_proj|up_proj|down_proj)\.(weight|input_scale|weight_scale|weight_scale_2)$)");
+    static const std::regex ngram(
+        R"(^model\.language_model\.layers\.([0-9]+)\.ple\.ple_embedding\.ngram_embedding\.shard_([0-9]+)\.weight$)");
+    for (const auto& stored : names) {
+        std::smatch match;
+        if (std::regex_match(stored, match, ngram)) {
+            add(
+                "model.block." + match[1].str() +
+                    ".position_embedding.ngram.shard." + match[2].str() +
+                    ".weight",
+                stored);
+            continue;
+        }
+        if (std::regex_match(stored, match, expert)) {
+            const auto source_layer = std::stoll(match[3].str());
+            const bool predictor = match[2].str() == "mtp" ||
+                source_layer >= text_layers;
+            const auto layer = predictor && match[2].str() != "mtp"
+                ? source_layer - text_layers : source_layer;
+            const auto projection = match[5].str() == "gate_proj" ? "gate" :
+                match[5].str() == "up_proj" ? "up" : "down";
+            add(
+                std::string(predictor ? "predictor.block." : "model.block.") +
+                    std::to_string(layer) + ".mlp.experts." + match[4].str() +
+                    "." + projection + "." + match[6].str(),
+                stored);
+            continue;
+        }
+        bool predictor = false;
+        if (!std::regex_match(stored, match, text_layer)) {
+            if (!std::regex_match(stored, match, predictor_layer)) continue;
+            predictor = true;
+        }
+        const auto source_layer = std::stoll(match[1].str());
+        if (!predictor && source_layer >= text_layers) predictor = true;
+        const auto layer = predictor &&
+                starts_with(stored, "model.language_model.")
+            ? source_layer - text_layers : source_layer;
+        const auto stored_suffix = match[2].str();
+        const auto suffix = std::find_if(
+            suffixes.begin(), suffixes.end(),
+            [&stored_suffix](const auto& item) {
+                return item.second == stored_suffix;
+            });
+        if (suffix == suffixes.end()) continue;
+        add(
+            std::string(predictor ? "predictor.block." : "model.block.") +
+                std::to_string(layer) + "." + std::string(suffix->first),
+            stored);
+    }
+}
+
+void add_glm5_hf_aliases(
+        MfqLegacyTensorAliases& result,
+        const json& config,
+        const std::unordered_set<std::string>& names) {
+    const auto add = [&](std::string canonical, std::string stored) {
+        add_alias(result, names, std::move(canonical), std::move(stored));
+    };
+    static const std::unordered_map<std::string_view, std::string_view> roots{
+        {"model.language_model.embed_tokens.weight", "model.token_embedding.weight"},
+        {"model.language_model.runtime_hash_metadata", "model.runtime.hash_metadata"},
+        {"model.language_model.norm.weight", "model.output_norm.weight"},
+        {"lm_head.weight", "model.output.weight"},
+    };
+    for (const auto& [stored, canonical] : roots) {
+        add(std::string(canonical), std::string(stored));
+    }
+    static const std::unordered_map<std::string_view, std::string_view> suffixes{
+        {"input_layernorm.weight", "attention.norm.weight"},
+        {"post_attention_layernorm.weight", "mlp.norm.weight"},
+        {"hc_attn_fn", "attention.mhc.pre.function"},
+        {"hc_attn_base", "attention.mhc.pre.base"},
+        {"hc_attn_scale", "attention.mhc.pre.scale"},
+        {"hc_ffn_fn", "mlp.mhc.pre.function"},
+        {"hc_ffn_base", "mlp.mhc.pre.base"},
+        {"hc_ffn_scale", "mlp.mhc.pre.scale"},
+        {"mlp.gate_proj.weight", "mlp.gate.weight"},
+        {"mlp.up_proj.weight", "mlp.up.weight"},
+        {"mlp.down_proj.weight", "mlp.down.weight"},
+        {"mlp.gate.weight", "mlp.router.weight"},
+        {"mlp.gate.e_score_correction_bias", "mlp.router.bias"},
+        {"mlp.experts.gate_up_proj", "mlp.experts.gate_up.weight"},
+        {"mlp.experts.down_proj", "mlp.experts.down.weight"},
+        {"mlp.shared_experts.gate_proj.weight", "mlp.shared_expert.gate.weight"},
+        {"mlp.shared_experts.up_proj.weight", "mlp.shared_expert.up.weight"},
+        {"mlp.shared_experts.down_proj.weight", "mlp.shared_expert.down.weight"},
+        {"self_attn.q_proj.weight", "linear_attention.query.weight"},
+        {"self_attn.k_proj.weight", "linear_attention.key.weight"},
+        {"self_attn.v_proj.weight", "linear_attention.value.weight"},
+        {"self_attn.q_conv1d.weight", "linear_attention.query_conv.weight"},
+        {"self_attn.k_conv1d.weight", "linear_attention.key_conv.weight"},
+        {"self_attn.v_conv1d.weight", "linear_attention.value_conv.weight"},
+        {"self_attn.f_a_proj.weight", "linear_attention.forget_a.weight"},
+        {"self_attn.f_b_proj.weight", "linear_attention.forget_b.weight"},
+        {"self_attn.g_a_proj.weight", "linear_attention.gate_a.weight"},
+        {"self_attn.g_b_proj.weight", "linear_attention.gate_b.weight"},
+        {"self_attn.b_proj.weight", "linear_attention.beta.weight"},
+        {"self_attn.dt_bias", "linear_attention.dt_bias"},
+        {"self_attn.A_log", "linear_attention.a"},
+        {"self_attn.o_norm.weight", "linear_attention.output_norm.weight"},
+        {"self_attn.o_proj.weight", "attention.output.weight"},
+        {"self_attn.q_a_proj.weight", "attention.query_a.weight"},
+        {"self_attn.q_a_layernorm.weight", "attention.query_a_norm.weight"},
+        {"self_attn.q_b_proj.weight", "attention.query_b.weight"},
+        {"self_attn.kv_a_proj_with_mqa.weight", "attention.key_value_a.weight"},
+        {"self_attn.kv_a_layernorm.weight", "attention.key_value_a_norm.weight"},
+        {"self_attn.kv_b_proj.weight", "attention.key_value_b.source.weight"},
+        {"self_attn.embed_q", "attention.latent.query_embedding.weight"},
+        {"self_attn.unembed_out", "attention.latent.output_unembedding.weight"},
+        {"self_attn.indexer.wq_b.weight", "attention.indexer.query.weight"},
+        {"self_attn.indexer.wk.weight", "attention.indexer.key.weight"},
+        {"self_attn.indexer.weights_proj.weight", "attention.indexer.score.weight"},
+        {"self_attn.indexer.k_norm.weight", "attention.indexer.key_norm.weight"},
+        {"self_attn.indexer.k_norm.bias", "attention.indexer.key_norm.bias"},
+        {"self_attn.indexer.index_kpool_compress_gate", "attention.indexer.pool.gate"},
+        {"self_attn.indexer.index_kpool_compress_ape", "attention.indexer.pool.position"},
+    };
+    static const std::unordered_map<std::string_view, std::string_view>
+        predictor_roots{
+            {"enorm.weight", "predictor.embedding_norm.weight"},
+            {"hnorm.weight", "predictor.hidden_norm.weight"},
+            {"eh_proj.weight", "predictor.fusion.weight"},
+            {"shared_head.norm.weight", "predictor.output_norm.weight"},
+        };
+    static const std::unordered_map<std::string_view, std::string_view>
+        vision_roots{
+            {"patch_embed.proj.weight", "patch_embedding.weight"},
+            {"patch_embed.proj.bias", "patch_embedding.bias"},
+            {"post_layernorm.weight", "output_norm.weight"},
+            {"downsample.weight", "downsample.weight"},
+            {"downsample.bias", "downsample.bias"},
+            {"merger.proj.weight", "merger.projection.weight"},
+            {"merger.post_projection_norm.weight", "merger.norm.weight"},
+            {"merger.post_projection_norm.bias", "merger.norm.bias"},
+            {"merger.gate_proj.weight", "merger.mlp.gate.weight"},
+            {"merger.up_proj.weight", "merger.mlp.up.weight"},
+            {"merger.down_proj.weight", "merger.mlp.down.weight"},
+        };
+    static const std::unordered_map<std::string_view, std::string_view>
+        vision_suffixes{
+            {"norm1.weight", "norm1.weight"},
+            {"norm2.weight", "norm2.weight"},
+            {"attn.qkv.weight", "attention.qkv.weight"},
+            {"attn.qkv.bias", "attention.qkv.bias"},
+            {"attn.q_norm.weight", "attention.query_norm.weight"},
+            {"attn.k_norm.weight", "attention.key_norm.weight"},
+            {"attn.proj.weight", "attention.output.weight"},
+            {"attn.proj.bias", "attention.output.bias"},
+            {"mlp.gate_proj.weight", "mlp.gate.weight"},
+            {"mlp.gate_proj.bias", "mlp.gate.bias"},
+            {"mlp.up_proj.weight", "mlp.up.weight"},
+            {"mlp.up_proj.bias", "mlp.up.bias"},
+            {"mlp.down_proj.weight", "mlp.down.weight"},
+            {"mlp.down_proj.bias", "mlp.down.bias"},
+        };
+    const auto text_layers = config_integer(config, "num_hidden_layers");
+    const json* text = &config;
+    if (const auto nested = config.find("text_config");
+        nested != config.end() && nested->is_object()) {
+        text = &*nested;
+    }
+    const auto layer_types = text->find("layer_types");
+    static const std::regex layer(
+        R"(^model\.language_model\.layers\.([0-9]+)\.(.+)$)");
+    static const std::regex expert(
+        R"(^model\.language_model\.layers\.([0-9]+)\.mlp\.experts\.([0-9]+)\.(gate_proj|up_proj|down_proj)\.(weight|weight_scale|weight_scale_2)$)");
+    static const std::regex vision_block(
+        R"(^model\.visual\.blocks\.([0-9]+)\.(.+)$)");
+    for (const auto& stored : names) {
+        if (starts_with(stored, "model.visual.")) {
+            const auto relative = stored.substr(std::string_view("model.visual.").size());
+            if (const auto root = vision_roots.find(relative);
+                root != vision_roots.end()) {
+                add("vision." + std::string(root->second), stored);
+                continue;
+            }
+            std::smatch match;
+            if (std::regex_match(stored, match, vision_block)) {
+                if (const auto suffix = vision_suffixes.find(match[2].str());
+                    suffix != vision_suffixes.end()) {
+                    add(
+                        "vision.block." + match[1].str() + "." +
+                            std::string(suffix->second),
+                        stored);
+                    continue;
+                }
+            }
+        }
+        std::smatch match;
+        if (std::regex_match(stored, match, expert)) {
+            const auto source_layer = std::stoll(match[1].str());
+            const bool predictor = source_layer >= text_layers;
+            const auto layer_index = predictor
+                ? source_layer - text_layers : source_layer;
+            const auto projection = match[3].str() == "gate_proj" ? "gate" :
+                match[3].str() == "up_proj" ? "up" : "down";
+            add(
+                std::string(predictor ? "predictor.block." : "model.block.") +
+                    std::to_string(layer_index) + ".mlp.experts." +
+                    match[2].str() + "." + projection + "." +
+                    match[4].str(),
+                stored);
+            continue;
+        }
+        if (!std::regex_match(stored, match, layer)) continue;
+        const auto source_layer = std::stoll(match[1].str());
+        const bool predictor = source_layer >= text_layers;
+        const auto layer_index = predictor
+            ? source_layer - text_layers : source_layer;
+        const auto stored_suffix = match[2].str();
+        if (predictor) {
+            if (const auto root = predictor_roots.find(stored_suffix);
+                root != predictor_roots.end()) {
+                add(std::string(root->second), stored);
+                continue;
+            }
+        }
+        auto canonical_suffix = suffixes.find(stored_suffix);
+        if (canonical_suffix == suffixes.end()) continue;
+        auto value = std::string(canonical_suffix->second);
+        if (stored_suffix == "self_attn.o_proj.weight") {
+            const bool linear = !predictor && layer_types != text->end() &&
+                layer_types->is_array() &&
+                source_layer < static_cast<std::int64_t>(layer_types->size()) &&
+                (*layer_types)[static_cast<std::size_t>(source_layer)] ==
+                    "linear_attention";
+            value = linear
+                ? "linear_attention.output.weight"
+                : "attention.output.weight";
+        }
+        add(
+            std::string(predictor ? "predictor.block." : "model.block.") +
+                std::to_string(layer_index) + "." + value,
+            stored);
     }
 }
 
@@ -692,9 +1041,7 @@ void add_deepseek_v4_aliases(
             {"attention.compressor.position", "attn.compressor.ape"},
             {"attention.compressor.norm.weight", "attn.compressor.norm.weight"},
             {"attention.indexer.query.weight", "attn.indexer.wq_b.weight"},
-            {"attention.indexer.key.weight", "attn.indexer.wk.weight"},
             {"attention.indexer.score.weight", "attn.indexer.weights_proj.weight"},
-            {"attention.indexer.key_norm.weight", "attn.indexer.k_norm.weight"},
             {"attention.indexer.compressor.key_value.weight", "attn.indexer.compressor.wkv.weight"},
             {"attention.indexer.compressor.gate.weight", "attn.indexer.compressor.wgate.weight"},
             {"attention.indexer.compressor.position", "attn.indexer.compressor.ape"},
@@ -710,10 +1057,6 @@ void add_deepseek_v4_aliases(
             {"mlp.shared_expert.gate.weight", "ffn.shared_experts.w1.weight"},
             {"mlp.shared_expert.up.weight", "ffn.shared_experts.w3.weight"},
             {"mlp.shared_expert.down.weight", "ffn.shared_experts.w2.weight"},
-            {"engram.embedding.weight", "engram.embed.weight"},
-            {"engram.key_value.weight", "engram.wkv.weight"},
-            {"engram.query.weight", "engram.q_weight"},
-            {"engram.key.weight", "engram.k_weight"},
         };
     const auto dynamic_expert_suffix = [](std::string_view suffix)
             -> std::optional<std::string> {
@@ -786,8 +1129,6 @@ void add_deepseek_v4_aliases(
             {"confidence_head.proj.weight", "confidence.projection.weight"},
             {"markov_head.markov_w1.weight", "markov.input.weight"},
             {"markov_head.markov_w2.weight", "markov.output.weight"},
-            {"markov_head.embed.weight", "markov.embedding.weight"},
-            {"markov_head.head.weight", "markov.output.weight"},
         };
     for (const auto& stored : names) {
         if (!starts_with(stored, "mtp.")) continue;
@@ -1076,11 +1417,13 @@ MfqLegacyTensorAliases make_legacy_tensor_aliases(
     const std::unordered_set<std::string> names(
         stored_names.begin(), stored_names.end());
     MfqLegacyTensorAliases result;
-    // The tuned raw-HF Metal runtime intentionally retains the older V4
-    // canonical tensor contract.  Keep this source-format choice explicit so
-    // a V4.1 config cannot redirect it to the portable MFQ V4.1 contract.
-    if (identity(artifact_architecture) == "deepseek_v4_raw_hf") {
-        add_deepseek_v4_aliases(result, names);
+    if (qwen4_family(artifact_architecture, config)) {
+        add_qwen4_hf_aliases(result, config, names);
+        add_derived_aliases(result, names);
+        return result;
+    }
+    if (glm5_family(artifact_architecture, config)) {
+        add_glm5_hf_aliases(result, config, names);
         add_derived_aliases(result, names);
         return result;
     }

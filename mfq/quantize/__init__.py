@@ -4,6 +4,9 @@ This subpackage converts a full-precision tensor to an MFQ-specified precision:
 
 - ``nint_quant`` -- neuron-anchored INT tensor-level quantization (the main weight path).
 - ``nint_quant_torch`` -- CUDA/Metal NINT tensor-level quantization (the main large-model conversion path).
+- ``mxfp4_sq`` -- native-MXFP4 scalar quantization with per-neuron SQ1/SQ2/SQ3/SQ4 selection.
+- ``fp8_sq`` -- native-output E4M3 scalar quantization for MXFP8-SQ and
+  FP8-128SQ with per-neuron SQ1--SQ8 selection.
 - ``nvq_quant`` -- joint search over E8/D4 codewords and neuron/sub-group scales.
 - ``nvq_quant_torch`` -- offline CUDA/Metal quantization and native assignment-kernel dispatch for NVQ1-L/NVQ2/NVQ3.
 - ``nvq_jsc`` -- calibration-free NVQ2J joint scale/codebook-state training and streamed fixed-table quantization.

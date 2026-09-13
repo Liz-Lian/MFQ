@@ -178,17 +178,6 @@ constexpr double kDepthSpikeRatio = 2.0;
 constexpr double kDepthSpikeDamp = 0.25;
 constexpr double kDepthMarginalMs = 7.0;
 constexpr double kDepthHysteresis = 1.03;
-constexpr double kDepthExitMargin = 1.15;
-// oMLX can afford a long losing streak because its standard decoder later
-// schedules MTP re-entry probes. The native C++ engine hands the remainder of
-// this request to plain decode with no re-entry path, so lingering for 16
-// cycles consumes most short generations. The full depth warmup has already
-// measured both alternatives; require only three consecutive losing choices.
-constexpr int kDepthExitStreak = 3;
-// The first maximum-depth pass includes graph compilation and is discarded by
-// update_time(). The second pass is the first representative realized sample.
-constexpr int kDepthRealizedWindow = 1;
-constexpr double kDepthRealizedMargin = 1.03;
 
 } // namespace
 
@@ -256,15 +245,7 @@ void MlxMtpDepthController::observe(
 
     cycle_ms = std::max(0.0, cycle_ms);
     if (time_sample) {
-        const bool has_warm_timing =
-            cycle_ms_[static_cast<std::size_t>(used_depth)].has_value();
         update_time(used_depth, cycle_ms);
-        if (used_depth > 0 && has_warm_timing) {
-            ++realized_window_cycles_;
-            realized_window_tokens_ +=
-                static_cast<std::uint64_t>(accepted_drafts + 1);
-            realized_window_ms_ += cycle_ms;
-        }
     }
     for (std::size_t depth = 0; depth < cycle_age_ms_.size(); ++depth) {
         if (cycle_age_ms_[depth]) {
@@ -277,46 +258,16 @@ void MlxMtpDepthController::observe(
     milliseconds_since_probe_ += cycle_ms;
     milliseconds_since_explore_ += cycle_ms;
 
-    const auto resolve_realized_window = [&] {
-        if (realized_window_cycles_ < kDepthRealizedWindow ||
-            !cycle_ms_.front() || realized_window_ms_ <= 0.0) {
-            return;
-        }
-        const double measured_tokens_per_ms =
-            static_cast<double>(realized_window_tokens_) /
-            realized_window_ms_;
-        const double baseline_tokens_per_ms =
-            1.0 / std::max(1.0e-6, *cycle_ms_.front());
-        realized_speculation_losing_ =
-            measured_tokens_per_ms <
-                baseline_tokens_per_ms * kDepthRealizedMargin;
-        realized_window_cycles_ = 0;
-        realized_window_tokens_ = 0;
-        realized_window_ms_ = 0.0;
-    };
-
-    if (speculation_losing()) {
-        ++exit_streak_;
-    } else {
-        exit_streak_ = 0;
-    }
-
     if (!warmup_.empty()) {
         warmup_.erase(warmup_.begin());
         if (!warmup_.empty()) {
             current_depth_ = warmup_.front();
             return;
         }
-        // The descending sweep plus three plain cycles has measured actual
-        // request-local throughput. A clear loss should hand off immediately
-        // instead of spending the rest of a short response exploring depths.
-        resolve_realized_window();
         current_depth_ = best_depth();
         milliseconds_since_probe_ = 0.0;
         return;
     }
-
-    resolve_realized_window();
 
     if (probe_left_ > 0) {
         --probe_left_;
@@ -350,11 +301,6 @@ void MlxMtpDepthController::observe(
     if (explore_due) {
         milliseconds_since_explore_ = 0.0;
     }
-}
-
-bool MlxMtpDepthController::should_exit() const noexcept {
-    return realized_speculation_losing_ ||
-        exit_streak_ >= kDepthExitStreak;
 }
 
 double MlxMtpDepthController::conditional_acceptance(
@@ -452,18 +398,6 @@ double MlxMtpDepthController::score(int depth) const {
         expected += run;
     }
     return expected / std::max(1.0e-6, time_estimate(depth));
-}
-
-bool MlxMtpDepthController::speculation_losing() const {
-    if (!warmup_.empty() || !cycle_ms_.front()) {
-        return false;
-    }
-    const double baseline = score(0);
-    double best = 0.0;
-    for (int depth = 1; depth <= maximum_depth_; ++depth) {
-        best = std::max(best, score(depth));
-    }
-    return baseline > 0.0 && best < baseline * kDepthExitMargin;
 }
 
 int MlxMtpDepthController::best_depth() const {
@@ -781,8 +715,7 @@ std::int32_t run_mlx_mtp_generation(
         request.predictor_maximum_depth <= 0 ||
         request.predictor_maximum_depth > kMlxMtpEngineMaximumDraftDepth ||
         !callbacks.target_cache_position || !callbacks.prepare_draft ||
-        !callbacks.verify_target || !callbacks.resolve_target ||
-        !callbacks.plain_decode) {
+        !callbacks.verify_target || !callbacks.resolve_target) {
         throw std::invalid_argument("invalid MTP engine configuration");
     }
     mlx_validate_token_set(request.eos_token_ids, request.vocab);
@@ -825,7 +758,7 @@ std::int32_t run_mlx_mtp_generation(
 
     const bool compact_stochastic =
         !request.sampling.greedy() && request.sampling.top_k > 0 &&
-        request.sampling.top_k <= 64;
+        request.sampling.top_k <= 128;
     MlxSamplingParams draft_sampling = request.sampling;
     if (compact_stochastic) {
         // The proposal may be sharper than the target distribution because
@@ -883,17 +816,6 @@ std::int32_t run_mlx_mtp_generation(
                    .count()
             << '\n';
     }
-
-    const auto finish_without_mtp = [&](std::int32_t last_token) {
-        while (generated < request.generation_limit) {
-            const auto next = sample_token(callbacks.plain_decode(last_token));
-            if (!emit(next)) {
-                break;
-            }
-            last_token = next;
-        }
-        return generated;
-    };
 
     while (generated < request.generation_limit) {
         const auto cycle_started = std::chrono::steady_clock::now();
@@ -1114,10 +1036,6 @@ std::int32_t run_mlx_mtp_generation(
         }
 
         pending = verification.next_token;
-        if (depth_controller.should_exit()) {
-            return finish_without_mtp(pending);
-        }
-
         std::vector<std::int32_t> next_ids;
         next_ids.reserve(static_cast<std::size_t>(accepted + 1));
         next_ids.insert(
@@ -1272,9 +1190,9 @@ array verify_stochastic_mtp_top_k_chain_device(
     const array& random,
     int drafts,
     int top_k) {
-    if (top_k <= 0 || top_k > 64) {
+    if (top_k <= 0 || top_k > 128) {
         throw std::invalid_argument(
-            "MTP compact stochastic verification requires top_k in [1,64]");
+            "MTP compact stochastic verification requires top_k in [1,128]");
     }
     if (drafts <= 0 || drafts > 5) {
         throw std::invalid_argument(

@@ -5,12 +5,10 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <future>
 #include <limits>
-#include <list>
-#include <mutex>
 #include <stdexcept>
 #include <string_view>
-#include <unordered_map>
 #include <utility>
 
 namespace mfq::metal {
@@ -23,7 +21,6 @@ constexpr std::string_view kEngramAsset =
     "__mfq_asset__/deepseek-v41-engram-v1.bin";
 constexpr std::array<std::uint8_t, 8> kEngramMagic{
     'M', 'F', 'Q', 'E', 'N', 'G', 'R', '1'};
-constexpr std::size_t kMxHeaderBytes = 56;
 constexpr std::int64_t kDeadToken = -1;
 
 class ByteCursor {
@@ -118,30 +115,52 @@ array dense_array(
     return mlx::core::contiguous(std::move(value));
 }
 
-float decode_e4m3(std::uint8_t raw) {
-    if ((raw & 0x7fu) == 0x7fu) {
-        return std::numeric_limits<float>::quiet_NaN();
+std::size_t cache_capacity_rows(const DeepseekV41Config& config) {
+    const char* raw = std::getenv("MFQ_DEEPSEEK_V41_ENGRAM_CACHE_ROWS");
+    if (raw != nullptr && *raw != '\0') {
+        char* end = nullptr;
+        const auto parsed = std::strtoull(raw, &end, 10);
+        if (end == raw || *end != '\0' ||
+            parsed > std::numeric_limits<std::size_t>::max()) {
+            throw std::runtime_error(
+                "invalid MFQ_DEEPSEEK_V41_ENGRAM_CACHE_ROWS");
+        }
+        return static_cast<std::size_t>(parsed);
     }
-    const float sign = (raw & 0x80u) ? -1.0f : 1.0f;
-    const int exponent = (raw >> 3u) & 0x0fu;
-    const int mantissa = raw & 0x07u;
-    return sign * (exponent == 0
-        ? std::ldexp(static_cast<float>(mantissa), -9)
-        : std::ldexp(
-              1.0f + static_cast<float>(mantissa) / 8.0f,
-              exponent - 7));
+    constexpr std::size_t fallback_mib = 256;
+    raw = std::getenv("MFQ_DEEPSEEK_V41_ENGRAM_CACHE_MIB");
+    char* end = nullptr;
+    const auto cache_mib = raw == nullptr || *raw == '\0'
+        ? fallback_mib
+        : std::strtoull(raw, &end, 10);
+    if ((raw != nullptr && *raw != '\0' &&
+         (end == raw || *end != '\0')) ||
+        cache_mib == 0 ||
+        cache_mib > std::numeric_limits<std::size_t>::max() /
+            (std::size_t{1} << 20) ||
+        config.engram_layer_ids.empty() || config.engram_head_dim <= 0) {
+        throw std::runtime_error(
+            "invalid MFQ_DEEPSEEK_V41_ENGRAM_CACHE_MIB");
+    }
+    const auto bytes_per_table =
+        static_cast<std::size_t>(cache_mib) * (std::size_t{1} << 20) /
+        config.engram_layer_ids.size();
+    const auto decoded_row_bytes =
+        static_cast<std::size_t>(config.engram_head_dim) *
+        sizeof(mlx::core::float16_t);
+    return std::max<std::size_t>(1, bytes_per_table / decoded_row_bytes);
 }
 
-std::size_t cache_capacity_rows() {
-    constexpr std::size_t fallback = 16'384;
-    const char* raw = std::getenv("MFQ_DEEPSEEK_V41_ENGRAM_CACHE_ROWS");
+std::size_t io_worker_count() {
+    constexpr std::size_t fallback = 8;
+    const char* raw = std::getenv("MFQ_DEEPSEEK_V41_ENGRAM_IO_WORKERS");
     if (raw == nullptr || *raw == '\0') return fallback;
     char* end = nullptr;
     const auto parsed = std::strtoull(raw, &end, 10);
-    if (end == raw || *end != '\0' ||
+    if (end == raw || *end != '\0' || parsed == 0 ||
         parsed > std::numeric_limits<std::size_t>::max()) {
         throw std::runtime_error(
-            "invalid MFQ_DEEPSEEK_V41_ENGRAM_CACHE_ROWS");
+            "invalid MFQ_DEEPSEEK_V41_ENGRAM_IO_WORKERS");
     }
     return static_cast<std::size_t>(parsed);
 }
@@ -156,19 +175,6 @@ std::uint64_t checked_product(
             " byte size overflows");
     }
     return left * right;
-}
-
-std::uint64_t read_u64_at(
-    std::span<const std::uint8_t> bytes,
-    std::size_t offset) {
-    if (offset > bytes.size() || 8 > bytes.size() - offset) {
-        throw std::runtime_error("truncated DeepSeek-V4.1 Engram MX header");
-    }
-    std::uint64_t value = 0;
-    for (int index = 0; index < 8; ++index) {
-        value |= static_cast<std::uint64_t>(bytes[offset + index]) << (8 * index);
-    }
-    return value;
 }
 
 } // namespace
@@ -524,224 +530,6 @@ void MlxDeepseekV41EngramHashState::restore(
     context_ = std::move(snapshot.context);
 }
 
-class MlxDeepseekV41Engram::Table {
-public:
-    static std::shared_ptr<Table> load(
-        const MfqContainer& model,
-        const std::string& name,
-        std::int64_t expected_rows,
-        int expected_width) {
-        const auto& record = model.record(name);
-        if (record.dtype != "MXFP8") {
-            throw std::runtime_error(
-                "DeepSeek-V4.1 Engram table must use native MXFP8: " + name);
-        }
-        const auto bytes = model.read_range(name, 0, kMxHeaderBytes);
-        if (bytes.size() < kMxHeaderBytes ||
-            std::memcmp(bytes.data(), "MXT1", 4) != 0 ||
-            bytes[4] != 1 || bytes[5] != 8 || bytes[6] != 0 || bytes[7] != 0) {
-            throw std::runtime_error(
-                "invalid DeepSeek-V4.1 Engram MXFP8 header: " + name);
-        }
-        const auto rows = read_u64_at(bytes, 8);
-        const auto columns = read_u64_at(bytes, 16);
-        const auto storage_rows = read_u64_at(bytes, 24);
-        const auto storage_columns = read_u64_at(bytes, 32);
-        const auto scale_rows = read_u64_at(bytes, 40);
-        const auto scale_columns = read_u64_at(bytes, 48);
-        if (rows != static_cast<std::uint64_t>(expected_rows) ||
-            columns != static_cast<std::uint64_t>(expected_width) ||
-            storage_rows != rows || storage_columns != columns ||
-            scale_rows != rows || scale_columns != columns / 32 ||
-            columns == 0 || columns % 32) {
-            throw std::runtime_error(
-                "DeepSeek-V4.1 Engram table is not row-wise MXFP8: " + name);
-        }
-        const auto value_bytes = checked_product(rows, columns, "value");
-        const auto scale_bytes = checked_product(
-            scale_rows, scale_columns, "scale");
-        if (value_bytes > std::numeric_limits<std::uint64_t>::max() -
-                kMxHeaderBytes ||
-            scale_bytes > std::numeric_limits<std::uint64_t>::max() -
-                kMxHeaderBytes - value_bytes ||
-            kMxHeaderBytes + value_bytes + scale_bytes != record.nbytes) {
-            throw std::runtime_error(
-                "DeepSeek-V4.1 Engram MXFP8 payload size disagrees: " + name);
-        }
-        return std::shared_ptr<Table>(new Table(
-            model,
-            name,
-            kMxHeaderBytes,
-            kMxHeaderBytes + value_bytes,
-            static_cast<std::int64_t>(rows),
-            static_cast<int>(columns),
-            cache_capacity_rows()));
-    }
-
-    array gather(
-        std::span<const std::int64_t> rows,
-        int batch,
-        int tokens,
-        int hash_columns) const {
-        const auto expected = static_cast<std::size_t>(batch) * tokens * hash_columns;
-        if (batch <= 0 || tokens <= 0 || hash_columns <= 0 ||
-            rows.size() != expected) {
-            throw std::invalid_argument(
-                "DeepSeek-V4.1 Engram lookup geometry disagrees");
-        }
-        std::vector<std::pair<std::int64_t, std::size_t>> requests;
-        requests.reserve(rows.size());
-        for (std::size_t index = 0; index < rows.size(); ++index) {
-            if (rows[index] < 0 || rows[index] >= rows_) {
-                throw std::out_of_range(
-                    "DeepSeek-V4.1 Engram lookup row is outside the table");
-            }
-            requests.emplace_back(rows[index], index);
-        }
-        std::sort(
-            requests.begin(), requests.end(),
-            [](const auto& left, const auto& right) {
-                return left.first < right.first ||
-                    (left.first == right.first && left.second < right.second);
-            });
-        std::vector<mlx::core::float16_t> output(
-            expected * static_cast<std::size_t>(width_));
-        std::lock_guard lock(mutex_);
-        std::size_t begin = 0;
-        while (begin < requests.size()) {
-            std::size_t end = begin + 1;
-            while (end < requests.size() &&
-                   requests[end].first == requests[begin].first) {
-                ++end;
-            }
-            const auto& decoded = row_locked(requests[begin].first);
-            for (std::size_t request = begin; request < end; ++request) {
-                std::copy_n(
-                    decoded.data(),
-                    width_,
-                    output.data() + requests[request].second *
-                        static_cast<std::size_t>(width_));
-            }
-            begin = end;
-        }
-        return array(
-            output.begin(),
-            Shape{batch, tokens, hash_columns * width_});
-    }
-
-    std::size_t cached_rows() const noexcept {
-        std::lock_guard lock(mutex_);
-        return cache_.size();
-    }
-
-private:
-    struct CacheEntry {
-        std::vector<mlx::core::float16_t> values;
-        std::list<std::int64_t>::iterator recency;
-    };
-
-    Table(
-        MfqContainer model,
-        std::string name,
-        std::uint64_t values_offset,
-        std::uint64_t scales_offset,
-        std::int64_t rows,
-        int width,
-        std::size_t capacity)
-        : model_(std::move(model)),
-          name_(std::move(name)),
-          values_offset_(values_offset),
-          scales_offset_(scales_offset),
-          rows_(rows),
-          width_(width),
-          capacity_(capacity) {
-        for (std::size_t raw = 0; raw < e4m3_.size(); ++raw) {
-            e4m3_[raw] = decode_e4m3(static_cast<std::uint8_t>(raw));
-        }
-        for (std::size_t raw = 0; raw < e8m0_.size(); ++raw) {
-            e8m0_[raw] = raw == 255
-                ? std::numeric_limits<float>::quiet_NaN()
-                : std::ldexp(1.0f, static_cast<int>(raw) - 127);
-        }
-        scratch_.resize(static_cast<std::size_t>(width_));
-        raw_values_.resize(static_cast<std::size_t>(width_));
-        raw_scales_.resize(static_cast<std::size_t>(width_ / 32));
-    }
-
-    void decode_row(
-        std::int64_t row,
-        std::vector<mlx::core::float16_t>& output) const {
-        model_.read_range_into(
-            name_,
-            values_offset_ + static_cast<std::uint64_t>(row) *
-                static_cast<std::uint64_t>(width_),
-            std::as_writable_bytes(std::span<std::uint8_t>(raw_values_)));
-        model_.read_range_into(
-            name_,
-            scales_offset_ + static_cast<std::uint64_t>(row) *
-                static_cast<std::uint64_t>(width_ / 32),
-            std::as_writable_bytes(std::span<std::uint8_t>(raw_scales_)));
-        for (int group = 0; group < width_ / 32; ++group) {
-            const auto scale = e8m0_[raw_scales_[static_cast<std::size_t>(group)]];
-            if (!std::isfinite(scale)) {
-                throw std::runtime_error(
-                    "DeepSeek-V4.1 Engram row contains an invalid E8M0 scale");
-            }
-            for (int column = 0; column < 32; ++column) {
-                const auto value = e4m3_[raw_values_[static_cast<std::size_t>(
-                    group * 32 + column)]];
-                if (!std::isfinite(value)) {
-                    throw std::runtime_error(
-                        "DeepSeek-V4.1 Engram row contains an E4M3 NaN");
-                }
-                output[static_cast<std::size_t>(group * 32 + column)] =
-                    static_cast<mlx::core::float16_t>(value * scale);
-            }
-        }
-    }
-
-    const std::vector<mlx::core::float16_t>& row_locked(
-        std::int64_t row) const {
-        const auto found = cache_.find(row);
-        if (found != cache_.end()) {
-            recency_.splice(recency_.begin(), recency_, found->second.recency);
-            return found->second.values;
-        }
-        if (capacity_ == 0) {
-            decode_row(row, scratch_);
-            return scratch_;
-        }
-        if (cache_.size() >= capacity_) {
-            const auto victim = recency_.back();
-            recency_.pop_back();
-            cache_.erase(victim);
-        }
-        recency_.push_front(row);
-        CacheEntry entry{
-            std::vector<mlx::core::float16_t>(static_cast<std::size_t>(width_)),
-            recency_.begin(),
-        };
-        decode_row(row, entry.values);
-        return cache_.emplace(row, std::move(entry)).first->second.values;
-    }
-
-    MfqContainer model_;
-    std::string name_;
-    std::uint64_t values_offset_;
-    std::uint64_t scales_offset_;
-    std::int64_t rows_;
-    int width_;
-    std::size_t capacity_;
-    std::array<float, 256> e4m3_{};
-    std::array<float, 256> e8m0_{};
-    mutable std::mutex mutex_;
-    mutable std::list<std::int64_t> recency_;
-    mutable std::unordered_map<std::int64_t, CacheEntry> cache_;
-    mutable std::vector<mlx::core::float16_t> scratch_;
-    mutable std::vector<std::uint8_t> raw_values_;
-    mutable std::vector<std::uint8_t> raw_scales_;
-};
-
 MlxDeepseekV41Engram MlxDeepseekV41Engram::load(
     const MfqContainer& model,
     const DeepseekV41Config& config,
@@ -780,11 +568,13 @@ MlxDeepseekV41Engram MlxDeepseekV41Engram::load(
         config,
         layer,
         hash_layer,
-        Table::load(
+        std::make_shared<MlxMxfp8RowStore>(
             model,
             prefix + ".embedding.weight",
             config.engram_num_embeddings[static_cast<std::size_t>(hash_layer)],
-            static_cast<int>(config.engram_head_dim)),
+            static_cast<int>(config.engram_head_dim),
+            cache_capacity_rows(config),
+            io_worker_count()),
         std::move(projection),
         std::move(query_key));
 }
@@ -793,7 +583,7 @@ MlxDeepseekV41Engram::MlxDeepseekV41Engram(
     DeepseekV41Config config,
     int layer,
     int hash_layer_index,
-    std::shared_ptr<Table> table,
+    std::shared_ptr<MlxMxfp8RowStore> table,
     MlxLinear projection,
     array query_key_weight)
     : config_(std::move(config)),
@@ -818,11 +608,29 @@ array MlxDeepseekV41Engram::forward(
         throw std::invalid_argument(
             "DeepSeek-V4.1 Engram activation geometry disagrees");
     }
-    auto embeddings = table_->gather(
-        hashes.layer(hash_layer_index_),
-        batch,
-        tokens,
-        hashes.hash_columns);
+    const auto row_ids = hashes.layer(hash_layer_index_);
+    if (row_ids.size() != static_cast<std::size_t>(batch) * tokens *
+            hashes.hash_columns) {
+        throw std::invalid_argument(
+            "DeepSeek-V4.1 Engram lookup geometry disagrees");
+    }
+    array gathered(0.0f);
+    if (hashes.prefetched_rows.empty()) {
+        gathered = table_->gather(row_ids);
+    } else {
+        if (hashes.prefetched_rows.size() !=
+                static_cast<std::size_t>(hashes.layers) ||
+            !hashes.prefetched_rows[
+                static_cast<std::size_t>(hash_layer_index_)].valid()) {
+            throw std::logic_error(
+                "DeepSeek-V4.1 Engram prefetch state is incomplete");
+        }
+        gathered = hashes.prefetched_rows[
+            static_cast<std::size_t>(hash_layer_index_)].get();
+    }
+    auto embeddings = mlx::core::reshape(
+        std::move(gathered),
+        Shape{batch, tokens, hashes.hash_columns * table_->width()});
     auto key_value = projection_(embeddings);
     const int key_width = streams * hidden;
     auto key = mlx::core::slice(
@@ -870,8 +678,36 @@ array MlxDeepseekV41Engram::forward(
         : mlx::core::astype(std::move(output), hidden_streams.dtype());
 }
 
+void MlxDeepseekV41Engram::prefetch(
+    DeepseekV41EngramHashBatch& hashes) const {
+    if (hash_layer_index_ < 0 || hash_layer_index_ >= hashes.layers ||
+        hashes.prefetched_rows.size() !=
+            static_cast<std::size_t>(hashes.layers)) {
+        throw std::invalid_argument(
+            "DeepSeek-V4.1 Engram prefetch geometry disagrees");
+    }
+    auto& slot = hashes.prefetched_rows[
+        static_cast<std::size_t>(hash_layer_index_)];
+    if (slot.valid()) {
+        throw std::logic_error(
+            "DeepSeek-V4.1 Engram table was prefetched twice");
+    }
+    auto rows = std::vector<std::int64_t>(
+        hashes.layer(hash_layer_index_).begin(),
+        hashes.layer(hash_layer_index_).end());
+    slot = std::async(
+        std::launch::async,
+        [table = table_, rows = std::move(rows)] {
+            return table->gather(rows);
+        }).share();
+}
+
 std::size_t MlxDeepseekV41Engram::cached_rows() const noexcept {
     return table_->cached_rows();
+}
+
+MlxMxfp8RowStoreStats MlxDeepseekV41Engram::ssd_stats() const {
+    return table_->stats();
 }
 
 } // namespace mfq::metal

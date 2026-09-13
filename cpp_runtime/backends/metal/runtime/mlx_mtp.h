@@ -121,8 +121,6 @@ struct MlxMtpEngineCallbacks {
     // suffix. This closes the target cache transaction for every verify call.
     std::function<void(int accepted_drafts, int draft_count)> resolve_target;
 
-    // Ordinary one-token target decode used after adaptive MTP exits.
-    std::function<mlx::core::array(std::int32_t pending_token)> plain_decode;
 };
 
 struct MlxMtpEngineRequest {
@@ -156,7 +154,8 @@ std::int32_t run_mlx_mtp_generation(
 // Runtime draft-depth controller adapted from oMLX's production MTP loop.
 // It learns conditional acceptance by draft position and the measured wall
 // time of every verify width, then maximizes expected emitted tokens / ms.
-// Depth zero is a measured plain-decode escape hatch.
+// Depth zero is a reversible plain-decode mode; periodic probes can restore
+// speculation when acceptance or runtime conditions improve.
 class MlxMtpDepthController {
 public:
     explicit MlxMtpDepthController(int maximum_depth = 3);
@@ -172,8 +171,6 @@ public:
         int accepted_drafts,
         double cycle_ms,
         bool time_sample = true);
-    bool should_exit() const noexcept;
-
     double conditional_acceptance(int position) const;
     std::optional<double> measured_cycle_ms(int depth) const;
 
@@ -182,7 +179,6 @@ private:
     double time_estimate(int depth) const;
     double marginal_estimate() const;
     double score(int depth) const;
-    bool speculation_losing() const;
     int best_depth() const;
     std::optional<int> best_rival() const;
     std::optional<int> most_stale() const;
@@ -191,11 +187,6 @@ private:
     int current_depth_ = 1;
     int cycles_ = 0;
     int probe_left_ = 0;
-    int exit_streak_ = 0;
-    int realized_window_cycles_ = 0;
-    std::uint64_t realized_window_tokens_ = 0;
-    double realized_window_ms_ = 0.0;
-    bool realized_speculation_losing_ = false;
     double milliseconds_since_probe_ = 0.0;
     double milliseconds_since_explore_ = 0.0;
     std::vector<double> acceptance_;

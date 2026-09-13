@@ -12,6 +12,25 @@ namespace mfq::metal {
 
 bool is_mx_dtype(std::string_view dtype) noexcept;
 
+// Model-neutral activation fake-quantization boundaries used by native-QAT
+// graphs. The returned values are unpacked F16, but every element is exactly
+// representable by the corresponding native MX format.
+mlx::core::array mlx_mxfp8_sim(
+    const mlx::core::array& input);
+mlx::core::array mlx_mxfp4_e4m3_scale_sim(
+    const mlx::core::array& input);
+
+// Weighted RMSNorm, adjacent-pair tail RoPE, and MXFP8 activation simulation.
+// A device-specialized fused kernel is selected by operator geometry; all
+// other inputs use the composition of the same model-neutral primitives.
+mlx::core::array mlx_weighted_rms_rope_mxfp8_sim(
+    const mlx::core::array& input,
+    const mlx::core::array& norm_weight,
+    float eps,
+    int rotary_dimension,
+    const mlx::core::array& cosine,
+    const mlx::core::array& sine);
+
 class MlxMxWeight {
 public:
     static MlxMxWeight from_blob(
@@ -47,8 +66,11 @@ public:
     int bits() const noexcept { return bits_; }
     int input_size() const noexcept { return input_size_; }
     int output_size() const noexcept { return output_size_; }
-    int scale_block_size() const noexcept {
-        return mxfp8_scale_block_size_;
+    int scale_row_block_size() const noexcept {
+        return mxfp8_scale_row_block_size_;
+    }
+    int scale_column_block_size() const noexcept {
+        return mxfp8_scale_column_block_size_;
     }
     std::size_t packed_nbytes() const noexcept;
 
@@ -71,7 +93,8 @@ private:
     mlx::core::array values_;
     mlx::core::array scales_;
     std::optional<mlx::core::array> expanded_mxfp8_scales_;
-    int mxfp8_scale_block_size_ = 0;
+    int mxfp8_scale_row_block_size_ = 0;
+    int mxfp8_scale_column_block_size_ = 0;
     int bits_ = 0;
     int input_size_ = 0;
     int output_size_ = 0;

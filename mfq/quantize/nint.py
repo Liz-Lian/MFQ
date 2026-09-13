@@ -195,8 +195,8 @@ def allocate_row_profiles(
     """Choose one measured ``(q, k)`` candidate per row under one bit budget.
 
     The supplied loss table should already contain the complete NAQ objective:
-    input-channel weighting and output-neuron importance.  The uniform NINTv1
-    point is always retained as a non-regression fallback.
+    input-channel weighting and output-neuron importance.  The corresponding
+    uniform NINT preset is always retained as a non-regression fallback.
     """
 
     losses = np.asarray(row_losses, dtype=np.float64)

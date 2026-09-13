@@ -1804,6 +1804,57 @@ def test_managed_runtime_reports_and_bounds_queued_requests(tmp_path: Path) -> N
     asyncio.run(run())
 
 
+def test_managed_runtime_closes_backend_stream_when_consumer_stops(
+    tmp_path: Path,
+) -> None:
+    class InterruptibleBackend(IdleBackend):
+        def __init__(self) -> None:
+            self.stream_closed = False
+
+        async def stream(self, **_options: object):
+            try:
+                yield BackendDelta(content_delta="partial")
+                await asyncio.Event().wait()
+            finally:
+                self.stream_closed = True
+
+    async def run() -> None:
+        model = tmp_path / "interruptible.mfq"
+        _model(model)
+        catalog = ModelCatalog([tmp_path], cache_seconds=0)
+        artifact = await catalog.resolve((await catalog.list()).data[0].id)
+        backend = InterruptibleBackend()
+        instance = _ManagedRuntime(
+            id=uuid4(),
+            artifact=artifact,
+            process=SimpleNamespace(returncode=None),
+            backend=backend,
+            port=0,
+            context_size=4096,
+            state=RuntimeInstanceState.READY,
+            request_slots=asyncio.Semaphore(1),
+        )
+        pool = ManagedRuntimePool(catalog, tmp_path / "runtime")
+        pool._instances[instance.id] = instance
+
+        stream = pool.stream(
+            model=artifact.resource.name,
+            messages=[{"role": "user", "content": "hello"}],
+            sampling=SamplingParams(),
+        )
+        assert (await anext(stream)).content_delta == "partial"
+        assert instance.active_requests == 1
+        await stream.aclose()
+
+        assert backend.stream_closed
+        assert instance.active_requests == 0
+        assert instance.state == RuntimeInstanceState.READY
+        assert instance.request_slots is not None
+        assert not instance.request_slots.locked()
+
+    asyncio.run(run())
+
+
 def test_minicpmo_voice_component_activates_in_the_managed_runtime(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -14,7 +14,13 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
 
-from mfq.server.backend import BackendDelta, BackendError, ChatBackend, OpenAIChatBackend
+from mfq.server.backend import (
+    BackendDelta,
+    BackendError,
+    ChatBackend,
+    OpenAIChatBackend,
+    closing_backend_stream,
+)
 from mfq.server.catalog import DiscoveredModel, ModelArtifactNotFoundError, ModelCatalog
 from mfq.server.jobs import JobContext, JobExecutionError
 from mfq.server.models import (
@@ -712,16 +718,19 @@ class ManagedRuntimePool:
         if instance is None:
             if self.fallback is None:
                 raise BackendError("model_not_loaded", f"model is not loaded: {model}")
-            async for delta in self.fallback.stream(
-                model=model,
-                messages=messages,
-                sampling=sampling,
-                session_id=session_id,
-                tools=tools,
-                tool_choice=tool_choice,
-                response_format=response_format,
-            ):
-                yield delta
+            async with closing_backend_stream(
+                self.fallback.stream(
+                    model=model,
+                    messages=messages,
+                    sampling=sampling,
+                    session_id=session_id,
+                    tools=tools,
+                    tool_choice=tool_choice,
+                    response_format=response_format,
+                )
+            ) as fallback_stream:
+                async for delta in fallback_stream:
+                    yield delta
             return
         assert instance.request_slots is not None
         acquired = False
@@ -766,16 +775,19 @@ class ManagedRuntimePool:
             self._last_instance_id = instance.id
         try:
             effective_sampling = self._sampling_for_instance(instance, sampling)
-            async for delta in instance.backend.stream(
-                model=instance.artifact.resource.name,
-                messages=messages,
-                sampling=effective_sampling,
-                session_id=session_id,
-                tools=tools,
-                tool_choice=tool_choice,
-                response_format=response_format,
-            ):
-                yield delta
+            async with closing_backend_stream(
+                instance.backend.stream(
+                    model=instance.artifact.resource.name,
+                    messages=messages,
+                    sampling=effective_sampling,
+                    session_id=session_id,
+                    tools=tools,
+                    tool_choice=tool_choice,
+                    response_format=response_format,
+                )
+            ) as backend_stream:
+                async for delta in backend_stream:
+                    yield delta
         finally:
             async with self._lock:
                 instance.active_requests = max(0, instance.active_requests - 1)

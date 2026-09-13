@@ -8,6 +8,7 @@ import json
 import os
 import time
 from collections.abc import AsyncIterator, Sequence
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Protocol
@@ -112,6 +113,20 @@ class ChatBackend(Protocol):
     def realtime_connect(self, *, mode: str = "audio") -> Any: ...
 
     async def aclose(self) -> None: ...
+
+
+@asynccontextmanager
+async def closing_backend_stream(
+    stream: AsyncIterator[BackendDelta],
+) -> AsyncIterator[AsyncIterator[BackendDelta]]:
+    """Close a nested backend iterator when its forwarding stream stops early."""
+
+    try:
+        yield stream
+    finally:
+        close = getattr(stream, "aclose", None)
+        if callable(close):
+            await close()
 
 
 class OpenAIChatBackend:

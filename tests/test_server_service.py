@@ -222,6 +222,53 @@ def test_explicit_cancel_stops_a_response_and_allows_immediate_edited_retry(
     asyncio.run(run())
 
 
+def test_stream_disconnect_closes_backend_and_terminates_response(tmp_path: Path) -> None:
+    class InterruptibleBackend(FakeBackend):
+        def __init__(self) -> None:
+            super().__init__()
+            self.stream_closed = False
+
+        async def stream(self, **kwargs: Any) -> AsyncIterator[BackendDelta]:
+            self.calls.append(kwargs)
+            try:
+                yield BackendDelta(content_delta="partial")
+                await asyncio.Event().wait()
+            finally:
+                self.stream_closed = True
+
+    async def run() -> None:
+        backend = InterruptibleBackend()
+        service = make_service(tmp_path, backend)
+        await asyncio.to_thread(
+            service.store.create_session,
+            CreateSessionRequest(model="model-a"),
+            session_id=SESSION_ID,
+        )
+        prepared = await service.prepare_response(
+            SESSION_ID,
+            CreateResponseRequest(
+                request_id=REQUEST_ID,
+                expected_revision=0,
+                input=[{"type": "text", "text": "question"}],
+                stream=True,
+            ),
+        )
+
+        stream = service.stream_response(prepared)
+        assert "session.state" in await anext(stream)
+        assert "partial" in await anext(stream)
+        await stream.aclose()
+
+        assert backend.stream_closed
+        assert SESSION_ID not in service._active_responses
+        responses = await service.list_responses(SESSION_ID)
+        assert responses.data[0].status == ResponseStatus.CANCELLED
+        session = await service.get_session(SESSION_ID)
+        assert session.state == SessionState.INTERRUPTED
+
+    asyncio.run(run())
+
+
 def test_media_upload_retrieval_and_multimodal_forwarding(tmp_path: Path) -> None:
     async def run() -> None:
         backend = FakeBackend((BackendDelta(content_delta="seen", finish_reason="stop"),))

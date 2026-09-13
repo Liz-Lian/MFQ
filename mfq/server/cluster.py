@@ -9,7 +9,7 @@ import json
 import os
 import time
 from collections.abc import AsyncIterator, Sequence
-from contextlib import aclosing, suppress
+from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
@@ -17,7 +17,13 @@ from uuid import UUID, uuid4
 
 import httpx
 
-from mfq.server.backend import BackendDelta, BackendError, BackendToolCallDelta, ChatBackend
+from mfq.server.backend import (
+    BackendDelta,
+    BackendError,
+    BackendToolCallDelta,
+    ChatBackend,
+    closing_backend_stream,
+)
 from mfq.server.models import (
     RemoteNodeResource,
     ResponseFormat,
@@ -187,20 +193,23 @@ class ClusterBackend:
     ) -> AsyncIterator[BackendDelta]:
         node = await self._select(model)
         if node is None:
-            async for delta in self.local.stream(
-                model=model,
-                messages=messages,
-                sampling=sampling,
-                session_id=session_id,
-                tools=tools,
-                tool_choice=tool_choice,
-                response_format=response_format,
-            ):
-                yield delta
+            async with closing_backend_stream(
+                self.local.stream(
+                    model=model,
+                    messages=messages,
+                    sampling=sampling,
+                    session_id=session_id,
+                    tools=tools,
+                    tool_choice=tool_choice,
+                    response_format=response_format,
+                )
+            ) as local_stream:
+                async for delta in local_stream:
+                    yield delta
             return
         node.active_requests += 1
         try:
-            async with aclosing(
+            async with closing_backend_stream(
                 self._remote_stream(
                     node.resource,
                     model=model,

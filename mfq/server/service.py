@@ -13,7 +13,13 @@ from datetime import datetime, timezone
 from typing import Any
 from uuid import UUID, uuid4
 
-from mfq.server.backend import BackendDelta, BackendError, BackendToolCallDelta, ChatBackend
+from mfq.server.backend import (
+    BackendDelta,
+    BackendError,
+    BackendToolCallDelta,
+    ChatBackend,
+    closing_backend_stream,
+)
 from mfq.server.catalog import (
     DuplicateModelNameError,
     ModelArtifactNotFoundError,
@@ -1586,24 +1592,27 @@ class ServerService:
         sequence += 1
         accumulator = _OutputAccumulator()
         try:
-            async for delta in self.backend.stream(
-                model=prepared.begin.session.model,
-                messages=prepared.backend_messages,
-                sampling=prepared.request.sampling,
-                session_id=prepared.begin.session.id,
-                tools=prepared.request.tools,
-                tool_choice=prepared.request.tool_choice,
-                response_format=prepared.request.response_format,
-            ):
-                accumulator.apply(delta)
-                payloads = self._delta_payloads(prepared.begin.response.id, delta)
-                for payload in payloads:
-                    yield self._encode_sse(
-                        payload,
-                        sequence,
-                        session_id=prepared.begin.session.id,
-                    )
-                    sequence += 1
+            async with closing_backend_stream(
+                self.backend.stream(
+                    model=prepared.begin.session.model,
+                    messages=prepared.backend_messages,
+                    sampling=prepared.request.sampling,
+                    session_id=prepared.begin.session.id,
+                    tools=prepared.request.tools,
+                    tool_choice=prepared.request.tool_choice,
+                    response_format=prepared.request.response_format,
+                )
+            ) as backend_stream:
+                async for delta in backend_stream:
+                    accumulator.apply(delta)
+                    payloads = self._delta_payloads(prepared.begin.response.id, delta)
+                    for payload in payloads:
+                        yield self._encode_sse(
+                            payload,
+                            sequence,
+                            session_id=prepared.begin.session.id,
+                        )
+                        sequence += 1
             finish_reason = self._require_finish_reason(accumulator)
             completed = await asyncio.to_thread(
                 self.store.complete_response,
@@ -1630,7 +1639,7 @@ class ServerService:
                 sequence,
                 session_id=session.id,
             )
-        except asyncio.CancelledError:
+        except (asyncio.CancelledError, GeneratorExit):
             detail = ErrorDetail(
                 code="client_cancelled",
                 message="client disconnected before the response completed",

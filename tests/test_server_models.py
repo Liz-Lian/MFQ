@@ -735,8 +735,31 @@ def test_failed_runtime_start_does_not_leave_a_stuck_pool_slot(tmp_path: Path) -
     asyncio.run(run())
 
 
+def test_stale_load_cleanup_cannot_release_a_new_load_reservation() -> None:
+    pool = ManagedRuntimePool(ModelCatalog([]), "runtime")
+    stale_event = asyncio.Event()
+    current_event = asyncio.Event()
+    pool._load_events["tiny"] = current_event
+    pool._loading_model_names.add("tiny")
+    pool._loading_artifact_ids["tiny"] = "artifact-current"
+    pool._load_ports["tiny"] = 32123
+    pool._load_bytes["tiny"] = 4096
+    pool._reserved_ports.add(32123)
+
+    pool._finish_model_load_locked("tiny", stale_event, None)
+
+    assert stale_event.is_set()
+    assert pool._load_events["tiny"] is current_event
+    assert "tiny" in pool._loading_model_names
+    assert pool._loading_artifact_ids["tiny"] == "artifact-current"
+    assert pool._load_ports["tiny"] == 32123
+    assert pool._load_bytes["tiny"] == 4096
+    assert 32123 in pool._reserved_ports
+
+
 def test_request_driven_load_waiters_receive_the_same_startup_error(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     async def run() -> None:
         model_dir = tmp_path / "models"
@@ -755,7 +778,17 @@ def test_request_driven_load_waiters_receive_the_same_startup_error(
             ModelCatalog([model_dir], cache_seconds=0),
             executable,
             startup_timeout_seconds=5,
+            load_failure_cooldown_seconds=60,
         )
+        starts = 0
+        create_subprocess = asyncio.create_subprocess_exec
+
+        async def counted_create_subprocess(*args: object, **kwargs: object):
+            nonlocal starts
+            starts += 1
+            return await create_subprocess(*args, **kwargs)
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", counted_create_subprocess)
 
         async def consume() -> None:
             async for _delta in pool.stream(
@@ -780,6 +813,11 @@ def test_request_driven_load_waiters_receive_the_same_startup_error(
                 for item in results
                 if isinstance(item, BackendError)
             } == {503}
+            assert starts == 1
+            with pytest.raises(BackendError) as cached:
+                await consume()
+            assert cached.value.code == "runtime_start_failed"
+            assert starts == 1
             assert (await pool.instances()).data == []
         finally:
             await pool.aclose()

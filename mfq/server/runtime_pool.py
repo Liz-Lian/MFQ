@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import socket
 import subprocess
+import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from contextlib import suppress
 from dataclasses import dataclass, field
@@ -114,6 +115,13 @@ class _RuntimeLoadContext:
                     await result
 
 
+@dataclass(frozen=True)
+class _CachedLoadFailure:
+    artifact_id: str
+    detail: ErrorDetail
+    failed_at: float
+
+
 class ManagedRuntimePool:
     """Own local runtime processes while retaining an optional external fallback."""
 
@@ -129,6 +137,7 @@ class ManagedRuntimePool:
         max_queued_requests_per_instance: int | None = None,
         max_runtime_memory_bytes: int | None = None,
         default_idle_ttl_seconds: int | None = None,
+        load_failure_cooldown_seconds: float = 30.0,
         metric_interval_seconds: float = 2.0,
         backend: str = "metal",
         voice_component: Any | None = None,
@@ -148,6 +157,8 @@ class ManagedRuntimePool:
             raise ValueError("max_runtime_memory_bytes must be positive")
         if default_idle_ttl_seconds is not None and default_idle_ttl_seconds < 0:
             raise ValueError("default_idle_ttl_seconds must be non-negative")
+        if load_failure_cooldown_seconds < 0:
+            raise ValueError("load_failure_cooldown_seconds must be non-negative")
         self.catalog = catalog
         self.executable = Path(executable).expanduser().resolve()
         self.fallback = fallback
@@ -161,6 +172,7 @@ class ManagedRuntimePool:
         )
         self.max_runtime_memory_bytes = max_runtime_memory_bytes
         self.default_idle_ttl_seconds = default_idle_ttl_seconds
+        self.load_failure_cooldown_seconds = load_failure_cooldown_seconds
         self.metric_interval_seconds = max(0.25, metric_interval_seconds)
         if backend not in {"cuda", "metal"}:
             raise ValueError(f"unsupported native backend: {backend}")
@@ -173,6 +185,8 @@ class ManagedRuntimePool:
         self._loading_model_names: set[str] = set()
         self._load_events: dict[str, asyncio.Event] = {}
         self._load_errors: dict[str, ErrorDetail] = {}
+        self._load_failures: dict[str, _CachedLoadFailure] = {}
+        self._loading_artifact_ids: dict[str, str] = {}
         self._load_requests: dict[str, ModelLoadRequest] = {}
         self._reserved_ports: set[int] = set()
         self._load_ports: dict[str, int] = {}
@@ -386,6 +400,8 @@ class ManagedRuntimePool:
             self._loading_model_names.add(model_name)
             self._load_events[model_name] = load_event
             self._load_errors.pop(model_name, None)
+            self._load_failures.pop(model_name, None)
+            self._loading_artifact_ids[model_name] = artifact.resource.id
             self._load_ports[model_name] = port
             self._load_bytes[model_name] = incoming_bytes
 
@@ -1004,6 +1020,8 @@ class ManagedRuntimePool:
                 event.set()
             self._load_events.clear()
             self._loading_model_names.clear()
+            self._loading_artifact_ids.clear()
+            self._load_failures.clear()
             self._load_ports.clear()
             self._load_bytes.clear()
             self._reserved_ports.clear()
@@ -1071,11 +1089,23 @@ class ManagedRuntimePool:
             )
             event = self._load_events.get(model_name)
             request = self._load_requests.get(model_name)
+            cached_failure = self._load_failures.get(model_name)
+            if cached_failure is not None and (
+                cached_failure.artifact_id != artifact_id
+                or self.load_failure_cooldown_seconds == 0
+                or time.monotonic() - cached_failure.failed_at
+                >= self.load_failure_cooldown_seconds
+            ):
+                self._load_failures.pop(model_name, None)
+                self._load_errors.pop(model_name, None)
+                cached_failure = None
         if ready is not None:
             return ready
         if event is not None:
             await self._wait_for_model_ready(model_name)
             return await self._select_loaded_artifact(model_name, artifact_id)
+        if cached_failure is not None:
+            raise self._backend_load_error(cached_failure.detail)
 
         exact_request = (request or ModelLoadRequest(model=model_name)).model_copy(
             update={
@@ -1223,14 +1253,23 @@ class ManagedRuntimePool:
         error: ErrorDetail | None,
     ) -> None:
         owns_event = self._load_events.get(model) is event
-        if owns_event:
-            if error is None:
-                self._load_errors.pop(model, None)
-            elif model not in self._load_errors:
-                self._load_errors[model] = error
+        if not owns_event:
+            event.set()
+            return
+        artifact_id = self._loading_artifact_ids.pop(model, None)
+        if error is None:
+            self._load_errors.pop(model, None)
+            self._load_failures.pop(model, None)
+        elif model not in self._load_errors:
+            self._load_errors[model] = error
+        if error is not None and artifact_id is not None:
+            self._load_failures[model] = _CachedLoadFailure(
+                artifact_id=artifact_id,
+                detail=error,
+                failed_at=time.monotonic(),
+            )
         self._loading_model_names.discard(model)
-        if owns_event:
-            self._load_events.pop(model, None)
+        self._load_events.pop(model, None)
         port = self._load_ports.pop(model, None)
         if port is not None:
             self._reserved_ports.discard(port)

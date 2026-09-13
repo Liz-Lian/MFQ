@@ -22,6 +22,7 @@ from mfq.formats.hf_source import HfSourceTensorStore
 from mfq.formats.io import save
 from mfq.server.catalog import ModelCatalog
 from mfq.server.hf_tokenizer import (
+    DEEPSEEK_V4_CHAT_TEMPLATE,
     ensure_hf_tokenizer_gguf,
     ensure_mfq_tokenizer_gguf,
     native_hf_asset_environment,
@@ -269,6 +270,25 @@ def test_hf_tokenizer_cache_is_reusable_and_runtime_selected(
     arguments = native_tokenizer_arguments(model)
     assert arguments[0] == "--tokenizer-gguf"
     assert Path(arguments[1]).is_file()
+
+
+def test_deepseek_v4_without_hf_template_uses_processor_fallback(
+    tmp_path: Path,
+) -> None:
+    model = tmp_path / "DeepSeek-V4-Vision-Test"
+    _hf_fixture(model, model_type="deepseek_v4", tensor_name="embed.weight")
+    tokenizer_config_path = model / "tokenizer_config.json"
+    tokenizer_config = json.loads(tokenizer_config_path.read_text())
+    tokenizer_config.pop("chat_template")
+    tokenizer_config_path.write_text(json.dumps(tokenizer_config))
+
+    tokenizer = ensure_hf_tokenizer_gguf(model, tmp_path / "cache")
+    reader = GGUFReader(tokenizer, "r")
+
+    assert (
+        reader.get_field("tokenizer.chat_template").contents()
+        == DEEPSEEK_V4_CHAT_TEMPLATE
+    )
 
 
 def test_mfq_embedded_hf_tokenizer_cache_is_reusable_and_runtime_selected(

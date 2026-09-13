@@ -33,6 +33,9 @@ class HfTokenizerError(RuntimeError):
     pass
 
 
+DEEPSEEK_V4_CHAT_TEMPLATE = r"""{{- bos_token -}}{%- for message in messages -%}{%- if message['role'] == 'system' and loop.first -%}{{- message['content'] -}}{%- elif message['role'] == 'user' -%}{{- '<｜User｜>' + message['content'] -}}{%- elif message['role'] == 'tool' -%}{{- '<｜User｜><tool_result>' + message['content'] + '</tool_result>' -}}{%- elif message['role'] == 'assistant' -%}{{- '<｜Assistant｜>' -}}{%- if enable_thinking and message['reasoning_content'] is defined and message['reasoning_content'] -%}{{- message['reasoning_content'] + '</think>' -}}{%- endif -%}{{- message['content'] + eos_token -}}{%- endif -%}{%- endfor -%}{%- if add_generation_prompt -%}{{- '<｜Assistant｜>' -}}{%- if enable_thinking -%}{{- '<think>' -}}{%- else -%}{{- '</think>' -}}{%- endif -%}{%- endif -%}"""
+
+
 def _read_json(path: Path) -> dict[str, Any]:
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
@@ -145,7 +148,7 @@ def _special_id(
 
 def _fingerprint_payloads(payloads: tuple[tuple[str, bytes], ...]) -> str:
     digest = hashlib.sha256()
-    digest.update(b"mfq-hf-tokenizer-gguf-v2\0")
+    digest.update(b"mfq-hf-tokenizer-gguf-v5\0")
     for name, payload in payloads:
         digest.update(name.encode("utf-8"))
         digest.update(payload)
@@ -203,6 +206,15 @@ def _write_tokenizer_gguf(
     model_type = config.get("model_type")
     if not isinstance(model_type, str) or not model_type:
         raise HfTokenizerError("HF config.json has no model_type")
+    if (
+        not isinstance(tokenizer_config.get("chat_template"), (str, list))
+        and model_type == "deepseek_v4"
+    ):
+        tokenizer_config = dict(tokenizer_config)
+        # mlx-vlm's DeepseekV4Processor supplies this family fallback because
+        # the released Vision checkpoint has no tokenizer chat_template.  The
+        # thinking branch preserves MFQ's explicit reasoning API contract.
+        tokenizer_config["chat_template"] = DEEPSEEK_V4_CHAT_TEMPLATE
     model = tokenizer.get("model")
     if not isinstance(model, dict) or model.get("type") != "BPE":
         raise HfTokenizerError("only HF BPE tokenizers are supported by the native runtime")

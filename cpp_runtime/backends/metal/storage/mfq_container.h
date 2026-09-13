@@ -77,6 +77,10 @@ public:
         return source_paths_;
     }
 
+    bool is_hf_source() const noexcept {
+        return static_cast<bool>(hf_store_);
+    }
+
     const std::unordered_map<std::string, MfqRecord>& records() const noexcept {
         return records_;
     }

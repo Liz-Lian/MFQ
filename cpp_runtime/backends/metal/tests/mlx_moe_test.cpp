@@ -3958,6 +3958,12 @@ void test_mxfp4_smallm_nax_policy() {
     require(
         weight.recommended_mxfp4_nax_prefill_tokens(routes) == 5440,
         "MXFP4 NAX top-k=6 prefill recommendation mismatch");
+    const auto automatic_nax_disabled =
+        weight.with_automatic_mxfp4_nax_prefill(false);
+    require(
+        automatic_nax_disabled.recommended_mxfp4_nax_prefill_tokens(routes)
+            == 5440,
+        "explicit MXFP4 NAX force must override the source safety policy");
     require(
         weight.recommended_mxfp4_nax_prefill_tokens(1) == 32768,
         "MXFP4 NAX top-k=1 prefill recommendation mismatch");

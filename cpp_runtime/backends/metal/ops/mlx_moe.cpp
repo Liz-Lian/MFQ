@@ -150,7 +150,8 @@ bool mxfp4_nax_prefill_enabled(
     int route_count,
     int experts,
     int input_width,
-    int output_width) noexcept {
+    int output_width,
+    bool allow_automatic) noexcept {
     constexpr int kDefaultMinRoutes = 1024;
     const bool native_256_expert_geometry = experts == 256 && (
         (input_width == 4096 &&
@@ -171,7 +172,7 @@ bool mxfp4_nax_prefill_enabled(
     const char* value = std::getenv(
         "MFQ_METAL_MFE_PREFILL_NAX");
     if (value == nullptr) {
-        return automatic;
+        return allow_automatic && automatic;
     }
     const auto setting = std::string_view(value);
     if (
@@ -181,7 +182,7 @@ bool mxfp4_nax_prefill_enabled(
     ) {
         return true;
     }
-    return setting == "auto" && automatic;
+    return setting == "auto" && allow_automatic && automatic;
 }
 
 bool mxfp4_nax_smallm_preferred(
@@ -7852,6 +7853,7 @@ struct MlxMfeWeight::Impl {
     bool has_nepq_residual = false;
     std::optional<array> mxfp4_slot_ids;
     bool mxfp4_slot_ids_sorted = false;
+    bool automatic_mxfp4_nax_prefill = true;
     int k_lanes_override = 0;
     std::size_t packed_bytes = 0;
 
@@ -9126,6 +9128,12 @@ MlxMfeWeight MlxMfeWeight::concatenate_projections(
         first.out_per_expert,
         first.neuron_len,
         projection_count);
+    impl->automatic_mxfp4_nax_prefill = std::all_of(
+        weights.begin(),
+        weights.end(),
+        [](const MlxMfeWeight& weight) {
+            return weight.impl_->automatic_mxfp4_nax_prefill;
+        });
     impl->projection_views.reserve(weights.size());
     const bool split_standalone_projections = std::any_of(
         weights.begin(),
@@ -9492,6 +9500,24 @@ MlxMfeWeight MlxMfeWeight::concatenate_experts(
         first.out_per_expert,
         first.neuron_len,
         1);
+    impl->automatic_mxfp4_nax_prefill = std::all_of(
+        weights.begin(),
+        weights.end(),
+        [](const MlxMfeWeight& weight) {
+            return weight.impl_->automatic_mxfp4_nax_prefill;
+        });
+    return MlxMfeWeight(std::move(impl));
+}
+
+MlxMfeWeight MlxMfeWeight::with_automatic_mxfp4_nax_prefill(
+    bool enabled) const {
+    auto impl = std::make_shared<Impl>(*impl_);
+    impl->automatic_mxfp4_nax_prefill = enabled;
+    for (auto& projection : impl->projection_views) {
+        projection = MlxMfeWeight(projection)
+            .with_automatic_mxfp4_nax_prefill(enabled)
+            .impl_;
+    }
     return MlxMfeWeight(std::move(impl));
 }
 
@@ -9841,7 +9867,8 @@ int MlxMfeWeight::recommended_mxfp4_nax_prefill_tokens(
                route_count,
                impl_->experts,
                impl_->neuron_len,
-               impl_->out_per_expert)
+               impl_->out_per_expert,
+               impl_->automatic_mxfp4_nax_prefill)
         ? recommended_tokens
         : 0;
 }
@@ -10108,7 +10135,8 @@ array MlxMfeWeight::routed_matmul_sorted(
              route_count,
              impl_->experts,
              impl_->neuron_len,
-             impl_->out_per_expert) ||
+             impl_->out_per_expert,
+             impl_->automatic_mxfp4_nax_prefill) ||
          force_mxfp4_nax)
         && impl_->mxfp4_slot_ids.has_value()
         && impl_->projections == 1

@@ -76,7 +76,8 @@ array load_dense(
 
 MlxRoutedLinear load_routed(
     const MfqContainer& model,
-    const std::string& name) {
+    const std::string& name,
+    bool allow_automatic_mxfp4_nax_prefill = true) {
     const auto& record = model.record(name);
     if (record.dtype != "MFE") {
         throw std::runtime_error(
@@ -84,7 +85,11 @@ MlxRoutedLinear load_routed(
             + name);
     }
     const auto mapped = model.map_record(name);
-    return MlxRoutedLinear::from_blob(mapped.view());
+    auto weight = MlxMoeWeight::from_blob(mapped.view());
+    if (!allow_automatic_mxfp4_nax_prefill) {
+        weight = weight.with_automatic_mxfp4_nax_prefill(false);
+    }
+    return MlxRoutedLinear(std::move(weight));
 }
 
 std::optional<MlxGroupedLinear> make_grouped(
@@ -455,14 +460,31 @@ MlxDeepseekV4Moe MlxDeepseekV4Moe::load(
         routed_gate_up;
     std::optional<MlxRoutedLinear> routed_gate;
     std::optional<MlxRoutedLinear> routed_up;
+    // mlx-vlm executes the three raw checkpoint projections directly through
+    // SwitchGLU.  MFQ's grouped-MMQ path has matching end-to-end numerics for
+    // the virtual HF views; the large-M gather-QMM shortcut currently does
+    // not, and its small per-layer error becomes incoherent on long prompts.
+    // Keep native MFQ artifacts on their established optimized policy while
+    // raw-HF V4 defaults to the parity-verified path.
+    const bool allow_automatic_mxfp4_nax_prefill =
+        !model.is_hf_source();
     if (split_gate_up) {
         routed_gate.emplace(
-            load_routed(model, gate_name));
+            load_routed(
+                model,
+                gate_name,
+                allow_automatic_mxfp4_nax_prefill));
         routed_up.emplace(
-            load_routed(model, up_name));
+            load_routed(
+                model,
+                up_name,
+                allow_automatic_mxfp4_nax_prefill));
     } else {
         routed_gate_up.emplace(
-            load_routed(model, gate_up_name));
+            load_routed(
+                model,
+                gate_up_name,
+                allow_automatic_mxfp4_nax_prefill));
     }
     return MlxDeepseekV4Moe(
         config,
@@ -482,7 +504,10 @@ MlxDeepseekV4Moe MlxDeepseekV4Moe::load(
         std::move(routed_gate),
         std::move(routed_up),
         std::optional<MlxRoutedLinear>(
-            load_routed(model, down_name)),
+            load_routed(
+                model,
+                down_name,
+                allow_automatic_mxfp4_nax_prefill)),
         nullptr,
         nullptr,
         layer,
@@ -579,11 +604,16 @@ MlxDeepseekV4Moe MlxDeepseekV4Moe::load_named(
     std::optional<MlxRoutedLinear> gate_up;
     std::optional<MlxRoutedLinear> gate;
     std::optional<MlxRoutedLinear> up;
+    const bool allow_automatic_mxfp4_nax_prefill =
+        !model.is_hf_source();
     if (!stream_all && split) {
-        gate.emplace(load_routed(model, gate_name));
-        up.emplace(load_routed(model, up_name));
+        gate.emplace(load_routed(
+            model, gate_name, allow_automatic_mxfp4_nax_prefill));
+        up.emplace(load_routed(
+            model, up_name, allow_automatic_mxfp4_nax_prefill));
     } else if (!stream_all) {
-        gate_up.emplace(load_routed(model, gate_up_name));
+        gate_up.emplace(load_routed(
+            model, gate_up_name, allow_automatic_mxfp4_nax_prefill));
     }
     std::optional<array> visual_bias;
     if (config.has_vision() &&
@@ -644,7 +674,8 @@ MlxDeepseekV4Moe MlxDeepseekV4Moe::load_named(
         std::move(gate_up),
         std::move(gate),
         std::move(up),
-        std::optional<MlxRoutedLinear>(load_routed(model, down_name)),
+        std::optional<MlxRoutedLinear>(load_routed(
+            model, down_name, allow_automatic_mxfp4_nax_prefill)),
         nullptr,
         nullptr,
         0,

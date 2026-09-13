@@ -316,6 +316,12 @@ def test_backend_converts_deepseek_v4_dsml_content_to_openai_tool_calls() -> Non
     assert isinstance(payload, dict)
     assert payload["reasoning_format"] == "none"
     assert payload["tool_choice"] == "required"
+    prompt = payload["mfq_preformatted_prompt"]
+    assert isinstance(prompt, str)
+    assert prompt.startswith("<｜begin▁of▁sentence｜>")
+    assert '"name": "write"' in prompt
+    assert "<｜DSML｜tool_calls>" in prompt
+    assert prompt.endswith("<｜Assistant｜></think>")
 
 
 @pytest.mark.parametrize(

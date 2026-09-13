@@ -184,7 +184,7 @@ void test_fp4_sim() {
     require_close(
         evaluated_float(std::move(actual)),
         expected,
-        1e-3f,
+        1e-4f,
         "FP4");
 }
 
@@ -1506,6 +1506,91 @@ void test_direct_decode_attention_path() {
         "direct local decode attention");
 }
 
+void test_direct_multi_attention_matches_reference_plan() {
+    constexpr int heads = 64;
+    constexpr int dimension = 512;
+    constexpr int ratio = 4;
+    constexpr int window = 128;
+    constexpr int history = 0;
+    constexpr int queries = 257;
+    constexpr int pool_len = 700;
+    constexpr int topk_count = 512;
+
+    std::vector<float> query(
+        static_cast<std::size_t>(heads) * queries * dimension);
+    for (std::size_t index = 0; index < query.size(); ++index) {
+        query[index] = static_cast<float>(
+            static_cast<int>((index * 29 + 11) % 127) - 63) / 128.0f;
+    }
+    std::vector<float> local(
+        static_cast<std::size_t>(history + queries) * dimension);
+    for (std::size_t index = 0; index < local.size(); ++index) {
+        local[index] = static_cast<float>(
+            static_cast<int>((index * 17 + 7) % 97) - 48) / 96.0f;
+    }
+    std::vector<float> pool(
+        static_cast<std::size_t>(pool_len) * dimension);
+    for (std::size_t index = 0; index < pool.size(); ++index) {
+        pool[index] = static_cast<float>(
+            static_cast<int>((index * 13 + 5) % 89) - 44) / 88.0f;
+    }
+    std::vector<std::int32_t> topk_values(
+        static_cast<std::size_t>(queries) * topk_count);
+    for (int query_index = 0; query_index < queries; ++query_index) {
+        for (int pool_index = 0; pool_index < topk_count; ++pool_index) {
+            topk_values[
+                static_cast<std::size_t>(query_index) * topk_count +
+                pool_index] = (pool_index * 313 + query_index * 17) % pool_len;
+        }
+    }
+    std::vector<float> sinks(heads);
+    for (int head = 0; head < heads; ++head) {
+        sinks[head] = -0.75f + static_cast<float>(head) / 113.0f;
+    }
+
+    auto query_array = mlx::core::astype(
+        float_array(query, Shape{1, heads, queries, dimension}),
+        mlx::core::float16);
+    auto local_array = mlx::core::astype(
+        float_array(local, Shape{1, history + queries, dimension}),
+        mlx::core::float16);
+    auto pool_array = mlx::core::astype(
+        float_array(pool, Shape{1, pool_len, dimension}),
+        mlx::core::float16);
+    auto topk = int_array(
+        topk_values,
+        Shape{1, queries, topk_count});
+    auto sink_array = float_array(sinks, Shape{heads});
+    auto plan = mfq::metal::mlx_dsa_build_prefill_plan(
+        topk,
+        history,
+        history,
+        pool_len,
+        ratio,
+        window);
+    auto reference = mfq::metal::mlx_dsa_sparse_attention(
+        query_array,
+        mlx::core::concatenate({local_array, pool_array}, 1),
+        plan.first,
+        plan.second,
+        sink_array);
+    auto direct = mfq::metal::mlx_dsa_sparse_multi_attention(
+        query_array,
+        local_array,
+        pool_array,
+        pool_len,
+        topk,
+        sink_array,
+        history,
+        ratio,
+        window);
+    require_close(
+        evaluated_float(std::move(direct)),
+        evaluated_float(std::move(reference)),
+        1e-3f,
+        "direct multi-query sparse attention");
+}
+
 void test_short_prefill_plan_matches_circular_decode() {
     constexpr int heads = 64;
     constexpr int dimension = 512;
@@ -1731,6 +1816,7 @@ int main() {
         test_sparse_attention_path(6);
         test_sparse_attention_path(32);
         test_direct_decode_attention_path();
+        test_direct_multi_attention_matches_reference_plan();
         test_short_prefill_plan_matches_circular_decode();
         test_invalid_inputs();
         std::cout

@@ -17,6 +17,7 @@ from uuid import UUID, uuid4
 import httpx
 
 from mfq.server.capabilities import capabilities_for_architecture
+from mfq.server.deepseek_v4_prompt import render_deepseek_v4_prompt
 from mfq.server.models import (
     ModelCapabilities,
     ResponseFormat,
@@ -255,6 +256,25 @@ class OpenAIChatBackend:
             payload["mfq_session_id"] = str(session_id)
         if multimodal is not None:
             payload["mfq_multimodal"] = multimodal
+        if (
+            self._model_type is not None
+            and capabilities_for_architecture(
+                self._model_type
+            ).architecture_family == "deepseek_v4"
+        ):
+            # DeepSeek-V4 publishes a processor-side encoder rather than a HF
+            # chat_template.  Match mlx-vlm and send the native worker the
+            # canonical rendered prompt, while retaining messages/tools above
+            # so its output grammar and structured parser remain active.
+            payload["mfq_preformatted_prompt"] = render_deepseek_v4_prompt(
+                backend_messages,
+                tools=tools,
+                tool_choice=tool_choice,
+                response_format=response_format,
+                enable_thinking=sampling.enable_thinking,
+                reasoning_effort=sampling.reasoning_effort,
+                parallel_tool_calls=True,
+            )
         headers = {"Accept": "text/event-stream"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"

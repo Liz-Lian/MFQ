@@ -1325,6 +1325,19 @@ static RequestWork parse_work(const json & body, bool chat, const MfqTokenizer &
         work.token_constraint =
             make_token_constraint(tokenizer, chat_params);
         prompt = chat_params.prompt;
+        if (body.contains("mfq_preformatted_prompt") &&
+            !body["mfq_preformatted_prompt"].is_null()) {
+            if (!body["mfq_preformatted_prompt"].is_string() ||
+                body["mfq_preformatted_prompt"].get_ref<
+                    const std::string&>().empty()) {
+                throw ApiError(
+                    400,
+                    "invalid_request_error",
+                    "mfq_preformatted_prompt must be a non-empty string",
+                    "mfq_preformatted_prompt");
+            }
+            prompt = body["mfq_preformatted_prompt"].get<std::string>();
+        }
         parse_special = true;
         work.chat_parser.format = chat_params.format;
         work.chat_parser.reasoning_format =

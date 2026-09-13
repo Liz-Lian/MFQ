@@ -169,6 +169,11 @@ public:
     static MlxMfeWeight concatenate_experts(
         const std::vector<MlxMfeWeight>& weights);
 
+    // Return a shared-storage view with automatic large-M MLX gather-QMM
+    // selection enabled or disabled. Explicit environment forcing remains
+    // available for operator experiments.
+    MlxMfeWeight with_automatic_mxfp4_nax_prefill(bool enabled) const;
+
     // Build a native MXFP4 routed view over a shared slot arena without
     // copying packed values or scales. slot_for_expert maps each global
     // expert ID to one arena row.

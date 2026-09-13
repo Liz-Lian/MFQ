@@ -55,6 +55,12 @@ def test_serve_exposes_public_host_and_port_options(tmp_path: Path) -> None:
             "0.0.0.0",
             "--port",
             "9001",
+            "--max-queued-requests-per-runtime",
+            "7",
+            "--max-runtime-memory",
+            "12G",
+            "--runtime-idle-timeout",
+            "300",
         ]
     )
 
@@ -63,8 +69,14 @@ def test_serve_exposes_public_host_and_port_options(tmp_path: Path) -> None:
     assert defaults.model is None
     assert defaults.running_executable is None
     assert defaults.access_log is True
+    assert defaults.max_queued_requests_per_runtime is None
+    assert defaults.max_runtime_memory is None
+    assert defaults.runtime_idle_timeout is None
     assert args.host == "0.0.0.0"
     assert args.port == 9001
+    assert args.max_queued_requests_per_runtime == 7
+    assert args.max_runtime_memory == 12 * 1024**3
+    assert args.runtime_idle_timeout == 300
 
 
 def test_serve_accepts_an_empty_initial_model_catalog() -> None:

@@ -245,6 +245,100 @@ int main() try {
     }
 
     {
+        const auto lru_root = root / "restart-lru-test";
+        const std::vector<std::int64_t> old_tokens{31, 32, 33, 34};
+        const std::vector<std::int64_t> new_tokens{41, 42, 43, 44};
+        std::uint64_t one_file_bytes = 0;
+        {
+            PagedPrefixCache cache(PagedPrefixCacheConfig{
+                lru_root,
+                "restart-lru",
+                4,
+                4096,
+                0,
+                2,
+            });
+            BlockHash parent{};
+            (void)cache.store(
+                parent, old_tokens.data(), old_tokens.size(), payload({1, 2, 3}));
+            cache.flush();
+            one_file_bytes = cache.metrics().disk_bytes;
+            require(one_file_bytes > 0, "restart LRU fixture was not persisted");
+        }
+        {
+            PagedPrefixCache cache(PagedPrefixCacheConfig{
+                lru_root,
+                "restart-lru",
+                4,
+                one_file_bytes,
+                0,
+                2,
+            });
+            BlockHash parent{};
+            (void)cache.store(
+                parent, new_tokens.data(), new_tokens.size(), payload({4, 5, 6}));
+            cache.flush();
+            require(cache.match(new_tokens).matched_tokens == 4,
+                    "new block was treated as oldest after restart");
+            require(cache.match(old_tokens).matched_tokens == 0,
+                    "restart LRU did not evict the older persisted block");
+        }
+    }
+
+    {
+        const auto recovery_root = root / "scan-recovery-test";
+        std::filesystem::path canonical;
+        {
+            PagedPrefixCache cache(PagedPrefixCacheConfig{
+                recovery_root,
+                "scan-recovery",
+                4,
+                4096,
+                0,
+                2,
+            });
+            BlockHash parent{};
+            const auto hash = cache.store(
+                parent, tokens.data(), 4, payload({7, 8, 9}));
+            cache.flush();
+            const auto text = block_hash_hex(hash);
+            canonical = recovery_root /
+                block_hash_hex(sha256("scan-recovery")) /
+                text.substr(0, 2) /
+                (text + ".mfqkv");
+        }
+        const auto invalid_dir = canonical.parent_path().parent_path() / "ff";
+        std::filesystem::create_directories(invalid_dir);
+        const auto duplicate = invalid_dir /
+            "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff.mfqkv";
+        std::filesystem::copy_file(canonical, duplicate);
+        const auto truncated = invalid_dir /
+            "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee.mfqkv";
+        {
+            std::ofstream output(truncated, std::ios::binary);
+            output << "incomplete";
+        }
+        {
+            PagedPrefixCache cache(PagedPrefixCacheConfig{
+                recovery_root,
+                "scan-recovery",
+                4,
+                4096,
+                0,
+                2,
+            });
+            require(!std::filesystem::exists(duplicate),
+                    "non-canonical duplicate cache block survived recovery");
+            require(!std::filesystem::exists(truncated),
+                    "truncated cache block survived recovery");
+            require(cache.metrics().corrupt_blocks == 2,
+                    "rejected startup cache blocks were not counted");
+            require(cache.match(tokens).matched_tokens == 4,
+                    "valid block was lost during startup recovery");
+        }
+    }
+
+    {
         const auto pin_root = root / "pin-test";
         PagedPrefixCache cache(PagedPrefixCacheConfig{
             pin_root,

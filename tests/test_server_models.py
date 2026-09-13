@@ -17,13 +17,14 @@ import pytest
 from mfq.formats.header import FileHeader
 from mfq.formats.io import save
 from mfq.server.api import create_app
-from mfq.server.backend import BackendDelta
+from mfq.server.backend import BackendDelta, BackendError
 from mfq.server.catalog import (
     MODEL_FILE_INDEX,
     DiscoveredModel,
     DuplicateModelNameError,
     ModelCatalog,
 )
+from mfq.server.jobs import JobExecutionError
 from mfq.server.models import JobStatus, RuntimeInstanceState, SamplingParams
 from mfq.server.runtime_pool import ManagedRuntimePool, RuntimeConflictError, _ManagedRuntime
 from mfq.server.service import ServerService
@@ -34,6 +35,29 @@ from mfq.tools.split_mfq import split_mfq
 class IdleBackend:
     async def aclose(self) -> None:
         return None
+
+
+class _TestJobContext:
+    def __init__(self) -> None:
+        self.callbacks = []
+
+    def raise_if_cancelled(self) -> None:
+        return None
+
+    def add_cleanup(self, callback) -> None:
+        self.callbacks.append(callback)
+
+    async def progress(self, *_args, **_kwargs) -> None:
+        return None
+
+    async def log(self, *_args, **_kwargs) -> None:
+        return None
+
+    async def cleanup(self) -> None:
+        for callback in reversed(self.callbacks):
+            result = callback()
+            if result is not None:
+                await result
 
 
 def test_empty_runtime_pool_reports_an_idle_server() -> None:
@@ -655,10 +679,179 @@ def test_concurrent_loads_reserve_the_catalog_name(tmp_path: Path) -> None:
 
                 assert sorted(job["status"] for job in jobs) == ["failed", "succeeded"]
                 failed = next(job for job in jobs if job["status"] == "failed")
-                assert failed["error"]["code"] == "model_already_loaded"
+                assert failed["error"]["code"] in {
+                    "model_already_loaded",
+                    "model_already_loading",
+                }
                 assert len((await pool.instances()).data) == 1
         finally:
             await service.aclose()
+
+    asyncio.run(run())
+
+
+def test_failed_runtime_start_does_not_leave_a_stuck_pool_slot(tmp_path: Path) -> None:
+    async def run() -> None:
+        model_dir = tmp_path / "models"
+        model_dir.mkdir()
+        _model(model_dir / "tiny.mfq", architecture="qwen35")
+        executable = tmp_path / "fake-runtime"
+        executable.write_text(
+            "#!/usr/bin/env python3\nraise SystemExit(2)\n",
+            encoding="utf-8",
+        )
+        executable.chmod(executable.stat().st_mode | stat.S_IXUSR)
+        catalog = ModelCatalog([model_dir], cache_seconds=0)
+        pool = ManagedRuntimePool(
+            catalog,
+            executable,
+            startup_timeout_seconds=5,
+            max_instances=1,
+        )
+        store = SessionStore(tmp_path / "mfq.server.sqlite3")
+        service = ServerService(store, pool, catalog=catalog, runtime_manager=pool)
+        app = create_app(service)
+        async with app.router.lifespan_context(app):
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+                accepted = await client.post(
+                    "/api/v1/models/load", json={"model": "tiny"}
+                )
+                failed = await _wait_for_job(client, accepted.json()["operation_id"])
+                assert failed["status"] == "failed", failed
+                for _ in range(100):
+                    if not (await pool.instances()).data:
+                        break
+                    await asyncio.sleep(0.01)
+                assert (await pool.instances()).data == []
+
+                _fake_runtime(executable)
+                accepted = await client.post(
+                    "/api/v1/models/load", json={"model": "tiny"}
+                )
+                loaded = await _wait_for_job(client, accepted.json()["operation_id"])
+                assert loaded["status"] == "succeeded", loaded
+
+    asyncio.run(run())
+
+
+def test_request_driven_load_waiters_receive_the_same_startup_error(
+    tmp_path: Path,
+) -> None:
+    async def run() -> None:
+        model_dir = tmp_path / "models"
+        model_dir.mkdir()
+        _model(model_dir / "broken.mfq", architecture="qwen35")
+        executable = tmp_path / "fake-runtime"
+        executable.write_text(
+            "#!/usr/bin/env python3\n"
+            "import time\n"
+            "time.sleep(0.1)\n"
+            "raise SystemExit(2)\n",
+            encoding="utf-8",
+        )
+        executable.chmod(executable.stat().st_mode | stat.S_IXUSR)
+        pool = ManagedRuntimePool(
+            ModelCatalog([model_dir], cache_seconds=0),
+            executable,
+            startup_timeout_seconds=5,
+        )
+
+        async def consume() -> None:
+            async for _delta in pool.stream(
+                model="broken",
+                messages=[{"role": "user", "content": "hello"}],
+                sampling=SamplingParams(),
+            ):
+                pass
+
+        try:
+            results = await asyncio.gather(
+                consume(),
+                consume(),
+                return_exceptions=True,
+            )
+            assert all(isinstance(item, BackendError) for item in results)
+            assert {item.code for item in results if isinstance(item, BackendError)} == {
+                "runtime_start_failed"
+            }
+            assert {
+                item.status_code
+                for item in results
+                if isinstance(item, BackendError)
+            } == {503}
+            assert (await pool.instances()).data == []
+        finally:
+            await pool.aclose()
+
+    asyncio.run(run())
+
+
+def test_request_driven_model_loads_coalesce_and_restore_exact_settings(
+    tmp_path: Path,
+) -> None:
+    async def run() -> None:
+        model_dir = tmp_path / "models"
+        model_dir.mkdir()
+        _model(model_dir / "first.mfq", architecture="qwen35")
+        _model(model_dir / "second.mfq", architecture="qwen35")
+        executable = tmp_path / "fake-runtime"
+        _fake_runtime(executable)
+        catalog = ModelCatalog([model_dir], cache_seconds=0)
+        pool = ManagedRuntimePool(
+            catalog,
+            executable,
+            startup_timeout_seconds=5,
+            max_instances=1,
+        )
+        store = SessionStore(tmp_path / "mfq.server.sqlite3")
+        service = ServerService(store, pool, catalog=catalog, runtime_manager=pool)
+        app = create_app(service)
+        async with app.router.lifespan_context(app):
+            activated = await asyncio.gather(
+                pool._ensure_model_loaded("first"),
+                pool._ensure_model_loaded("first"),
+            )
+            assert activated[0] is not None
+            assert activated[0] is activated[1]
+            assert [item.model for item in (await pool.instances()).data] == ["first"]
+
+            first_id = (await pool.instances()).data[0].id
+            unload_context = _TestJobContext()
+            await pool.unload(
+                unload_context,  # type: ignore[arg-type]
+                {"instance_id": str(first_id)},
+            )
+            await unload_context.cleanup()
+            load_context = _TestJobContext()
+            await pool.load(
+                load_context,  # type: ignore[arg-type]
+                {
+                    "model": "first",
+                    "context_size": 8192,
+                    "prefill_chunk_size": 333,
+                    "prefix_cache_disk_bytes": 123456,
+                    "prefix_cache_block_tokens": 64,
+                    "pin": False,
+                },
+            )
+            await load_context.cleanup()
+            second_context = _TestJobContext()
+            await pool.load(
+                second_context,  # type: ignore[arg-type]
+                {"model": "second"},
+            )
+            await second_context.cleanup()
+            assert [item.model for item in (await pool.instances()).data] == ["second"]
+
+            assert await pool._ensure_model_loaded("first")
+            restored = (await pool.instances()).data
+            assert [item.model for item in restored] == ["first"]
+            assert restored[0].context_size == 8192
+            saved = pool._load_requests["first"]
+            assert saved.prefill_chunk_size == 333
+            assert saved.prefix_cache_disk_bytes == 123456
+            assert saved.prefix_cache_block_tokens == 64
 
     asyncio.run(run())
 
@@ -714,6 +907,58 @@ def test_runtime_pool_evicts_idle_lru_but_preserves_pinned_models(
     asyncio.run(run())
 
 
+def test_runtime_memory_budget_evicts_idle_models_and_respects_pins(
+    tmp_path: Path,
+) -> None:
+    async def scenario(root: Path, *, pinned: bool) -> None:
+        root.mkdir()
+        _model(root / "first.mfq", architecture="qwen35")
+        _model(root / "second.mfq", architecture="qwen35")
+        executable = root / "fake-runtime"
+        _fake_runtime(executable)
+        catalog = ModelCatalog([root], cache_seconds=0)
+        artifacts = (await catalog.list()).data
+        budget = max(item.total_bytes for item in artifacts)
+        pool = ManagedRuntimePool(
+            catalog,
+            executable,
+            startup_timeout_seconds=5,
+            max_instances=2,
+            max_runtime_memory_bytes=budget,
+        )
+        first_context = _TestJobContext()
+        try:
+            await pool.load(
+                first_context,  # type: ignore[arg-type]
+                {"model": "first", "pin": pinned},
+            )
+            await first_context.cleanup()
+            second_context = _TestJobContext()
+            if pinned:
+                with pytest.raises(JobExecutionError) as blocked:
+                    await pool.load(
+                        second_context,  # type: ignore[arg-type]
+                        {"model": "second"},
+                    )
+                assert blocked.value.detail.code == "runtime_memory_limit"
+                assert [item.model for item in (await pool.instances()).data] == ["first"]
+            else:
+                await pool.load(
+                    second_context,  # type: ignore[arg-type]
+                    {"model": "second"},
+                )
+                await second_context.cleanup()
+                assert [item.model for item in (await pool.instances()).data] == ["second"]
+        finally:
+            await pool.aclose()
+
+    async def run() -> None:
+        await scenario(tmp_path / "evictable", pinned=False)
+        await scenario(tmp_path / "pinned", pinned=True)
+
+    asyncio.run(run())
+
+
 def test_runtime_pool_unloads_an_idle_ttl_model(tmp_path: Path) -> None:
     async def run() -> None:
         model_dir = tmp_path / "models"
@@ -728,6 +973,7 @@ def test_runtime_pool_unloads_an_idle_ttl_model(tmp_path: Path) -> None:
             startup_timeout_seconds=5,
             max_instances=1,
             metric_interval_seconds=0.25,
+            default_idle_ttl_seconds=0,
         )
         store = SessionStore(tmp_path / "mfq.server.sqlite3")
         service = ServerService(store, pool, catalog=catalog, runtime_manager=pool)
@@ -736,8 +982,7 @@ def test_runtime_pool_unloads_an_idle_ttl_model(tmp_path: Path) -> None:
             transport = httpx.ASGITransport(app=app)
             async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
                 accepted = await client.post(
-                    "/api/v1/models/load",
-                    json={"model": "ephemeral", "idle_ttl_seconds": 0},
+                    "/api/v1/models/load", json={"model": "ephemeral"},
                 )
                 loaded = await _wait_for_job(client, accepted.json()["operation_id"])
                 assert loaded["status"] == "succeeded", loaded
@@ -843,6 +1088,7 @@ def test_started_runtime_is_registered_in_the_instances_api(tmp_path: Path) -> N
                 assert instances[0]["model"] == "initial"
                 assert instances[0]["state"] == "ready"
                 assert instances[0]["context_size"] == 8192
+                assert instances[0]["resident_bytes"] > 0
 
                 models = await client.get("/api/v1/runtime/models")
                 assert models.status_code == 200
@@ -921,13 +1167,15 @@ def test_started_runtime_monitor_reports_abnormal_exit(tmp_path: Path) -> None:
             stdin=subprocess.DEVNULL,
         )
         pool = ManagedRuntimePool(catalog, tmp_path / "runtime", max_instances=1)
-        pool.register_started(
+        instance_id = pool.register_started(
             artifact=artifact,
             process=process,
             backend=IdleBackend(),
             port=43123,
             context_size=8192,
         )
+        session_id = uuid4()
+        pool._session_routes[session_id] = instance_id
         store = SessionStore(tmp_path / "mfq.server.sqlite3")
         service = ServerService(
             store,
@@ -946,6 +1194,87 @@ def test_started_runtime_monitor_reports_abnormal_exit(tmp_path: Path) -> None:
             assert instances.data[0].error is not None
             assert instances.data[0].error.code == "runtime_exited"
             assert "137" in instances.data[0].error.message
+            assert session_id not in pool._session_routes
+            assert await pool._select("initial", session_id=session_id) is None
+            assert await pool._current_backend() is None
+
+    asyncio.run(run())
+
+
+def test_runtime_selection_does_not_route_a_session_to_the_wrong_model(
+    tmp_path: Path,
+) -> None:
+    async def run() -> None:
+        first_path = tmp_path / "first.mfq"
+        second_path = tmp_path / "second.mfq"
+        _model(first_path)
+        _model(second_path)
+        catalog = ModelCatalog([tmp_path], cache_seconds=0)
+        first_artifact = await catalog.resolve_path(first_path)
+        second_artifact = await catalog.resolve_path(second_path)
+        pool = ManagedRuntimePool(catalog, tmp_path / "runtime", max_instances=2)
+        first = _ManagedRuntime(
+            id=uuid4(),
+            artifact=first_artifact,
+            process=SimpleNamespace(returncode=None),
+            backend=IdleBackend(),
+            port=1,
+            context_size=4096,
+            state=RuntimeInstanceState.READY,
+            request_slots=asyncio.Semaphore(1),
+        )
+        second = _ManagedRuntime(
+            id=uuid4(),
+            artifact=second_artifact,
+            process=SimpleNamespace(returncode=None),
+            backend=IdleBackend(),
+            port=2,
+            context_size=4096,
+            state=RuntimeInstanceState.READY,
+            request_slots=asyncio.Semaphore(1),
+        )
+        pool._instances = {first.id: first, second.id: second}
+        session_id = uuid4()
+        pool._session_routes[session_id] = first.id
+
+        assert await pool._select("second", session_id=session_id) is second
+        assert session_id not in pool._session_routes
+
+        first.state = RuntimeInstanceState.FAILED
+        pool._last_instance_id = first.id
+        assert pool._current_instance_locked() is second
+
+    asyncio.run(run())
+
+
+def test_request_driven_load_rejects_a_changed_artifact_behind_a_loaded_name(
+    tmp_path: Path,
+) -> None:
+    async def run() -> None:
+        model = tmp_path / "shared.mfq"
+        _model(model, architecture="qwen35")
+        catalog = ModelCatalog([tmp_path], cache_seconds=0)
+        original = await catalog.resolve((await catalog.list()).data[0].id)
+        instance = _ManagedRuntime(
+            id=uuid4(),
+            artifact=original,
+            process=SimpleNamespace(returncode=None),
+            backend=IdleBackend(),
+            port=1,
+            context_size=4096,
+            state=RuntimeInstanceState.READY,
+            request_slots=asyncio.Semaphore(1),
+        )
+        pool = ManagedRuntimePool(catalog, tmp_path / "runtime", max_instances=2)
+        pool._instances[instance.id] = instance
+
+        _model(model, architecture="minicpmo45")
+        changed = (await catalog.list(refresh=True)).data[0]
+        assert changed.id != original.resource.id
+        with pytest.raises(BackendError) as conflict:
+            await pool._ensure_model_loaded(changed.id)
+        assert conflict.value.code == "model_name_conflict"
+        assert conflict.value.status_code == 409
 
     asyncio.run(run())
 
@@ -985,14 +1314,18 @@ def test_managed_runtime_reports_and_bounds_queued_requests(tmp_path: Path) -> N
             state=RuntimeInstanceState.READY,
             request_slots=asyncio.Semaphore(1),
         )
-        pool = ManagedRuntimePool(catalog, tmp_path / "runtime")
+        pool = ManagedRuntimePool(
+            catalog,
+            tmp_path / "runtime",
+            max_queued_requests_per_instance=1,
+        )
         pool._instances[instance.id] = instance
         assert await pool._select(artifact.resource.name, session_id=None) is instance
         assert await pool._select(artifact.resource.id, session_id=None) is None
 
-        async def consume() -> None:
+        async def consume(model: str = artifact.resource.name) -> None:
             async for _ in pool.stream(
-                model=artifact.resource.name,
+                model=model,
                 messages=[{"role": "user", "content": "hello"}],
                 sampling=SamplingParams(),
                 session_id=session_id,
@@ -1000,7 +1333,7 @@ def test_managed_runtime_reports_and_bounds_queued_requests(tmp_path: Path) -> N
                 pass
 
         session_id = uuid4()
-        first = asyncio.create_task(consume())
+        first = asyncio.create_task(consume(artifact.resource.id))
         await entered.wait()
         assert await pool.cancel_response(session_id)
         assert blocking_backend.cancelled == [session_id]
@@ -1010,6 +1343,12 @@ def test_managed_runtime_reports_and_bounds_queued_requests(tmp_path: Path) -> N
         assert instance.queued_requests == 1
         listed = await pool.instances()
         assert listed.data[0].queued_requests == 1
+        with pytest.raises(BackendError) as rejected:
+            await consume()
+        assert rejected.value.code == "runtime_queue_full"
+        assert rejected.value.status_code == 429
+        assert rejected.value.retryable
+        assert instance.queued_requests == 1
         release.set()
         await asyncio.gather(first, second)
         assert seen_models == [artifact.resource.name, artifact.resource.name]

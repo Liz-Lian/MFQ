@@ -279,6 +279,9 @@ def _run(args: argparse.Namespace) -> int:
             startup_timeout_seconds=args.runtime_startup_timeout,
             max_instances=args.max_runtime_instances,
             max_requests_per_instance=args.max_requests_per_runtime,
+            max_queued_requests_per_instance=args.max_queued_requests_per_runtime,
+            max_runtime_memory_bytes=args.max_runtime_memory or None,
+            default_idle_ttl_seconds=args.runtime_idle_timeout,
             backend=selected_backend,
             voice_component=voice_component,
             runtime_environment=runtime_environment,
@@ -312,6 +315,7 @@ def _run(args: argparse.Namespace) -> int:
                 ),
                 port=runtime.port,
                 context_size=args.context_size,
+                prefill_chunk_size=args.prefill_chunk_size,
             )
         store = SessionStore(args.db.expanduser().resolve())
         backend = ClusterBackend(runtime_manager, store)
@@ -428,6 +432,21 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
     parser.add_argument("--api-key-env", default="MFQ_SERVER_API_KEY")
     parser.add_argument("--max-runtime-instances", type=_positive_int, default=2)
     parser.add_argument("--max-requests-per-runtime", type=_positive_int, default=1)
+    parser.add_argument(
+        "--max-queued-requests-per-runtime",
+        type=_nonnegative_int,
+        help="maximum waiting requests per model runtime (default: max(32, 4x concurrency))",
+    )
+    parser.add_argument(
+        "--max-runtime-memory",
+        type=_byte_size,
+        help="aggregate resident-model admission budget, such as 96G",
+    )
+    parser.add_argument(
+        "--runtime-idle-timeout",
+        type=_nonnegative_int,
+        help="default seconds before an idle unpinned model is unloaded",
+    )
     parser.add_argument("--log-level", default="info")
     parser.add_argument(
         "--access-log",

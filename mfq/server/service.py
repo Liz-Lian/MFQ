@@ -1115,7 +1115,7 @@ class ServerService:
         except BackendError as error:
             raise ServiceError(
                 error.status_code
-                if error.status_code in {400, 404, 409, 413, 415, 422, 501, 502, 503}
+                if error.status_code in {400, 404, 409, 413, 415, 422, 429, 501, 502, 503}
                 else 503,
                 error.code,
                 str(error),
@@ -1402,7 +1402,10 @@ class ServerService:
         except BackendError as error:
             await self._terminate_backend_failure(prepared.begin.response.id, error)
             raise ServiceError(
-                502,
+                error.status_code
+                if error.status_code
+                in {400, 404, 409, 413, 415, 422, 429, 501, 502, 503}
+                else 502,
                 error.code,
                 str(error),
                 retryable=error.retryable,

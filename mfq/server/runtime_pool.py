@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import socket
 import subprocess
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -77,6 +77,41 @@ class _ManagedRuntime:
     monitor_task: asyncio.Task[None] | None = None
     realtime_gateway: Any | None = None
     realtime_error: str | None = None
+    resident_bytes: int | None = None
+    kv_bytes: int | None = None
+    usage_refreshed_at: float = 0.0
+
+
+class _RuntimeLoadContext:
+    """Job-context subset used by request-driven model activation."""
+
+    def __init__(self) -> None:
+        self._cleanup_callbacks: list[Callable[[], Awaitable[None] | None]] = []
+
+    def raise_if_cancelled(self) -> None:
+        return None
+
+    def add_cleanup(self, callback: Callable[[], Awaitable[None] | None]) -> None:
+        self._cleanup_callbacks.append(callback)
+
+    async def progress(
+        self,
+        value: float,
+        *,
+        message: str | None = None,
+        data: dict[str, Any] | None = None,
+    ) -> None:
+        del value, message, data
+
+    async def log(self, message: str, **options: Any) -> None:
+        del message, options
+
+    async def cleanup(self) -> None:
+        for callback in reversed(self._cleanup_callbacks):
+            with suppress(Exception):
+                result = callback()
+                if result is not None:
+                    await result
 
 
 class ManagedRuntimePool:
@@ -91,6 +126,9 @@ class ManagedRuntimePool:
         startup_timeout_seconds: float = 1800.0,
         max_instances: int = 2,
         max_requests_per_instance: int = 1,
+        max_queued_requests_per_instance: int | None = None,
+        max_runtime_memory_bytes: int | None = None,
+        default_idle_ttl_seconds: int | None = None,
         metric_interval_seconds: float = 2.0,
         backend: str = "metal",
         voice_component: Any | None = None,
@@ -101,12 +139,28 @@ class ManagedRuntimePool:
             raise ValueError("max_instances must be positive")
         if max_requests_per_instance < 1:
             raise ValueError("max_requests_per_instance must be positive")
+        if (
+            max_queued_requests_per_instance is not None
+            and max_queued_requests_per_instance < 0
+        ):
+            raise ValueError("max_queued_requests_per_instance must be non-negative")
+        if max_runtime_memory_bytes is not None and max_runtime_memory_bytes < 1:
+            raise ValueError("max_runtime_memory_bytes must be positive")
+        if default_idle_ttl_seconds is not None and default_idle_ttl_seconds < 0:
+            raise ValueError("default_idle_ttl_seconds must be non-negative")
         self.catalog = catalog
         self.executable = Path(executable).expanduser().resolve()
         self.fallback = fallback
         self.startup_timeout_seconds = startup_timeout_seconds
         self.max_instances = max_instances
         self.max_requests_per_instance = max_requests_per_instance
+        self.max_queued_requests_per_instance = (
+            max(32, max_requests_per_instance * 4)
+            if max_queued_requests_per_instance is None
+            else max_queued_requests_per_instance
+        )
+        self.max_runtime_memory_bytes = max_runtime_memory_bytes
+        self.default_idle_ttl_seconds = default_idle_ttl_seconds
         self.metric_interval_seconds = max(0.25, metric_interval_seconds)
         if backend not in {"cuda", "metal"}:
             raise ValueError(f"unsupported native backend: {backend}")
@@ -117,6 +171,12 @@ class ManagedRuntimePool:
         self.store = None
         self._instances: dict[UUID, _ManagedRuntime] = {}
         self._loading_model_names: set[str] = set()
+        self._load_events: dict[str, asyncio.Event] = {}
+        self._load_errors: dict[str, ErrorDetail] = {}
+        self._load_requests: dict[str, ModelLoadRequest] = {}
+        self._reserved_ports: set[int] = set()
+        self._load_ports: dict[str, int] = {}
+        self._load_bytes: dict[str, int] = {}
         self._session_routes: dict[UUID, UUID] = {}
         self._last_instance_id: UUID | None = None
         self._lock = asyncio.Lock()
@@ -157,6 +217,7 @@ class ManagedRuntimePool:
         backend: ChatBackend,
         port: int,
         context_size: int,
+        prefill_chunk_size: int = 2048,
     ) -> UUID:
         """Register a ready process started before the server event loop exists."""
 
@@ -186,9 +247,15 @@ class ManagedRuntimePool:
             context_size=context_size,
             state=RuntimeInstanceState.READY,
             last_used_at=datetime.now(timezone.utc),
+            idle_ttl_seconds=self.default_idle_ttl_seconds,
             request_slots=asyncio.Semaphore(self.max_requests_per_instance),
         )
         self._instances[instance.id] = instance
+        self._load_requests[artifact.resource.name] = ModelLoadRequest(
+            model=artifact.resource.name,
+            context_size=context_size,
+            prefill_chunk_size=prefill_chunk_size,
+        )
         self._last_instance_id = instance.id
         return instance.id
 
@@ -228,7 +295,7 @@ class ManagedRuntimePool:
                 "runtime_launcher_missing",
                 "the Python MLX worker has no MFQ CLI launcher",
             )
-        evicted: _ManagedRuntime | None = None
+        evicted: list[_ManagedRuntime] = []
         async with self._lock:
             if self._closed:
                 raise RuntimeManagementError("runtime pool is closed")
@@ -241,103 +308,114 @@ class ManagedRuntimePool:
                 ),
                 None,
             )
-            if existing is not None or model_name in self._loading_model_names:
+            if existing is not None and existing.state == RuntimeInstanceState.FAILED:
+                self._detach_instance_locked(existing)
+                existing = None
+            if existing is not None:
                 raise _job_error(
                     "model_already_loaded",
-                    (
-                        f"model is already loaded by runtime instance {existing.id}"
-                        if existing is not None
-                        else f"model is already loading: {model_name}"
-                    ),
+                    f"model is already loaded by runtime instance {existing.id}",
                 )
-            active_count = sum(
-                item.state != RuntimeInstanceState.FAILED for item in self._instances.values()
-            ) + len(self._loading_model_names)
-            if active_count >= self.max_instances:
-                evicted = self._detach_lru_instance_locked()
-                if evicted is None:
-                    raise _job_error(
-                        "runtime_instance_limit",
-                        "managed runtime instance limit reached; all instances are pinned or busy",
+            if model_name in self._loading_model_names:
+                raise _job_error(
+                    "model_already_loading",
+                    f"model is already loading: {model_name}",
+                    retryable=True,
+                )
+            resident_names = {
+                item.artifact.resource.name
+                for item in self._instances.values()
+                if item.state != RuntimeInstanceState.FAILED
+            }
+            active_count = len(resident_names) + sum(
+                name not in resident_names for name in self._loading_model_names
+            )
+            incoming_bytes = artifact.resource.total_bytes
+            if (
+                self.max_runtime_memory_bytes is not None
+                and incoming_bytes > self.max_runtime_memory_bytes
+            ):
+                raise _job_error(
+                    "runtime_model_too_large",
+                    f"model requires {incoming_bytes} bytes but the runtime memory "
+                    f"budget is {self.max_runtime_memory_bytes} bytes",
+                )
+            committed_bytes = sum(
+                self._committed_runtime_bytes(item)
+                for item in self._instances.values()
+                if item.state != RuntimeInstanceState.FAILED
+            ) + sum(
+                reserved_bytes
+                for name, reserved_bytes in self._load_bytes.items()
+                if name not in resident_names
+            )
+            while (
+                active_count >= self.max_instances
+                or (
+                    self.max_runtime_memory_bytes is not None
+                    and committed_bytes + incoming_bytes
+                    > self.max_runtime_memory_bytes
+                )
+            ):
+                victim = self._detach_lru_instance_locked()
+                if victim is None:
+                    memory_limited = (
+                        self.max_runtime_memory_bytes is not None
+                        and committed_bytes + incoming_bytes
+                        > self.max_runtime_memory_bytes
                     )
-            port = self._free_port()
-            self._loading_model_names.add(model_name)
-
-        if evicted is not None:
-            try:
-                await context.log(
-                    f"Evicting idle runtime {evicted.artifact.resource.name} "
-                    f"before loading {model_name}"
+                    raise _job_error(
+                        "runtime_memory_limit" if memory_limited else "runtime_instance_limit",
+                        (
+                            "runtime memory budget reached; all remaining instances "
+                            "are pinned or busy"
+                            if memory_limited
+                            else "managed runtime instance limit reached; all instances "
+                            "are pinned or busy"
+                        ),
+                        retryable=True,
+                    )
+                evicted.append(victim)
+                active_count = max(0, active_count - 1)
+                committed_bytes = max(
+                    0,
+                    committed_bytes - self._committed_runtime_bytes(victim),
                 )
-                await self._stop_process(evicted)
-            except BaseException:
+            port = self._reserve_free_port_locked()
+            load_event = asyncio.Event()
+            self._loading_model_names.add(model_name)
+            self._load_events[model_name] = load_event
+            self._load_errors.pop(model_name, None)
+            self._load_ports[model_name] = port
+            self._load_bytes[model_name] = incoming_bytes
+
+        if evicted:
+            try:
+                for victim in evicted:
+                    await context.log(
+                        f"Evicting idle runtime {victim.artifact.resource.name} "
+                        f"before loading {model_name}"
+                    )
+                    await self._stop_process(victim)
+            except BaseException as error:
+                for victim in evicted:
+                    with suppress(Exception):
+                        await self._stop_process(victim)
                 async with self._lock:
-                    self._loading_model_names.discard(model_name)
+                    self._finish_model_load_locked(
+                        model_name,
+                        load_event,
+                        self._runtime_load_error(error),
+                    )
                 raise
 
-        if python_mlx_worker:
-            command = python_mlx_runtime_command(
-                self.controller_command,
-                model=artifact.path,
-                model_name=artifact.resource.name,
-                host="127.0.0.1",
-                port=port,
-                context_size=request.context_size,
-                prefill_chunk_size=request.prefill_chunk_size,
-            )
-        else:
-            command = [
-                str(self.executable),
-                "--mfq",
-                str(artifact.path),
-                "--server",
-                "--host",
-                "127.0.0.1",
-                "--port",
-                str(port),
-                "--ctx-size",
-                str(request.context_size),
-                "--model-name",
-                artifact.resource.name,
-            ]
-            if self.backend == "metal":
-                command.extend(["--prefill-chunk-size", str(request.prefill_chunk_size)])
-            command.extend(native_tokenizer_arguments(artifact.path))
-            if request.moe_gpu_cache_gb is not None:
-                command.extend(["--moe-gpu-cache-gb", str(request.moe_gpu_cache_gb)])
-        process_environment = native_runtime_environment(
-            self.executable, self.backend, model=artifact.path
-        )
-        process_environment.update(self.runtime_environment)
-        cache_environment = {
-            "MFQ_SERVER_MAX_KV_SESSIONS": request.prefix_cache_max_sessions,
-            "MFQ_SERVER_MAX_KV_SNAPSHOTS_PER_SESSION": (
-                request.prefix_cache_max_snapshots_per_session
-            ),
-            "MFQ_SERVER_KV_SESSION_BYTES": request.prefix_cache_max_bytes,
-            "MFQ_SERVER_DISABLE_PREFIX_CACHE": (
-                None if request.prefix_cache_enabled else 1
-            ),
-            "MFQ_SERVER_PREFIX_CACHE_DISK_BYTES": request.prefix_cache_disk_bytes,
-            "MFQ_SERVER_PREFIX_CACHE_HOT_BYTES": (
-                request.prefix_cache_hot_bytes
-                if request.prefix_cache_hot_bytes is not None
-                else request.prefix_cache_max_bytes
-            ),
-            "MFQ_SERVER_PREFIX_CACHE_BLOCK_TOKENS": (
-                request.prefix_cache_block_tokens
-            ),
-            "MFQ_SERVER_PREFIX_CACHE_PENDING_BYTES": (
-                request.prefix_cache_pending_bytes
-            ),
-        }
-        for name, value in cache_environment.items():
-            if value is not None:
-                process_environment[name] = str(value)
-        if self.backend == "cuda" and request.device_ids:
-            process_environment["CUDA_VISIBLE_DEVICES"] = ",".join(request.device_ids)
-
         try:
+            command, process_environment = self._launch_configuration(
+                artifact,
+                request,
+                python_mlx_worker=python_mlx_worker,
+                port=port,
+            )
             await context.progress(0.02, message="Starting runtime process")
             process = await asyncio.create_subprocess_exec(
                 *command,
@@ -347,9 +425,13 @@ class ManagedRuntimePool:
                 start_new_session=True,
                 env=process_environment,
             )
-        except BaseException:
+        except BaseException as error:
             async with self._lock:
-                self._loading_model_names.discard(model_name)
+                self._finish_model_load_locked(
+                    model_name,
+                    load_event,
+                    self._runtime_load_error(error),
+                )
             raise
         configured_video_library = process_environment.get("MFQ_AVFOUNDATION_VIDEO_LIBRARY")
         avfoundation_video_library = (
@@ -379,18 +461,29 @@ class ManagedRuntimePool:
             port=port,
             context_size=request.context_size,
             sampling_defaults=request.sampling_defaults,
-            idle_ttl_seconds=request.idle_ttl_seconds,
+            idle_ttl_seconds=(
+                request.idle_ttl_seconds
+                if request.idle_ttl_seconds is not None
+                else self.default_idle_ttl_seconds
+            ),
             pinned=request.pin,
             request_slots=asyncio.Semaphore(self.max_requests_per_instance),
         )
         try:
             async with self._lock:
-                self._loading_model_names.discard(model_name)
+                if self._closed:
+                    raise RuntimeManagementError("runtime pool is closed")
                 self._instances[instance.id] = instance
-        except BaseException:
-            async with self._lock:
-                self._loading_model_names.discard(model_name)
-            await self._stop_process(instance)
+        except BaseException as error:
+            try:
+                await self._stop_process(instance)
+            finally:
+                async with self._lock:
+                    self._finish_model_load_locked(
+                        model_name,
+                        load_event,
+                        self._runtime_load_error(error),
+                    )
             raise
 
         keep_process = False
@@ -398,7 +491,22 @@ class ManagedRuntimePool:
         async def cleanup_failed_start() -> None:
             if keep_process:
                 return
-            await self._stop_process(instance)
+            async with self._lock:
+                if self._instances.get(instance.id) is instance:
+                    self._detach_instance_locked(instance)
+            try:
+                await self._stop_process(instance)
+            finally:
+                async with self._lock:
+                    self._finish_model_load_locked(
+                        model_name,
+                        load_event,
+                        ErrorDetail(
+                            code="runtime_start_failed",
+                            message=f"runtime failed while loading {model_name}",
+                            retryable=True,
+                        ),
+                    )
 
         context.add_cleanup(cleanup_failed_start)
         instance.output_task = asyncio.create_task(
@@ -442,10 +550,15 @@ class ManagedRuntimePool:
                 retryable=True,
             )
 
-        instance.state = RuntimeInstanceState.READY
-        instance.last_used_at = datetime.now(timezone.utc)
-        keep_process = True
+        pid = getattr(process, "pid", None)
+        if isinstance(pid, int) and pid > 0:
+            instance.resident_bytes = await asyncio.to_thread(
+                self._process_resident_bytes,
+                pid,
+            )
         async with self._lock:
+            instance.state = RuntimeInstanceState.READY
+            instance.last_used_at = datetime.now(timezone.utc)
             self._last_instance_id = instance.id
         instance.monitor_task = asyncio.create_task(
             self._monitor(instance), name=f"mfq-server-runtime-monitor-{instance.id}"
@@ -454,6 +567,24 @@ class ManagedRuntimePool:
             await context.progress(0.96, message="Enabling voice output")
             await self.enable_realtime(instance.id)
         await context.progress(1.0, message="Model ready")
+        async with self._lock:
+            if (
+                self._instances.get(instance.id) is not instance
+                or instance.state not in {
+                    RuntimeInstanceState.READY,
+                    RuntimeInstanceState.BUSY,
+                }
+            ):
+                raise _job_error(
+                    "runtime_start_failed",
+                    "runtime exited before model activation completed",
+                    retryable=True,
+                )
+            self._load_requests[model_name] = request.model_copy(
+                update={"model": model_name}
+            )
+            self._finish_model_load_locked(model_name, load_event, None)
+            keep_process = True
         return {
             "instance_id": str(instance.id),
             "model_id": artifact.resource.name,
@@ -466,39 +597,62 @@ class ManagedRuntimePool:
         request = ModelUnloadRequest.model_validate(payload)
         async with self._lock:
             instance = self._instances.get(request.instance_id)
-        if instance is None:
-            raise _job_error(
-                "runtime_instance_not_found",
-                f"runtime instance was not found: {request.instance_id}",
-            )
-        if (instance.active_requests or instance.queued_requests) and not request.force:
-            raise _job_error(
-                "runtime_busy",
-                "runtime has active or queued requests",
-                retryable=True,
-            )
-        instance.state = RuntimeInstanceState.UNLOADING
+            if instance is None:
+                raise _job_error(
+                    "runtime_instance_not_found",
+                    f"runtime instance was not found: {request.instance_id}",
+                )
+            if (instance.active_requests or instance.queued_requests) and not request.force:
+                raise _job_error(
+                    "runtime_busy",
+                    "runtime has active or queued requests",
+                    retryable=True,
+                )
+            instance.state = RuntimeInstanceState.UNLOADING
+
+        released = False
+
+        async def cleanup_incomplete_unload() -> None:
+            if released:
+                return
+            await self._stop_process(instance)
+            async with self._lock:
+                if self._instances.get(instance.id) is instance:
+                    self._detach_instance_locked(instance)
+
+        context.add_cleanup(cleanup_incomplete_unload)
         await context.progress(0.2, message="Stopping runtime")
         await self._stop_process(instance)
         await context.progress(0.9, message="Releasing runtime")
         async with self._lock:
-            self._instances.pop(instance.id, None)
-            self._session_routes = {
-                session_id: instance_id
-                for session_id, instance_id in self._session_routes.items()
-                if instance_id != instance.id
-            }
-            if self._last_instance_id == instance.id:
-                self._last_instance_id = None
+            if self._instances.get(instance.id) is instance:
+                self._detach_instance_locked(instance)
+            released = True
         await context.progress(1.0, message="Model unloaded")
         return {"instance_id": str(instance.id), "unloaded": True}
 
     async def instances(self) -> RuntimeInstanceList:
         async with self._lock:
             values = list(self._instances.values())
+            now = asyncio.get_running_loop().time()
+            refresh = []
+            for item in values:
+                if (
+                    item.state in {
+                        RuntimeInstanceState.READY,
+                        RuntimeInstanceState.BUSY,
+                    }
+                    and now - item.usage_refreshed_at >= self.metric_interval_seconds
+                ):
+                    item.usage_refreshed_at = now
+                    refresh.append(item)
             route_counts: dict[UUID, int] = {}
             for instance_id in self._session_routes.values():
                 route_counts[instance_id] = route_counts.get(instance_id, 0) + 1
+        if refresh:
+            await asyncio.gather(
+                *(self._refresh_instance_usage(item) for item in refresh)
+            )
         return RuntimeInstanceList(
             data=[
                 RuntimeInstanceResource(
@@ -508,8 +662,8 @@ class ManagedRuntimePool:
                     devices=[self.backend],
                     active_sessions=route_counts.get(item.id, 0),
                     queued_requests=item.queued_requests,
-                    resident_bytes=None,
-                    kv_bytes=None,
+                    resident_bytes=item.resident_bytes,
+                    kv_bytes=item.kv_bytes,
                     context_size=item.context_size,
                     started_at=item.started_at,
                     last_used_at=item.last_used_at,
@@ -533,6 +687,11 @@ class ManagedRuntimePool:
         response_format: ResponseFormat | None = None,
     ) -> AsyncIterator[BackendDelta]:
         instance = await self._select(model, session_id=session_id)
+        if instance is not None and instance.state == RuntimeInstanceState.LOADING:
+            await self._wait_for_model_ready(model)
+            instance = await self._select(model, session_id=session_id)
+        if instance is None:
+            instance = await self._ensure_model_loaded(model)
         if instance is None:
             if self.fallback is None:
                 raise BackendError("model_not_loaded", f"model is not loaded: {model}")
@@ -555,6 +714,17 @@ class ManagedRuntimePool:
                 RuntimeInstanceState.BUSY,
             }:
                 raise BackendError("model_not_ready", f"model runtime is {instance.state.value}")
+            if (
+                instance.active_requests + instance.queued_requests
+                >= self.max_requests_per_instance
+                + self.max_queued_requests_per_instance
+            ):
+                raise BackendError(
+                    "runtime_queue_full",
+                    f"model runtime queue is full: {model}",
+                    retryable=True,
+                    status_code=429,
+                )
             instance.queued_requests += 1
         try:
             await instance.request_slots.acquire()
@@ -601,6 +771,12 @@ class ManagedRuntimePool:
         async with self._lock:
             instance_id = self._session_routes.get(source_session_id)
             instance = self._instances.get(instance_id) if instance_id is not None else None
+            if instance is not None and instance.state not in {
+                RuntimeInstanceState.READY,
+                RuntimeInstanceState.BUSY,
+            }:
+                self._session_routes.pop(source_session_id, None)
+                instance = None
         if instance is None:
             return (
                 await self.fallback.fork_session(source_session_id, target_session_id)
@@ -617,6 +793,11 @@ class ManagedRuntimePool:
         async with self._lock:
             instance_id = self._session_routes.pop(session_id, None)
             instance = self._instances.get(instance_id) if instance_id is not None else None
+            if instance is not None and instance.state not in {
+                RuntimeInstanceState.READY,
+                RuntimeInstanceState.BUSY,
+            }:
+                instance = None
         if instance is None:
             return await self.fallback.close_session(session_id) if self.fallback else False
         return await instance.backend.close_session(session_id)
@@ -625,6 +806,12 @@ class ManagedRuntimePool:
         async with self._lock:
             instance_id = self._session_routes.get(session_id)
             instance = self._instances.get(instance_id) if instance_id is not None else None
+            if instance is not None and instance.state not in {
+                RuntimeInstanceState.READY,
+                RuntimeInstanceState.BUSY,
+            }:
+                self._session_routes.pop(session_id, None)
+                instance = None
         backend = instance.backend if instance is not None else self.fallback
         if backend is None:
             return False
@@ -638,7 +825,9 @@ class ManagedRuntimePool:
         return await backend.capabilities()
 
     async def runtime_status(self) -> dict[str, Any]:
-        backend = await self._current_backend()
+        async with self._lock:
+            instance = self._current_instance_locked()
+            backend = instance.backend if instance is not None else self.fallback
         if backend is None:
             return {
                 "runtime_state": "idle",
@@ -651,20 +840,28 @@ class ManagedRuntimePool:
                 "reloading": False,
             }
         status = dict(await backend.runtime_status())
-        async with self._lock:
-            instance = (
-                self._instances.get(self._last_instance_id)
-                if self._last_instance_id is not None
-                else None
-            )
         if instance is not None:
             status["instance_id"] = str(instance.id)
             status["runtime_state"] = instance.state.value
             if instance.sampling_defaults is not None:
                 status["sampling_defaults"] = instance.sampling_defaults.model_dump(mode="json")
-            status["process_resident_bytes"] = await asyncio.to_thread(
-                self._process_resident_bytes, instance.process.pid
+            pid = getattr(instance.process, "pid", None)
+            resident_bytes = (
+                await asyncio.to_thread(self._process_resident_bytes, pid)
+                if isinstance(pid, int) and pid > 0
+                else None
             )
+            status["process_resident_bytes"] = resident_bytes
+            kv_value = status.get(
+                "prefix_cache_hot_bytes",
+                status.get("prefix_cache_bytes"),
+            )
+            async with self._lock:
+                if self._instances.get(instance.id) is instance:
+                    if resident_bytes is not None:
+                        instance.resident_bytes = resident_bytes
+                    if isinstance(kv_value, (int, float)) and kv_value >= 0:
+                        instance.kv_bytes = int(kv_value)
         return status
 
     async def runtime_models(self) -> dict[str, Any]:
@@ -798,13 +995,24 @@ class ManagedRuntimePool:
             idle_reaper = self._idle_reaper_task
             self._idle_reaper_task = None
             self._idle_reaper_wakeup.set()
+            for model, event in self._load_events.items():
+                self._load_errors[model] = ErrorDetail(
+                    code="runtime_pool_closed",
+                    message="runtime pool closed while the model was loading",
+                    retryable=True,
+                )
+                event.set()
+            self._load_events.clear()
+            self._loading_model_names.clear()
+            self._load_ports.clear()
+            self._load_bytes.clear()
+            self._reserved_ports.clear()
         if idle_reaper is not None and idle_reaper is not asyncio.current_task():
             await idle_reaper
         for instance in instances:
             await self._stop_process(instance)
         async with self._lock:
             self._instances.clear()
-            self._loading_model_names.clear()
             self._session_routes.clear()
         if self.fallback is not None:
             await self.fallback.aclose()
@@ -814,15 +1022,155 @@ class ManagedRuntimePool:
             if session_id is not None:
                 instance_id = self._session_routes.get(session_id)
                 if instance_id is not None:
-                    return self._instances.get(instance_id)
+                    routed = self._instances.get(instance_id)
+                    if (
+                        routed is not None
+                        and routed.artifact.resource.name == model
+                        and routed.state in {
+                            RuntimeInstanceState.READY,
+                            RuntimeInstanceState.BUSY,
+                        }
+                    ):
+                        return routed
+                    self._session_routes.pop(session_id, None)
             matches = [
                 item
                 for item in self._instances.values()
                 if model == item.artifact.resource.name
+                and item.state in {
+                    RuntimeInstanceState.LOADING,
+                    RuntimeInstanceState.READY,
+                    RuntimeInstanceState.BUSY,
+                }
             ]
         if len(matches) > 1:
             raise BackendError("ambiguous_model", f"multiple loaded runtimes match {model}")
         return matches[0] if matches else None
+
+    async def _ensure_model_loaded(self, model: str) -> _ManagedRuntime | None:
+        try:
+            artifact = await self.catalog.resolve(model)
+        except ModelArtifactNotFoundError:
+            return None
+        model_name = artifact.resource.name
+        artifact_id = artifact.resource.id
+        async with self._lock:
+            if self._closed:
+                return None
+            ready = next(
+                (
+                    item
+                    for item in self._instances.values()
+                    if item.artifact.resource.id == artifact_id
+                    and item.state in {
+                        RuntimeInstanceState.READY,
+                        RuntimeInstanceState.BUSY,
+                    }
+                ),
+                None,
+            )
+            event = self._load_events.get(model_name)
+            request = self._load_requests.get(model_name)
+        if ready is not None:
+            return ready
+        if event is not None:
+            await self._wait_for_model_ready(model_name)
+            return await self._select_loaded_artifact(model_name, artifact_id)
+
+        exact_request = (request or ModelLoadRequest(model=model_name)).model_copy(
+            update={
+                "model": model_name,
+                "artifact_uri": f"mfq://{artifact_id}",
+            }
+        )
+        context = _RuntimeLoadContext()
+        try:
+            await self.load(
+                context,  # type: ignore[arg-type]
+                exact_request.model_dump(mode="python"),
+            )
+        except JobExecutionError as error:
+            if error.detail.code in {
+                "model_already_loaded",
+                "model_already_loading",
+            }:
+                await self._wait_for_model_ready(model_name)
+                return await self._select_loaded_artifact(model_name, artifact_id)
+            if error.detail.code == "model_artifact_not_found":
+                return None
+            async with self._lock:
+                self._load_errors[model_name] = error.detail
+            raise self._backend_load_error(error.detail) from error
+        except Exception as error:
+            detail = self._runtime_load_error(error)
+            async with self._lock:
+                self._load_errors[model_name] = detail
+            raise self._backend_load_error(detail) from error
+        finally:
+            await context.cleanup()
+        return await self._select_loaded_artifact(model_name, artifact_id)
+
+    async def _select_loaded_artifact(
+        self,
+        model_name: str,
+        artifact_id: str,
+    ) -> _ManagedRuntime | None:
+        selected = await self._select(model_name, session_id=None)
+        if selected is None:
+            return None
+        if selected.artifact.resource.id != artifact_id:
+            raise BackendError(
+                "model_name_conflict",
+                f"loaded model name {model_name!r} refers to a different artifact",
+                status_code=409,
+            )
+        return selected
+
+    async def _wait_for_model_ready(self, model: str) -> bool:
+        async with self._lock:
+            ready = next(
+                (
+                    item
+                    for item in self._instances.values()
+                    if item.artifact.resource.name == model
+                    and item.state in {
+                        RuntimeInstanceState.READY,
+                        RuntimeInstanceState.BUSY,
+                    }
+                ),
+                None,
+            )
+            event = self._load_events.get(model)
+            load_error = self._load_errors.get(model)
+        if ready is not None:
+            return True
+        if event is None:
+            if load_error is not None:
+                raise self._backend_load_error(load_error)
+            return False
+        try:
+            await asyncio.wait_for(
+                event.wait(),
+                timeout=max(1.0, self.startup_timeout_seconds),
+            )
+        except TimeoutError:
+            raise BackendError(
+                "runtime_start_timeout",
+                f"timed out waiting for model runtime: {model}",
+                retryable=True,
+                status_code=503,
+            ) from None
+        selected = await self._select(model, session_id=None)
+        if selected is not None and selected.state in {
+            RuntimeInstanceState.READY,
+            RuntimeInstanceState.BUSY,
+        }:
+            return True
+        async with self._lock:
+            error = self._load_errors.get(model)
+        if error is not None:
+            raise self._backend_load_error(error)
+        return False
 
     async def _current_backend(self) -> ChatBackend | None:
         async with self._lock:
@@ -835,7 +1183,10 @@ class ManagedRuntimePool:
             if self._last_instance_id is not None
             else None
         )
-        if instance is None:
+        if instance is None or instance.state not in {
+            RuntimeInstanceState.READY,
+            RuntimeInstanceState.BUSY,
+        }:
             instance = next(
                 (
                     item
@@ -864,6 +1215,66 @@ class ManagedRuntimePool:
         victim.state = RuntimeInstanceState.UNLOADING
         self._detach_instance_locked(victim)
         return victim
+
+    def _finish_model_load_locked(
+        self,
+        model: str,
+        event: asyncio.Event,
+        error: ErrorDetail | None,
+    ) -> None:
+        owns_event = self._load_events.get(model) is event
+        if owns_event:
+            if error is None:
+                self._load_errors.pop(model, None)
+            elif model not in self._load_errors:
+                self._load_errors[model] = error
+        self._loading_model_names.discard(model)
+        if owns_event:
+            self._load_events.pop(model, None)
+        port = self._load_ports.pop(model, None)
+        if port is not None:
+            self._reserved_ports.discard(port)
+        self._load_bytes.pop(model, None)
+        event.set()
+
+    @staticmethod
+    def _runtime_load_error(error: BaseException) -> ErrorDetail:
+        if isinstance(error, JobExecutionError):
+            return error.detail
+        if isinstance(error, asyncio.CancelledError):
+            return ErrorDetail(
+                code="runtime_load_cancelled",
+                message="runtime loading was cancelled",
+                retryable=True,
+            )
+        return ErrorDetail(
+            code="runtime_load_failed",
+            message=str(error) or type(error).__name__,
+            retryable=True,
+        )
+
+    @staticmethod
+    def _backend_load_error(detail: ErrorDetail) -> BackendError:
+        status_by_code = {
+            "model_artifact_incomplete": 409,
+            "model_conversion_required": 409,
+            "runtime_model_too_large": 413,
+            "unsupported_device": 422,
+            "runtime_identity_mismatch": 502,
+        }
+        return BackendError(
+            detail.code,
+            detail.message,
+            retryable=detail.retryable,
+            status_code=status_by_code.get(detail.code, 503),
+        )
+
+    @staticmethod
+    def _committed_runtime_bytes(instance: _ManagedRuntime) -> int:
+        return max(
+            instance.artifact.resource.total_bytes,
+            instance.resident_bytes or 0,
+        )
 
     def _detach_instance_locked(self, instance: _ManagedRuntime) -> None:
         self._instances.pop(instance.id, None)
@@ -973,23 +1384,78 @@ class ManagedRuntimePool:
             if isinstance(process, subprocess.Popen)
             else await process.wait()
         )
-        if instance.state == RuntimeInstanceState.UNLOADING or self._closed:
-            return
-        instance.state = RuntimeInstanceState.FAILED
-        instance.error = ErrorDetail(
+        error = ErrorDetail(
             code="runtime_exited",
             message=f"runtime process exited with status {status}",
             retryable=True,
         )
+        async with self._lock:
+            if (
+                instance.state == RuntimeInstanceState.UNLOADING
+                or self._closed
+                or self._instances.get(instance.id) is not instance
+            ):
+                return
+            instance.state = RuntimeInstanceState.FAILED
+            instance.error = error
+            self._session_routes = {
+                session_id: instance_id
+                for session_id, instance_id in self._session_routes.items()
+                if instance_id != instance.id
+            }
+            if self._last_instance_id == instance.id:
+                self._last_instance_id = next(
+                    (
+                        item.id
+                        for item in self._instances.values()
+                        if item.state in {
+                            RuntimeInstanceState.READY,
+                            RuntimeInstanceState.BUSY,
+                        }
+                    ),
+                    None,
+                )
         if self.store is not None:
             await asyncio.to_thread(
                 self.store.append_runtime_log,
                 RuntimeLogLevel.ERROR,
-                instance.error.message,
+                error.message,
                 instance_id=instance.id,
                 fields={"source": "runtime.lifecycle", "exit_status": status},
             )
         await instance.backend.aclose()
+
+    async def _refresh_instance_usage(self, instance: _ManagedRuntime) -> None:
+        pid = getattr(instance.process, "pid", None)
+        resident_task = (
+            asyncio.create_task(
+                asyncio.to_thread(self._process_resident_bytes, pid)
+            )
+            if isinstance(pid, int) and pid > 0
+            else None
+        )
+        runtime_status = getattr(instance.backend, "runtime_status", None)
+        status: dict[str, Any] | None = None
+        if callable(runtime_status):
+            try:
+                value = await asyncio.wait_for(runtime_status(), timeout=1.0)
+                if isinstance(value, dict):
+                    status = value
+            except Exception:
+                pass
+        resident = await resident_task if resident_task is not None else None
+        kv_bytes: int | None = None
+        if status is not None:
+            value = status.get("prefix_cache_hot_bytes", status.get("prefix_cache_bytes"))
+            if isinstance(value, (int, float)) and value >= 0:
+                kv_bytes = int(value)
+        async with self._lock:
+            if self._instances.get(instance.id) is not instance:
+                return
+            if resident is not None:
+                instance.resident_bytes = resident
+            if kv_bytes is not None:
+                instance.kv_bytes = kv_bytes
 
     async def _stop_process(self, instance: _ManagedRuntime) -> None:
         instance.state = RuntimeInstanceState.UNLOADING
@@ -1023,11 +1489,83 @@ class ManagedRuntimePool:
             process.kill()
             process.wait(timeout=5.0)
 
-    @staticmethod
-    def _free_port() -> int:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-            sock.bind(("127.0.0.1", 0))
-            return int(sock.getsockname()[1])
+    def _reserve_free_port_locked(self) -> int:
+        for _ in range(128):
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                sock.bind(("127.0.0.1", 0))
+                port = int(sock.getsockname()[1])
+            if port not in self._reserved_ports:
+                self._reserved_ports.add(port)
+                return port
+        raise RuntimeManagementError("unable to reserve a unique runtime port")
+
+    def _launch_configuration(
+        self,
+        artifact: DiscoveredModel,
+        request: ModelLoadRequest,
+        *,
+        python_mlx_worker: bool,
+        port: int,
+    ) -> tuple[list[str], dict[str, str]]:
+        if python_mlx_worker:
+            command = python_mlx_runtime_command(
+                self.controller_command,
+                model=artifact.path,
+                model_name=artifact.resource.name,
+                host="127.0.0.1",
+                port=port,
+                context_size=request.context_size,
+                prefill_chunk_size=request.prefill_chunk_size,
+            )
+        else:
+            command = [
+                str(self.executable),
+                "--mfq",
+                str(artifact.path),
+                "--server",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                str(port),
+                "--ctx-size",
+                str(request.context_size),
+                "--model-name",
+                artifact.resource.name,
+            ]
+            if self.backend == "metal":
+                command.extend(["--prefill-chunk-size", str(request.prefill_chunk_size)])
+            command.extend(native_tokenizer_arguments(artifact.path))
+            if request.moe_gpu_cache_gb is not None:
+                command.extend(["--moe-gpu-cache-gb", str(request.moe_gpu_cache_gb)])
+
+        process_environment = native_runtime_environment(
+            self.executable, self.backend, model=artifact.path
+        )
+        process_environment.update(self.runtime_environment)
+        cache_environment = {
+            "MFQ_SERVER_MAX_KV_SESSIONS": request.prefix_cache_max_sessions,
+            "MFQ_SERVER_MAX_KV_SNAPSHOTS_PER_SESSION": (
+                request.prefix_cache_max_snapshots_per_session
+            ),
+            "MFQ_SERVER_KV_SESSION_BYTES": request.prefix_cache_max_bytes,
+            "MFQ_SERVER_DISABLE_PREFIX_CACHE": (
+                None if request.prefix_cache_enabled else 1
+            ),
+            "MFQ_SERVER_PREFIX_CACHE_DISK_BYTES": request.prefix_cache_disk_bytes,
+            "MFQ_SERVER_PREFIX_CACHE_HOT_BYTES": (
+                request.prefix_cache_hot_bytes
+                if request.prefix_cache_hot_bytes is not None
+                else request.prefix_cache_max_bytes
+            ),
+            "MFQ_SERVER_PREFIX_CACHE_BLOCK_TOKENS": request.prefix_cache_block_tokens,
+            "MFQ_SERVER_PREFIX_CACHE_PENDING_BYTES": request.prefix_cache_pending_bytes,
+        }
+        for name, value in cache_environment.items():
+            if value is not None:
+                process_environment[name] = str(value)
+        if self.backend == "cuda" and request.device_ids:
+            process_environment["CUDA_VISIBLE_DEVICES"] = ",".join(request.device_ids)
+        return command, process_environment
 
     @staticmethod
     def _process_resident_bytes(pid: int) -> int | None:

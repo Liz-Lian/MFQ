@@ -40,6 +40,7 @@ constexpr std::uint32_t kFormatVersion = 1;
 constexpr std::uint64_t kHeaderBytes =
     8 + 4 + 32 + 32 + 32 + 4 + 4 + 8 + 32;
 constexpr std::string_view kHashDomain = "mfq-paged-prefix-v1";
+constexpr std::uint64_t kDiskSafeDenominator = 10;
 
 constexpr std::array<std::uint32_t, 64> kShaConstants{
     0x428a2f98U, 0x71374491U, 0xb5c0fbcfU, 0xe9b5dba5U,
@@ -492,6 +493,21 @@ public:
                 ++metrics_.deduplicated_writes;
                 return hash;
             }
+            const auto pending_files = static_cast<std::uint64_t>(
+                pending_.size()) + 1;
+            const auto pending_headers = pending_files >
+                    std::numeric_limits<std::uint64_t>::max() / kHeaderBytes
+                ? std::numeric_limits<std::uint64_t>::max()
+                : pending_files * kHeaderBytes;
+            const auto pending_payloads = pending_write_bytes_ >
+                    std::numeric_limits<std::uint64_t>::max() - payload_bytes
+                ? std::numeric_limits<std::uint64_t>::max()
+                : pending_write_bytes_ + payload_bytes;
+            const auto reserved_bytes = pending_payloads >
+                    std::numeric_limits<std::uint64_t>::max() - pending_headers
+                ? std::numeric_limits<std::uint64_t>::max()
+                : pending_payloads + pending_headers;
+            enforce_disk_budget_locked(reserved_bytes);
             put_hot_locked(hash, payload);
             const bool pending_bytes_full =
                 config_.max_pending_bytes == 0 ||
@@ -929,6 +945,13 @@ private:
     }
 
     void scan() {
+        struct ScannedEntry {
+            BlockHash hash{};
+            DiskEntry entry;
+            std::filesystem::file_time_type modified{};
+        };
+
+        std::vector<ScannedEntry> scanned;
         std::error_code error;
         for (std::filesystem::recursive_directory_iterator iterator(
                  namespace_dir_,
@@ -950,28 +973,68 @@ private:
                 iterator->path().extension() != ".mfqkv") {
                 continue;
             }
+            const auto reject = [&] {
+                std::error_code remove_error;
+                std::filesystem::remove(iterator->path(), remove_error);
+                ++metrics_.corrupt_blocks;
+            };
+            std::error_code symlink_error;
+            if (iterator->is_symlink(symlink_error)) {
+                reject();
+                continue;
+            }
+            if (symlink_error) continue;
             ParsedHeader header;
-            if (!read_header(iterator->path(), header)) continue;
+            if (!read_header(iterator->path(), header) ||
+                iterator->path().lexically_normal() !=
+                    path_for(header.hash).lexically_normal()) {
+                reject();
+                continue;
+            }
             const auto file_bytes = iterator->file_size(error);
             if (error) {
                 error.clear();
                 continue;
             }
+            if (header.payload_bytes >
+                    std::numeric_limits<std::uint64_t>::max() - kHeaderBytes ||
+                file_bytes != kHeaderBytes + header.payload_bytes) {
+                reject();
+                continue;
+            }
             const auto modified = iterator->last_write_time(error);
-            const auto last_used = error
-                ? ++clock_
-                : static_cast<std::uint64_t>(modified.time_since_epoch().count());
+            const auto ordering_time = error
+                ? std::filesystem::file_time_type::min()
+                : modified;
             error.clear();
-            disk_[header.hash] = DiskEntry{
-                iterator->path(),
-                header.parent,
-                header.token_count,
-                header.payload_bytes,
-                file_bytes,
-                last_used,
-                0,
-            };
-            disk_bytes_ += file_bytes;
+            scanned.push_back(ScannedEntry{
+                header.hash,
+                DiskEntry{
+                    iterator->path(),
+                    header.parent,
+                    header.token_count,
+                    header.payload_bytes,
+                    file_bytes,
+                    0,
+                    0,
+                },
+                ordering_time,
+            });
+        }
+        std::sort(
+            scanned.begin(),
+            scanned.end(),
+            [](const ScannedEntry& left, const ScannedEntry& right) {
+                if (left.modified != right.modified) {
+                    return left.modified < right.modified;
+                }
+                return left.entry.path.native() < right.entry.path.native();
+        });
+        for (auto& item : scanned) {
+            item.entry.last_used = ++clock_;
+            const auto file_bytes = item.entry.file_bytes;
+            const auto insertion = disk_.emplace(item.hash, std::move(item.entry));
+            if (insertion.second) disk_bytes_ += file_bytes;
         }
         enforce_disk_budget_locked();
         sync_metrics_locked();
@@ -1020,8 +1083,24 @@ private:
         sync_metrics_locked();
     }
 
-    void enforce_disk_budget_locked() {
-        while (disk_bytes_ > config_.max_disk_bytes && !disk_.empty()) {
+    std::uint64_t effective_disk_budget_locked() const {
+        std::error_code error;
+        const auto space = std::filesystem::space(namespace_dir_, error);
+        if (error) return config_.max_disk_bytes;
+        const auto available = static_cast<std::uint64_t>(space.available);
+        const auto managed_and_available = disk_bytes_ >
+                std::numeric_limits<std::uint64_t>::max() - available
+            ? std::numeric_limits<std::uint64_t>::max()
+            : disk_bytes_ + available;
+        const auto safe_available = managed_and_available -
+            managed_and_available / kDiskSafeDenominator;
+        return std::min(config_.max_disk_bytes, safe_available);
+    }
+
+    void enforce_disk_budget_locked(std::uint64_t reserved_bytes = 0) {
+        const auto budget = effective_disk_budget_locked();
+        const auto target = reserved_bytes >= budget ? 0 : budget - reserved_bytes;
+        while (disk_bytes_ > target && !disk_.empty()) {
             auto victim = disk_.end();
             for (auto iterator = disk_.begin(); iterator != disk_.end();
                  ++iterator) {

@@ -336,6 +336,74 @@ def test_service_failure_is_persisted_and_reported(tmp_path: Path) -> None:
     asyncio.run(run())
 
 
+def test_service_preserves_runtime_queue_backpressure_status(tmp_path: Path) -> None:
+    async def run() -> None:
+        backend = FakeBackend(
+            error=BackendError(
+                "runtime_queue_full",
+                "runtime queue is full",
+                retryable=True,
+                status_code=429,
+            )
+        )
+        service = make_service(tmp_path, backend)
+        await asyncio.to_thread(
+            service.store.create_session,
+            CreateSessionRequest(model="model-a"),
+            session_id=SESSION_ID,
+        )
+        prepared = await service.prepare_response(
+            SESSION_ID,
+            CreateResponseRequest(
+                request_id=REQUEST_ID,
+                expected_revision=0,
+                input=[{"type": "text", "text": "question"}],
+                stream=False,
+            ),
+        )
+        with pytest.raises(ServiceError) as caught:
+            await service.collect_response(prepared)
+        assert caught.value.status_code == 429
+        assert caught.value.detail.code == "runtime_queue_full"
+        assert caught.value.detail.retryable
+
+    asyncio.run(run())
+
+
+def test_service_preserves_request_driven_runtime_start_status(tmp_path: Path) -> None:
+    async def run() -> None:
+        backend = FakeBackend(
+            error=BackendError(
+                "runtime_start_failed",
+                "runtime process exited during startup",
+                retryable=True,
+                status_code=503,
+            )
+        )
+        service = make_service(tmp_path, backend)
+        await asyncio.to_thread(
+            service.store.create_session,
+            CreateSessionRequest(model="model-a"),
+            session_id=SESSION_ID,
+        )
+        prepared = await service.prepare_response(
+            SESSION_ID,
+            CreateResponseRequest(
+                request_id=REQUEST_ID,
+                expected_revision=0,
+                input=[{"type": "text", "text": "question"}],
+                stream=False,
+            ),
+        )
+        with pytest.raises(ServiceError) as caught:
+            await service.collect_response(prepared)
+        assert caught.value.status_code == 503
+        assert caught.value.detail.code == "runtime_start_failed"
+        assert caught.value.detail.retryable
+
+    asyncio.run(run())
+
+
 def test_service_applies_console_context_and_sampling_options(tmp_path: Path) -> None:
     async def run() -> None:
         backend = FakeBackend(

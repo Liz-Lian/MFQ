@@ -458,7 +458,8 @@ public:
             {
                 std::lock_guard<std::mutex> lock(mutex_);
                 if (disk_.count(parent) == 0 &&
-                    pending_.count(parent) == 0) {
+                    pending_.count(parent) == 0 &&
+                    hot_.count(parent) == 0) {
                     break;
                 }
             }
@@ -1054,13 +1055,22 @@ private:
         hot_[hash] = HotEntry{std::move(payload), ++clock_};
         hot_bytes_ += hot_[hash].payload->size();
         while (hot_bytes_ > config_.max_hot_bytes && !hot_.empty()) {
-            auto victim = hot_.begin();
-            for (auto iterator = std::next(hot_.begin());
-                 iterator != hot_.end(); ++iterator) {
-                if (iterator->second.last_used < victim->second.last_used) {
+            auto victim = hot_.end();
+            for (auto iterator = hot_.begin(); iterator != hot_.end();
+                 ++iterator) {
+                // A block with no durable copy must remain available while a
+                // live session pins it. Durable pinned blocks may still leave
+                // the hot tier and be restored from SSD on demand.
+                if (disk_.count(iterator->first) == 0 &&
+                    pins_.count(iterator->first) != 0) {
+                    continue;
+                }
+                if (victim == hot_.end() ||
+                    iterator->second.last_used < victim->second.last_used) {
                     victim = iterator;
                 }
             }
+            if (victim == hot_.end()) break;
             hot_bytes_ -= victim->second.payload->size();
             hot_.erase(victim);
         }
@@ -1118,11 +1128,8 @@ private:
             std::filesystem::remove(victim->second.path, error);
             if (error) break;
             disk_bytes_ -= victim->second.file_bytes;
-            auto hot = hot_.find(victim->first);
-            if (hot != hot_.end()) {
-                hot_bytes_ -= hot->second.payload->size();
-                hot_.erase(hot);
-            }
+            // Disk and RAM are independent tiers. A hot payload remains a
+            // valid content-addressed hit after its durable copy is evicted.
             disk_.erase(victim);
             ++metrics_.evictions;
         }

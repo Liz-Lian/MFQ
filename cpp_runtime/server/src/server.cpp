@@ -1374,6 +1374,11 @@ static RequestWork parse_work(const json & body, bool chat, const MfqTokenizer &
     }
     work.prompt = tokenizer.tokenize(prompt, parse_special);
     if (work.prompt.empty()) throw ApiError(400, "invalid_request_error", "prompt tokenized to an empty sequence", "prompt");
+    // Exact token prefixes are reusable independently of MFQ's optional
+    // session routing extension.  A session ID only pins the matched chain
+    // for fast continuation; content-addressed SSD/RAM blocks also serve
+    // ordinary OpenAI-compatible stateless requests.
+    work.cache_plan.stable_prefix_tokens = work.prompt.size();
     if (body.contains("mfq_session_id") && !body["mfq_session_id"].is_null()) {
         if (!body["mfq_session_id"].is_string()) {
             throw ApiError(
@@ -1388,7 +1393,6 @@ static RequestWork parse_work(const json & body, bool chat, const MfqTokenizer &
                 "mfq_session_id must contain 1 to 128 safe identifier bytes",
                 "mfq_session_id");
         }
-        work.cache_plan.stable_prefix_tokens = work.prompt.size();
     }
     if (chat && normalized_identity(model_type).rfind("deepseek_v4", 0) == 0 &&
         boolean_field(body, "add_generation_prompt", true)) {

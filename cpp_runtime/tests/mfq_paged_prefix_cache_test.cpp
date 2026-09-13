@@ -361,6 +361,30 @@ int main() try {
     }
 
     {
+        const auto hot_only_root = root / "hot-only-test";
+        PagedPrefixCache cache(PagedPrefixCacheConfig{
+            hot_only_root,
+            "hot-only",
+            4,
+            0,
+            4096,
+            2,
+        });
+        BlockHash parent{};
+        const auto hot = cache.store(
+            parent, tokens.data(), 4, payload({5, 6, 7, 8}));
+        cache.flush();
+        const auto stats = cache.metrics();
+        require(stats.disk_blocks == 0 && stats.hot_blocks == 1,
+                "RAM-only prefix block did not survive disk eviction");
+        require(cache.match(tokens).matched_tokens == 4,
+                "RAM-only prefix block was not matched");
+        const auto loaded = cache.load(hot);
+        require(loaded && *loaded == std::vector<std::uint8_t>({5, 6, 7, 8}),
+                "RAM-only prefix block could not be loaded");
+    }
+
+    {
         const auto byte_root = root / "pending-byte-test";
         PagedPrefixCache cache(PagedPrefixCacheConfig{
             byte_root,

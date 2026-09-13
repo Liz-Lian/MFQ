@@ -564,6 +564,13 @@ public:
         }
     }
 
+    bool persistent_prefix_enabled() const noexcept {
+        if constexpr (Codec::available) {
+            return static_cast<bool>(paged_cache_);
+        }
+        return false;
+    }
+
     std::size_t restore_best(
         Runtime& runtime,
         const std::string& requested_session,
@@ -884,8 +891,8 @@ private:
         const std::string& requested_session,
         const std::vector<std::int64_t>& prompt,
         std::size_t maximum_prefix_tokens) {
-        if (requested_session.empty() || max_sessions_ == 0 ||
-            !runtime.supports_text_session_state() || prompt.size() < 2) {
+        if (max_sessions_ == 0 || !runtime.supports_text_session_state() ||
+            prompt.size() < 2) {
             return 0;
         }
         const auto limit = std::min(
@@ -913,8 +920,10 @@ private:
                 matched_tokens,
                 paged_cache_->block_size_tokens());
             runtime.restore_text_session_state(std::move(state));
-            bind_paged_session(
-                requested_session, match.blocks, match.matched_tokens);
+            if (!requested_session.empty()) {
+                bind_paged_session(
+                    requested_session, match.blocks, match.matched_tokens);
+            }
             if (trace_) {
                 std::cerr
                     << "server_session_cache backend=metal action=paged_hit "
@@ -937,8 +946,7 @@ private:
     void store_paged(
         const std::string& session_id,
         const SessionState& state) {
-        if (session_id.empty() || max_sessions_ == 0 ||
-            state.tokens.empty()) {
+        if (max_sessions_ == 0 || state.tokens.empty()) {
             return;
         }
         const auto block_size = paged_cache_->block_size_tokens();
@@ -964,10 +972,12 @@ private:
                 std::move(payload));
             blocks.push_back(parent);
         }
-        bind_paged_session(
-            session_id,
-            std::move(blocks),
-            full_blocks * block_size);
+        if (!session_id.empty()) {
+            bind_paged_session(
+                session_id,
+                std::move(blocks),
+                full_blocks * block_size);
+        }
         if (trace_) {
             std::cerr
                 << "server_session_cache backend=metal action=paged_store "
@@ -1443,16 +1453,21 @@ int serve_loaded_runtime(
             auto& loaded_runtime = runtime_holder->value();
             const auto stable_prefix_tokens = std::min(
                 cache_plan.stable_prefix_tokens, prompt.size());
-            const bool session_enabled =
-                !cache_plan.session_id.empty() &&
+            const bool cache_enabled =
                 stable_prefix_tokens > 0 &&
+                (!cache_plan.session_id.empty() ||
+                 session_cache->persistent_prefix_enabled()) &&
                 loaded_runtime.supports_text_session_state();
-            if (session_enabled) {
+            if (cache_enabled) {
                 (void)session_cache->restore_best(
                     loaded_runtime,
                     cache_plan.session_id,
                     prompt,
                     stable_prefix_tokens);
+            }
+            auto effective_cache_plan = cache_plan;
+            if (!cache_enabled) {
+                effective_cache_plan.stable_prefix_tokens = 0;
             }
             const auto generated = generate_with_prefill_metrics(
                 loaded_runtime,
@@ -1461,10 +1476,10 @@ int serve_loaded_runtime(
                 sampling.max_tokens,
                 callback,
                 on_prefill,
-                cache_plan,
+                effective_cache_plan,
                 token_constraint,
                 prefill_chunk_size);
-            if (session_enabled &&
+            if (cache_enabled &&
                 loaded_runtime.cache_position() ==
                     static_cast<int>(stable_prefix_tokens)) {
                 try {

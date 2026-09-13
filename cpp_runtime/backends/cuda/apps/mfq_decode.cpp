@@ -22407,6 +22407,10 @@ public:
         }
     }
 
+    bool persistent_prefix_enabled() const noexcept {
+        return static_cast<bool>(paged_cache_);
+    }
+
     size_t restore_best(
             Model & model,
             const std::string & requested_session,
@@ -22689,8 +22693,7 @@ private:
             const std::string & requested_session,
             const std::vector<int64_t> & prompt,
             size_t maximum_prefix_tokens) {
-        if (requested_session.empty() || max_sessions_ == 0 ||
-                !model.supports_paged_text_session_state() ||
+        if (max_sessions_ == 0 || !model.supports_paged_text_session_state() ||
                 prompt.size() < 2) {
             return 0;
         }
@@ -22719,8 +22722,10 @@ private:
                 matched_tokens,
                 paged_cache_->block_size_tokens());
             model.restore_text_session_state(state);
-            bind_paged_session(
-                requested_session, match.blocks, match.matched_tokens);
+            if (!requested_session.empty()) {
+                bind_paged_session(
+                    requested_session, match.blocks, match.matched_tokens);
+            }
             if (trace_) {
                 std::cerr
                     << "server_session_cache backend=cuda action=paged_hit "
@@ -22743,8 +22748,7 @@ private:
     void store_paged(
             const std::string & session_id,
             const TextSessionState & state) {
-        if (session_id.empty() || max_sessions_ == 0 ||
-                state.tokens.empty()) {
+        if (max_sessions_ == 0 || state.tokens.empty()) {
             return;
         }
         const auto block_size = paged_cache_->block_size_tokens();
@@ -22770,10 +22774,12 @@ private:
                 std::move(payload));
             blocks.push_back(parent);
         }
-        bind_paged_session(
-            session_id,
-            std::move(blocks),
-            full_blocks * block_size);
+        if (!session_id.empty()) {
+            bind_paged_session(
+                session_id,
+                std::move(blocks),
+                full_blocks * block_size);
+        }
         if (trace_) {
             std::cerr
                 << "server_session_cache backend=cuda action=paged_store "
@@ -23371,11 +23377,12 @@ static int32_t generate_server_tokens(
     auto options = mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt64).device(mfq_tensor_backend::kCUDA);
     const size_t stable_prefix_tokens = std::min(
         cache_plan.stable_prefix_tokens, prompt.size());
-    const bool session_enabled =
-        !cache_plan.session_id.empty() &&
+    const bool cache_enabled =
         stable_prefix_tokens > 0 &&
+        (!cache_plan.session_id.empty() ||
+         session_cache.persistent_prefix_enabled()) &&
         model.supports_text_session_state();
-    const size_t reused_tokens = session_enabled
+    const size_t reused_tokens = cache_enabled
         ? session_cache.restore_best(
             model, cache_plan.session_id, prompt, stable_prefix_tokens)
         : 0;
@@ -23399,7 +23406,7 @@ static int32_t generate_server_tokens(
         {1}, mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kFloat32).device(mfq_tensor_backend::kCUDA));
     std::mt19937_64 rng(sampling.seed);
     const auto store_session_snapshot = [&](size_t token_count) {
-        if (!session_enabled || model.cache_pos !=
+        if (!cache_enabled || model.cache_pos !=
                 static_cast<int64_t>(token_count)) {
             return;
         }
@@ -23418,7 +23425,7 @@ static int32_t generate_server_tokens(
     };
     auto sample_first_token = [&]() {
         ServerPrefillCudaTimer prefill_timer;
-        if (session_enabled && stable_prefix_tokens < prompt.size()) {
+        if (cache_enabled && stable_prefix_tokens < prompt.size()) {
             if (reused_tokens < stable_prefix_tokens) {
                 auto stable_suffix = full_ids.narrow(
                     1, static_cast<int64_t>(reused_tokens),

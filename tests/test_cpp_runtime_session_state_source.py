@@ -39,6 +39,16 @@ def test_native_session_identifier_reaches_the_cuda_runtime() -> None:
     assert "cache_plan.session_id" in DECODE
 
 
+def test_stateless_text_requests_use_the_content_addressed_prefix_cache() -> None:
+    assert "work.cache_plan.stable_prefix_tokens = work.prompt.size();" in SERVER
+    assert "persistent_prefix_enabled()" in DECODE
+    assert "persistent_prefix_enabled()" in METAL_DECODE
+    assert "!cache_plan.session_id.empty() ||" in DECODE
+    assert "!cache_plan.session_id.empty() ||" in METAL_DECODE
+    assert "if (!requested_session.empty())" in DECODE
+    assert "if (!requested_session.empty())" in METAL_DECODE
+
+
 def test_full_attention_session_state_copies_only_visible_linear_kv() -> None:
     assert "struct TextSessionState" in DECODE
     assert "supports_text_session_state" in DECODE

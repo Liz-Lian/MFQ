@@ -274,3 +274,53 @@ def test_cluster_falls_back_to_legacy_runtime_inventory(tmp_path: Path) -> None:
         await client.aclose()
 
     asyncio.run(run())
+
+
+def test_stateless_remote_stream_releases_ephemeral_session(tmp_path: Path) -> None:
+    async def run() -> None:
+        store = SessionStore(tmp_path / "mfq.server.sqlite3")
+        requested_paths: list[str] = []
+        client = httpx.AsyncClient(
+            transport=_remote_app(requested_paths=requested_paths)
+        )
+        cluster = ClusterBackend(FakeBackend(), store, client=client)
+        service = ServerService(store, cluster, cluster=cluster)
+        transport = httpx.ASGITransport(app=create_app(service))
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as api:
+            created = await api.post(
+                "/api/v1/cluster/nodes",
+                json={"name": "worker-a", "url": "http://worker-a:8090"},
+            )
+            assert created.status_code == 201
+
+            chunks = [
+                delta
+                async for delta in cluster.stream(
+                    model="remote-model",
+                    messages=[{"role": "user", "content": "hello"}],
+                    sampling=__import__(
+                        "mfq.server.models", fromlist=["SamplingParams"]
+                    ).SamplingParams(),
+                )
+            ]
+            assert chunks[-1].finish_reason == "stop"
+            assert cluster._sessions == {}
+            assert (
+                "/api/v1/sessions/11111111-1111-4111-8111-111111111111"
+                in requested_paths
+            )
+
+            interrupted = cluster.stream(
+                model="remote-model",
+                messages=[{"role": "user", "content": "stop early"}],
+                sampling=__import__(
+                    "mfq.server.models", fromlist=["SamplingParams"]
+                ).SamplingParams(),
+            )
+            assert (await anext(interrupted)).content_delta == "remote"
+            await interrupted.aclose()
+            assert cluster._sessions == {}
+
+        await client.aclose()
+
+    asyncio.run(run())

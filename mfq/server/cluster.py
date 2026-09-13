@@ -9,6 +9,7 @@ import json
 import os
 import time
 from collections.abc import AsyncIterator, Sequence
+from contextlib import aclosing, suppress
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
@@ -199,17 +200,20 @@ class ClusterBackend:
             return
         node.active_requests += 1
         try:
-            async for delta in self._remote_stream(
-                node.resource,
-                model=model,
-                messages=messages,
-                sampling=sampling,
-                session_id=session_id,
-                tools=tools,
-                tool_choice=tool_choice,
-                response_format=response_format,
-            ):
-                yield delta
+            async with aclosing(
+                self._remote_stream(
+                    node.resource,
+                    model=model,
+                    messages=messages,
+                    sampling=sampling,
+                    session_id=session_id,
+                    tools=tools,
+                    tool_choice=tool_choice,
+                    response_format=response_format,
+                )
+            ) as remote_stream:
+                async for delta in remote_stream:
+                    yield delta
         finally:
             node.active_requests = max(0, node.active_requests - 1)
 
@@ -226,6 +230,7 @@ class ClusterBackend:
         response_format: ResponseFormat | None,
     ) -> AsyncIterator[BackendDelta]:
         headers = self._headers(node)
+        ephemeral = session_id is None
         key = (node.id, session_id or uuid4())
         remote = self._sessions.get(key)
         if remote is None or remote.synchronized_messages > len(messages):
@@ -242,6 +247,38 @@ class ClusterBackend:
                 synchronized_messages=0,
             )
             self._sessions[key] = remote
+        try:
+            async for delta in self._remote_session_stream(
+                node,
+                messages=messages,
+                sampling=sampling,
+                remote=remote,
+                headers=headers,
+                tools=tools,
+                tool_choice=tool_choice,
+                response_format=response_format,
+            ):
+                yield delta
+        finally:
+            if ephemeral and self._sessions.pop(key, None) is not None:
+                with suppress(httpx.HTTPError):
+                    await self._client.delete(
+                        f"{node.url}/api/v1/sessions/{remote.remote_id}",
+                        headers=headers,
+                    )
+
+    async def _remote_session_stream(
+        self,
+        node: RemoteNodeResource,
+        *,
+        messages: Sequence[dict[str, Any]],
+        sampling: SamplingParams,
+        remote: _RemoteSession,
+        headers: dict[str, str],
+        tools: Sequence[ToolDefinition],
+        tool_choice: ToolChoice,
+        response_format: ResponseFormat | None,
+    ) -> AsyncIterator[BackendDelta]:
         prior = messages[remote.synchronized_messages : -1]
         for message in prior:
             role = str(message.get("role", "user"))

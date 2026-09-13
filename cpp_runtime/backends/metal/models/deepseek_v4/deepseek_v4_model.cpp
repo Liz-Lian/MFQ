@@ -1,5 +1,7 @@
 #include "deepseek_v4_model.h"
 
+#include "mfq/nint_blob.h"
+
 #include "nlohmann/json.hpp"
 
 #include <algorithm>
@@ -1417,8 +1419,8 @@ inspect_deepseek_v4_tensor_metadata(
 
     if (is_nint_dtype(record.dtype)) {
         result.packed = true;
-        const auto bits =
-            cursor.scalar<std::uint8_t>("NINT bits");
+        const auto bits = mfq::nint_logical_bits(
+            cursor.scalar<std::uint8_t>("NINT bits"));
         const auto raw_sub_bits =
             cursor.scalar<std::uint8_t>("NINT sub bits");
         const auto sub_bits = raw_sub_bits & 0x7fu;

@@ -1,5 +1,6 @@
 #include "mlx_nint.h"
 
+#include "mfq/nint_blob.h"
 #include "mfq_mfe_prefill_embedded.h"
 #include "mlx_platform.h"
 #include "mlx_staging_allocator.h"
@@ -33,7 +34,6 @@ using mlx::core::MathMode;
 using mlx::core::Shape;
 using mlx::core::array;
 
-constexpr std::uint8_t kAdaptiveStorageFlag = 0x80;
 constexpr int kSubSelectorBits = 2;
 constexpr int kQSelectorBits = 3;
 
@@ -1379,8 +1379,8 @@ MlxNintWeight MlxNintWeight::from_blob(
     std::span<const std::uint8_t> blob) {
     BlobCursor cursor(blob);
     const auto raw_bits = cursor.scalar<std::uint8_t>("bits");
-    const bool adaptive_storage = (raw_bits & kAdaptiveStorageFlag) != 0;
-    const int bits = raw_bits & ~kAdaptiveStorageFlag;
+    const bool adaptive_storage = mfq::nint_has_adaptive_storage(raw_bits);
+    const int bits = mfq::nint_logical_bits(raw_bits);
     const int sub_bits = cursor.scalar<std::uint8_t>("sub bits");
     const int group_size = cursor.scalar<std::int32_t>("group size");
     const int axis = cursor.scalar<std::int32_t>("axis");

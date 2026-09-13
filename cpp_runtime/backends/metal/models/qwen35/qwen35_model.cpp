@@ -1,5 +1,7 @@
 #include "qwen35_model.h"
 
+#include "mfq/nint_blob.h"
+
 #include "nlohmann/json.hpp"
 
 #include <algorithm>
@@ -768,7 +770,8 @@ Qwen35TensorMetadata inspect_qwen35_tensor_metadata(
 
     if (is_nint_dtype(record.dtype)) {
         metadata.packed = true;
-        metadata.bits = cursor.scalar<std::uint8_t>("NINT bits");
+        metadata.bits = mfq::nint_logical_bits(
+            cursor.scalar<std::uint8_t>("NINT bits"));
         metadata.sub_bits = static_cast<std::int32_t>(
             cursor.scalar<std::uint8_t>("NINT sub bits") & 0x7fu);
         metadata.group_size =

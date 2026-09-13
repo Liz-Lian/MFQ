@@ -85,6 +85,8 @@ std::map<std::string, bool> caps::to_map() const {
         {"supports_tool_calls", supports_tool_calls},
         {"supports_parallel_tool_calls", supports_parallel_tool_calls},
         {"supports_system_role", supports_system_role},
+        {"supports_non_leading_system", supports_non_leading_system},
+        {"supports_multiple_system_messages", supports_multiple_system_messages},
         {"supports_preserve_reasoning", supports_preserve_reasoning},
         {"supports_object_arguments", supports_object_arguments},
     };
@@ -163,6 +165,65 @@ caps caps_get(jinja::program & prog) {
             if (!content->stats.used) {
                 result.supports_system_role = false;
             }
+        }
+    );
+
+    JJ_DEBUG("%s\n", ">>> Running capability check: non-leading system prompt");
+
+    caps_try_execute(
+        prog,
+        [&]() {
+            return json::array({
+                {
+                    {"role", "user"},
+                    {"content", "User message"}
+                },
+                {
+                    {"role", "system"},
+                    {"content", "Late system message"}
+                },
+            });
+        },
+        nullptr,
+        nullptr,
+        [&](bool success, value & messages, value &, const std::string &) {
+            auto & content = messages->at(1)->at("content");
+            caps_print_stats(content, "messages[1].content");
+            result.supports_non_leading_system =
+                success && content->stats.used;
+        }
+    );
+
+    JJ_DEBUG("%s\n", ">>> Running capability check: multiple system prompts");
+
+    caps_try_execute(
+        prog,
+        [&]() {
+            return json::array({
+                {
+                    {"role", "system"},
+                    {"content", "First system message"}
+                },
+                {
+                    {"role", "system"},
+                    {"content", "Second system message"}
+                },
+                {
+                    {"role", "user"},
+                    {"content", "User message"}
+                },
+            });
+        },
+        nullptr,
+        nullptr,
+        [&](bool success, value & messages, value &, const std::string &) {
+            auto & first_content = messages->at(0)->at("content");
+            auto & second_content = messages->at(1)->at("content");
+            caps_print_stats(first_content, "messages[0].content");
+            caps_print_stats(second_content, "messages[1].content");
+            result.supports_multiple_system_messages =
+                success && first_content->stats.used &&
+                second_content->stats.used;
         }
     );
 

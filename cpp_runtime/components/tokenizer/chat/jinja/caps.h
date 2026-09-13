@@ -11,6 +11,8 @@ struct caps {
     bool supports_tools = true;
     bool supports_tool_calls = true;
     bool supports_system_role = true;
+    bool supports_non_leading_system = true;
+    bool supports_multiple_system_messages = true;
     bool supports_parallel_tool_calls = true;
 
     // supports preserve reasoning trace in the full history, not just the last assistant message

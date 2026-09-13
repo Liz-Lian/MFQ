@@ -105,6 +105,108 @@ int main() try {
     require(
         applied.prompt == "user: hello\nassistant: ",
         "chat template output mismatch");
+    common_chat_templates_inputs flexible_inputs;
+    flexible_inputs.messages = {
+        {"user", "first"},
+        {"system", "late but supported"},
+    };
+    const auto flexible_applied =
+        common_chat_templates_apply(templates.get(), flexible_inputs);
+    require(
+        flexible_applied.prompt ==
+            "user: first\nsystem: late but supported\nassistant: ",
+        "supported non-leading system message was reordered");
+
+    const std::string strict_template =
+        "{% for message in messages %}"
+        "{% if message['role'] == 'system' and not loop.first %}"
+        "{{ raise_exception('System message must be at the beginning.') }}"
+        "{% endif %}"
+        "{{ message['role'] + ': ' + message['content'] + '\\n' }}"
+        "{% endfor %}"
+        "{% if add_generation_prompt %}assistant: {% endif %}";
+    auto strict_templates =
+        common_chat_templates_init(context, strict_template);
+    const auto strict_caps =
+        common_chat_templates_get_caps(strict_templates.get());
+    require(
+        !strict_caps.at("supports_non_leading_system") &&
+        !strict_caps.at("supports_multiple_system_messages"),
+        "strict system-message capabilities were not detected");
+    common_chat_templates_inputs late_system_inputs;
+    late_system_inputs.messages = {
+        {"system", "base"},
+        {"user", "first"},
+        {"assistant", "reply"},
+        {"system", "late"},
+        {"user", "second"},
+    };
+    const auto late_system_applied =
+        common_chat_templates_apply(strict_templates.get(), late_system_inputs);
+    require(
+        late_system_applied.prompt ==
+            "system: base\n\nlate\nuser: first\nassistant: reply\n"
+            "user: second\nassistant: ",
+        "late system-message fallback mismatch");
+
+    common_chat_templates_inputs distinct_role_inputs;
+    distinct_role_inputs.messages = {
+        {"system", "root policy"},
+        {"user", "first"},
+        {"developer", "application policy"},
+        {"user", "second"},
+    };
+    const auto distinct_role_applied =
+        common_chat_templates_apply(strict_templates.get(), distinct_role_inputs);
+    require(
+        distinct_role_applied.prompt ==
+            "system: System instructions (higher priority):\nroot policy\n\n"
+            "Developer instructions:\napplication policy\nuser: first\n"
+            "user: second\nassistant: ",
+        "system/developer compatibility fallback mismatch");
+    strict_templates.reset();
+
+    const std::string developer_template =
+        "{# <|channel|> #}"
+        "{% for message in messages %}"
+        "{% if message['role'] == 'system' and not loop.first %}"
+        "{{ raise_exception('System message must be at the beginning.') }}"
+        "{% endif %}"
+        "{{ message['role'] + ': ' + message['content'] + '\\n' }}"
+        "{% endfor %}"
+        "{% if add_generation_prompt %}assistant: {% endif %}";
+    auto developer_templates =
+        common_chat_templates_init(context, developer_template);
+    common_chat_templates_inputs developer_inputs;
+    developer_inputs.messages = {
+        {"system", "root policy"},
+        {"developer", "application policy"},
+        {"user", "hello"},
+    };
+    const auto developer_applied =
+        common_chat_templates_apply(developer_templates.get(), developer_inputs);
+    require(
+        developer_applied.prompt ==
+            "system: root policy\ndeveloper: application policy\n"
+            "user: hello\nassistant: ",
+        "native developer role was collapsed");
+
+    common_chat_templates_inputs late_system_with_developer_inputs;
+    late_system_with_developer_inputs.messages = {
+        {"system", "root policy"},
+        {"user", "first"},
+        {"developer", "application policy"},
+        {"system", "late root policy"},
+        {"user", "second"},
+    };
+    const auto late_system_with_developer_applied = common_chat_templates_apply(
+        developer_templates.get(), late_system_with_developer_inputs);
+    require(
+        late_system_with_developer_applied.prompt ==
+            "system: root policy\n\nlate root policy\nuser: first\n"
+            "developer: application policy\nuser: second\nassistant: ",
+        "native developer role changed during system fallback");
+    developer_templates.reset();
 
     mfq_text_grammar * grammar = mfq_text_grammar_init_impl(
         vocab, "root ::= \"h\"", "root", false, nullptr, 0, nullptr, 0);

@@ -20,6 +20,7 @@
 #include <ctime>
 #include <exception>
 #include <functional>
+#include <iterator>
 
 #include <optional>
 #include <set>
@@ -2703,6 +2704,98 @@ std::optional<common_chat_params> common_chat_try_specialized_template(
     return std::nullopt;
 }
 
+// Preserve the API message sequence for capable templates.  Templates with a
+// single leading instruction slot receive a render-only copy; developer
+// messages participate only when that template already lowers them to system.
+static std::optional<std::vector<common_chat_msg>> single_system_fallback(
+        const std::vector<common_chat_msg> & messages,
+        bool map_developer_to_system,
+        bool supports_non_leading_system,
+        bool supports_multiple_system_messages) {
+    const auto is_instruction = [map_developer_to_system](const common_chat_msg & message) {
+        return message.role == "system" ||
+               (map_developer_to_system && message.role == "developer");
+    };
+
+    size_t instruction_count = 0;
+    bool seen_conversation = false;
+    bool has_non_leading_instruction = false;
+    for (const auto & message : messages) {
+        if (is_instruction(message)) {
+            ++instruction_count;
+            has_non_leading_instruction =
+                has_non_leading_instruction || seen_conversation;
+        } else {
+            seen_conversation = true;
+        }
+    }
+    const bool needs_fallback =
+        (has_non_leading_instruction && !supports_non_leading_system) ||
+        (instruction_count > 1 && !supports_multiple_system_messages);
+    if (!needs_fallback) {
+        return std::nullopt;
+    }
+
+    std::vector<const common_chat_msg *> system_messages;
+    std::vector<const common_chat_msg *> developer_messages;
+    std::vector<common_chat_msg> conversation;
+    conversation.reserve(messages.size() - instruction_count);
+    for (const auto & message : messages) {
+        if (message.role == "system") {
+            system_messages.push_back(&message);
+        } else if (map_developer_to_system && message.role == "developer") {
+            developer_messages.push_back(&message);
+        } else {
+            conversation.push_back(message);
+        }
+    }
+
+    const auto join_content = [](const std::vector<const common_chat_msg *> & items) {
+        std::string result;
+        for (const auto * item : items) {
+            const auto rendered = item->to_json_oaicompat(true);
+            const std::string content = rendered.at("content").get<std::string>();
+            if (content.empty()) continue;
+            if (!result.empty()) result += "\n\n";
+            result += content;
+        }
+        return result;
+    };
+
+    const std::string system_content = join_content(system_messages);
+    const std::string developer_content = join_content(developer_messages);
+    common_chat_msg instruction;
+    instruction.role = "system";
+    for (const auto * message : developer_messages) {
+        for (const auto & field : message->extra_fields) {
+            instruction.extra_fields[field.first] = field.second;
+        }
+    }
+    for (const auto * message : system_messages) {
+        for (const auto & field : message->extra_fields) {
+            instruction.extra_fields[field.first] = field.second;
+        }
+    }
+    if (!system_messages.empty() && !developer_messages.empty()) {
+        instruction.content =
+            "System instructions (higher priority):\n" + system_content +
+            "\n\nDeveloper instructions:\n" + developer_content;
+    } else {
+        instruction.content = !system_messages.empty()
+            ? system_content
+            : developer_content;
+    }
+
+    std::vector<common_chat_msg> result;
+    result.reserve(conversation.size() + 1);
+    result.push_back(std::move(instruction));
+    result.insert(
+        result.end(),
+        std::make_move_iterator(conversation.begin()),
+        std::make_move_iterator(conversation.end()));
+    return result;
+}
+
 static common_chat_params common_chat_templates_apply_jinja(const struct common_chat_templates *        tmpls,
                                                             const struct common_chat_templates_inputs & inputs) {
     autoparser::generation_params params;
@@ -2717,7 +2810,17 @@ static common_chat_params common_chat_templates_apply_jinja(const struct common_
             : *tmpls->template_default;
     const auto & src             = tmpl.source();
     const auto & caps            = tmpl.original_caps();
-    params.messages              = render_message_to_json(inputs.messages, tmpl.original_caps());
+    const bool maps_developer_to_system =
+        src.find("<|channel|>") == std::string::npos;
+    const auto fallback_messages = single_system_fallback(
+        inputs.messages,
+        maps_developer_to_system,
+        caps.supports_non_leading_system,
+        caps.supports_multiple_system_messages);
+    const auto & effective_messages = fallback_messages
+        ? *fallback_messages
+        : inputs.messages;
+    params.messages              = render_message_to_json(effective_messages, tmpl.original_caps());
     params.tool_choice           = inputs.tool_choice;
     params.reasoning_format      = inputs.reasoning_format;
     params.enable_thinking       = inputs.enable_thinking;
@@ -2731,13 +2834,13 @@ static common_chat_params common_chat_templates_apply_jinja(const struct common_
     if (params.continue_final_message != COMMON_CHAT_CONTINUATION_NONE) {
         params.add_generation_prompt = false;
 
-        if (!inputs.messages.empty()) {
+        if (!effective_messages.empty()) {
             // Render messages[:-1] and store continuation message separately
-            params.continue_msg = inputs.messages.back();
+            params.continue_msg = effective_messages.back();
             params.messages.erase(params.messages.size() - 1);
         }
 
-        if (params.continue_final_message == COMMON_CHAT_CONTINUATION_AUTO && !inputs.messages.empty()) {
+        if (params.continue_final_message == COMMON_CHAT_CONTINUATION_AUTO && !effective_messages.empty()) {
             // Resolve based on message content
             params.continue_final_message = COMMON_CHAT_CONTINUATION_CONTENT;
             if (!params.continue_msg.reasoning_content.empty() &&
@@ -2748,7 +2851,7 @@ static common_chat_params common_chat_templates_apply_jinja(const struct common_
         }
     }
 
-    if (src.find("<|channel|>") == std::string::npos) {
+    if (maps_developer_to_system) {
         // map developer to system for all models except for GPT-OSS
         workaround::map_developer_role_to_system(params.messages);
     }

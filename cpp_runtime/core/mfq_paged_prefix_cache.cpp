@@ -565,121 +565,140 @@ public:
         std::vector<LoadRequest> requests;
         requests.reserve(hashes.size());
         std::uint64_t load_epoch = 0;
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            load_epoch = cache_epoch_;
-            for (const auto& hash : hashes) {
-                const auto hot = hot_.find(hash);
-                if (hot != hot_.end()) {
+        try {
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                load_epoch = cache_epoch_;
+                for (const auto& hash : hashes) {
+                    const auto hot = hot_.find(hash);
+                    if (hot != hot_.end()) {
+                        requests.push_back(LoadRequest{
+                            hash,
+                            LoadSource::Hot,
+                            hot->second.payload,
+                            {},
+                        });
+                        continue;
+                    }
+                    const auto queued = pending_.find(hash);
+                    if (queued != pending_.end()) {
+                        requests.push_back(LoadRequest{
+                            hash,
+                            LoadSource::Pending,
+                            queued->second,
+                            {},
+                        });
+                        continue;
+                    }
+                    const auto found = disk_.find(hash);
+                    if (found == disk_.end()) break;
                     requests.push_back(LoadRequest{
                         hash,
-                        LoadSource::Hot,
-                        hot->second.payload,
+                        LoadSource::Disk,
                         {},
+                        found->second.path,
                     });
-                    continue;
+                    // Keep the durable copy alive after releasing mutex_: an
+                    // overlapping write can enforce the SSD budget while
+                    // these payloads are being read.
+                    ++found->second.pins;
                 }
-                const auto queued = pending_.find(hash);
-                if (queued != pending_.end()) {
-                    requests.push_back(LoadRequest{
-                        hash,
-                        LoadSource::Pending,
-                        queued->second,
-                        {},
-                    });
-                    continue;
+            }
+
+            std::vector<std::optional<std::vector<std::uint8_t>>> cold_payloads(
+                requests.size());
+            std::vector<std::size_t> cold_indices;
+            cold_indices.reserve(requests.size());
+            for (std::size_t index = 0; index < requests.size(); ++index) {
+                if (requests[index].source == LoadSource::Disk) {
+                    cold_indices.push_back(index);
                 }
-                const auto found = disk_.find(hash);
-                if (found == disk_.end()) break;
-                requests.push_back(LoadRequest{
-                    hash,
-                    LoadSource::Disk,
-                    {},
-                    found->second.path,
-                });
             }
-        }
 
-        std::vector<std::optional<std::vector<std::uint8_t>>> cold_payloads(
-            requests.size());
-        std::vector<std::size_t> cold_indices;
-        cold_indices.reserve(requests.size());
-        for (std::size_t index = 0; index < requests.size(); ++index) {
-            if (requests[index].source == LoadSource::Disk) {
-                cold_indices.push_back(index);
-            }
-        }
-
-        const auto read_cold = [&](std::size_t cold_index) {
-            const auto request_index = cold_indices[cold_index];
-            const auto& request = requests[request_index];
-            cold_payloads[request_index] = read_payload(
-                request.path, request.hash);
-        };
-        if (cold_indices.size() == 1 || config_.max_parallel_reads == 1) {
-            for (std::size_t index = 0; index < cold_indices.size(); ++index) {
-                read_cold(index);
-            }
-        } else if (!cold_indices.empty()) {
-            const auto worker_count = std::min(
-                cold_indices.size(), config_.max_parallel_reads);
-            std::atomic<std::size_t> next{0};
-            std::mutex error_mutex;
-            std::exception_ptr first_error;
-            std::vector<std::thread> readers;
-            readers.reserve(worker_count);
-            for (std::size_t worker = 0; worker < worker_count; ++worker) {
-                readers.emplace_back([&] {
-                    while (true) {
-                        const auto index = next.fetch_add(1);
-                        if (index >= cold_indices.size()) break;
-                        try {
-                            read_cold(index);
-                        } catch (...) {
-                            std::lock_guard<std::mutex> lock(error_mutex);
-                            if (!first_error) {
-                                first_error = std::current_exception();
+            const auto read_cold = [&](std::size_t cold_index) {
+                const auto request_index = cold_indices[cold_index];
+                const auto& request = requests[request_index];
+                cold_payloads[request_index] = read_payload(
+                    request.path, request.hash);
+            };
+            if (cold_indices.size() == 1 || config_.max_parallel_reads == 1) {
+                for (std::size_t index = 0; index < cold_indices.size();
+                     ++index) {
+                    read_cold(index);
+                }
+            } else if (!cold_indices.empty()) {
+                const auto worker_count = std::min(
+                    cold_indices.size(), config_.max_parallel_reads);
+                std::atomic<std::size_t> next{0};
+                std::mutex error_mutex;
+                std::exception_ptr first_error;
+                std::vector<std::thread> readers;
+                readers.reserve(worker_count);
+                for (std::size_t worker = 0; worker < worker_count; ++worker) {
+                    readers.emplace_back([&] {
+                        while (true) {
+                            const auto index = next.fetch_add(1);
+                            if (index >= cold_indices.size()) break;
+                            try {
+                                read_cold(index);
+                            } catch (...) {
+                                std::lock_guard<std::mutex> lock(error_mutex);
+                                if (!first_error) {
+                                    first_error = std::current_exception();
+                                }
                             }
                         }
-                    }
-                });
+                    });
+                }
+                for (auto& reader : readers) reader.join();
+                if (first_error) std::rethrow_exception(first_error);
             }
-            for (auto& reader : readers) reader.join();
-            if (first_error) std::rethrow_exception(first_error);
-        }
 
-        std::vector<PagedPrefixPayload> result;
-        result.reserve(requests.size());
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (load_epoch != cache_epoch_) return result;
-        for (std::size_t index = 0; index < requests.size(); ++index) {
-            auto& request = requests[index];
-            if (request.source == LoadSource::Disk) {
-                if (!cold_payloads[index]) {
-                    erase_corrupt_locked(request.hash);
-                    break;
-                }
-                request.payload =
-                    std::make_shared<const std::vector<std::uint8_t>>(
-                        std::move(*cold_payloads[index]));
-                put_hot_locked(request.hash, request.payload);
-                const auto found = disk_.find(request.hash);
-                if (found != disk_.end()) {
-                    found->second.last_used = ++clock_;
-                }
-                ++metrics_.disk_hits;
-            } else {
-                if (request.source == LoadSource::Hot) {
-                    const auto hot = hot_.find(request.hash);
-                    if (hot != hot_.end()) {
-                        hot->second.last_used = ++clock_;
-                    }
-                }
-                ++metrics_.hot_hits;
+            std::vector<PagedPrefixPayload> result;
+            result.reserve(requests.size());
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (load_epoch != cache_epoch_) {
+                // clear() removed every entry carrying this load's leases.
+                // A same-hash entry recreated in the new epoch must not be
+                // charged for an older read.
+                return result;
             }
-            result.push_back(std::move(request.payload));
+            for (std::size_t index = 0; index < requests.size(); ++index) {
+                auto& request = requests[index];
+                if (request.source == LoadSource::Disk) {
+                    if (!cold_payloads[index]) {
+                        erase_corrupt_locked(request.hash);
+                        break;
+                    }
+                    request.payload =
+                        std::make_shared<const std::vector<std::uint8_t>>(
+                            std::move(*cold_payloads[index]));
+                    put_hot_locked(request.hash, request.payload);
+                    const auto found = disk_.find(request.hash);
+                    if (found != disk_.end()) {
+                        found->second.last_used = ++clock_;
+                    }
+                    ++metrics_.disk_hits;
+                } else {
+                    if (request.source == LoadSource::Hot) {
+                        const auto hot = hot_.find(request.hash);
+                        if (hot != hot_.end()) {
+                            hot->second.last_used = ++clock_;
+                        }
+                    }
+                    ++metrics_.hot_hits;
+                }
+                result.push_back(std::move(request.payload));
+            }
+            release_disk_read_pins_locked(requests);
+            return result;
+        } catch (...) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (load_epoch == cache_epoch_) {
+                release_disk_read_pins_locked(requests);
+            }
+            throw;
         }
-        return result;
     }
 
     void pin(const std::vector<BlockHash>& blocks) {
@@ -1113,6 +1132,20 @@ private:
         }
         ++metrics_.corrupt_blocks;
         sync_metrics_locked();
+    }
+
+    void release_disk_read_pins_locked(
+        const std::vector<LoadRequest>& requests) {
+        for (const auto& request : requests) {
+            if (request.source != LoadSource::Disk) continue;
+            auto found = disk_.find(request.hash);
+            if (found != disk_.end() && found->second.pins > 0) {
+                --found->second.pins;
+            }
+        }
+        // A writer may have deferred LRU eviction while one of these files
+        // was leased by the reader.
+        enforce_disk_budget_locked();
     }
 
     std::uint64_t effective_disk_budget_locked() const {

@@ -1816,6 +1816,65 @@ def test_runtime_memory_budget_evicts_idle_models_and_respects_pins(
     asyncio.run(run())
 
 
+def test_failed_load_admission_does_not_partially_retire_lru_models(
+    tmp_path: Path,
+) -> None:
+    async def run() -> None:
+        _model(tmp_path / "idle.mfq", architecture="qwen35")
+        _model(tmp_path / "pinned.mfq", architecture="qwen35")
+        _model(tmp_path / "incoming.mfq", architecture="qwen35")
+        catalog = ModelCatalog([tmp_path], cache_seconds=0)
+        idle_artifact = await catalog.resolve("idle")
+        pinned_artifact = await catalog.resolve("pinned")
+        incoming_artifact = await catalog.resolve("incoming")
+        unit = incoming_artifact.resource.total_bytes
+        idle = _ManagedRuntime(
+            id=uuid4(),
+            artifact=idle_artifact,
+            process=SimpleNamespace(returncode=None),
+            backend=IdleBackend(),
+            port=1,
+            context_size=4096,
+            state=RuntimeInstanceState.READY,
+            resident_bytes=unit,
+            last_used_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        )
+        pinned = _ManagedRuntime(
+            id=uuid4(),
+            artifact=pinned_artifact,
+            process=SimpleNamespace(returncode=None),
+            backend=IdleBackend(),
+            port=2,
+            context_size=4096,
+            state=RuntimeInstanceState.READY,
+            resident_bytes=unit,
+            last_used_at=datetime(2026, 1, 2, tzinfo=timezone.utc),
+            pinned=True,
+        )
+        pool = ManagedRuntimePool(
+            catalog,
+            tmp_path / "runtime",
+            max_instances=3,
+            max_runtime_memory_bytes=unit + unit // 2,
+        )
+        pool._instances = {idle.id: idle, pinned.id: pinned}
+        session_id = uuid4()
+        pool._session_routes[session_id] = idle.id
+
+        with pytest.raises(JobExecutionError) as blocked:
+            await pool.load(
+                _TestJobContext(),  # type: ignore[arg-type]
+                {"model": "incoming"},
+            )
+
+        assert blocked.value.detail.code == "runtime_memory_limit"
+        assert idle.state == RuntimeInstanceState.READY
+        assert pinned.state == RuntimeInstanceState.READY
+        assert pool._session_routes[session_id] == idle.id
+
+    asyncio.run(run())
+
+
 def test_runtime_pool_unloads_an_idle_ttl_model(tmp_path: Path) -> None:
     async def run() -> None:
         model_dir = tmp_path / "models"

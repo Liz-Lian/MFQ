@@ -435,7 +435,6 @@ class ManagedRuntimePool:
                         "the model artifact changed while its current runtime is busy",
                         retryable=True,
                     )
-                self._mark_instance_unloading_locked(existing)
                 evicted.append(existing)
                 existing = None
             if existing is not None:
@@ -472,7 +471,9 @@ class ManagedRuntimePool:
                     > self.max_runtime_memory_bytes
                 )
             ):
-                victim = self._claim_lru_instance_for_unload_locked()
+                victim = self._lru_instance_for_unload_locked(
+                    excluded_ids=claimed_instance_ids,
+                )
                 if victim is None:
                     memory_limited = (
                         self.max_runtime_memory_bytes is not None
@@ -491,12 +492,15 @@ class ManagedRuntimePool:
                         retryable=True,
                     )
                 evicted.append(victim)
+                claimed_instance_ids.add(victim.id)
                 active_count = max(0, active_count - 1)
                 committed_bytes = max(
                     0,
                     committed_bytes - self._committed_runtime_bytes(victim),
                 )
             port = self._reserve_free_port_locked()
+            for victim in evicted:
+                self._mark_instance_unloading_locked(victim)
             load_event = asyncio.Event()
             self._loading_model_names.add(model_name)
             self._load_events[model_name] = load_event
@@ -1708,11 +1712,17 @@ class ManagedRuntimePool:
             )
         return instance
 
-    def _claim_lru_instance_for_unload_locked(self) -> _ManagedRuntime | None:
+    def _lru_instance_for_unload_locked(
+        self,
+        *,
+        excluded_ids: set[UUID] | None = None,
+    ) -> _ManagedRuntime | None:
+        excluded = excluded_ids or set()
         candidates = [
             item
             for item in self._instances.values()
-            if not item.pinned
+            if item.id not in excluded
+            and not item.pinned
             and item.state == RuntimeInstanceState.READY
             and item.active_requests == 0
             and item.queued_requests == 0
@@ -1724,6 +1734,12 @@ class ManagedRuntimePool:
             candidates,
             key=lambda item: (item.last_used_at or item.started_at, item.started_at),
         )
+        return victim
+
+    def _claim_lru_instance_for_unload_locked(self) -> _ManagedRuntime | None:
+        victim = self._lru_instance_for_unload_locked()
+        if victim is None:
+            return None
         self._mark_instance_unloading_locked(victim)
         return victim
 

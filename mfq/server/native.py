@@ -243,7 +243,9 @@ def reserve_loopback_port() -> int:
         return int(listener.getsockname()[1])
 
 
-def native_tokenizer_arguments(model: str | Path) -> list[str]:
+def native_tokenizer_arguments(model: str | Path, backend: str) -> list[str]:
+    if backend != "metal":
+        return []
     model_path = Path(model).expanduser().resolve()
     if model_path.is_dir():
         tokenizer = ensure_hf_tokenizer_gguf(model_path)
@@ -319,7 +321,7 @@ class NativeRuntime:
             command.extend(["--prefill-chunk-size", str(self.prefill_chunk_size)])
         if self.context_size > 0:
             command.extend(["--ctx-size", str(self.context_size)])
-        command.extend(native_tokenizer_arguments(self.model))
+        command.extend(native_tokenizer_arguments(self.model, self.backend))
         return command
 
     def start(self) -> None:

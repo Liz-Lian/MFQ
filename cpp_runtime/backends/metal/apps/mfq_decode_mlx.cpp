@@ -6,6 +6,7 @@
 #include "mlx_moe.h"
 #include "mlx_qwen4_causal_lm.h"
 #include "mlx_qwen35_causal_lm.h"
+#include "mlx_stream_sync.h"
 #include "mlx_tensor.h"
 #include "qwen35_model.h"
 
@@ -58,13 +59,19 @@ void release_host_allocator_cache() {
     malloc_zone_pressure_relief(nullptr, 0);
 }
 
-void release_model_load_staging_memory() {
+void release_allocator_caches() {
+    mlx::core::clear_cache();
+    release_host_allocator_cache();
+}
+
+void release_model_load_staging_memory(
+    const mlx::core::Stream& runtime_stream) {
     // Model conversion and MFE repacking leave large, now-unused buffers in
     // both the MLX cache and macOS malloc's large-object depot. Keeping those
     // pages makes a single fully resident model look tens of GiB larger and
     // can force useful weights into swap before the first request.
-    mlx::core::clear_cache();
-    release_host_allocator_cache();
+    mfq::metal::drain_metal_work(runtime_stream);
+    release_allocator_caches();
 }
 
 struct Arguments {
@@ -1539,12 +1546,12 @@ int serve_loaded_runtime(
             mlx::core::set_default_device(
                 mlx::core::Device::gpu);
             mlx::core::set_default_stream(runtime_stream);
-            mlx::core::synchronize();
+            mfq::metal::drain_metal_work(runtime_stream);
 
             const auto previous_context = *loaded_context;
             session_cache->clear_live_sessions();
             runtime_holder->reset();
-            release_model_load_staging_memory();
+            release_model_load_staging_memory(runtime_stream);
             const auto started =
                 std::chrono::steady_clock::now();
             std::cout
@@ -1561,7 +1568,7 @@ int serve_loaded_runtime(
                     cache_bytes_from_environment(
                         "MFQ_SERVER_PREFIX_CACHE_HOT_BYTES",
                         2ULL * 1024ULL * 1024ULL * 1024ULL));
-                release_model_load_staging_memory();
+                release_model_load_staging_memory(runtime_stream);
                 *loaded_context = requested_context;
                 const auto seconds =
                     std::chrono::duration<double>(
@@ -1588,7 +1595,7 @@ int serve_loaded_runtime(
                         cache_bytes_from_environment(
                             "MFQ_SERVER_PREFIX_CACHE_HOT_BYTES",
                             2ULL * 1024ULL * 1024ULL * 1024ULL));
-                    release_model_load_staging_memory();
+                    release_model_load_staging_memory(runtime_stream);
                     *loaded_context = previous_context;
                 } catch (const std::exception& restore_error) {
                     throw std::runtime_error(
@@ -1622,9 +1629,10 @@ int serve_loaded_runtime(
     session_control.clear = [runtime_mutex, runtime_holder, session_cache,
                              runtime_stream] {
         std::lock_guard<std::mutex> lock(*runtime_mutex);
-        const auto released = session_cache->clear();
         mlx::core::set_default_device(mlx::core::Device::gpu);
         mlx::core::set_default_stream(runtime_stream);
+        mfq::metal::drain_metal_work(runtime_stream);
+        const auto released = session_cache->clear();
         if (runtime_holder->has_value()) {
             auto& loaded_runtime = runtime_holder->value();
             if constexpr (requires { loaded_runtime.reset_cache(1); }) {
@@ -1633,8 +1641,7 @@ int serve_loaded_runtime(
                 loaded_runtime.reset();
             }
         }
-        mlx::core::synchronize(runtime_stream);
-        release_model_load_staging_memory();
+        release_allocator_caches();
         return released;
     };
     session_control.trim_hot = [session_cache](std::uint64_t target_bytes) {
@@ -1879,7 +1886,7 @@ int run_native_server(
             mfq::metal::MlxDeepseekV41CausalLm::load(
                 container, context, expert_cache_bytes);
         runtime.prewarm_ssd_expert_arena();
-        release_model_load_staging_memory();
+        release_model_load_staging_memory(runtime_stream);
         const auto load_seconds =
             std::chrono::duration<double>(
                 std::chrono::steady_clock::now() - started).count();
@@ -1940,7 +1947,7 @@ int run_native_server(
                 container,
                 context,
                 expert_cache_bytes);
-        release_model_load_staging_memory();
+        release_model_load_staging_memory(runtime_stream);
         const auto load_seconds =
             std::chrono::duration<double>(
                 std::chrono::steady_clock::now() -
@@ -1996,7 +2003,7 @@ int run_native_server(
                 container,
                 arguments.context_size,
                 arguments.server);
-        release_model_load_staging_memory();
+        release_model_load_staging_memory(runtime_stream);
         mlx::core::set_cache_limit(kMinicpmoDuplexCacheLimitBytes);
         const auto load_seconds = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - started).count();
@@ -2048,7 +2055,7 @@ int run_native_server(
             mfq::metal::MlxQwen4CausalLm::load(
                 container, context, expert_cache_bytes);
         runtime.prewarm_ssd_expert_arena();
-        release_model_load_staging_memory();
+        release_model_load_staging_memory(runtime_stream);
         const auto load_seconds = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - started).count();
         std::cout
@@ -2099,7 +2106,7 @@ int run_native_server(
         << std::endl;
     auto runtime =
         mfq::metal::MlxQwen35CausalLm::load(container);
-    release_model_load_staging_memory();
+    release_model_load_staging_memory(runtime_stream);
     const auto load_seconds = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - started).count();
     std::cout

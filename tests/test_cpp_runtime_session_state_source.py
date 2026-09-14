@@ -29,6 +29,12 @@ PAGED_SOURCE = (ROOT / "cpp_runtime" / "core" / "mfq_paged_prefix_cache.cpp").re
 METAL_PAGED_CODEC = (
     ROOT / "cpp_runtime" / "backends" / "metal" / "runtime" / "mlx_paged_session_codec.cpp"
 ).read_text(encoding="utf-8")
+METAL_COMPONENTS = (
+    ROOT / "cpp_runtime" / "backends" / "metal" / "runtime" / "mlx_server_components.cpp"
+).read_text(encoding="utf-8")
+METAL_STREAM_SYNC = (
+    ROOT / "cpp_runtime" / "backends" / "metal" / "runtime" / "mlx_stream_sync.h"
+).read_text(encoding="utf-8")
 
 
 def test_native_session_identifier_reaches_the_cuda_runtime() -> None:
@@ -118,8 +124,32 @@ def test_metal_server_bounds_and_explicitly_reclaims_allocator_cache() -> None:
     assert "mlx::core::set_cache_limit(allocator_cache_limit)" in METAL_DECODE
     assert '"mlx_cache_limit_bytes"' in METAL_DECODE
     assert "loaded_runtime.reset_cache(1)" in METAL_DECODE
-    assert "mlx::core::synchronize(runtime_stream)" in METAL_DECODE
-    assert "release_model_load_staging_memory();" in METAL_DECODE
+    assert "drain_metal_work(runtime_stream)" in METAL_DECODE
+    assert "release_model_load_staging_memory(runtime_stream);" in METAL_DECODE
+
+
+def test_metal_server_drains_async_work_before_releasing_cache_storage() -> None:
+    assert METAL_STREAM_SYNC.index("synchronize(runtime_stream)") < METAL_STREAM_SYNC.index(
+        "synchronize();"
+    )
+    clear_control = METAL_DECODE.split("session_control.clear =", 1)[1].split(
+        "session_control.trim_hot =", 1
+    )[0]
+    assert clear_control.index("drain_metal_work(runtime_stream)") < clear_control.index(
+        "session_cache->clear()"
+    )
+    duplex_start = METAL_COMPONENTS.split("result.duplex.start =", 1)[1].split(
+        "result.duplex.step =", 1
+    )[0]
+    assert duplex_start.index("drain_metal_work(runtime_stream)") < duplex_start.index(
+        "runtime.reset()"
+    )
+    duplex_stop = METAL_COMPONENTS.split("result.duplex.stop =", 1)[1].split(
+        "return result;", 1
+    )[0]
+    assert duplex_stop.index("drain_metal_work(runtime_stream)") < duplex_stop.index(
+        "runtime_holder->value().reset()"
+    )
 
 
 def test_supported_metal_text_graphs_capture_and_restore_prefix_state() -> None:

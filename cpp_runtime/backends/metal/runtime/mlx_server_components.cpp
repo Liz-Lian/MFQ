@@ -1,4 +1,5 @@
 #include "mlx_server_components.h"
+#include "mlx_stream_sync.h"
 
 #include <chrono>
 #include <cstdint>
@@ -317,6 +318,7 @@ MlxServerComponentCallbacks make_mlx_server_components(
             mlx::core::set_default_device(mlx::core::Device::gpu);
             mlx::core::set_default_stream(runtime_stream);
             auto& runtime = runtime_holder->value();
+            drain_metal_work(runtime_stream);
             runtime.reset();
             mlx::core::clear_cache();
 
@@ -478,8 +480,8 @@ MlxServerComponentCallbacks make_mlx_server_components(
             if (!runtime_holder->has_value()) return;
             mlx::core::set_default_device(mlx::core::Device::gpu);
             mlx::core::set_default_stream(runtime_stream);
+            drain_metal_work(runtime_stream);
             runtime_holder->value().reset();
-            mlx::core::synchronize(runtime_stream);
             mlx::core::clear_cache();
             malloc_zone_pressure_relief(nullptr, 0);
         };

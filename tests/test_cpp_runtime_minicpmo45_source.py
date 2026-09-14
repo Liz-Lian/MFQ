@@ -428,7 +428,7 @@ def test_minicpmo45_metal_duplex_tracks_all_cache_lifetimes():
     assert "kMinicpmoDuplexCacheLimitBytes" in METAL_DECODE
     assert "set_cache_limit(kMinicpmoDuplexCacheLimitBytes)" in METAL_DECODE
     assert "runtime_holder->reset();" in METAL_DECODE
-    assert "release_model_load_staging_memory();" in METAL_DECODE
+    assert "release_model_load_staging_memory(runtime_stream);" in METAL_DECODE
 
 
 def test_minicpmo45_realtime_uses_official_demo_defaults():

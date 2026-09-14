@@ -357,7 +357,6 @@ mfq_tensor_backend::Tensor moe_add_shared_gate_cuda(
 mfq_tensor_backend::Tensor moe_weighted_reduce_shared_gate_cuda(
     mfq_tensor_backend::Tensor pair_output, mfq_tensor_backend::Tensor weights,
     mfq_tensor_backend::Tensor shared, mfq_tensor_backend::Tensor gate_logits);
-void mfe_set_small_mmq_cuda(int64_t mode);
 std::vector<mfq_tensor_backend::Tensor> gdn_cuda(mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k, mfq_tensor_backend::Tensor v,
                                     mfq_tensor_backend::Tensor g, mfq_tensor_backend::Tensor beta, MfqOptional<mfq_tensor_backend::Tensor> state);
 std::vector<mfq_tensor_backend::Tensor> gdn_inplace_cuda(mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k, mfq_tensor_backend::Tensor v,
@@ -27212,17 +27211,14 @@ static int run_gemma_moe_check(
 
         if (tokens != 1) {
             g_force_moe_prefill_mma_off = false;
-            mfe_set_small_mmq_cuda(1);
             auto mma = time_ms(forward, reps);
             auto mma_first = mma.second.clone();
             auto mma_repeat = forward().clone();
             mfq_cuda_synchronize();
             g_force_moe_prefill_mma_off = true;
-            mfe_set_small_mmq_cuda(0);
             auto baseline = time_ms(forward, reps);
             mfq_cuda_synchronize();
             g_force_moe_prefill_mma_off = false;
-            mfe_set_small_mmq_cuda(-1);
             auto repeat_diff = (mma_repeat - mma_first).abs().to(mfq_tensor_backend::kFloat32);
             auto baseline_diff = (mma_first - baseline.second).abs().to(mfq_tensor_backend::kFloat32);
             std::cout << std::setprecision(6)
@@ -27378,31 +27374,6 @@ static int run_moe_check(
                       << " rel_l2=" << (diff.norm().item<double>() / baseline_norm)
                       << " mean_abs=" << diff.abs().mean().item<float>()
                       << " max_abs=" << diff.abs().max().item<float>()
-                      << "\n";
-        }
-
-        const char * small_mmq_ab_env = std::getenv("MFQ_CHECK_MOE_SMALL_MMQ_AB");
-        if (small_mmq_ab_env != nullptr && std::atoi(small_mmq_ab_env) != 0 &&
-                tokens >= 16 && tokens <= 128) {
-            mfe_set_small_mmq_cuda(1);
-            auto candidate = ffn.forward(x);
-            mfe_set_small_mmq_cuda(0);
-            auto baseline = ffn.forward(x);
-            mfq_cuda_synchronize();
-            mfe_set_small_mmq_cuda(-1);
-            auto candidate_f32 = candidate.to(mfq_tensor_backend::kFloat32);
-            auto baseline_f32 = baseline.to(mfq_tensor_backend::kFloat32);
-            auto diff = candidate_f32 - baseline_f32;
-            const double baseline_norm = baseline_f32.norm().item<double>();
-            std::cout << "moe_small_mmq_ab"
-                      << " tokens=" << tokens
-                      << " equal=" << (candidate.equal(baseline) ? 1 : 0)
-                      << " differing=" << candidate.ne(baseline).sum().item<int64_t>()
-                      << " rel_l2=" << (diff.norm().item<double>() / baseline_norm)
-                      << " mean_abs=" << diff.abs().mean().item<float>()
-                      << " max_abs=" << diff.abs().max().item<float>()
-                      << " candidate_checksum=" << candidate_f32.sum().item<double>()
-                      << " baseline_checksum=" << baseline_f32.sum().item<double>()
                       << "\n";
         }
 

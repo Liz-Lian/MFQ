@@ -1,5 +1,6 @@
 #include "mfq_cuda_context.h"
 
+#include <algorithm>
 #include <limits>
 #include <cstdlib>
 #include <iostream>

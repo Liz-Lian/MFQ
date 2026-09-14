@@ -268,7 +268,9 @@ def reserve_loopback_port() -> int:
         return int(listener.getsockname()[1])
 
 
-def native_tokenizer_arguments(model: str | Path) -> list[str]:
+def native_tokenizer_arguments(model: str | Path, backend: str) -> list[str]:
+    if backend != "metal":
+        return []
     model_path = Path(model).expanduser().resolve()
     if model_path.is_dir():
         tokenizer = ensure_hf_tokenizer_gguf(model_path)
@@ -372,7 +374,7 @@ class NativeRuntime:
             )
         if self.moe_gpu_cache_gb is not None:
             command.extend(["--moe-gpu-cache-gb", str(self.moe_gpu_cache_gb)])
-        command.extend(native_tokenizer_arguments(self.model))
+        command.extend(native_tokenizer_arguments(self.model, self.backend))
         return command
 
     def start(self) -> None:

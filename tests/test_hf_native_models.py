@@ -284,7 +284,7 @@ def test_hf_tokenizer_cache_is_reusable_and_runtime_selected(
     assert reader.get_field("tokenizer.ggml.eos_token_id").contents() == 4
 
     monkeypatch.setenv("MFQ_SERVER_TOKENIZER_CACHE_DIR", str(cache))
-    arguments = native_tokenizer_arguments(model)
+    arguments = native_tokenizer_arguments(model, "metal")
     assert arguments[0] == "--tokenizer-gguf"
     assert Path(arguments[1]).is_file()
 
@@ -440,8 +440,9 @@ def test_mfq_embedded_hf_tokenizer_cache_is_reusable_and_runtime_selected(
     ]
 
     monkeypatch.setenv("MFQ_SERVER_TOKENIZER_CACHE_DIR", str(cache))
-    arguments = native_tokenizer_arguments(model)
+    arguments = native_tokenizer_arguments(model, "metal")
     assert arguments == ["--tokenizer-gguf", str(tokenizer)]
+    assert native_tokenizer_arguments(model, "cuda") == []
 
 
 def test_minicpmo_native_runtime_materializes_exact_resampler_asset(

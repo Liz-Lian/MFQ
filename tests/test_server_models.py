@@ -1634,6 +1634,99 @@ def test_runtime_pool_close_waits_for_an_inflight_idle_unload(tmp_path: Path) ->
     asyncio.run(run())
 
 
+def test_runtime_stop_closes_backend_after_process_control_failure(
+    tmp_path: Path,
+) -> None:
+    async def run() -> None:
+        _model(tmp_path / "model.mfq")
+        catalog = ModelCatalog([tmp_path], cache_seconds=0)
+        artifact = await catalog.resolve("model")
+
+        class ClosingBackend(IdleBackend):
+            closed = False
+
+            async def aclose(self) -> None:
+                self.closed = True
+
+        class BrokenProcess:
+            returncode = None
+
+            def terminate(self) -> None:
+                raise RuntimeError("terminate failed")
+
+        backend = ClosingBackend()
+        instance = _ManagedRuntime(
+            id=uuid4(),
+            artifact=artifact,
+            process=BrokenProcess(),  # type: ignore[arg-type]
+            backend=backend,
+            port=0,
+            context_size=4096,
+        )
+        pool = ManagedRuntimePool(catalog, tmp_path / "runtime")
+        with pytest.raises(RuntimeError, match="terminate failed"):
+            await pool._stop_process(instance)
+        assert backend.closed
+
+    asyncio.run(run())
+
+
+def test_runtime_pool_close_attempts_every_instance_before_reporting_error(
+    tmp_path: Path,
+) -> None:
+    async def run() -> None:
+        _model(tmp_path / "first.mfq")
+        _model(tmp_path / "second.mfq")
+        catalog = ModelCatalog([tmp_path], cache_seconds=0)
+        first_artifact = await catalog.resolve("first")
+        second_artifact = await catalog.resolve("second")
+
+        class ClosingBackend(IdleBackend):
+            closed = False
+
+            async def aclose(self) -> None:
+                self.closed = True
+
+        fallback = ClosingBackend()
+        pool = ManagedRuntimePool(
+            catalog,
+            tmp_path / "runtime",
+            fallback=fallback,
+        )
+        first = _ManagedRuntime(
+            id=uuid4(),
+            artifact=first_artifact,
+            process=SimpleNamespace(returncode=0),
+            backend=IdleBackend(),
+            port=0,
+            context_size=4096,
+        )
+        second = _ManagedRuntime(
+            id=uuid4(),
+            artifact=second_artifact,
+            process=SimpleNamespace(returncode=0),
+            backend=IdleBackend(),
+            port=0,
+            context_size=4096,
+        )
+        pool._instances = {first.id: first, second.id: second}
+        attempts = []
+
+        async def stop(instance: _ManagedRuntime) -> None:
+            attempts.append(instance.id)
+            if instance is first:
+                raise RuntimeError("first stop failed")
+
+        pool._stop_process = stop  # type: ignore[method-assign]
+        with pytest.raises(RuntimeError, match="first stop failed"):
+            await pool.aclose()
+        assert attempts == [first.id, second.id]
+        assert fallback.closed
+        assert pool._instances == {}
+
+    asyncio.run(run())
+
+
 def test_started_runtime_is_registered_in_the_instances_api(tmp_path: Path) -> None:
     async def run() -> None:
         model = tmp_path / "initial.mfq"

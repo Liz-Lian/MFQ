@@ -1194,13 +1194,24 @@ class ManagedRuntimePool:
             self._reserved_ports.clear()
         if idle_reaper is not None and idle_reaper is not asyncio.current_task():
             await idle_reaper
+        first_error: Exception | None = None
         for instance in instances:
-            await self._stop_process(instance)
+            try:
+                await self._stop_process(instance)
+            except Exception as error:
+                if first_error is None:
+                    first_error = error
         async with self._lock:
             self._instances.clear()
             self._session_routes.clear()
         if self.fallback is not None:
-            await self.fallback.aclose()
+            try:
+                await self.fallback.aclose()
+            except Exception as error:
+                if first_error is None:
+                    first_error = error
+        if first_error is not None:
+            raise first_error
 
     async def _select(self, model: str, *, session_id: UUID | None) -> _ManagedRuntime | None:
         stale_backend: ChatBackend | None = None
@@ -1894,32 +1905,56 @@ class ManagedRuntimePool:
         instance.state = RuntimeInstanceState.UNLOADING
         instance.realtime_gateway = None
         process = instance.process
-        if isinstance(process, subprocess.Popen):
-            await asyncio.to_thread(self._stop_popen, process)
-        elif process.returncode is None:
-            process.terminate()
-            try:
-                await asyncio.wait_for(process.wait(), timeout=10.0)
-            except TimeoutError:
-                process.kill()
-                await process.wait()
+        first_error: Exception | None = None
+        try:
+            if isinstance(process, subprocess.Popen):
+                await asyncio.to_thread(self._stop_popen, process)
+            elif process.returncode is None:
+                process.terminate()
+                try:
+                    await asyncio.wait_for(process.wait(), timeout=10.0)
+                except TimeoutError:
+                    process.kill()
+                    await process.wait()
+        except ProcessLookupError:
+            pass
+        except Exception as error:
+            first_error = error
         current = asyncio.current_task()
         for task in (instance.monitor_task, instance.output_task):
-            if task is not None and task is not current and not task.done():
-                task.cancel()
-                with suppress(asyncio.CancelledError):
-                    await task
-        await instance.backend.aclose()
+            if task is None or task is current or task.done():
+                continue
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except Exception as error:
+                if first_error is None:
+                    first_error = error
+        try:
+            await instance.backend.aclose()
+        except Exception as error:
+            if first_error is None:
+                first_error = error
+        if first_error is not None:
+            raise first_error
 
     @staticmethod
     def _stop_popen(process: subprocess.Popen[bytes]) -> None:
         if process.poll() is not None:
             return
-        process.terminate()
+        try:
+            process.terminate()
+        except ProcessLookupError:
+            return
         try:
             process.wait(timeout=10.0)
         except subprocess.TimeoutExpired:
-            process.kill()
+            try:
+                process.kill()
+            except ProcessLookupError:
+                return
             process.wait(timeout=5.0)
 
     def _reserve_free_port_locked(self) -> int:

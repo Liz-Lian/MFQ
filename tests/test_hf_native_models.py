@@ -289,11 +289,16 @@ def test_hf_tokenizer_cache_is_reusable_and_runtime_selected(
     assert Path(arguments[1]).is_file()
 
 
+@pytest.mark.parametrize(
+    "model_type",
+    ["deepseek_v4", "deepseek_v4_text", "deepseek_v4_vision"],
+)
 def test_deepseek_v4_without_hf_template_uses_processor_fallback(
     tmp_path: Path,
+    model_type: str,
 ) -> None:
     model = tmp_path / "DeepSeek-V4-Vision-Test"
-    _hf_fixture(model, model_type="deepseek_v4", tensor_name="embed.weight")
+    _hf_fixture(model, model_type=model_type, tensor_name="embed.weight")
     tokenizer_config_path = model / "tokenizer_config.json"
     tokenizer_config = json.loads(tokenizer_config_path.read_text())
     tokenizer_config.pop("chat_template")
@@ -308,11 +313,16 @@ def test_deepseek_v4_without_hf_template_uses_processor_fallback(
     )
 
 
+@pytest.mark.parametrize(
+    "model_type",
+    ["deepseek_v41", "deepseek_v41_text", "deepseek_v41_vision"],
+)
 def test_deepseek_v41_without_hf_template_uses_processor_bootstrap(
     tmp_path: Path,
+    model_type: str,
 ) -> None:
     model = tmp_path / "DeepSeek-V41-Vision-Test"
-    _hf_fixture(model, model_type="deepseek_v41", tensor_name="embed.weight")
+    _hf_fixture(model, model_type=model_type, tensor_name="embed.weight")
     tokenizer_config_path = model / "tokenizer_config.json"
     tokenizer_config = json.loads(tokenizer_config_path.read_text())
     tokenizer_config.pop("chat_template")

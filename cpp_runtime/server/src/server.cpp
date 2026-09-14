@@ -621,6 +621,24 @@ static common_chat_params apply_chat_template(
     }
 }
 
+static std::optional<std::string> request_preformatted_prompt(
+        const json & body) {
+    if (!body.contains("mfq_preformatted_prompt") ||
+        body["mfq_preformatted_prompt"].is_null()) {
+        return std::nullopt;
+    }
+    if (!body["mfq_preformatted_prompt"].is_string() ||
+        body["mfq_preformatted_prompt"].get_ref<
+            const std::string&>().empty()) {
+        throw ApiError(
+            400,
+            "invalid_request_error",
+            "mfq_preformatted_prompt must be a non-empty string",
+            "mfq_preformatted_prompt");
+    }
+    return body["mfq_preformatted_prompt"].get<std::string>();
+}
+
 static int64_t integer_field(const json & body, const char * name, int64_t fallback) {
     if (!body.contains(name) || body[name].is_null()) return fallback;
     if (!body[name].is_number_integer()) {
@@ -1319,53 +1337,74 @@ static RequestWork parse_work(const json & body, bool chat, const MfqTokenizer &
     std::string prompt;
     bool parse_special = false;
     if (chat) {
-        const common_chat_params chat_params =
-            apply_chat_template(
-                body, templates, work.sampling.enable_thinking);
-        work.token_constraint =
-            make_token_constraint(tokenizer, chat_params);
-        prompt = chat_params.prompt;
-        if (body.contains("mfq_preformatted_prompt") &&
-            !body["mfq_preformatted_prompt"].is_null()) {
-            if (!body["mfq_preformatted_prompt"].is_string() ||
-                body["mfq_preformatted_prompt"].get_ref<
-                    const std::string&>().empty()) {
+        const auto preformatted_prompt =
+            request_preformatted_prompt(body);
+        if (preformatted_prompt) {
+            if (!body.contains("messages") ||
+                !body["messages"].is_array() ||
+                body["messages"].empty()) {
                 throw ApiError(
                     400,
                     "invalid_request_error",
-                    "mfq_preformatted_prompt must be a non-empty string",
-                    "mfq_preformatted_prompt");
+                    "messages must be a non-empty array",
+                    "messages");
             }
-            prompt = body["mfq_preformatted_prompt"].get<std::string>();
+            // The managed API has already applied the architecture-registered
+            // processor protocol.  Treat that prompt as authoritative: an old
+            // or deliberately minimal cached Jinja template must not reject or
+            // reinterpret its tool, media, or extended message fields.
+            prompt = *preformatted_prompt;
+            work.chat_parser.reasoning_format =
+                request_reasoning_format(body);
+            work.chat_parser.reasoning_in_content =
+                work.stream &&
+                work.chat_parser.reasoning_format ==
+                    COMMON_REASONING_FORMAT_DEEPSEEK_LEGACY;
+            work.chat_parser.parse_tool_calls = false;
+        } else {
+            if (templates == nullptr) {
+                throw ApiError(
+                    400,
+                    "unsupported_parameter",
+                    "the tokenizer has no chat template; use /v1/completions "
+                    "with a preformatted prompt",
+                    "messages");
+            }
+            const common_chat_params chat_params =
+                apply_chat_template(
+                    body, templates, work.sampling.enable_thinking);
+            work.token_constraint =
+                make_token_constraint(tokenizer, chat_params);
+            prompt = chat_params.prompt;
+            work.chat_parser.format = chat_params.format;
+            work.chat_parser.reasoning_format =
+                request_reasoning_format(body);
+            work.chat_parser.reasoning_in_content =
+                work.stream &&
+                work.chat_parser.reasoning_format ==
+                    COMMON_REASONING_FORMAT_DEEPSEEK_LEGACY;
+            work.chat_parser.generation_prompt =
+                chat_params.generation_prompt;
+            work.chat_parser.parse_tool_calls = true;
+            if (!chat_params.parser.empty()) {
+                work.chat_parser.parser.load(chat_params.parser);
+            }
+            if (body.contains("continue_final_message") &&
+                !body["continue_final_message"].is_null()) {
+                work.chat_parser.is_continuation =
+                    common_chat_continuation_parse(
+                        body["continue_final_message"]) !=
+                    COMMON_CHAT_CONTINUATION_NONE;
+            }
+            for (const auto & text : chat_params.preserved_tokens) {
+                const auto tokens = tokenizer.tokenize(text, true);
+                work.preserved_tokens.insert(tokens.begin(), tokens.end());
+            }
+            work.stops.insert(
+                work.stops.end(), chat_params.additional_stops.begin(),
+                chat_params.additional_stops.end());
         }
         parse_special = true;
-        work.chat_parser.format = chat_params.format;
-        work.chat_parser.reasoning_format =
-            request_reasoning_format(body);
-        work.chat_parser.reasoning_in_content =
-            work.stream &&
-            work.chat_parser.reasoning_format ==
-                COMMON_REASONING_FORMAT_DEEPSEEK_LEGACY;
-        work.chat_parser.generation_prompt =
-            chat_params.generation_prompt;
-        work.chat_parser.parse_tool_calls = true;
-        if (!chat_params.parser.empty()) {
-            work.chat_parser.parser.load(chat_params.parser);
-        }
-        if (body.contains("continue_final_message") &&
-            !body["continue_final_message"].is_null()) {
-            work.chat_parser.is_continuation =
-                common_chat_continuation_parse(
-                    body["continue_final_message"]) !=
-                COMMON_CHAT_CONTINUATION_NONE;
-        }
-        for (const auto & text : chat_params.preserved_tokens) {
-            const auto tokens = tokenizer.tokenize(text, true);
-            work.preserved_tokens.insert(tokens.begin(), tokens.end());
-        }
-        work.stops.insert(
-            work.stops.end(), chat_params.additional_stops.begin(),
-            chat_params.additional_stops.end());
     } else {
         if (!body.contains("prompt") || !body["prompt"].is_string()) {
             throw ApiError(400, "invalid_request_error", "prompt must be a string", "prompt");
@@ -4090,13 +4129,6 @@ int run_mfq_server(
             return;
         }
         try {
-            if (chat && !chat_templates) {
-                throw ApiError(
-                    400,
-                    "unsupported_parameter",
-                    "the tokenizer has no chat template; use /v1/completions with a preformatted prompt",
-                    "messages");
-            }
             const json body = parse_body(req);
             RequestWork work = parse_work(
                 body, chat, *tokenizer, chat_templates.get(),

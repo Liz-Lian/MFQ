@@ -84,6 +84,22 @@ def test_server_uses_native_gguf_jinja_template_and_common_parser() -> None:
     assert "format_dsv4_chat_prompt" not in SERVER
 
 
+def test_processor_owned_prompts_bypass_cached_jinja_templates() -> None:
+    parse_work = _section(
+        SERVER,
+        "static RequestWork parse_work",
+        "static size_t complete_utf8_prefix",
+    )
+
+    assert "request_preformatted_prompt(body)" in parse_work
+    assert "if (preformatted_prompt)" in parse_work
+    assert "prompt = *preformatted_prompt;" in parse_work
+    assert "work.chat_parser.parse_tool_calls = false;" in parse_work
+    assert parse_work.index("if (preformatted_prompt)") < parse_work.index(
+        "apply_chat_template("
+    )
+
+
 def test_server_enforces_complete_chat_template_tool_calls() -> None:
     assert "MfqGrammarConstraint" in SERVER
     assert "make_token_constraint(tokenizer, chat_params)" in SERVER

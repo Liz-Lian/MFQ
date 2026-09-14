@@ -86,6 +86,79 @@ def test_empty_runtime_pool_reports_an_idle_server() -> None:
     asyncio.run(run())
 
 
+def test_startup_models_use_the_managed_load_path(tmp_path: Path) -> None:
+    async def run() -> None:
+        model = tmp_path / "startup.mfq"
+        executable = tmp_path / "fake-runtime"
+        _model(model, architecture="qwen35")
+        _fake_runtime(executable)
+        catalog = ModelCatalog([tmp_path], cache_seconds=0)
+        artifact = await catalog.resolve_path(model)
+        request = ModelLoadRequest(
+            model=artifact.resource.name,
+            artifact_uri=f"mfq://{artifact.resource.id}",
+            context_size=8192,
+            prefill_chunk_size=333,
+            prefix_cache_disk_bytes=1234,
+        )
+        pool = ManagedRuntimePool(
+            catalog,
+            executable,
+            startup_timeout_seconds=5,
+            startup_loads=[request],
+        )
+
+        try:
+            await pool.start()
+            instances = (await pool.instances()).data
+            assert len(instances) == 1
+            assert instances[0].model == "startup"
+            assert instances[0].state == RuntimeInstanceState.READY
+            assert instances[0].context_size == 8192
+            remembered = pool._load_requests["startup"]
+            assert remembered.artifact_uri == f"mfq://{artifact.resource.id}"
+            assert remembered.prefill_chunk_size == 333
+            assert remembered.prefix_cache_disk_bytes == 1234
+            assert pool._startup_loads == []
+        finally:
+            await pool.aclose()
+
+    asyncio.run(run())
+
+
+def test_failed_startup_model_remains_retryable_without_spawning(
+    tmp_path: Path,
+) -> None:
+    async def run() -> None:
+        model = tmp_path / "too-large.mfq"
+        executable = tmp_path / "fake-runtime"
+        _model(model, architecture="qwen35")
+        _fake_runtime(executable)
+        catalog = ModelCatalog([tmp_path], cache_seconds=0)
+        artifact = await catalog.resolve_path(model)
+        request = ModelLoadRequest(
+            model=artifact.resource.name,
+            artifact_uri=f"mfq://{artifact.resource.id}",
+        )
+        pool = ManagedRuntimePool(
+            catalog,
+            executable,
+            max_runtime_memory_bytes=1,
+            startup_loads=[request],
+        )
+
+        try:
+            with pytest.raises(JobExecutionError) as blocked:
+                await pool.start()
+            assert blocked.value.detail.code == "runtime_model_too_large"
+            assert pool._instances == {}
+            assert pool._startup_loads == [request]
+        finally:
+            await pool.aclose()
+
+    asyncio.run(run())
+
+
 def _model(path: Path, *, architecture: str = "test-model") -> None:
     save(
         path,

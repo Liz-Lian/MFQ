@@ -208,18 +208,6 @@ def _select_backend(requested: str, running_executable: Path | None) -> str:
     raise BuildError(f"unsupported inference backend: {requested}")
 
 
-def _avfoundation_video_library(executable: Path) -> Path | None:
-    from mfq.server.native import find_native_runtime_resource
-
-    configured = os.environ.get("MFQ_AVFOUNDATION_VIDEO_LIBRARY")
-    candidate = (
-        Path(configured).expanduser().resolve()
-        if configured
-        else find_native_runtime_resource(executable, "libmfq_avfoundation_video.dylib")
-    )
-    return candidate if candidate is not None and candidate.is_file() else None
-
-
 def _run(args: argparse.Namespace) -> int:
     client_api_key = os.environ.get(args.api_key_env, "")
     if error := network_auth_error(args.host, client_api_key):
@@ -232,13 +220,11 @@ def _run(args: argparse.Namespace) -> int:
 
     from mfq.server.api import create_app
     from mfq.server.auth import ApiKeyManager
-    from mfq.server.backend import OpenAIChatBackend
     from mfq.server.catalog import ModelCatalog
     from mfq.server.cluster import ClusterBackend
     from mfq.server.components import VoiceOutputComponent
     from mfq.server.jobs import JobManager
     from mfq.server.models import ModelLoadRequest
-    from mfq.server.native import NativeRuntime
     from mfq.server.runtime_pool import ManagedRuntimePool
     from mfq.server.service import ServerService
     from mfq.server.storage import SessionStore
@@ -282,26 +268,13 @@ def _run(args: argparse.Namespace) -> int:
     configured_roots[0].mkdir(parents=True, exist_ok=True)
     catalog = ModelCatalog(configured_roots)
     voice_component = VoiceOutputComponent(args.work_dir.expanduser().resolve())
-    runtime = None
-    try:
-        runtime_manager = ManagedRuntimePool(
-            catalog,
-            executable,
-            startup_timeout_seconds=args.runtime_startup_timeout,
-            max_instances=args.max_runtime_instances,
-            max_requests_per_instance=args.max_requests_per_runtime,
-            max_queued_requests_per_instance=args.max_queued_requests_per_runtime,
-            max_runtime_memory_bytes=args.max_runtime_memory or None,
-            default_idle_ttl_seconds=args.runtime_idle_timeout,
-            backend=selected_backend,
-            voice_component=voice_component,
-            runtime_environment=runtime_environment,
-            controller_command=_controller_command(),
-        )
-        if model is not None:
-            initial_artifact = asyncio.run(catalog.resolve_path(model))
-            initial_request = ModelLoadRequest(
+    startup_loads: list[ModelLoadRequest] = []
+    if model is not None:
+        initial_artifact = asyncio.run(catalog.resolve_path(model))
+        startup_loads.append(
+            ModelLoadRequest(
                 model=initial_artifact.resource.name,
+                artifact_uri=f"mfq://{initial_artifact.resource.id}",
                 context_size=args.context_size or 32768,
                 prefill_chunk_size=args.prefill_chunk_size,
                 moe_gpu_cache_gb=args.moe_gpu_cache_gb,
@@ -310,89 +283,67 @@ def _run(args: argparse.Namespace) -> int:
                 prefix_cache_hot_bytes=args.prefix_cache_hot_size,
                 prefix_cache_block_tokens=args.prefix_cache_block_tokens,
             )
-            runtime = NativeRuntime(
-                executable=executable,
-                model=model,
-                model_name=initial_artifact.resource.name,
-                backend=selected_backend,
-                context_size=initial_request.context_size,
-                prefill_chunk_size=args.prefill_chunk_size,
-                continuous_batching=(
-                    args.max_requests_per_runtime
-                    if selected_backend == "cuda"
-                    and args.max_requests_per_runtime > 1
-                    else 0
-                ),
-                routed_expert_bytes=initial_artifact.routed_expert_bytes,
-                moe_gpu_cache_gb=initial_request.moe_gpu_cache_gb,
-                startup_timeout=args.runtime_startup_timeout,
-                environment=runtime_environment,
-                architecture=initial_artifact.resource.architecture,
-                controller_command=_controller_command(),
-            )
-            runtime.start()
-            if runtime.process is None or runtime.port is None:
-                raise RuntimeError("initial native runtime did not expose its process and port")
-            runtime_manager.register_started(
-                artifact=initial_artifact,
-                process=runtime.process,
-                backend=OpenAIChatBackend(
-                    runtime.base_url,
-                    local_tensor_files=True,
-                    avfoundation_video_library=_avfoundation_video_library(executable),
-                    model_type=initial_artifact.resource.architecture,
-                ),
-                port=runtime.port,
-                load_request=initial_request,
-            )
-        store = SessionStore(args.db.expanduser().resolve())
-        backend = ClusterBackend(runtime_manager, store)
-        binary_dir = _console_script_dir(sys.executable)
-        perplexity = executable.with_name("mfq-perplexity")
-        handlers = ToolJobHandlers(
-            catalog,
-            ToolJobPaths(
-                work_root=args.work_dir.expanduser().resolve(),
-                python=Path(sys.executable),
-                modelscope=(
-                    (binary_dir / "modelscope") if (binary_dir / "modelscope").is_file() else None
-                ),
-                huggingface=(binary_dir / "hf") if (binary_dir / "hf").is_file() else None,
-                runtime=executable,
-                perplexity=perplexity if perplexity.is_file() else None,
-                standalone_cli=bool(getattr(sys, "frozen", False)),
-                internal_modelscope=importlib.util.find_spec("modelscope_hub") is not None,
-                internal_huggingface=importlib.util.find_spec("huggingface_hub") is not None,
+        )
+    runtime_manager = ManagedRuntimePool(
+        catalog,
+        executable,
+        startup_timeout_seconds=args.runtime_startup_timeout,
+        max_instances=args.max_runtime_instances,
+        max_requests_per_instance=args.max_requests_per_runtime,
+        max_queued_requests_per_instance=args.max_queued_requests_per_runtime,
+        max_runtime_memory_bytes=args.max_runtime_memory or None,
+        default_idle_ttl_seconds=args.runtime_idle_timeout,
+        backend=selected_backend,
+        voice_component=voice_component,
+        runtime_environment=runtime_environment,
+        controller_command=_controller_command(),
+        startup_loads=startup_loads,
+    )
+    store = SessionStore(args.db.expanduser().resolve())
+    backend = ClusterBackend(runtime_manager, store)
+    binary_dir = _console_script_dir(sys.executable)
+    perplexity = executable.with_name("mfq-perplexity")
+    handlers = ToolJobHandlers(
+        catalog,
+        ToolJobPaths(
+            work_root=args.work_dir.expanduser().resolve(),
+            python=Path(sys.executable),
+            modelscope=(
+                (binary_dir / "modelscope") if (binary_dir / "modelscope").is_file() else None
             ),
-            voice_component=voice_component,
-            activate_voice_output=runtime_manager.enable_realtime,
-        )
-        jobs = JobManager(store, handlers.handlers())
-        service = ServerService(
-            store,
-            backend,
-            jobs=jobs,
-            catalog=catalog,
-            runtime_manager=runtime_manager,
-            tool_handlers=handlers,
-            cluster=backend,
-            voice_component=voice_component,
-        )
-        api_keys = ApiKeyManager(store, client_api_key) if client_api_key else None
-        public_url = f"http://{args.host}:{args.port}"
-        print(f"MFQ Server ready: {public_url}")
-        if web_root is None:
-            print("Web UI assets were not found; serving the API only")
-        uvicorn.run(
-            create_app(service, web_root=web_root, api_keys=api_keys),
-            host=args.host,
-            port=args.port,
-            log_level=args.log_level,
-            access_log=args.access_log,
-        )
-    finally:
-        if runtime is not None:
-            runtime.stop()
+            huggingface=(binary_dir / "hf") if (binary_dir / "hf").is_file() else None,
+            runtime=executable,
+            perplexity=perplexity if perplexity.is_file() else None,
+            standalone_cli=bool(getattr(sys, "frozen", False)),
+            internal_modelscope=importlib.util.find_spec("modelscope_hub") is not None,
+            internal_huggingface=importlib.util.find_spec("huggingface_hub") is not None,
+        ),
+        voice_component=voice_component,
+        activate_voice_output=runtime_manager.enable_realtime,
+    )
+    jobs = JobManager(store, handlers.handlers())
+    service = ServerService(
+        store,
+        backend,
+        jobs=jobs,
+        catalog=catalog,
+        runtime_manager=runtime_manager,
+        tool_handlers=handlers,
+        cluster=backend,
+        voice_component=voice_component,
+    )
+    api_keys = ApiKeyManager(store, client_api_key) if client_api_key else None
+    public_url = f"http://{args.host}:{args.port}"
+    print(f"MFQ Server ready: {public_url}")
+    if web_root is None:
+        print("Web UI assets were not found; serving the API only")
+    uvicorn.run(
+        create_app(service, web_root=web_root, api_keys=api_keys),
+        host=args.host,
+        port=args.port,
+        log_level=args.log_level,
+        access_log=args.access_log,
+    )
     return 0
 
 

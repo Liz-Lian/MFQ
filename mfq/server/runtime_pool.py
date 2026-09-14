@@ -206,6 +206,7 @@ class ManagedRuntimePool:
         voice_component: Any | None = None,
         runtime_environment: dict[str, str] | None = None,
         controller_command: Sequence[str] = (),
+        startup_loads: Sequence[ModelLoadRequest] = (),
     ) -> None:
         if max_instances < 1:
             raise ValueError("max_instances must be positive")
@@ -243,6 +244,7 @@ class ManagedRuntimePool:
         self.voice_component = voice_component
         self.runtime_environment = dict(runtime_environment or {})
         self.controller_command = tuple(str(value) for value in controller_command)
+        self._startup_loads = [request.model_copy(deep=True) for request in startup_loads]
         self.store = None
         self._instances: dict[UUID, _ManagedRuntime] = {}
         self._loading_model_names: set[str] = set()
@@ -265,7 +267,7 @@ class ManagedRuntimePool:
         self._closed = False
 
     async def start(self) -> None:
-        """Start lifecycle monitors for runtimes registered before the event loop."""
+        """Start lifecycle monitors and configured startup models."""
 
         async with self._lock:
             if self._closed:
@@ -289,6 +291,22 @@ class ManagedRuntimePool:
                 )
                 self._background_tasks.add(task)
                 task.add_done_callback(self._background_task_done)
+            startup_loads = tuple(self._startup_loads)
+            self._startup_loads.clear()
+
+        for index, request in enumerate(startup_loads):
+            context = _RuntimeLoadContext()
+            try:
+                await self.load(
+                    context,  # type: ignore[arg-type]
+                    request.model_dump(mode="python"),
+                )
+            except BaseException:
+                async with self._lock:
+                    self._startup_loads[:0] = startup_loads[index:]
+                raise
+            finally:
+                await context.cleanup()
 
     def _background_task_done(self, task: asyncio.Task[Any]) -> None:
         self._background_tasks.discard(task)

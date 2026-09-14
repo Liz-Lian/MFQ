@@ -1,8 +1,7 @@
 """Executable ownership rules for shared native-runtime behavior."""
 
-from pathlib import Path
 import re
-
+from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 METAL = ROOT / "cpp_runtime" / "backends" / "metal"
@@ -229,7 +228,8 @@ def test_dspark_adapters_keep_only_predictor_math_and_cache_state() -> None:
         assert "mlx_sparse_selected_mla_attention(" in source
         assert "void MlxDeepseek" in source and "::propose(" in source
         assert "draft_impl(" in source
-        assert "const int physical_width = std::min(requested, available_width);" in source
+        assert "const int physical_width = available_width;" in source
+        assert "evaluate the complete physical block" in source
     assert "stable_dspark_state_" in DSV
     assert "stable_dspark_state_" in DSV41
     assert "MlxMtpDepthPolicy" not in DSV

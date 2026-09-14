@@ -5,7 +5,7 @@ import base64
 import hashlib
 import json
 from pathlib import Path
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import httpx
 import pytest
@@ -668,6 +668,57 @@ def test_cluster_close_serializes_with_refresh_and_is_idempotent(
             await cluster.nodes()
         assert closed.value.code == "backend_closed"
         assert closed.value.status_code == 503
+        await client.aclose()
+
+    asyncio.run(run())
+
+
+def test_retired_node_sessions_are_released_concurrently(tmp_path: Path) -> None:
+    async def run() -> None:
+        active = 0
+        maximum_active = 0
+        all_started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal active, maximum_active
+            if request.method != "DELETE":
+                return httpx.Response(404)
+            active += 1
+            maximum_active = max(maximum_active, active)
+            if active == 3:
+                all_started.set()
+            try:
+                await release.wait()
+            finally:
+                active -= 1
+            return httpx.Response(204)
+
+        store = SessionStore(tmp_path / "mfq.server.sqlite3")
+        node = store.create_remote_node(
+            CreateRemoteNodeRequest(
+                name="worker-a",
+                url="http://worker-a:8090",
+            )
+        )
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        cluster = ClusterBackend(FakeBackend(), store, client=client)
+        for _ in range(3):
+            local_id = uuid4()
+            cluster._sessions[(node.id, local_id)] = (
+                cluster._remote_session_from_payload(
+                    node,
+                    {"id": str(uuid4()), "revision": 0},
+                    synchronized_messages=0,
+                )
+            )
+
+        cleanup = asyncio.create_task(cluster._release_node_sessions(node))
+        await asyncio.wait_for(all_started.wait(), timeout=1)
+        assert maximum_active == 3
+        release.set()
+        await asyncio.wait_for(cleanup, timeout=1)
+        assert cluster._sessions == {}
         await client.aclose()
 
     asyncio.run(run())

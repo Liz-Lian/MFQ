@@ -38,6 +38,7 @@ from mfq.server.models import (
 from mfq.server.storage import SessionStore
 
 _NodeVersion = tuple[UUID, str, str | None, bool, datetime]
+_SESSION_CLEANUP_CONCURRENCY = 8
 
 
 @dataclass
@@ -820,8 +821,15 @@ class ClusterBackend:
             ]
         if not sessions:
             return
-        for remote in sessions:
-            await self._discard_routed_session(remote)
+        for offset in range(0, len(sessions), _SESSION_CLEANUP_CONCURRENCY):
+            await asyncio.gather(
+                *(
+                    self._discard_routed_session(remote)
+                    for remote in sessions[
+                        offset : offset + _SESSION_CLEANUP_CONCURRENCY
+                    ]
+                )
+            )
 
     async def _discard_routed_session(self, remote: _RemoteSession) -> None:
         try:

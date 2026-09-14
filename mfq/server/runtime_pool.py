@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import os
 import socket
 import subprocess
 import time
@@ -24,6 +23,7 @@ from mfq.server.backend import (
     preflight_backend_request,
 )
 from mfq.server.catalog import DiscoveredModel, ModelArtifactNotFoundError, ModelCatalog
+from mfq.server.host_memory import host_memory_snapshot, total_physical_memory
 from mfq.server.jobs import JobContext, JobExecutionError
 from mfq.server.models import (
     ErrorDetail,
@@ -281,11 +281,8 @@ class ManagedRuntimePool:
 
         if backend != "metal":
             return None
-        try:
-            total_bytes = int(os.sysconf("SC_PHYS_PAGES")) * int(
-                os.sysconf("SC_PAGE_SIZE")
-            )
-        except (AttributeError, OSError, TypeError, ValueError):
+        total_bytes = total_physical_memory()
+        if total_bytes is None:
             return None
         if total_bytes <= 0:
             return None
@@ -438,10 +435,15 @@ class ManagedRuntimePool:
             artifact.resource.architecture,
             artifact.path,
         )
+        async with self._lock:
+            if self._closed:
+                raise RuntimeManagementError("runtime pool is closed")
+            residency_ceiling = self._effective_runtime_memory_budget_locked()
         request = self._apply_automatic_expert_residency(
             artifact,
             request,
             runtime_route=runtime_route,
+            memory_ceiling=residency_ceiling,
         )
         python_mlx_worker = runtime_route.python_mlx_worker
         request_capacity = native_request_capacity(
@@ -552,12 +554,12 @@ class ManagedRuntimePool:
                 self._committed_pool_bytes_locked()
                 - sum(self._committed_runtime_bytes(item) for item in evicted),
             )
+            memory_ceiling = self._effective_runtime_memory_budget_locked()
             while (
                 active_count >= self.max_instances
                 or (
-                    self.max_runtime_memory_bytes is not None
-                    and committed_bytes + incoming_bytes
-                    > self.max_runtime_memory_bytes
+                    memory_ceiling is not None
+                    and committed_bytes + incoming_bytes > memory_ceiling
                 )
             ):
                 victim = self._lru_instance_for_unload_locked(
@@ -565,9 +567,8 @@ class ManagedRuntimePool:
                 )
                 if victim is None:
                     memory_limited = (
-                        self.max_runtime_memory_bytes is not None
-                        and committed_bytes + incoming_bytes
-                        > self.max_runtime_memory_bytes
+                        memory_ceiling is not None
+                        and committed_bytes + incoming_bytes > memory_ceiling
                     )
                     raise _job_error(
                         "runtime_memory_limit" if memory_limited else "runtime_instance_limit",
@@ -1216,6 +1217,9 @@ class ManagedRuntimePool:
         async with self._lock:
             memory_status = {
                 "runtime_memory_budget_bytes": self.max_runtime_memory_bytes,
+                "runtime_memory_effective_budget_bytes": (
+                    self._effective_runtime_memory_budget_locked()
+                ),
                 "runtime_memory_budget_mode": (
                     "automatic"
                     if self.automatic_memory_budget
@@ -1849,11 +1853,12 @@ class ManagedRuntimePool:
         return victim
 
     def _claim_over_budget_instances_for_unload_locked(self) -> list[_ManagedRuntime]:
-        if self.max_runtime_memory_bytes is None:
+        memory_ceiling = self._effective_runtime_memory_budget_locked()
+        if memory_ceiling is None:
             return []
         committed = self._committed_pool_bytes_locked()
         victims = []
-        while committed > self.max_runtime_memory_bytes:
+        while committed > memory_ceiling:
             victim = self._claim_lru_instance_for_unload_locked()
             if victim is None:
                 break
@@ -1874,6 +1879,9 @@ class ManagedRuntimePool:
             return
         async with self._lock:
             if self._closed:
+                return
+            memory_ceiling = self._effective_runtime_memory_budget_locked()
+            if memory_ceiling is None:
                 return
             if prospective_model is not None and (
                 prospective_model in self._loading_model_names
@@ -1896,7 +1904,7 @@ class ManagedRuntimePool:
                 if active_count >= self.max_instances:
                     return
             committed = self._committed_pool_bytes_locked() + additional_bytes
-            if committed <= self.max_runtime_memory_bytes:
+            if committed <= memory_ceiling:
                 return
             candidates = sorted(
                 (
@@ -1923,7 +1931,7 @@ class ManagedRuntimePool:
                 ):
                     continue
                 committed = self._committed_pool_bytes_locked() + additional_bytes
-                excess = committed - self.max_runtime_memory_bytes
+                excess = committed - memory_ceiling
                 if excess <= 0:
                     return
                 hot_bytes = instance.kv_bytes or 0
@@ -2036,6 +2044,21 @@ class ManagedRuntimePool:
             if name not in resident_names
         )
 
+    def _effective_runtime_memory_budget_locked(self) -> int | None:
+        """Cap automatic admission by memory the host can reclaim right now."""
+
+        ceiling = self.max_runtime_memory_bytes
+        if ceiling is None or not self.automatic_memory_budget:
+            return ceiling
+        snapshot = host_memory_snapshot()
+        if snapshot is None:
+            return ceiling
+        dynamic_ceiling = (
+            self._committed_pool_bytes_locked()
+            + snapshot.reclaimable(active_ratio=0.5)
+        )
+        return max(1, min(ceiling, dynamic_ceiling))
+
     def _estimated_load_bytes(
         self,
         artifact: DiscoveredModel,
@@ -2057,11 +2080,8 @@ class ManagedRuntimePool:
         if cache_gb is None:
             if self.backend != "metal" or artifact.resource.format != "hf":
                 return total_bytes
-            try:
-                physical_bytes = int(os.sysconf("SC_PHYS_PAGES")) * int(
-                    os.sysconf("SC_PAGE_SIZE")
-                )
-            except (AttributeError, OSError, TypeError, ValueError):
+            physical_bytes = total_physical_memory()
+            if physical_bytes is None:
                 # Conservatively reserve the complete model when the host
                 # cannot reproduce the native Metal worker's automatic budget.
                 return total_bytes
@@ -2079,10 +2099,15 @@ class ManagedRuntimePool:
         request: ModelLoadRequest,
         *,
         runtime_route: RuntimeRoute,
+        memory_ceiling: int | None = None,
     ) -> ModelLoadRequest:
         """Fit an oversized native MFQ MoE into the Metal residency budget."""
 
-        ceiling = self.max_runtime_memory_bytes
+        ceiling = (
+            memory_ceiling
+            if memory_ceiling is not None
+            else self.max_runtime_memory_bytes
+        )
         if (
             request.moe_gpu_cache_gb is not None
             or self.backend != "metal"

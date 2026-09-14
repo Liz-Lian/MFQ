@@ -28,6 +28,7 @@ from mfq.server.catalog import (
     DuplicateModelNameError,
     ModelCatalog,
 )
+from mfq.server.host_memory import HostMemorySnapshot
 from mfq.server.jobs import JobExecutionError
 from mfq.server.models import (
     JobStatus,
@@ -89,10 +90,9 @@ def test_empty_runtime_pool_reports_an_idle_server() -> None:
 def test_metal_runtime_pool_derives_a_safe_default_memory_budget(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    values = {"SC_PHYS_PAGES": 128, "SC_PAGE_SIZE": 1 << 30}
     monkeypatch.setattr(
-        "mfq.server.runtime_pool.os.sysconf",
-        lambda name: values[name],
+        "mfq.server.runtime_pool.total_physical_memory",
+        lambda: 128 << 30,
     )
 
     automatic = ManagedRuntimePool(ModelCatalog([]), "runtime", backend="metal")
@@ -118,6 +118,42 @@ def test_metal_runtime_pool_derives_a_safe_default_memory_budget(
     assert explicit.automatic_memory_budget is False
     assert cuda.max_runtime_memory_bytes is None
     assert cuda.automatic_memory_budget is False
+
+
+def test_automatic_memory_budget_tracks_current_reclaimable_memory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gib = 1 << 30
+    monkeypatch.setattr(
+        "mfq.server.runtime_pool.total_physical_memory",
+        lambda: 128 * gib,
+    )
+    monkeypatch.setattr(
+        "mfq.server.runtime_pool.host_memory_snapshot",
+        lambda: HostMemorySnapshot(
+            total=128 * gib,
+            free=4 * gib,
+            active=80 * gib,
+            inactive=4 * gib,
+            wired=40 * gib,
+        ),
+    )
+
+    automatic = ManagedRuntimePool(ModelCatalog([]), "runtime", backend="metal")
+    automatic._load_bytes["resident"] = 30 * gib
+    explicit = ManagedRuntimePool(
+        ModelCatalog([]),
+        "runtime",
+        backend="metal",
+        max_runtime_memory_bytes=100 * gib,
+    )
+    explicit._load_bytes["resident"] = 30 * gib
+
+    assert automatic._effective_runtime_memory_budget_locked() == 78 * gib
+    assert explicit._effective_runtime_memory_budget_locked() == 100 * gib
+    assert HostMemorySnapshot(0, -1, 10, -1, 0).reclaimable(
+        active_ratio=2.0
+    ) == 10
 
 
 def test_startup_models_use_the_managed_load_path(tmp_path: Path) -> None:
@@ -463,10 +499,9 @@ def test_native_hf_metal_auto_streaming_reserves_its_expert_cache(
         path=model,
         routed_expert_bytes=8 << 30,
     )
-    values = {"SC_PHYS_PAGES": 6, "SC_PAGE_SIZE": 1 << 30}
     monkeypatch.setattr(
-        "mfq.server.runtime_pool.os.sysconf",
-        lambda name: values[name],
+        "mfq.server.runtime_pool.total_physical_memory",
+        lambda: 6 << 30,
     )
     request = ModelLoadRequest(model="native-hf")
     route = RuntimeRoute(architecture_family="qwen4_exp", backbone="qwen4_exp")
@@ -571,6 +606,19 @@ def test_oversized_mfq_moe_gets_an_automatic_metal_expert_budget(
         full_resident,
         runtime_route=route,
     ) == 125 << 30
+
+    pressure_limited = pool._apply_automatic_expert_residency(
+        artifact,
+        ModelLoadRequest(model="oversized"),
+        runtime_route=route,
+        memory_ceiling=60 << 30,
+    )
+    assert pressure_limited.moe_gpu_cache_gb == 42
+    assert pool._estimated_load_bytes(
+        artifact,
+        pressure_limited,
+        runtime_route=route,
+    ) == 57 << 30
 
 
 def test_catalog_loads_registered_external_mfq_files(tmp_path: Path) -> None:
@@ -755,6 +803,7 @@ def test_empty_runtime_pool_reports_idle_state(tmp_path: Path) -> None:
 
         assert await pool.runtime_status() == {
             "runtime_memory_budget_bytes": None,
+            "runtime_memory_effective_budget_bytes": None,
             "runtime_memory_budget_mode": "disabled",
             "runtime_memory_committed_bytes": 0,
             "runtime_state": "idle",

@@ -546,6 +546,51 @@ def test_backend_proxies_runtime_console_resources() -> None:
     ]
 
 
+def test_backend_bounds_local_control_requests_by_operation() -> None:
+    observed: dict[str, float] = {}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        timeout = request.extensions.get("timeout", {})
+        observed[request.url.path] = float(timeout["read"])
+        if request.url.path == "/health":
+            return httpx.Response(
+                200,
+                json={"model": "model-a", "model_type": "qwen3"},
+            )
+        if request.url.path.endswith("/cancel"):
+            return httpx.Response(200, json={"cancelled": True})
+        return httpx.Response(200, json={"status": "ok"})
+
+    async def run() -> None:
+        session_id = UUID("11111111-1111-4111-8111-111111111111")
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        backend = OpenAIChatBackend(
+            "http://backend",
+            client=client,
+            control_timeout_seconds=7,
+            long_control_timeout_seconds=11,
+        )
+        await backend.capabilities()
+        await backend.runtime_status()
+        await backend.reload_runtime(8192)
+        await backend.clear_runtime_cache()
+        await backend.trim_runtime_cache()
+        assert await backend.close_session(session_id)
+        assert await backend.cancel_response(session_id)
+        await client.aclose()
+
+    asyncio.run(run())
+    assert observed == {
+        "/health": 7,
+        "/api/status": 7,
+        "/api/reload": 11,
+        "/api/runtime/cache/clear": 11,
+        "/api/runtime/cache/trim": 7,
+        "/api/runtime/sessions/11111111-1111-4111-8111-111111111111": 7,
+        "/api/runtime/sessions/11111111-1111-4111-8111-111111111111/cancel": 1,
+    }
+
+
 def test_backend_forwards_runtime_session_lifecycle() -> None:
     requests: list[tuple[str, str, dict[str, object] | None, str | None]] = []
     backend_key = "unit-test-key"

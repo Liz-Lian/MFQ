@@ -143,10 +143,17 @@ class OpenAIChatBackend:
         avfoundation_video_library: str | Path | None = None,
         local_tensor_files: bool = False,
         model_type: str | None = None,
+        control_timeout_seconds: float = 30.0,
+        long_control_timeout_seconds: float = 1800.0,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         self._owns_client = client is None
+        self.control_timeout_seconds = max(0.25, control_timeout_seconds)
+        self.long_control_timeout_seconds = max(
+            self.control_timeout_seconds,
+            long_control_timeout_seconds,
+        )
         hostname = urlsplit(self.base_url).hostname
         self._client = client or httpx.AsyncClient(
             timeout=httpx.Timeout(connect=5.0, read=None, write=30.0, pool=5.0),
@@ -477,10 +484,16 @@ class OpenAIChatBackend:
         # media preprocessing. Briefly retry so cancellation remains reliable
         # at that boundary without delaying an already-active decode.
         for attempt in range(20):
-            payload = await self._json_request(
-                "POST",
-                f"/api/runtime/sessions/{session_id}/cancel",
-            )
+            try:
+                payload = await self._json_request(
+                    "POST",
+                    f"/api/runtime/sessions/{session_id}/cancel",
+                    timeout_seconds=min(1.0, self.control_timeout_seconds),
+                )
+            except BackendError as error:
+                if error.retryable:
+                    return False
+                raise
             if payload.get("cancelled") is True:
                 return True
             if attempt < 19:
@@ -495,6 +508,7 @@ class OpenAIChatBackend:
             response = await self._client.get(
                 f"{self.base_url}/health",
                 headers=headers,
+                timeout=self._control_timeout(self.control_timeout_seconds),
             )
             if response.status_code >= 400:
                 raise self._http_error(response.status_code, response.content)
@@ -632,10 +646,15 @@ class OpenAIChatBackend:
             "POST",
             "/api/reload",
             json_body={"context_size": context_size},
+            timeout_seconds=self.long_control_timeout_seconds,
         )
 
     async def clear_runtime_cache(self) -> dict[str, Any]:
-        return await self._json_request("POST", "/api/runtime/cache/clear")
+        return await self._json_request(
+            "POST",
+            "/api/runtime/cache/clear",
+            timeout_seconds=self.long_control_timeout_seconds,
+        )
 
     async def trim_runtime_cache(self, target_bytes: int = 0) -> dict[str, Any]:
         if target_bytes < 0:
@@ -670,6 +689,7 @@ class OpenAIChatBackend:
         path: str,
         *,
         json_body: dict[str, Any] | None = None,
+        timeout_seconds: float | None = None,
     ) -> dict[str, Any]:
         headers = {}
         if self.api_key:
@@ -680,6 +700,11 @@ class OpenAIChatBackend:
                 f"{self.base_url}{path}",
                 json=json_body,
                 headers=headers,
+                timeout=self._control_timeout(
+                    self.control_timeout_seconds
+                    if timeout_seconds is None
+                    else timeout_seconds
+                ),
             )
             if response.status_code >= 400:
                 raise self._http_error(response.status_code, response.content)
@@ -688,8 +713,14 @@ class OpenAIChatBackend:
             raise
         except httpx.TimeoutException as error:
             raise BackendError("backend_timeout", str(error), retryable=True) from error
-        except (httpx.HTTPError, ValueError) as error:
-            raise BackendError("backend_protocol_error", str(error), retryable=True) from error
+        except httpx.HTTPError as error:
+            raise BackendError(
+                "backend_connection_error",
+                str(error),
+                retryable=True,
+            ) from error
+        except ValueError as error:
+            raise BackendError("backend_protocol_error", str(error)) from error
         if not isinstance(payload, dict):
             raise BackendProtocolError(f"backend {path} response must be a JSON object")
         return payload
@@ -710,10 +741,20 @@ class OpenAIChatBackend:
                 f"{self.base_url}{path}",
                 json=json_body,
                 headers=headers,
+                timeout=self._control_timeout(self.control_timeout_seconds),
             )
         except httpx.HTTPError:
             return False
         return bool(200 <= response.status_code < 300)
+
+    @staticmethod
+    def _control_timeout(seconds: float) -> httpx.Timeout:
+        return httpx.Timeout(
+            seconds,
+            connect=min(5.0, seconds),
+            write=min(30.0, seconds),
+            pool=min(5.0, seconds),
+        )
 
     @staticmethod
     async def _iter_sse_data(response: httpx.Response) -> AsyncIterator[str]:

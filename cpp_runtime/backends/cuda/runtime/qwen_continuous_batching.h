@@ -526,6 +526,8 @@ public:
                 static_cast<double>(max_batch_seen_.load())},
             {"continuous_batching_admissions",
                 static_cast<double>(admissions_.load())},
+            {"continuous_batching_interleaved_admissions",
+                static_cast<double>(interleaved_admissions_.load())},
             {"continuous_batching_compactions",
                 static_cast<double>(compactions_.load())},
             {"continuous_batching_batched_greedy_batches",
@@ -664,13 +666,15 @@ private:
         }
     }
 
-    std::vector<std::shared_ptr<Request>> take_pending() {
+    std::vector<std::shared_ptr<Request>> take_pending(
+            size_t admission_limit) {
         std::vector<std::shared_ptr<Request>> requests;
         std::lock_guard<std::mutex> lock(queue_mutex_);
         const size_t available = max_sequences_ >
                 static_cast<int32_t>(active_.size())
             ? static_cast<size_t>(max_sequences_) - active_.size() : 0;
-        const size_t count = std::min(available, pending_.size());
+        const size_t count = std::min(
+            {available, pending_.size(), admission_limit});
         requests.reserve(count);
         for (size_t index = 0; index < count; ++index) {
             requests.push_back(std::move(pending_.front()));
@@ -1218,9 +1222,21 @@ private:
                         if (stopping_) continue;
                     }
                 }
-                auto incoming = take_pending();
+                // Do not let a burst of prompt prefills starve established
+                // decodes. CUDA kernels cannot be preempted, so service one
+                // decode step first and join at most one new request per
+                // contended scheduler turn. Fully chunking a single long
+                // prefill is a separate scheduling capability.
+                const bool decode_was_active = !active_.empty();
+                if (decode_was_active) decode_active();
+                auto incoming = take_pending(decode_was_active
+                    ? size_t{1}
+                    : static_cast<size_t>(max_sequences_));
+                if (decode_was_active && !incoming.empty()) {
+                    ++interleaved_admissions_;
+                }
                 admit_requests(incoming);
-                decode_active();
+                if (!decode_was_active) decode_active();
             } catch (...) {
                 auto error = std::current_exception();
                 fail_requests(active_, error);
@@ -1253,6 +1269,7 @@ private:
     std::atomic<int64_t> decode_tokens_{0};
     std::atomic<int64_t> max_batch_seen_{0};
     std::atomic<int64_t> admissions_{0};
+    std::atomic<int64_t> interleaved_admissions_{0};
     std::atomic<int64_t> compactions_{0};
     std::atomic<int64_t> batched_greedy_batches_{0};
     std::atomic<int64_t> packed_metadata_batches_{0};

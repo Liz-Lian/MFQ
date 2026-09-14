@@ -64,6 +64,16 @@ def test_scheduler_supports_dynamic_join_retire_and_per_request_sampling():
     assert "DecodeGraphTpProjectionScope tp_projection_scope" in BATCHING
 
 
+def test_scheduler_services_decode_before_contended_prefill_admission():
+    decode_first = "if (decode_was_active) decode_active();"
+    limited_join = "? size_t{1}"
+    admission = "admit_requests(incoming);"
+    assert decode_first in BATCHING
+    assert limited_join in BATCHING
+    assert BATCHING.index(decode_first) < BATCHING.index(admission)
+    assert "continuous_batching_interleaved_admissions" in BATCHING
+
+
 def test_qwen_decode_accepts_independent_batch_positions():
     assert "cache_positions.size(0) == B" in DECODE
     assert "write_positions.size(0) == B" in DECODE

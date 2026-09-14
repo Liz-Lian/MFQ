@@ -1053,17 +1053,17 @@ def test_runtime_memory_enforcement_evicts_only_idle_unpinned_instances(
         pool._instances = {older.id: older, newer.id: newer}
 
         async with pool._lock:
-            victims = pool._detach_over_budget_locked()
+            victims = pool._claim_over_budget_instances_for_unload_locked()
 
         assert victims == [older]
-        assert list(pool._instances) == [newer.id]
+        assert list(pool._instances) == [older.id, newer.id]
         assert older.state == RuntimeInstanceState.UNLOADING
 
         newer.resident_bytes = 101
         newer.pinned = True
         async with pool._lock:
-            assert pool._detach_over_budget_locked() == []
-        assert list(pool._instances) == [newer.id]
+            assert pool._claim_over_budget_instances_for_unload_locked() == []
+        assert list(pool._instances) == [older.id, newer.id]
 
     asyncio.run(run())
 
@@ -1169,13 +1169,13 @@ def test_runtime_control_lease_blocks_lru_eviction(tmp_path: Path) -> None:
 
         async with pool._lock:
             assert instance.control_leases == 1
-            assert pool._detach_lru_instance_locked() is None
+            assert pool._claim_lru_instance_for_unload_locked() is None
 
         release.set()
         assert await clearing == {"cleared": True}
         async with pool._lock:
             assert instance.control_leases == 0
-            assert pool._detach_lru_instance_locked() is instance
+            assert pool._claim_lru_instance_for_unload_locked() is instance
 
     asyncio.run(run())
 
@@ -1281,7 +1281,7 @@ def test_runtime_memory_enforcement_trims_idle_hot_tiers_before_models(
 
         await pool._trim_idle_prefix_caches_for_budget()
         async with pool._lock:
-            victims = pool._detach_over_budget_locked()
+            victims = pool._claim_over_budget_instances_for_unload_locked()
 
         assert older_backend.targets == [0]
         assert newer_backend.targets == [20]
@@ -1619,6 +1619,7 @@ def test_named_load_replaces_an_idle_stale_artifact_revision(
             ModelCatalog([model_dir], cache_seconds=0),
             executable,
             startup_timeout_seconds=5,
+            max_instances=1,
         )
 
         try:
@@ -1942,6 +1943,60 @@ def test_runtime_stop_uses_kill_after_terminate_failure(tmp_path: Path) -> None:
         assert process.killed
         assert process.returncode == -9
         assert backend.closed
+
+    asyncio.run(run())
+
+
+def test_runtime_retirement_keeps_a_failed_process_visible_for_retry(
+    tmp_path: Path,
+) -> None:
+    async def run() -> None:
+        _model(tmp_path / "model.mfq")
+        catalog = ModelCatalog([tmp_path], cache_seconds=0)
+        artifact = await catalog.resolve("model")
+        instance = _ManagedRuntime(
+            id=uuid4(),
+            artifact=artifact,
+            process=SimpleNamespace(returncode=None),
+            backend=IdleBackend(),
+            port=0,
+            context_size=4096,
+            state=RuntimeInstanceState.READY,
+            resident_bytes=123,
+        )
+        pool = ManagedRuntimePool(catalog, tmp_path / "runtime")
+        pool._instances[instance.id] = instance
+        session_id = uuid4()
+        pool._session_routes[session_id] = instance.id
+        pool._last_instance_id = instance.id
+        attempts = 0
+
+        async def stop_process(candidate: _ManagedRuntime) -> None:
+            nonlocal attempts
+            assert candidate is instance
+            attempts += 1
+            if attempts == 1:
+                raise RuntimeError("process is still alive")
+
+        pool._stop_process = stop_process  # type: ignore[method-assign]
+
+        with pytest.raises(RuntimeError, match="still alive"):
+            await pool._retire_instance(instance)
+
+        listed = (await pool.instances()).data
+        assert len(listed) == 1
+        assert listed[0].id == instance.id
+        assert listed[0].state == RuntimeInstanceState.UNLOADING
+        assert listed[0].error is not None
+        assert listed[0].error.code == "runtime_unload_failed"
+        assert pool._committed_pool_bytes_locked() == 123
+        assert session_id not in pool._session_routes
+        assert pool._last_instance_id is None
+
+        await pool._retire_instance(instance)
+
+        assert attempts == 2
+        assert instance.id not in pool._instances
 
     asyncio.run(run())
 

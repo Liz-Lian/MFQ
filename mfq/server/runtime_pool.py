@@ -84,6 +84,7 @@ class _ManagedRuntime:
     error: ErrorDetail | None = None
     output_task: asyncio.Task[None] | None = None
     monitor_task: asyncio.Task[None] | None = None
+    retirement_task: asyncio.Task[None] | None = None
     realtime_gateway: Any | None = None
     realtime_error: str | None = None
     reserved_bytes: int | None = None
@@ -432,8 +433,7 @@ class ManagedRuntimePool:
                         "the model artifact changed while its current runtime is busy",
                         retryable=True,
                     )
-                existing.state = RuntimeInstanceState.UNLOADING
-                self._detach_instance_locked(existing)
+                self._mark_instance_unloading_locked(existing)
                 evicted.append(existing)
                 existing = None
             if existing is not None:
@@ -447,15 +447,21 @@ class ManagedRuntimePool:
                     f"model is already loading: {model_name}",
                     retryable=True,
                 )
+            claimed_instance_ids = {item.id for item in evicted}
             resident_names = {
                 item.artifact.resource.name
                 for item in self._instances.values()
                 if item.state != RuntimeInstanceState.FAILED
+                and item.id not in claimed_instance_ids
             }
             active_count = len(resident_names) + sum(
                 name not in resident_names for name in self._loading_model_names
             )
-            committed_bytes = self._committed_pool_bytes_locked()
+            committed_bytes = max(
+                0,
+                self._committed_pool_bytes_locked()
+                - sum(self._committed_runtime_bytes(item) for item in evicted),
+            )
             while (
                 active_count >= self.max_instances
                 or (
@@ -464,7 +470,7 @@ class ManagedRuntimePool:
                     > self.max_runtime_memory_bytes
                 )
             ):
-                victim = self._detach_lru_instance_locked()
+                victim = self._claim_lru_instance_for_unload_locked()
                 if victim is None:
                     memory_limited = (
                         self.max_runtime_memory_bytes is not None
@@ -505,11 +511,11 @@ class ManagedRuntimePool:
                         f"Evicting idle runtime {victim.artifact.resource.name} "
                         f"before loading {model_name}"
                     )
-                    await self._stop_process(victim)
+                    await self._retire_instance(victim)
             except BaseException as error:
                 for victim in evicted:
                     with suppress(Exception):
-                        await self._stop_process(victim)
+                        await self._retire_instance(victim)
                 async with self._lock:
                     self._finish_model_load_locked(
                         model_name,
@@ -604,11 +610,8 @@ class ManagedRuntimePool:
         async def cleanup_failed_start() -> None:
             if keep_process:
                 return
-            async with self._lock:
-                if self._instances.get(instance.id) is instance:
-                    self._detach_instance_locked(instance)
             try:
-                await self._stop_process(instance)
+                await self._retire_instance(instance)
             finally:
                 async with self._lock:
                     self._finish_model_load_locked(
@@ -734,18 +737,13 @@ class ManagedRuntimePool:
         async def cleanup_incomplete_unload() -> None:
             if released:
                 return
-            await self._stop_process(instance)
-            async with self._lock:
-                if self._instances.get(instance.id) is instance:
-                    self._detach_instance_locked(instance)
+            await self._retire_instance(instance)
 
         context.add_cleanup(cleanup_incomplete_unload)
         await context.progress(0.2, message="Stopping runtime")
-        await self._stop_process(instance)
+        await self._retire_instance(instance)
         await context.progress(0.9, message="Releasing runtime")
         async with self._lock:
-            if self._instances.get(instance.id) is instance:
-                self._detach_instance_locked(instance)
             released = True
         await context.progress(1.0, message="Model unloaded")
         return {"instance_id": str(instance.id), "unloaded": True}
@@ -1340,7 +1338,7 @@ class ManagedRuntimePool:
         first_error: Exception | None = None
         for instance in instances:
             try:
-                await self._stop_process(instance)
+                await self._retire_instance(instance)
             except Exception as error:
                 if first_error is None:
                     first_error = error
@@ -1640,7 +1638,7 @@ class ManagedRuntimePool:
             )
         return instance
 
-    def _detach_lru_instance_locked(self) -> _ManagedRuntime | None:
+    def _claim_lru_instance_for_unload_locked(self) -> _ManagedRuntime | None:
         candidates = [
             item
             for item in self._instances.values()
@@ -1656,17 +1654,16 @@ class ManagedRuntimePool:
             candidates,
             key=lambda item: (item.last_used_at or item.started_at, item.started_at),
         )
-        victim.state = RuntimeInstanceState.UNLOADING
-        self._detach_instance_locked(victim)
+        self._mark_instance_unloading_locked(victim)
         return victim
 
-    def _detach_over_budget_locked(self) -> list[_ManagedRuntime]:
+    def _claim_over_budget_instances_for_unload_locked(self) -> list[_ManagedRuntime]:
         if self.max_runtime_memory_bytes is None:
             return []
         committed = self._committed_pool_bytes_locked()
         victims = []
         while committed > self.max_runtime_memory_bytes:
-            victim = self._detach_lru_instance_locked()
+            victim = self._claim_lru_instance_for_unload_locked()
             if victim is None:
                 break
             victims.append(victim)
@@ -1881,8 +1878,7 @@ class ManagedRuntimePool:
         observed = max(candidates)
         return observed if observed > 0 else None
 
-    def _detach_instance_locked(self, instance: _ManagedRuntime) -> None:
-        self._instances.pop(instance.id, None)
+    def _unroute_instance_locked(self, instance: _ManagedRuntime) -> None:
         self._session_routes = {
             session_id: instance_id
             for session_id, instance_id in self._session_routes.items()
@@ -1897,6 +1893,14 @@ class ManagedRuntimePool:
                 ),
                 None,
             )
+
+    def _mark_instance_unloading_locked(self, instance: _ManagedRuntime) -> None:
+        instance.state = RuntimeInstanceState.UNLOADING
+        self._unroute_instance_locked(instance)
+
+    def _detach_instance_locked(self, instance: _ManagedRuntime) -> None:
+        self._instances.pop(instance.id, None)
+        self._unroute_instance_locked(instance)
 
     async def _idle_reaper(self) -> None:
         while True:
@@ -1948,16 +1952,15 @@ class ManagedRuntimePool:
                     idle_seconds = (now - instance.last_used_at).total_seconds()
                     if idle_seconds < instance.idle_ttl_seconds:
                         continue
-                    instance.state = RuntimeInstanceState.UNLOADING
-                    self._detach_instance_locked(instance)
+                    self._mark_instance_unloading_locked(instance)
                     victims.append((instance, "idle_ttl"))
                 victims.extend(
                     (instance, "memory_budget")
-                    for instance in self._detach_over_budget_locked()
+                    for instance in self._claim_over_budget_instances_for_unload_locked()
                 )
             for instance, reason in victims:
                 try:
-                    await self._stop_process(instance)
+                    await self._retire_instance(instance)
                     if self.store is not None:
                         message = (
                             f"runtime unloaded after {instance.idle_ttl_seconds}s "
@@ -1981,6 +1984,44 @@ class ManagedRuntimePool:
                             instance_id=instance.id,
                             fields={"source": "runtime.lifecycle", "reason": reason},
                         )
+
+    async def _retire_instance(self, instance: _ManagedRuntime) -> None:
+        """Stop one registered runtime once and detach it only after success."""
+
+        async with self._lock:
+            if self._instances.get(instance.id) is not instance:
+                return
+            self._mark_instance_unloading_locked(instance)
+            task = instance.retirement_task
+            if task is None or task.done():
+                task = asyncio.create_task(
+                    self._stop_and_detach_instance(instance),
+                    name=f"mfq-server-runtime-retire-{instance.id}",
+                )
+                instance.retirement_task = task
+                task.add_done_callback(self._retirement_task_done)
+        await asyncio.shield(task)
+
+    @staticmethod
+    def _retirement_task_done(task: asyncio.Task[None]) -> None:
+        with suppress(asyncio.CancelledError):
+            task.exception()
+
+    async def _stop_and_detach_instance(self, instance: _ManagedRuntime) -> None:
+        try:
+            await self._stop_process(instance)
+        except BaseException as error:
+            async with self._lock:
+                if self._instances.get(instance.id) is instance:
+                    instance.error = ErrorDetail(
+                        code="runtime_unload_failed",
+                        message=str(error) or type(error).__name__,
+                        retryable=True,
+                    )
+            raise
+        async with self._lock:
+            if self._instances.get(instance.id) is instance:
+                self._detach_instance_locked(instance)
 
     @staticmethod
     def _supports_voice_output(architecture: str) -> bool:

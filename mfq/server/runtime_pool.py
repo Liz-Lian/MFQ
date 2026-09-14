@@ -2079,14 +2079,23 @@ class ManagedRuntimePool:
         )
         runtime_status = getattr(instance.backend, "runtime_status", None)
         status: dict[str, Any] | None = None
-        if callable(runtime_status):
-            try:
-                value = await asyncio.wait_for(runtime_status(), timeout=1.0)
-                if isinstance(value, dict):
-                    status = value
-            except Exception:
-                pass
-        resident = await resident_task if resident_task is not None else None
+        try:
+            if callable(runtime_status):
+                try:
+                    value = await asyncio.wait_for(runtime_status(), timeout=1.0)
+                    if isinstance(value, dict):
+                        status = value
+                except Exception:
+                    pass
+            resident = await resident_task if resident_task is not None else None
+        except BaseException:
+            # Cancelling the idle reaper or a load transaction must not leave
+            # its concurrently scheduled process-memory probe behind.
+            if resident_task is not None:
+                if not resident_task.done():
+                    resident_task.cancel()
+                await asyncio.gather(resident_task, return_exceptions=True)
+            raise
         observed_resident = self._observed_runtime_bytes(resident, status)
         kv_bytes: int | None = None
         if status is not None:

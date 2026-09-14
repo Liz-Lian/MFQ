@@ -1304,20 +1304,31 @@ def create_app(
                             await websocket.send_text(message)
 
                 tasks = {
-                    asyncio.create_task(send_upstream()),
-                    asyncio.create_task(send_client()),
+                    asyncio.create_task(
+                        send_upstream(),
+                        name="mfq-realtime-client-to-runtime",
+                    ),
+                    asyncio.create_task(
+                        send_client(),
+                        name="mfq-realtime-runtime-to-client",
+                    ),
                 }
-                done, pending = await asyncio.wait(
-                    tasks,
-                    return_when=asyncio.FIRST_COMPLETED,
-                )
-                for task in pending:
-                    task.cancel()
-                for task in pending:
-                    with suppress(asyncio.CancelledError):
-                        await task
-                for task in done:
-                    task.result()
+                try:
+                    done, _ = await asyncio.wait(
+                        tasks,
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    for task in done:
+                        task.result()
+                finally:
+                    # The route itself can be cancelled during application
+                    # shutdown before either relay finishes.  Always tear down
+                    # both directions so the upstream runtime socket cannot
+                    # outlive its client or the ASGI request task.
+                    for task in tasks:
+                        if not task.done():
+                            task.cancel()
+                    await asyncio.gather(*tasks, return_exceptions=True)
                 with suppress(Exception):
                     await websocket.close(code=1000)
         except WebSocketDisconnect:

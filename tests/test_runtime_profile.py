@@ -27,7 +27,7 @@ def test_architecture_registry_is_partial() -> None:
 
     deepseek = architecture_profile("deepseek_v4_vision")
     assert deepseek is not None
-    assert deepseek["chat"]["mtp_max_draft_tokens"] == 5
+    assert deepseek["chat"]["mtp_max_draft_tokens"] == 2
 
     deepseek_v41 = architecture_profile("DeepseekV41ForCausalLM")
     assert deepseek_v41 is not None

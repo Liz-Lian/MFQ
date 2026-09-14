@@ -723,6 +723,14 @@ std::int32_t run_mlx_mtp_generation(
         !callbacks.verify_target || !callbacks.resolve_target) {
         throw std::invalid_argument("invalid MTP engine configuration");
     }
+    if (request.token_constraint &&
+        (!request.token_constraint->allows ||
+         !request.token_constraint->apply ||
+         !request.token_constraint->accept ||
+         !request.token_constraint->clone)) {
+        throw std::invalid_argument(
+            "MTP token constraint must support allows/apply/accept/clone");
+    }
     mlx_validate_token_set(request.eos_token_ids, request.vocab);
 
     stats = {};
@@ -731,24 +739,63 @@ std::int32_t run_mlx_mtp_generation(
     MlxSampler sampler(request.sampling);
     sampler.discard_random(request.sampler_draws_consumed);
     auto counts = std::move(request.token_counts);
+    auto constraint_cursor = request.token_constraint
+        ? request.token_constraint->clone()
+        : MfqTokenConstraintPtr{};
+    if (request.token_constraint &&
+        (!constraint_cursor || !constraint_cursor->allows ||
+         !constraint_cursor->apply || !constraint_cursor->accept)) {
+        throw std::runtime_error(
+            "MTP token constraint clone is incomplete");
+    }
 
-    const auto sample_token = [&](const array& raw_logits) {
+    const auto sample_token = [&] (
+            const array& raw_logits,
+            const std::optional<array>& token_counts,
+            const MfqTokenConstraintPtr& constraint) {
         const auto logits = mtp_sampling_row(
             raw_logits, request.vocab, "target");
-        auto sampled = counts
-            ? sampler.sample(logits, *counts)
+        auto sampled = token_counts
+            ? sampler.sample(logits, *token_counts)
             : sampler.sample(logits);
         sampled.eval();
-        const auto token = sampled.data<std::int32_t>()[0];
+        auto token = sampled.data<std::int32_t>()[0];
         if (token < 0 || token >= request.vocab) {
             throw std::runtime_error(
                 "MTP target sampler returned an out-of-range token");
+        }
+        if (constraint && !constraint->allows(token)) {
+            auto adjusted = token_counts
+                ? sampler.apply_penalties(logits, *token_counts)
+                : logits;
+            adjusted = mlx::core::contiguous(
+                mlx::core::astype(adjusted, mlx::core::float32));
+            adjusted.eval();
+            std::vector<float> masked(
+                adjusted.data<float>(),
+                adjusted.data<float>() + request.vocab);
+            constraint->apply(masked.data(), masked.size());
+            const array constrained_logits(
+                masked.begin(),
+                Shape{1, request.vocab},
+                mlx::core::float32);
+            sampled = sampler.sample(constrained_logits);
+            sampled.eval();
+            token = sampled.data<std::int32_t>()[0];
+            if (token < 0 || token >= request.vocab ||
+                !constraint->allows(token)) {
+                throw std::runtime_error(
+                    "MTP constrained target sampler returned an invalid token");
+            }
         }
         return token;
     };
 
     std::int32_t generated = 0;
     const auto emit = [&](std::int32_t token) {
+        if (request.token_constraint) {
+            request.token_constraint->accept(token);
+        }
         if (counts) {
             const array token_id(
                 {token}, Shape{1, 1}, mlx::core::int32);
@@ -779,7 +826,11 @@ std::int32_t run_mlx_mtp_generation(
               std::clamp(request.sampling.mtp_max_draft_tokens, 1, 5));
     MlxMtpDepthController depth_controller(maximum_depth);
 
-    auto pending = sample_token(request.initial_logits);
+    auto pending = sample_token(
+        request.initial_logits, counts, request.token_constraint);
+    if (constraint_cursor) {
+        constraint_cursor->accept(pending);
+    }
     if (!emit(pending)) {
         return generated;
     }
@@ -889,14 +940,8 @@ std::int32_t run_mlx_mtp_generation(
         std::vector<std::int32_t> draft_ids;
         draft_ids.reserve(static_cast<std::size_t>(draft_count));
         if (draft_count == 0) {
-            auto sampled = sampler.sample(mtp_sampling_row(
-                target_rows, request.vocab, "adjusted target"));
-            sampled.eval();
-            const auto next = sampled.data<std::int32_t>()[0];
-            if (next < 0 || next >= request.vocab) {
-                throw std::runtime_error(
-                    "MTP target sampler returned an out-of-range token");
-            }
+            const auto next = sample_token(
+                target_rows, std::nullopt, constraint_cursor);
             verification = {0, next, true};
         } else if (request.sampling.greedy()) {
             auto target_tokens = sample_greedy(target_rows);
@@ -978,11 +1023,44 @@ std::int32_t run_mlx_mtp_generation(
                 sampler.next_uniform());
         }
 
-        const int accepted = static_cast<int>(verification.accepted_drafts);
+        int accepted = static_cast<int>(verification.accepted_drafts);
         if (accepted < 0 || accepted > draft_count ||
             verification.next_token < 0 ||
             verification.next_token >= request.vocab) {
             throw std::runtime_error("MTP verification returned invalid data");
+        }
+        if (constraint_cursor) {
+            bool corrected = false;
+            for (int index = 0; index < accepted; ++index) {
+                const auto token =
+                    draft_ids.at(static_cast<std::size_t>(index));
+                if (!constraint_cursor->allows(token)) {
+                    accepted = index;
+                    auto row = mlx::core::slice(
+                        target_rows,
+                        Shape{index, 0},
+                        Shape{index + 1, request.vocab});
+                    verification.next_token = sample_token(
+                        row, std::nullopt, constraint_cursor);
+                    verification.bonus = false;
+                    corrected = true;
+                    break;
+                }
+                constraint_cursor->accept(token);
+            }
+            if (!corrected &&
+                !constraint_cursor->allows(verification.next_token)) {
+                auto row = mlx::core::slice(
+                    target_rows,
+                    Shape{accepted, 0},
+                    Shape{accepted + 1, request.vocab});
+                verification.next_token = sample_token(
+                    row, std::nullopt, constraint_cursor);
+                verification.bonus = false;
+            }
+            constraint_cursor->accept(verification.next_token);
+            verification.accepted_drafts =
+                static_cast<std::size_t>(accepted);
         }
         stats.accepted_tokens += static_cast<std::uint64_t>(accepted);
         for (int position = 0; position < accepted; ++position) {

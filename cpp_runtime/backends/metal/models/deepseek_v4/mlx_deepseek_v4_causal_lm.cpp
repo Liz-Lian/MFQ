@@ -2055,9 +2055,11 @@ std::int32_t MlxDeepseekV4CausalLm::generate_impl(
         last_mtp_stats_ = {dspark_.has_value(), false, 0, 0, 0};
         return 0;
     }
+    const bool constraint_supports_mtp =
+        !token_constraint || static_cast<bool>(token_constraint->clone);
     const bool dspark_candidate =
-        dspark_.has_value() && sampling.enable_mtp && !token_constraint &&
-        max_tokens > 1;
+        dspark_.has_value() && sampling.enable_mtp &&
+        constraint_supports_mtp && max_tokens > 1;
 
     const int prompt_count =
         static_cast<int>(
@@ -2449,6 +2451,11 @@ std::int32_t MlxDeepseekV4CausalLm::generate_impl(
                 "DeepSeek-V4 DSpark state was not initialized");
         }
 
+        auto mtp_sampling = sampling;
+        mtp_sampling.mtp_max_draft_tokens = std::min(
+            mtp_sampling.mtp_max_draft_tokens,
+            kDeepseekV4MtpMaximumDraftTokens);
+
         MlxMtpEngineCallbacks mtp_callbacks;
         mtp_callbacks.target_cache_position = [this] {
             return cache_position_;
@@ -2529,12 +2536,14 @@ std::int32_t MlxDeepseekV4CausalLm::generate_impl(
                 max_context_,
                 dspark_->block_size(),
                 logits,
-                sampling,
-                sampling.has_penalties()
+                mtp_sampling,
+                mtp_sampling.has_penalties()
                     ? std::optional<array>(counts)
                     : std::nullopt,
                 std::span<const std::int64_t>(eos),
                 callback,
+                0u,
+                token_constraint,
             },
             mtp_callbacks,
             last_mtp_stats_);

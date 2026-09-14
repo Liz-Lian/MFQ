@@ -2672,12 +2672,21 @@ std::optional<common_chat_params> common_chat_try_specialized_template(
         return common_chat_params_init_gigachat_v3(tmpl, params);
     }
 
-    // DeepSeek V3.2 format detection: template defines dsml_token and uses it for tool calls.
-    // The template source contains the token as a variable assignment, not as a literal in markup.
-    if (src.find("dsml_token") != std::string::npos &&
+    // DeepSeek V3.2/V4 format detection. Full templates expose DSML tools,
+    // while raw-HF checkpoints may use the official single-turn template
+    // containing only the assistant and thinking markers. Both variants need
+    // the DeepSeek parser so </think> is split from visible content.
+    const bool deepseek_dsml_template =
+        src.find("dsml_token") != std::string::npos &&
         (src.find("function_calls") != std::string::npos ||
          src.find("tool_calls") != std::string::npos) &&
-        src.find("DSML") != std::string::npos) {
+        src.find("DSML") != std::string::npos;
+    const bool deepseek_thinking_template =
+        src.find("<｜Assistant｜>") != std::string::npos &&
+        src.find("enable_thinking") != std::string::npos &&
+        src.find("<think>") != std::string::npos &&
+        src.find("</think>") != std::string::npos;
+    if (deepseek_dsml_template || deepseek_thinking_template) {
         LOG_DBG("Using specialized template: DeepSeek V3.2\n");
         return common_chat_params_init_deepseek_v3_2(tmpl, params);
     }

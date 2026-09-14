@@ -2215,7 +2215,7 @@ def test_runtime_stop_uses_kill_after_terminate_failure(tmp_path: Path) -> None:
     asyncio.run(run())
 
 
-def test_runtime_retirement_keeps_a_failed_process_visible_for_retry(
+def test_runtime_retirement_retries_a_failed_process_automatically(
     tmp_path: Path,
 ) -> None:
     async def run() -> None:
@@ -2261,10 +2261,17 @@ def test_runtime_retirement_keeps_a_failed_process_visible_for_retry(
         assert session_id not in pool._session_routes
         assert pool._last_instance_id is None
 
-        await pool._retire_instance(instance)
+        for _ in range(100):
+            if instance.id not in pool._instances:
+                break
+            await asyncio.sleep(0.01)
 
         assert attempts == 2
         assert instance.id not in pool._instances
+        assert instance.retirement_retry_task is not None
+        await instance.retirement_retry_task
+        assert instance.retirement_retry_task.done()
+        await pool.aclose()
 
     asyncio.run(run())
 

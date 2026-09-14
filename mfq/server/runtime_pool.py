@@ -90,6 +90,8 @@ class _ManagedRuntime:
     output_task: asyncio.Task[None] | None = None
     monitor_task: asyncio.Task[None] | None = None
     retirement_task: asyncio.Task[None] | None = None
+    retirement_retry_task: asyncio.Task[None] | None = None
+    retirement_failures: int = 0
     realtime_gateway: Any | None = None
     realtime_error: str | None = None
     reserved_bytes: int | None = None
@@ -2198,15 +2200,51 @@ class ManagedRuntimePool:
         except BaseException as error:
             async with self._lock:
                 if self._instances.get(instance.id) is instance:
+                    instance.retirement_failures += 1
                     instance.error = ErrorDetail(
                         code="runtime_unload_failed",
                         message=str(error) or type(error).__name__,
                         retryable=True,
                     )
+                    self._schedule_retirement_retry_locked(instance)
             raise
         async with self._lock:
             if self._instances.get(instance.id) is instance:
                 self._detach_instance_locked(instance)
+
+    def _schedule_retirement_retry_locked(self, instance: _ManagedRuntime) -> None:
+        if self._closed:
+            return
+        retry = instance.retirement_retry_task
+        if retry is not None and not retry.done():
+            return
+        retry = asyncio.create_task(
+            self._retry_retirement(instance),
+            name=f"mfq-server-runtime-retire-retry-{instance.id}",
+        )
+        instance.retirement_retry_task = retry
+        self._background_tasks.add(retry)
+        retry.add_done_callback(self._background_task_done)
+
+    async def _retry_retirement(self, instance: _ManagedRuntime) -> None:
+        """Retry a failed teardown until it succeeds or the pool closes."""
+
+        while True:
+            failures = max(1, instance.retirement_failures)
+            delay = min(30.0, 0.25 * (2 ** min(failures - 1, 7)))
+            await asyncio.sleep(delay)
+            async with self._lock:
+                if (
+                    self._closed
+                    or self._instances.get(instance.id) is not instance
+                    or instance.state != RuntimeInstanceState.UNLOADING
+                ):
+                    return
+            try:
+                await self._retire_instance(instance)
+            except Exception:
+                continue
+            return
 
     @staticmethod
     def _supports_voice_output(architecture: str) -> bool:

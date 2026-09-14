@@ -180,12 +180,10 @@ int main() {
     hybrid.cache_position = 8;
     hybrid.cache_batch = 1;
     hybrid.layers.emplace_back(mini.layers.front());
-    auto convolution = mlx::core::astype(
-        mlx::core::array({1.0f, 2.0f}, mlx::core::Shape{1, 2}),
-        mlx::core::float16);
-    auto recurrent = mlx::core::astype(
-        mlx::core::array({3.0f, 4.0f}, mlx::core::Shape{1, 2}),
-        mlx::core::float16);
+    auto convolution = mlx::core::array(
+        {1.0f, 2.0f}, mlx::core::Shape{1, 2});
+    auto recurrent = mlx::core::array(
+        {3.0f, 4.0f}, mlx::core::Shape{1, 2});
     hybrid.layers.emplace_back(MlxQwen35LinearAttentionCacheSnapshot{
         convolution,
         recurrent,
@@ -255,12 +253,10 @@ int main() {
     auto short_kv = mini.layers.front();
     short_kv.position = 4;
     short_hybrid.layers.emplace_back(std::move(short_kv));
-    auto short_convolution = mlx::core::astype(
-        mlx::core::array({11.0f, 12.0f}, mlx::core::Shape{1, 2}),
-        mlx::core::float16);
-    auto short_recurrent = mlx::core::astype(
-        mlx::core::array({13.0f, 14.0f}, mlx::core::Shape{1, 2}),
-        mlx::core::float16);
+    auto short_convolution = mlx::core::array(
+        {11.0f, 12.0f}, mlx::core::Shape{1, 2});
+    auto short_recurrent = mlx::core::array(
+        {13.0f, 14.0f}, mlx::core::Shape{1, 2});
     short_hybrid.layers.emplace_back(MlxQwen35LinearAttentionCacheSnapshot{
         short_convolution,
         short_recurrent,

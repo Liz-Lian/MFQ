@@ -338,7 +338,17 @@ DecodedBlock read_block(const std::vector<std::uint8_t>& payload) {
                 throw std::runtime_error(
                     "invalid unavailable recurrent cache marker");
             }
-        } else if (layer.kind != kRecurrentLayer) {
+        } else if (layer.kind == kRecurrentLayer) {
+            if (dtype_value != 0 || layer.batch != 1 || layer.heads != 0 ||
+                layer.maximum_sequence != 0 || layer.head_dimension != 0 ||
+                layer.capacity != 0 || layer.position <= 0 ||
+                layer.first.dtype != mlx::core::float32 ||
+                layer.second.dtype != mlx::core::float32 ||
+                layer.first.data == nullptr || layer.second.data == nullptr) {
+                throw std::runtime_error(
+                    "invalid recurrent cache checkpoint");
+            }
+        } else {
             throw std::runtime_error("unknown MLX cache layer kind");
         }
         block.layers.push_back(std::move(layer));
@@ -368,6 +378,19 @@ std::vector<DecodedBlock> decode_blocks(
             block.count != block_size ||
             (expected_layers != 0 && block.layers.size() != expected_layers)) {
             throw std::runtime_error("incompatible MLX cache block chain");
+        }
+        const auto boundary = static_cast<std::uint64_t>(block.start) +
+            static_cast<std::uint64_t>(block.count);
+        if (boundary >
+                static_cast<std::uint64_t>(
+                    std::numeric_limits<std::int32_t>::max()) ||
+            std::any_of(
+                block.layers.begin(),
+                block.layers.end(),
+                [boundary](const DecodedLayer& layer) {
+                    return layer.position != static_cast<int>(boundary);
+                })) {
+            throw std::runtime_error("MLX cache layer boundary mismatch");
         }
         expected_start += block.count;
         expected_layers = block.layers.size();
@@ -484,6 +507,7 @@ MlxQwen35LinearAttentionCacheSnapshot rebuild_recurrent(
     std::size_t token_count) {
     const auto& final = blocks.back().layers.at(layer_index);
     if (final.kind != kRecurrentLayer || final.batch != 1 ||
+        final.position != static_cast<int>(token_count) ||
         final.first.data == nullptr || final.second.data == nullptr) {
         throw std::runtime_error("invalid recurrent cache boundary block");
     }
@@ -742,6 +766,19 @@ bool MlxPagedSessionCodec<MlxQwen35TextSessionState>::has_exact_boundary(
     const auto block = read_block(*payload);
     if (block.runtime != kQwen35Runtime) {
         throw std::runtime_error("incompatible Qwen3.5 cache block");
+    }
+    const auto boundary = static_cast<std::uint64_t>(block.start) +
+        static_cast<std::uint64_t>(block.count);
+    if (boundary >
+            static_cast<std::uint64_t>(
+                std::numeric_limits<std::int32_t>::max()) ||
+        std::any_of(
+            block.layers.begin(),
+            block.layers.end(),
+            [boundary](const DecodedLayer& layer) {
+                return layer.position != static_cast<int>(boundary);
+            })) {
+        throw std::runtime_error("Qwen3.5 cache checkpoint boundary mismatch");
     }
     return std::none_of(
         block.layers.begin(),

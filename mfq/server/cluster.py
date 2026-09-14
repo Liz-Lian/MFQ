@@ -23,6 +23,7 @@ from mfq.server.backend import (
     BackendToolCallDelta,
     ChatBackend,
     closing_backend_stream,
+    iter_sse_data,
 )
 from mfq.server.models import (
     RemoteNodeResource,
@@ -428,6 +429,7 @@ class ClusterBackend:
                     stale_remote,
                     headers,
                 )
+        completed = False
         try:
             async for delta in self._remote_session_stream(
                 node,
@@ -440,8 +442,14 @@ class ClusterBackend:
                 response_format=response_format,
             ):
                 yield delta
+            completed = True
         finally:
-            if ephemeral and self._sessions.pop(key, None) is not None:
+            reusable = remote.synchronized_messages == len(messages) + 1
+            if (
+                (ephemeral or not completed or not reusable)
+                and self._sessions.get(key) is remote
+            ):
+                self._sessions.pop(key, None)
                 await self._discard_remote_session(node, remote, headers)
 
     async def _remote_session_stream(
@@ -509,10 +517,10 @@ class ClusterBackend:
                         retryable=response.status_code >= 500,
                         status_code=response.status_code,
                     )
-                async for line in response.aiter_lines():
-                    if not line.startswith("data: "):
-                        continue
-                    frame = json.loads(line[6:])
+                saw_completed = False
+                saw_terminal_state = False
+                async for data in iter_sse_data(response):
+                    frame = json.loads(data)
                     if not isinstance(frame, dict):
                         raise ValueError("remote SSE frame must be an object")
                     payload = frame.get("payload", {})
@@ -535,6 +543,9 @@ class ClusterBackend:
                             )
                         )
                     elif kind == "response.completed":
+                        if saw_completed:
+                            raise ValueError("remote response completed more than once")
+                        saw_completed = True
                         usage = (
                             TokenUsage.model_validate(payload["usage"])
                             if payload.get("usage")
@@ -551,7 +562,14 @@ class ClusterBackend:
                             performance=performance,
                         )
                     elif kind == "session.state":
-                        remote.revision = int(payload.get("revision", remote.revision))
+                        revision = payload.get("revision")
+                        if not isinstance(revision, int) or isinstance(revision, bool):
+                            raise ValueError(
+                                "remote session.state is missing an integer revision"
+                            )
+                        remote.revision = revision
+                        if saw_completed:
+                            saw_terminal_state = True
                     elif kind == "error":
                         detail = payload.get("error", {})
                         raise BackendError(
@@ -559,6 +577,15 @@ class ClusterBackend:
                             str(detail.get("message", "remote node failed")),
                             retryable=bool(detail.get("retryable", False)),
                         )
+                if not saw_completed:
+                    raise BackendError(
+                        "remote_node_protocol_error",
+                        "remote response stream ended without response.completed",
+                        retryable=True,
+                        status_code=502,
+                    )
+                if saw_terminal_state:
+                    remote.synchronized_messages = len(messages) + 1
         except BackendError:
             raise
         except httpx.TimeoutException as error:
@@ -581,7 +608,6 @@ class ClusterBackend:
                 str(error),
                 status_code=502,
             ) from error
-        remote.synchronized_messages = len(messages) + 1
 
     async def _request_json(
         self,

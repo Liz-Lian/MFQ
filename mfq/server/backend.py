@@ -131,6 +131,25 @@ async def closing_backend_stream(
             await close()
 
 
+async def iter_sse_data(response: httpx.Response) -> AsyncIterator[str]:
+    """Yield complete SSE data fields while ignoring comments and metadata."""
+
+    data_lines: list[str] = []
+    async for line in response.aiter_lines():
+        if line == "":
+            if data_lines:
+                yield "\n".join(data_lines)
+                data_lines.clear()
+            continue
+        if line.startswith(":"):
+            continue
+        if line.startswith("data:"):
+            value = line[5:]
+            data_lines.append(value[1:] if value.startswith(" ") else value)
+    if data_lines:
+        yield "\n".join(data_lines)
+
+
 class OpenAIChatBackend:
     """Forward text generation to MFQ's existing C++ streaming endpoint."""
 
@@ -319,7 +338,7 @@ class OpenAIChatBackend:
                         f"backend returned unexpected content type {content_type!r}"
                     )
                 saw_done = False
-                async for data in self._iter_sse_data(response):
+                async for data in iter_sse_data(response):
                     if data == "[DONE]":
                         trailing_reasoning = ""
                         trailing_content = ""
@@ -755,23 +774,6 @@ class OpenAIChatBackend:
             write=min(30.0, seconds),
             pool=min(5.0, seconds),
         )
-
-    @staticmethod
-    async def _iter_sse_data(response: httpx.Response) -> AsyncIterator[str]:
-        data_lines: list[str] = []
-        async for line in response.aiter_lines():
-            if line == "":
-                if data_lines:
-                    yield "\n".join(data_lines)
-                    data_lines.clear()
-                continue
-            if line.startswith(":"):
-                continue
-            if line.startswith("data:"):
-                value = line[5:]
-                data_lines.append(value[1:] if value.startswith(" ") else value)
-        if data_lines:
-            yield "\n".join(data_lines)
 
     @staticmethod
     def _parse_event(data: str) -> BackendDelta:

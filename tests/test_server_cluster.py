@@ -13,7 +13,11 @@ import pytest
 from mfq.server.api import create_app
 from mfq.server.backend import BackendDelta, BackendError
 from mfq.server.cluster import ClusterBackend
-from mfq.server.models import CreateRemoteNodeRequest, UpdateRemoteNodeRequest
+from mfq.server.models import (
+    CreateRemoteNodeRequest,
+    SamplingParams,
+    UpdateRemoteNodeRequest,
+)
 from mfq.server.service import ServerService
 from mfq.server.storage import SessionStore
 from tests.test_server_service import FakeBackend
@@ -25,6 +29,7 @@ def _remote_app(
     *,
     legacy_models_endpoint: bool = False,
     runtime_status_code: int = 200,
+    response_frames: list[dict[str, object]] | None = None,
 ):
     session_count = 0
 
@@ -84,7 +89,7 @@ def _remote_app(
         if path.endswith("/responses"):
             if response_requests is not None:
                 response_requests.append(json.loads(request.content))
-            frames = [
+            default_frames = [
                 {
                     "protocol_version": "1.0",
                     "session_id": "11111111-1111-4111-8111-111111111111",
@@ -115,6 +120,7 @@ def _remote_app(
                     "payload": {"type": "session.state", "state": "idle", "revision": 2},
                 },
             ]
+            frames = default_frames if response_frames is None else response_frames
             content = "".join(f"data: {json.dumps(frame)}\n\n" for frame in frames)
             return httpx.Response(200, text=content, headers={"content-type": "text/event-stream"})
         if path.endswith("/responses/cancel"):
@@ -362,6 +368,93 @@ def test_stateless_remote_stream_releases_ephemeral_session(tmp_path: Path) -> N
             await interrupted.aclose()
             assert cluster._sessions == {}
 
+        await client.aclose()
+
+    asyncio.run(run())
+
+
+def test_interrupted_remote_stream_discards_persistent_session(
+    tmp_path: Path,
+) -> None:
+    async def run() -> None:
+        partial = {
+            "protocol_version": "1.0",
+            "session_id": "11111111-1111-4111-8111-111111111111",
+            "sequence": 0,
+            "timestamp": "2026-08-12T00:00:00Z",
+            "payload": {
+                "type": "response.text.delta",
+                "response_id": "22222222-2222-4222-8222-222222222222",
+                "delta": "partial",
+            },
+        }
+        requested_paths: list[str] = []
+        store = SessionStore(tmp_path / "mfq.server.sqlite3")
+        store.create_remote_node(
+            CreateRemoteNodeRequest(name="worker-a", url="http://worker-a:8090")
+        )
+        client = httpx.AsyncClient(
+            transport=_remote_app(
+                requested_paths=requested_paths,
+                response_frames=[partial],
+            )
+        )
+        cluster = ClusterBackend(FakeBackend(), store, client=client)
+        stream = cluster.stream(
+            model="remote-model",
+            messages=[{"role": "user", "content": "hello"}],
+            sampling=SamplingParams(),
+            session_id=UUID("33333333-3333-4333-8333-333333333333"),
+        )
+        assert (await anext(stream)).content_delta == "partial"
+        with pytest.raises(BackendError) as interrupted:
+            await anext(stream)
+        assert interrupted.value.code == "remote_node_protocol_error"
+        assert cluster._sessions == {}
+        assert any(
+            path.startswith("/api/v1/sessions/") and not path.endswith("/responses")
+            for path in requested_paths
+        )
+        await client.aclose()
+
+    asyncio.run(run())
+
+
+def test_remote_completion_without_terminal_revision_is_not_reused(
+    tmp_path: Path,
+) -> None:
+    completed = {
+        "protocol_version": "1.0",
+        "session_id": "11111111-1111-4111-8111-111111111111",
+        "sequence": 0,
+        "timestamp": "2026-08-12T00:00:00Z",
+        "payload": {
+            "type": "response.completed",
+            "response_id": "22222222-2222-4222-8222-222222222222",
+            "finish_reason": "stop",
+        },
+    }
+
+    async def run() -> None:
+        store = SessionStore(tmp_path / "mfq.server.sqlite3")
+        store.create_remote_node(
+            CreateRemoteNodeRequest(name="worker-a", url="http://worker-a:8090")
+        )
+        client = httpx.AsyncClient(
+            transport=_remote_app(response_frames=[completed])
+        )
+        cluster = ClusterBackend(FakeBackend(), store, client=client)
+        deltas = [
+            delta
+            async for delta in cluster.stream(
+                model="remote-model",
+                messages=[{"role": "user", "content": "hello"}],
+                sampling=SamplingParams(),
+                session_id=UUID("33333333-3333-4333-8333-333333333333"),
+            )
+        ]
+        assert deltas[-1].finish_reason == "stop"
+        assert cluster._sessions == {}
         await client.aclose()
 
     asyncio.run(run())

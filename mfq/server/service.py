@@ -297,6 +297,8 @@ class ServerService:
         self.stream_keepalive_seconds = max(0.01, stream_keepalive_seconds)
         self._active_responses: dict[UUID, tuple[UUID, asyncio.Task[Any]]] = {}
         self._runtime_metric_state: dict[str, tuple[float, tuple[Any, ...]]] = {}
+        self._close_lock = asyncio.Lock()
+        self._closed = False
         if runtime_manager is not None:
             runtime_manager.store = store
             self.jobs.register(
@@ -312,8 +314,37 @@ class ServerService:
         await self.jobs.start()
 
     async def aclose(self) -> None:
-        await self.jobs.close()
-        await self.backend.aclose()
+        async with self._close_lock:
+            if self._closed:
+                return
+            self._closed = True
+            await self.jobs.close()
+
+            active = tuple(self._active_responses.items())
+            cancel_backend = getattr(self.backend, "cancel_response", None)
+            if active and callable(cancel_backend):
+                await asyncio.gather(
+                    *(
+                        asyncio.wait_for(
+                            cancel_backend(session_id),
+                            timeout=5.0,
+                        )
+                        for session_id, _ in active
+                    ),
+                    return_exceptions=True,
+                )
+
+            current = asyncio.current_task()
+            tasks = {
+                task
+                for _, (_, task) in active
+                if task is not current and not task.done()
+            }
+            for task in tasks:
+                task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            await self.backend.aclose()
 
     async def create_job(self, request: CreateJobRequest) -> JobResource:
         try:

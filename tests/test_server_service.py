@@ -231,6 +231,51 @@ def test_explicit_cancel_stops_a_response_and_allows_immediate_edited_retry(
     asyncio.run(run())
 
 
+def test_service_close_cancels_and_drains_active_responses(tmp_path: Path) -> None:
+    class BlockingBackend(FakeBackend):
+        def __init__(self) -> None:
+            super().__init__()
+            self.started = asyncio.Event()
+
+        async def stream(self, **kwargs: Any) -> AsyncIterator[BackendDelta]:
+            self.calls.append(kwargs)
+            self.started.set()
+            await asyncio.Event().wait()
+            yield BackendDelta(content_delta="unreachable")
+
+    async def run() -> None:
+        backend = BlockingBackend()
+        service = make_service(tmp_path, backend)
+        await asyncio.to_thread(
+            service.store.create_session,
+            CreateSessionRequest(model="model-a"),
+            session_id=SESSION_ID,
+        )
+        prepared = await service.prepare_response(
+            SESSION_ID,
+            CreateResponseRequest(
+                request_id=REQUEST_ID,
+                expected_revision=0,
+                input=[{"type": "text", "text": "question"}],
+                stream=False,
+            ),
+        )
+        response = asyncio.create_task(service.collect_response(prepared))
+        await asyncio.wait_for(backend.started.wait(), timeout=1)
+
+        await service.aclose()
+        await service.aclose()
+
+        assert response.cancelled()
+        assert backend.cancelled_sessions == [SESSION_ID]
+        assert backend.closed
+        assert not service._active_responses
+        [stored] = (await service.list_responses(SESSION_ID)).data
+        assert stored.status == ResponseStatus.CANCELLED
+
+    asyncio.run(run())
+
+
 def test_stream_disconnect_closes_backend_and_terminates_response(tmp_path: Path) -> None:
     class InterruptibleBackend(FakeBackend):
         def __init__(self) -> None:

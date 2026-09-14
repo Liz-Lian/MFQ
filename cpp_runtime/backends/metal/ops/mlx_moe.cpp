@@ -217,17 +217,19 @@ bool mxfp4_nax_smallm_preferred(
         return false;
     }
     const auto* ids = expert_ids.data<std::int32_t>();
+    bool has_duplicate = false;
     for (std::size_t index = 0; index < expert_ids.size(); ++index) {
         if (ids[index] < 0 || ids[index] >= experts) {
             return false;
         }
         for (std::size_t previous = 0; previous < index; ++previous) {
             if (ids[index] == ids[previous]) {
-                return true;
+                has_duplicate = true;
+                break;
             }
         }
     }
-    return false;
+    return has_duplicate;
 }
 
 bool mxfp4_decode_down_reduce_enabled() noexcept {
@@ -2543,6 +2545,17 @@ struct GroupedMmqParameters {
 
 static_assert(sizeof(GroupedMmqParameters) == 52);
 
+struct Mxfp4BlocksConfig {
+    Shape output_shape;
+    int route_count = 0;
+    int max_blocks = 0;
+    int experts = 0;
+    int output_width = 0;
+    int input_width = 0;
+    int block_rows = 32;
+    bool paired = false;
+};
+
 // Adapted from oMLX's DeepSeek-V4 block-list builder.  The expert IDs have
 // already been sorted, so one GPU thread can find each expert's contiguous
 // range and split it into independently schedulable BM-row blocks.
@@ -3318,6 +3331,126 @@ array mxfp4_decode_reduce_dispatch(
         std::move(shape),
         dtype,
         std::make_shared<Mxfp4DecodeReducePrimitive>(
+            stream,
+            std::move(config)),
+        std::move(inputs));
+}
+
+class Mxfp4BlocksPrimitive final
+    : public mlx::core::UnaryPrimitive {
+public:
+    Mxfp4BlocksPrimitive(
+        mlx::core::Stream stream,
+        Mxfp4BlocksConfig config)
+        : UnaryPrimitive(stream),
+          config_(std::move(config)) {}
+
+    void eval_cpu(
+        const std::vector<array>&,
+        array&) override {
+        throw std::runtime_error(
+            "MXFP4 block primitive has no CPU path");
+    }
+
+    void eval_gpu(
+        const std::vector<array>& inputs,
+        array& output) override {
+        if (inputs.size() != 9) {
+            throw std::logic_error(
+                "MXFP4 block primitive input count mismatch");
+        }
+        output.set_data(
+            mlx::core::allocator::malloc(output.nbytes()));
+        auto& selected_stream = stream();
+        auto& device = mlx::core::metal::device(
+            selected_stream.device);
+        CompileOptions compile_options;
+        compile_options.math_mode = MathMode::Fast;
+        auto* library = device.get_library(
+            "mfq_dsv4_mxfp4_blocks_v5",
+            compile_options,
+            [] {
+                std::string source;
+                source.reserve(
+                    sizeof(detail::kSteelMmaSource)
+                    + sizeof(detail::kMfePrefillSource)
+                    + 128);
+                source += "#include <metal_stdlib>\n";
+                source += "#include <metal_simdgroup>\n";
+                source += "#include <metal_simdgroup_matrix>\n";
+                source += "using namespace metal;\n";
+                source += detail::kSteelMmaSource;
+                source += detail::kMfePrefillSource;
+                return source;
+            });
+        const char* kernel_name = config_.paired
+            ? "mfq_dsv4_mxfp4_pair_concat_f16_bm32_bn32_bk32"
+            : "mfq_dsv4_mxfp4_single_f16_bm32_bn32_bk32";
+        auto* kernel = device.get_kernel(
+            kernel_name,
+            library);
+        auto& encoder =
+            mlx::core::metal::get_command_encoder(
+                selected_stream);
+        encoder.set_compute_pipeline_state(kernel);
+        for (int index = 0; index < 9; ++index) {
+            encoder.set_input_array(
+                inputs[static_cast<std::size_t>(index)],
+                index);
+        }
+        encoder.set_output_array(output, 9);
+        encoder.set_bytes(config_.max_blocks, 10);
+        encoder.set_bytes(config_.output_width, 11);
+        encoder.set_bytes(config_.input_width, 12);
+        encoder.dispatch_threadgroups(
+            MTL::Size(
+                ((config_.paired ? 2 : 1) * config_.output_width + 31) / 32,
+                config_.max_blocks,
+                1),
+            MTL::Size(64, 1, 1));
+    }
+
+    const char* name() const override {
+        return "Mxfp4BlocksPrimitive";
+    }
+
+    bool is_equivalent(
+        const mlx::core::Primitive& other) const override {
+        const auto* primitive =
+            dynamic_cast<const Mxfp4BlocksPrimitive*>(&other);
+        return primitive != nullptr
+            && primitive->config_.route_count == config_.route_count
+            && primitive->config_.max_blocks == config_.max_blocks
+            && primitive->config_.experts == config_.experts
+            && primitive->config_.output_width == config_.output_width
+            && primitive->config_.input_width == config_.input_width
+            && primitive->config_.block_rows == config_.block_rows
+            && primitive->config_.paired == config_.paired;
+    }
+
+    std::vector<Shape> output_shapes(
+        const std::vector<array>&) override {
+        return {config_.output_shape};
+    }
+
+private:
+    Mxfp4BlocksConfig config_;
+};
+
+array mxfp4_blocks_dispatch(
+    std::vector<array> inputs,
+    Mxfp4BlocksConfig config) {
+    auto stream = mlx::core::default_stream(
+        mlx::core::default_device());
+    if (stream.device != mlx::core::Device::gpu) {
+        throw std::invalid_argument(
+            "MXFP4 blocks require the Metal device");
+    }
+    auto shape = config.output_shape;
+    return array(
+        std::move(shape),
+        mlx::core::float16,
+        std::make_shared<Mxfp4BlocksPrimitive>(
             stream,
             std::move(config)),
         std::move(inputs));
@@ -8042,19 +8175,60 @@ struct MlxMfeWeight::Impl {
             && descriptor_values.size()
                 == static_cast<std::size_t>(experts) * kDescriptorSize
         ) {
+            const auto value_stride = checked_product(
+                static_cast<std::size_t>(out_per_expert),
+                static_cast<std::size_t>(neuron_len / 2),
+                "MXFP4 slot value stride");
+            const auto scale_stride = checked_product(
+                static_cast<std::size_t>(out_per_expert),
+                static_cast<std::size_t>(neuron_len / 32),
+                "MXFP4 slot scale stride");
             std::vector<std::int32_t> slots(
                 static_cast<std::size_t>(experts));
+            bool valid_slots = value_stride != 0 && scale_stride != 0
+                && mx_values.size() % value_stride == 0
+                && mx_scales.size() % scale_stride == 0
+                && mx_values.size() / value_stride
+                    == mx_scales.size() / scale_stride;
             for (int expert = 0; expert < experts; ++expert) {
-                slots[static_cast<std::size_t>(expert)] =
-                    descriptor_values[
-                        static_cast<std::size_t>(expert) * kDescriptorSize
-                        + kLocalExpert];
+                const auto base = static_cast<std::size_t>(expert)
+                    * kDescriptorSize;
+                const int local = descriptor_values[base + kLocalExpert];
+                const int value_offset =
+                    descriptor_values[base + kMxValueOffset];
+                const int scale_offset =
+                    descriptor_values[base + kMxScaleOffset];
+                if (!valid_slots || local < 0 || value_offset < 0
+                    || scale_offset < 0
+                    || static_cast<std::size_t>(value_offset) % value_stride
+                        != 0
+                    || static_cast<std::size_t>(scale_offset) % scale_stride
+                        != 0) {
+                    valid_slots = false;
+                    break;
+                }
+                const auto value_slot =
+                    static_cast<std::size_t>(value_offset) / value_stride
+                    + static_cast<std::size_t>(local);
+                const auto scale_slot =
+                    static_cast<std::size_t>(scale_offset) / scale_stride
+                    + static_cast<std::size_t>(local);
+                if (value_slot != scale_slot
+                    || value_slot >= mx_values.size() / value_stride) {
+                    valid_slots = false;
+                    break;
+                }
+                slots[static_cast<std::size_t>(expert)] = checked_int(
+                    value_slot,
+                    "MXFP4 physical expert slot");
             }
-            mxfp4_slot_ids_sorted =
-                std::is_sorted(slots.begin(), slots.end());
-            mxfp4_slot_ids.emplace(make_int32_array(
-                slots,
-                Shape{experts}));
+            if (valid_slots) {
+                mxfp4_slot_ids_sorted =
+                    std::is_sorted(slots.begin(), slots.end());
+                mxfp4_slot_ids.emplace(make_int32_array(
+                    slots,
+                    Shape{experts}));
+            }
         }
         const char* specialize_env = std::getenv(
             "MFQ_METAL_MFE_SPECIALIZE");
@@ -9816,6 +9990,159 @@ bool MlxMfeWeight::prefers_mxfp4_smallm_nax(
             impl_->out_per_expert);
 }
 
+bool MlxMfeWeight::prefers_mxfp4_nax_prefill(
+    int route_count) const noexcept {
+    return route_count > 0
+        && impl_->mxfp4_slot_ids.has_value()
+        && impl_->projections == 1
+        && impl_->rotations.empty()
+        && mxfp4_nax_prefill_enabled(
+            route_count,
+            impl_->experts,
+            impl_->neuron_len,
+            impl_->out_per_expert,
+            impl_->automatic_mxfp4_nax_prefill);
+}
+
+bool MlxMfeWeight::supports_mxfp4_blocks() const noexcept {
+    return impl_->mxfp4_slot_ids.has_value()
+        && impl_->mxfp4_slot_ids->dtype() == mlx::core::int32
+        && impl_->mxfp4_slot_ids->size()
+            == static_cast<std::size_t>(impl_->experts)
+        && impl_->projections == 1
+        && impl_->rotations.empty()
+        && impl_->family_mask
+            == (std::uint32_t{1} << kFamilyMxfp4);
+}
+
+bool MlxMfeWeight::supports_mxfp4_pair_blocks(
+    const MlxMfeWeight& other) const noexcept {
+    return supports_mxfp4_blocks()
+        && other.supports_mxfp4_blocks()
+        && impl_->experts == other.impl_->experts
+        && impl_->out_per_expert == other.impl_->out_per_expert
+        && impl_->neuron_len == other.impl_->neuron_len;
+}
+
+array MlxMfeWeight::mxfp4_blocks_sorted_impl(
+    const MlxMfeWeight* other,
+    const array& sorted_input,
+    const MlxGroupedMmqPlan& plan) const {
+    const bool paired = other != nullptr;
+    if (
+        sorted_input.ndim() != 2
+        || sorted_input.shape(0) != plan.route_count
+        || sorted_input.shape(1) != impl_->neuron_len
+        || plan.experts != impl_->experts
+        || plan.max_blocks <= 0
+        || plan.block_rows != 32
+    ) {
+        throw std::invalid_argument(
+            "MXFP4 block plan or sorted input is incompatible");
+    }
+
+    const auto packed_view = [](const Impl& impl) {
+        const auto stride = checked_product(
+            static_cast<std::size_t>(impl.out_per_expert),
+            static_cast<std::size_t>(impl.neuron_len / 2),
+            "MXFP4 block packed stride");
+        if (stride == 0 || impl.mx_values.size() % stride != 0) {
+            throw std::runtime_error(
+                "MXFP4 block packed arena geometry is invalid");
+        }
+        const auto slots = impl.mx_values.size() / stride;
+        return mlx::core::reshape(
+            mlx::core::view(impl.mx_values, mlx::core::uint32),
+            Shape{
+                checked_int(slots, "MXFP4 block slot count"),
+                impl.out_per_expert,
+                impl.neuron_len / 8,
+            });
+    };
+    const auto scale_view = [](const Impl& impl) {
+        const auto stride = checked_product(
+            static_cast<std::size_t>(impl.out_per_expert),
+            static_cast<std::size_t>(impl.neuron_len / 32),
+            "MXFP4 block scale stride");
+        if (stride == 0 || impl.mx_scales.size() % stride != 0) {
+            throw std::runtime_error(
+                "MXFP4 block scale arena geometry is invalid");
+        }
+        const auto slots = impl.mx_scales.size() / stride;
+        return mlx::core::reshape(
+            impl.mx_scales,
+            Shape{
+                checked_int(slots, "MXFP4 block scale slot count"),
+                impl.out_per_expert,
+                impl.neuron_len / 32,
+            });
+    };
+    // Match oMLX's DeepSeek-V4 MXFP4 path: the following SwiGLU stage already
+    // consumes FP16, so running the block GEMM in BF16 only adds cost before
+    // an unavoidable cast and does not preserve additional output precision.
+    auto source = sorted_input.dtype() == mlx::core::float16
+        ? sorted_input
+        : mlx::core::astype(sorted_input, mlx::core::float16);
+    source = mlx::core::expand_dims(
+        mlx::core::contiguous(std::move(source)),
+        1);
+    const auto& second = paired ? *other->impl_ : *impl_;
+    return mxfp4_blocks_dispatch(
+        {
+            std::move(source),
+            packed_view(*impl_),
+            scale_view(*impl_),
+            *impl_->mxfp4_slot_ids,
+            packed_view(second),
+            scale_view(second),
+            *second.mxfp4_slot_ids,
+            plan.block_meta,
+            plan.block_count,
+        },
+        Mxfp4BlocksConfig{
+            .output_shape = Shape{
+                plan.route_count,
+                (paired ? 2 : 1) * impl_->out_per_expert,
+            },
+            .route_count = plan.route_count,
+            .max_blocks = plan.max_blocks,
+            .experts = impl_->experts,
+            .output_width = impl_->out_per_expert,
+            .input_width = impl_->neuron_len,
+            .block_rows = plan.block_rows,
+            .paired = paired,
+        });
+}
+
+array MlxMfeWeight::mxfp4_block_matmul_sorted(
+    const array& sorted_input,
+    const MlxGroupedMmqPlan& plan) const {
+    if (!supports_mxfp4_blocks()) {
+        throw std::invalid_argument(
+            "MXFP4 blocks require a pure-MXFP4 weight");
+    }
+    return mxfp4_blocks_sorted_impl(nullptr, sorted_input, plan);
+}
+
+array MlxMfeWeight::mxfp4_pair_swiglu_sorted(
+    const MlxMfeWeight& other,
+    const array& sorted_input,
+    const MlxGroupedMmqPlan& plan,
+    float limit) const {
+    if (!supports_mxfp4_pair_blocks(other)) {
+        throw std::invalid_argument(
+            "MXFP4 pair blocks require compatible pure-MXFP4 weights");
+    }
+    if (!std::isfinite(limit) || limit < 0.0f) {
+        throw std::invalid_argument(
+            "MXFP4 pair SwiGLU limit must be finite and non-negative");
+    }
+    auto pair = mxfp4_blocks_sorted_impl(&other, sorted_input, plan);
+    return limit > 0.0f
+        ? moe_limited_swiglu_split(std::move(pair), limit)
+        : moe_swiglu_split(std::move(pair));
+}
+
 int MlxMfeWeight::recommended_mxfp4_nax_prefill_tokens(
     int routes_per_token) const noexcept {
     if (routes_per_token <= 0) return 0;
@@ -10092,7 +10419,24 @@ array MlxMfeWeight::routed_matmul_sorted(
             "routed input must have [tokens,K] or [tokens,routes,K] shape");
     }
 
-    auto source = input.dtype() == mlx::core::float16
+    const bool use_mxfp4_nax =
+        (mxfp4_nax_prefill_enabled(
+             route_count,
+             impl_->experts,
+             impl_->neuron_len,
+             impl_->out_per_expert,
+             impl_->automatic_mxfp4_nax_prefill) ||
+         force_mxfp4_nax)
+        && impl_->mxfp4_slot_ids.has_value()
+        && impl_->projections == 1
+        && impl_->rotations.empty();
+    // MLX's native gather-QMM accepts both BF16 and FP16 activations. Keep
+    // BF16 intact on that path so raw-HF DeepSeek-V4 matches the checkpoint's
+    // activation dtype. The heterogeneous Metal kernels still consume FP16,
+    // so only the exact native MXFP4 path may bypass the existing cast.
+    const bool preserve_bfloat16 =
+        use_mxfp4_nax && input.dtype() == mlx::core::bfloat16;
+    auto source = input.dtype() == mlx::core::float16 || preserve_bfloat16
         ? input
         : mlx::core::astype(input, mlx::core::float16);
     source = mlx::core::contiguous(source);
@@ -10130,19 +10474,7 @@ array MlxMfeWeight::routed_matmul_sorted(
     // Prefill-sized pure-MXFP4 projections can use MLX's batched gather-QMM
     // without repacking. The automatic policy is selected from device and
     // tensor geometry; model identity is deliberately irrelevant.
-    if (
-        (mxfp4_nax_prefill_enabled(
-             route_count,
-             impl_->experts,
-             impl_->neuron_len,
-             impl_->out_per_expert,
-             impl_->automatic_mxfp4_nax_prefill) ||
-         force_mxfp4_nax)
-        && impl_->mxfp4_slot_ids.has_value()
-        && impl_->projections == 1
-        && impl_->rotations.empty()
-        && source.dtype() == mlx::core::float16
-    ) {
+    if (use_mxfp4_nax) {
         array sorted_source = [&]() {
             if (input_is_sorted) {
                 return source;

@@ -20,6 +20,7 @@ int main() {
             }
             controller.observe(3, 3, 30.0);
             controller.observe(3, 3, 29.0);
+            controller.observe(3, 3, 28.0);
             controller.observe(0, 0, 22.0);
             controller.observe(0, 0, 21.0);
             controller.observe(0, 0, 23.0);
@@ -34,6 +35,7 @@ int main() {
             mfq::metal::MlxMtpDepthController controller(1);
             controller.observe(1, 0, 80.0);
             controller.observe(1, 0, 75.0);
+            controller.observe(1, 0, 70.0);
             controller.observe(0, 0, 40.0);
             controller.observe(0, 0, 39.0);
             controller.observe(0, 0, 41.0);
@@ -47,6 +49,7 @@ int main() {
             mfq::metal::MlxMtpDepthController controller(3);
             controller.observe(3, 0, 70.0);
             controller.observe(3, 0, 65.0);
+            controller.observe(3, 0, 60.0);
             controller.observe(0, 0, 30.0);
             controller.observe(0, 0, 29.0);
             controller.observe(0, 0, 31.0);
@@ -72,6 +75,7 @@ int main() {
             mfq::metal::MlxMtpDepthController controller(3);
             controller.observe(3, 3, 45.0);
             controller.observe(3, 3, 44.0);
+            controller.observe(3, 3, 43.0);
             controller.observe(0, 0, 30.0);
             controller.observe(0, 0, 30.0);
             controller.observe(0, 0, 30.0);
@@ -83,6 +87,7 @@ int main() {
         {
             mfq::metal::MlxMtpDepthController controller(5);
             controller.observe(5, 5, 1104.0);
+            controller.observe(5, 5, 721.0);
             controller.observe(5, 5, 235.0);
             controller.observe(0, 0, 46.6);
             controller.observe(0, 0, 46.6);

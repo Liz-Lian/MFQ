@@ -57,6 +57,15 @@ bool force_ssd_route_transactions() noexcept {
     return value != nullptr && std::string_view(value) != "0";
 }
 
+int resident_prefill_eval_group_layers() noexcept {
+    const char* value = std::getenv(
+        "MFQ_DSV4_PREFILL_EVAL_GROUP");
+    if (value != nullptr) {
+        return std::clamp(std::atoi(value), 1, 43);
+    }
+    return 1;
+}
+
 int checked_int(
     std::int64_t value,
     const char* label) {
@@ -1330,8 +1339,18 @@ array MlxDeepseekV4CausalLm::forward_chunk(
     const bool compact_resident_speculation =
         bounded_prefill && tokens <= 6 && dspark_hidden != nullptr &&
         visibility == nullptr && !expert_offload_ && !ssd_expert_cache_;
-    const bool materialize_each_layer =
+    const bool materialize_bounded_prefill =
         bounded_prefill && !compact_resident_speculation;
+    const bool group_resident_prefill =
+        materialize_bounded_prefill
+        && !expert_offload_
+        && !ssd_expert_cache_
+        && dspark_hidden == nullptr
+        && visibility == nullptr
+        && !detail::component_profile_active();
+    const int prefill_eval_group = group_resident_prefill
+        ? resident_prefill_eval_group_layers()
+        : 1;
     std::array<
         std::optional<MlxSsdPrefetchedExpertLayer>,
         2> routed_pipeline;
@@ -1440,6 +1459,7 @@ array MlxDeepseekV4CausalLm::forward_chunk(
             group_begin = group_end;
         }
     } else {
+        std::size_t eval_group_begin = 0;
         for (std::size_t index = 0;
              index < layers_.size();
              ++index) {
@@ -1454,12 +1474,27 @@ array MlxDeepseekV4CausalLm::forward_chunk(
                 prefetched,
                 visibility);
             capture_target(index);
-            if (materialize_each_layer) {
-                // Hidden and cache branches share the layer projections.
+            const bool eval_group_boundary =
+                static_cast<int>(index - eval_group_begin + 1)
+                    >= prefill_eval_group
+                || index + 1 == layers_.size();
+            if (materialize_bounded_prefill && eval_group_boundary) {
+                // Hidden and cache branches share every projection in this
+                // resident layer group. Submit them together to reduce graph
+                // walks and command-buffer boundaries while keeping bounded
+                // intermediates. SSD/offload and profiling stay at group 1.
                 std::vector<array> layer_outputs{hidden_values};
-                layer_outputs.reserve(12);
-                append_state_arrays(states_[index], layer_outputs);
+                layer_outputs.reserve(
+                    1 + (index - eval_group_begin + 1) * 12);
+                for (std::size_t state_index = eval_group_begin;
+                     state_index <= index;
+                     ++state_index) {
+                    append_state_arrays(
+                        states_[state_index],
+                        layer_outputs);
+                }
                 detail::eval_with_timing(std::move(layer_outputs));
+                eval_group_begin = index + 1;
             }
             if (prefetched != nullptr) {
                 routed_pipeline[index % 2].reset();
@@ -1487,7 +1522,7 @@ array MlxDeepseekV4CausalLm::forward_chunk(
             : mlx::core::concatenate(std::move(captured), -1);
     }
     if (skip_lm_head) {
-        if (!materialize_each_layer) {
+        if (!materialize_bounded_prefill) {
             throw std::logic_error(
                 "DeepSeek-V4 can skip lm_head only after bounded prefill");
         }
@@ -1516,7 +1551,7 @@ array MlxDeepseekV4CausalLm::forward_chunk(
     detail::profile_eval(
         "model.lm_head_cast",
         logits);
-    if (!materialize_each_layer) {
+    if (!materialize_bounded_prefill) {
         // Decode and compact resident verification own bounded cache updates
         // per layer. Keep the graph lazy, then materialize logits and every
         // updated cache array together instead of synchronizing per layer.

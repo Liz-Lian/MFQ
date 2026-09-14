@@ -1,4 +1,5 @@
 #include "mlx_moe.h"
+#include "mlx_moe_ops.h"
 #include "mlx_mxfp4_sq.h"
 #include "mfq_container.h"
 
@@ -290,7 +291,7 @@ float decode_mxfp4_code(std::uint8_t code) {
     return (code & 8u) == 0u ? value : -value;
 }
 
-Mxfp4Fixture make_mxfp4(int rows, int input) {
+Mxfp4Fixture make_mxfp4(int rows, int input, int seed = 0) {
     if (rows <= 0 || input <= 0 || input % 32 != 0) {
         throw std::runtime_error("invalid MXFP4 fixture geometry");
     }
@@ -305,13 +306,14 @@ Mxfp4Fixture make_mxfp4(int rows, int input) {
             scales[
                 static_cast<std::size_t>(row) * (input / 32)
                 + group
-            ] = static_cast<std::uint8_t>(125 + (row + group) % 5);
+            ] = static_cast<std::uint8_t>(
+                125 + (row + group + seed) % 5);
         }
         for (int column = 0; column < input; column += 2) {
             const auto low = static_cast<std::uint8_t>(
-                (row * 7 + column * 3 + 1) & 15);
+                (row * 7 + column * 3 + seed * 5 + 1) & 15);
             const auto high = static_cast<std::uint8_t>(
-                (row * 11 + column * 5 + 6) & 15);
+                (row * 11 + column * 5 + seed * 3 + 6) & 15);
             values[
                 static_cast<std::size_t>(row) * (input / 2)
                 + column / 2
@@ -3723,6 +3725,250 @@ void test_mxfp4_mfe_and_projection_offsets() {
     }
 }
 
+void test_mxfp4_multi_pool_native_slots() {
+    constexpr int experts = 2;
+    constexpr int output = 7;
+    constexpr int input = 64;
+    constexpr int tokens = 2;
+    const std::array<Mxfp4Fixture, experts> fixtures{
+        make_mxfp4(output, input, 0),
+        make_mxfp4(output, input, 7),
+    };
+    std::vector<std::uint8_t> blob;
+    append_magic(blob, "MFE1");
+    append<std::uint32_t>(blob, experts);
+    append<std::uint32_t>(blob, output);
+    append<std::uint32_t>(blob, input);
+    append<std::uint32_t>(blob, experts);
+    for (int expert = 0; expert < experts; ++expert) {
+        append<std::uint32_t>(blob, 1);
+        append<std::uint32_t>(blob, 5);
+        append<std::uint64_t>(blob, fixtures[expert].blob.size());
+        append<std::uint64_t>(blob, 0);
+        append<std::int32_t>(blob, expert);
+        blob.insert(blob.end(), {'M', 'X', 'F', 'P', '4'});
+        append_bytes(blob, fixtures[expert].blob);
+    }
+
+    const auto weight = mfq::metal::MlxMoeWeight::from_blob(blob);
+    std::vector<float> source(tokens * input);
+    for (std::size_t index = 0; index < source.size(); ++index) {
+        source[index] = static_cast<float>(
+            static_cast<int>((index * 13 + 5) % 29) - 14) / 128.0f;
+    }
+    const auto source_array = mlx::core::astype(
+        mlx::core::array(source.begin(), mlx::core::Shape{tokens, input}),
+        mlx::core::bfloat16);
+    const std::vector<std::int32_t> ids{1, 0};
+    const auto ids_array = mlx::core::array(
+        ids.begin(), mlx::core::Shape{tokens, 1});
+    const auto route_order = mlx::core::contiguous(
+        mlx::core::astype(
+            mlx::core::argsort(mlx::core::reshape(
+                ids_array,
+                mlx::core::Shape{tokens})),
+            mlx::core::int32));
+    auto sorted = weight.routed_matmul_sorted(
+        source_array,
+        ids_array,
+        route_order,
+        false,
+        false,
+        0.0f,
+        nullptr,
+        true);
+    require(
+        sorted.dtype() == mlx::core::bfloat16,
+        "multi-pool MXFP4 gather-QMM did not preserve BF16");
+    const auto actual = evaluated_floats(mlx::core::take(
+        std::move(sorted),
+        mlx::core::argsort(route_order),
+        0));
+    const auto rounded_source = evaluated_floats(source_array);
+    for (int token = 0; token < tokens; ++token) {
+        const int expert = ids[static_cast<std::size_t>(token)];
+        for (int row = 0; row < output; ++row) {
+            float expected = 0.0f;
+            for (int column = 0; column < input; ++column) {
+                expected += rounded_source[
+                    static_cast<std::size_t>(token) * input + column]
+                    * fixtures[expert].dense[
+                        static_cast<std::size_t>(row) * input + column];
+            }
+            require_close(
+                actual[static_cast<std::size_t>(token) * output + row],
+                expected,
+                2.5e-2f);
+        }
+    }
+}
+
+void test_mxfp4_pair_blocks_matches_native_projections() {
+    constexpr int experts = 4;
+    constexpr int slots = 4;
+    constexpr int output = 32;
+    constexpr int input = 64;
+    constexpr int tokens = 45;
+    constexpr int routes = 1;
+    constexpr int route_count = tokens * routes;
+    constexpr std::size_t packed_stride =
+        static_cast<std::size_t>(output) * input / 2;
+    constexpr std::size_t scale_stride =
+        static_cast<std::size_t>(output) * input / 32;
+
+    std::vector<std::uint8_t> gate_values(slots * packed_stride);
+    std::vector<std::uint8_t> up_values(slots * packed_stride);
+    std::vector<std::uint8_t> gate_scales(slots * scale_stride);
+    std::vector<std::uint8_t> up_scales(slots * scale_stride);
+    for (std::size_t index = 0; index < gate_values.size(); ++index) {
+        gate_values[index] = static_cast<std::uint8_t>(
+            ((index * 13 + 0x31) & 15u)
+            | (((index * 7 + 0x0b) & 15u) << 4));
+        up_values[index] = static_cast<std::uint8_t>(
+            ((index * 5 + 0x07) & 15u)
+            | (((index * 11 + 0x03) & 15u) << 4));
+    }
+    for (std::size_t index = 0; index < gate_scales.size(); ++index) {
+        gate_scales[index] = static_cast<std::uint8_t>(126 + index % 3);
+        up_scales[index] = static_cast<std::uint8_t>(125 + index % 4);
+    }
+    const std::vector<std::int32_t> gate_slots{2, 0, 3, 1};
+    const std::vector<std::int32_t> up_slots{1, 3, 0, 2};
+    const auto gate = mfq::metal::MlxMoeWeight::from_mxfp4_slots(
+        experts,
+        output,
+        input,
+        gate_slots,
+        mlx::core::array(
+            gate_values.begin(),
+            mlx::core::Shape{slots, static_cast<int>(packed_stride)}),
+        mlx::core::array(
+            gate_scales.begin(),
+            mlx::core::Shape{slots, static_cast<int>(scale_stride)}));
+    const auto up = mfq::metal::MlxMoeWeight::from_mxfp4_slots(
+        experts,
+        output,
+        input,
+        up_slots,
+        mlx::core::array(
+            up_values.begin(),
+            mlx::core::Shape{slots, static_cast<int>(packed_stride)}),
+        mlx::core::array(
+            up_scales.begin(),
+            mlx::core::Shape{slots, static_cast<int>(scale_stride)}));
+    require(
+        gate.supports_mxfp4_pair_blocks(up),
+        "compatible MXFP4 slot views rejected pair blocks");
+
+    std::vector<float> input_values(tokens * input);
+    for (std::size_t index = 0; index < input_values.size(); ++index) {
+        input_values[index] = static_cast<float>(
+            static_cast<int>((index * 17 + 9) % 41) - 20) / 256.0f;
+    }
+    std::vector<std::int32_t> sorted_ids(route_count);
+    std::fill(sorted_ids.begin(), sorted_ids.begin() + 35, 0);
+    std::fill(sorted_ids.begin() + 35, sorted_ids.begin() + 40, 1);
+    std::fill(sorted_ids.begin() + 40, sorted_ids.begin() + 43, 2);
+    std::fill(sorted_ids.begin() + 43, sorted_ids.end(), 3);
+    std::vector<std::int32_t> ids(route_count);
+    for (int index = 0; index < route_count; ++index) {
+        ids[static_cast<std::size_t>((index * 17) % route_count)] =
+            sorted_ids[static_cast<std::size_t>(index)];
+    }
+    const auto ids_array = mlx::core::array(
+        ids.begin(),
+        mlx::core::Shape{tokens, routes});
+    const auto route_order = mlx::core::contiguous(
+        mlx::core::astype(
+            mlx::core::argsort(mlx::core::reshape(
+                ids_array,
+                mlx::core::Shape{route_count})),
+            mlx::core::int32));
+    const auto plan = gate.build_grouped_mmq_plan(
+        ids_array,
+        route_order,
+        32);
+    require(
+        plan.block_rows == 32 && plan.route_count == route_count,
+        "MXFP4 pair block plan geometry mismatch");
+
+    const auto check_dtype = [&](mlx::core::Dtype dtype, float tolerance) {
+        auto source = mlx::core::astype(
+            mlx::core::array(
+                input_values.begin(),
+                mlx::core::Shape{tokens, input}),
+            dtype);
+        auto sorted_source = mlx::core::take(source, route_order, 0);
+        const auto single_reference = evaluated_floats(
+            gate.routed_matmul_sorted(
+                sorted_source,
+                ids_array,
+                route_order,
+                true,
+                false,
+                0.0f,
+                &plan,
+                true));
+        auto single = gate.mxfp4_block_matmul_sorted(
+            sorted_source,
+            plan);
+        require(
+            single.dtype() == mlx::core::float16,
+            "MXFP4 single block output dtype mismatch");
+        const auto single_actual = evaluated_floats(std::move(single));
+        require(
+            single_actual.size() == single_reference.size(),
+            "MXFP4 single block output size mismatch");
+        for (std::size_t index = 0; index < single_actual.size(); ++index) {
+            require_close(
+                single_actual[index],
+                single_reference[index],
+                tolerance);
+        }
+        auto gate_output = gate.routed_matmul_sorted(
+            sorted_source,
+            ids_array,
+            route_order,
+            true,
+            false,
+            0.0f,
+            &plan,
+            true);
+        auto up_output = up.routed_matmul_sorted(
+            sorted_source,
+            ids_array,
+            route_order,
+            true,
+            false,
+            0.0f,
+            &plan,
+            true);
+        constexpr float swiglu_limit = 10.0f;
+        const auto reference = evaluated_floats(
+            mfq::metal::moe_limited_swiglu_pair(
+                std::move(gate_output),
+                std::move(up_output),
+                swiglu_limit));
+        auto paired = gate.mxfp4_pair_swiglu_sorted(
+            up,
+            sorted_source,
+            plan,
+            swiglu_limit);
+        require(
+            paired.dtype() == mlx::core::float16,
+            "MXFP4 pair block output dtype mismatch");
+        const auto actual = evaluated_floats(std::move(paired));
+        require(
+            actual.size() == reference.size(),
+            "MXFP4 pair block output size mismatch");
+        for (std::size_t index = 0; index < actual.size(); ++index) {
+            require_close(actual[index], reference[index], tolerance);
+        }
+    };
+    check_dtype(mlx::core::float16, 8e-3f);
+    check_dtype(mlx::core::bfloat16, 3e-2f);
+}
+
 void test_mxfp4_sq_mfe_reuses_linear_kernel() {
     constexpr int experts = 3;
     constexpr int output = 5;
@@ -3956,6 +4202,9 @@ void test_mxfp4_smallm_nax_policy() {
         : std::optional<std::string>(prior_prefill);
     setenv("MFQ_METAL_MFE_PREFILL_NAX", "1", 1);
     require(
+        weight.prefers_mxfp4_nax_prefill(4 * routes),
+        "MXFP4 NAX prefill query ignored an explicit enable");
+    require(
         weight.recommended_mxfp4_nax_prefill_tokens(routes) == 5440,
         "MXFP4 NAX top-k=6 prefill recommendation mismatch");
     const auto automatic_nax_disabled =
@@ -3976,6 +4225,9 @@ void test_mxfp4_smallm_nax_policy() {
         paired.recommended_mxfp4_nax_prefill_tokens(routes) == 5440,
         "split MXFP4 projections lost their prefill recommendation");
     setenv("MFQ_METAL_MFE_PREFILL_NAX", "0", 1);
+    require(
+        !weight.prefers_mxfp4_nax_prefill(4 * routes),
+        "MXFP4 NAX prefill query ignored an explicit disable");
     require(
         weight.recommended_mxfp4_nax_prefill_tokens(routes) == 0,
         "MXFP4 NAX prefill disable override was ignored");
@@ -4023,6 +4275,33 @@ void test_mxfp4_smallm_nax_policy() {
         "small-M MXFP4 NAX output size mismatch");
     for (std::size_t index = 0; index < reference.size(); ++index) {
         require_close(reference[index], forced_nax[index], 4e-3f);
+    }
+
+    const auto bf16_input = mlx::core::astype(
+        input_array,
+        mlx::core::bfloat16);
+    auto bf16_sorted = weight.routed_matmul_sorted(
+        bf16_input,
+        repeated_ids,
+        route_order,
+        false,
+        false,
+        0.0f,
+        nullptr,
+        true);
+    require(
+        bf16_sorted.dtype() == mlx::core::bfloat16,
+        "native MXFP4 gather-QMM did not preserve BF16 activations");
+    const auto bf16_nax = evaluated_floats(
+        mlx::core::take(
+            std::move(bf16_sorted),
+            mlx::core::argsort(route_order),
+            0));
+    require(
+        reference.size() == bf16_nax.size(),
+        "BF16 MXFP4 NAX output size mismatch");
+    for (std::size_t index = 0; index < reference.size(); ++index) {
+        require_close(reference[index], bf16_nax[index], 1.5e-2f);
     }
 
     if (saved.has_value()) {
@@ -6430,6 +6709,8 @@ int main(int argc, char** argv) {
         test_all_families_and_projections();
         test_swiglu_ffn();
         test_mxfp4_mfe_and_projection_offsets();
+        test_mxfp4_multi_pool_native_slots();
+        test_mxfp4_pair_blocks_matches_native_projections();
         test_mxfp4_sq_mfe_reuses_linear_kernel();
         test_mxfp4_sq_mixed_mfe_routes_without_sq_heterogeneous_kernel();
         test_mxfp4_smallm_nax_policy();

@@ -743,6 +743,22 @@ void test_glu_and_expert_scale() {
         mfq::metal::moe_limited_swiglu_split(
             input,
             swiglu_limit);
+    const std::vector<float> gate_values{
+        -1.0f, 0.5f, 2.0f,
+        0.2f, -1.3f, 0.7f,
+    };
+    const std::vector<float> up_values{
+        0.25f, -0.75f, 1.5f,
+        1.0f, 0.4f, -0.5f,
+    };
+    auto paired_limited_swiglu = mfq::metal::moe_limited_swiglu_pair(
+        mlx::core::astype(
+            array(gate_values.begin(), Shape{2, 3}),
+            mlx::core::float16),
+        mlx::core::astype(
+            array(up_values.begin(), Shape{2, 3}),
+            mlx::core::float16),
+        swiglu_limit);
     auto geglu = mfq::metal::moe_geglu_split(input);
     require(
         swiglu.shape() == Shape{2, 3} &&
@@ -750,11 +766,14 @@ void test_glu_and_expert_scale() {
             geglu.shape() == Shape{2, 3} &&
             swiglu.dtype() == mlx::core::float16 &&
             limited_swiglu.dtype() == mlx::core::float16 &&
+            paired_limited_swiglu.dtype() == mlx::core::float16 &&
             geglu.dtype() == mlx::core::float16,
         "GLU split shape or dtype mismatch");
     const auto swiglu_values = floats(swiglu);
     const auto limited_swiglu_values =
         floats(limited_swiglu);
+    const auto paired_limited_values =
+        floats(paired_limited_swiglu);
     const auto geglu_values = floats(geglu);
     for (int row = 0; row < 2; ++row) {
         for (int column = 0; column < 3; ++column) {
@@ -793,6 +812,10 @@ void test_glu_and_expert_scale() {
                 static_cast<float>(
                     static_cast<mlx::core::float16_t>(
                         limited_silu * limited_up)),
+                1e-6f);
+            require_close(
+                paired_limited_values[row * 3 + column],
+                limited_swiglu_values[row * 3 + column],
                 1e-6f);
             require_close(
                 geglu_values[row * 3 + column],

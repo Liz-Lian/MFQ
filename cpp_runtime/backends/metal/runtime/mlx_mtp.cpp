@@ -202,11 +202,16 @@ MlxMtpDepthController::MlxMtpDepthController(
     // Pair that with a plain-decode baseline and interpolate the intermediate
     // widths; periodic probes refine any non-linearity later. This avoids
     // forcing every request through all 1..N widths before useful decoding.
-    // Probe the maximum twice so update_time() drops one-time Metal graph and
-    // fused-attention compilation via its warmup minimum.
+    // Probe the maximum three times so update_time() can discard both cold
+    // graph shapes seen by recurrent predictors: the first proposal is built
+    // from the prompt state, while the first continuation folds verified
+    // hidden rows before proposing again.  On large models both shapes can
+    // compile independently, so two samples can still leave the controller
+    // with a cold timing and incorrectly pin an otherwise profitable request
+    // to plain decoding.
     warmup_.insert(
         warmup_.end(),
-        {maximum_depth_, maximum_depth_});
+        {maximum_depth_, maximum_depth_, maximum_depth_});
     // Depth-one predictors still need a measured plain-decode reference.
     // Without it the controller can never discover that a valid but costly
     // one-token predictor loses to the target model alone.

@@ -1,6 +1,7 @@
 #include "mlx_deepseek_v4_moe.h"
 
 #include "mlx_eval_timing.h"
+#include "mlx_platform.h"
 #include "mlx_moe_ops.h"
 
 #include <algorithm>
@@ -34,6 +35,20 @@ double current_thread_cpu_seconds() noexcept {
 bool ssd_device_route_enabled() noexcept {
     const char* value = std::getenv("MFQ_SSD_DEVICE_ROUTE");
     return value != nullptr && std::string_view(value) != "0";
+}
+
+bool mxfp4_pair_blocks_enabled(int route_count) noexcept {
+    // The crossover was validated on M3 Ultra. Small tails retain MLX's
+    // lower-overhead gather-QMM path, and other Apple GPU families stay on
+    // the portable implementation until measured independently.
+    if (route_count < 16384) return false;
+    const char* value = std::getenv(
+        "MFQ_DSV4_MXFP4_PAIR_BLOCKS");
+    if (value == nullptr) {
+        return mlx_apple_chip_is("Apple M3 Ultra");
+    }
+    const auto setting = std::string_view(value);
+    return setting == "1" || setting == "true" || setting == "on";
 }
 
 int checked_int(std::size_t value, const char* name) {
@@ -197,13 +212,9 @@ array limited_swiglu_pair(
     array gate,
     array up,
     float limit) {
-    return moe_limited_swiglu_split(
-        mlx::core::concatenate(
-            {
-                std::move(gate),
-                std::move(up),
-            },
-            -1),
+    return moe_limited_swiglu_pair(
+        std::move(gate),
+        std::move(up),
         limit);
 }
 
@@ -460,31 +471,23 @@ MlxDeepseekV4Moe MlxDeepseekV4Moe::load(
         routed_gate_up;
     std::optional<MlxRoutedLinear> routed_gate;
     std::optional<MlxRoutedLinear> routed_up;
-    // mlx-vlm executes the three raw checkpoint projections directly through
-    // SwitchGLU.  MFQ's grouped-MMQ path has matching end-to-end numerics for
-    // the virtual HF views; the large-M gather-QMM shortcut currently does
-    // not, and its small per-layer error becomes incoherent on long prompts.
-    // Keep native MFQ artifacts on their established optimized policy while
-    // raw-HF V4 defaults to the parity-verified path.
-    const bool allow_automatic_mxfp4_nax_prefill =
-        !model.is_hf_source();
+    // Raw-HF virtual expert views now carry their physical MXFP4 arena slots,
+    // so they can share the same geometry-gated native prefill policy as MFQ
+    // artifacts without relying on a model/source-specific environment flag.
     if (split_gate_up) {
         routed_gate.emplace(
             load_routed(
                 model,
-                gate_name,
-                allow_automatic_mxfp4_nax_prefill));
+                gate_name));
         routed_up.emplace(
             load_routed(
                 model,
-                up_name,
-                allow_automatic_mxfp4_nax_prefill));
+                up_name));
     } else {
         routed_gate_up.emplace(
             load_routed(
                 model,
-                gate_up_name,
-                allow_automatic_mxfp4_nax_prefill));
+                gate_up_name));
     }
     return MlxDeepseekV4Moe(
         config,
@@ -506,8 +509,7 @@ MlxDeepseekV4Moe MlxDeepseekV4Moe::load(
         std::optional<MlxRoutedLinear>(
             load_routed(
                 model,
-                down_name,
-                allow_automatic_mxfp4_nax_prefill)),
+                down_name)),
         nullptr,
         nullptr,
         layer,
@@ -604,16 +606,14 @@ MlxDeepseekV4Moe MlxDeepseekV4Moe::load_named(
     std::optional<MlxRoutedLinear> gate_up;
     std::optional<MlxRoutedLinear> gate;
     std::optional<MlxRoutedLinear> up;
-    const bool allow_automatic_mxfp4_nax_prefill =
-        !model.is_hf_source();
     if (!stream_all && split) {
         gate.emplace(load_routed(
-            model, gate_name, allow_automatic_mxfp4_nax_prefill));
+            model, gate_name));
         up.emplace(load_routed(
-            model, up_name, allow_automatic_mxfp4_nax_prefill));
+            model, up_name));
     } else if (!stream_all) {
         gate_up.emplace(load_routed(
-            model, gate_up_name, allow_automatic_mxfp4_nax_prefill));
+            model, gate_up_name));
     }
     std::optional<array> visual_bias;
     if (config.has_vision() &&
@@ -675,7 +675,7 @@ MlxDeepseekV4Moe MlxDeepseekV4Moe::load_named(
         std::move(gate),
         std::move(up),
         std::optional<MlxRoutedLinear>(load_routed(
-            model, down_name, allow_automatic_mxfp4_nax_prefill)),
+            model, down_name)),
         nullptr,
         nullptr,
         0,
@@ -1059,6 +1059,22 @@ MlxDeepseekV4Moe::MlxDeepseekV4Moe(
 int MlxDeepseekV4Moe::recommended_prefill_chunk_size() const noexcept {
     if (expert_offload_ || ssd_expert_cache_ || !routed_down_) {
         return 0;
+    }
+    // Raw-HF V4F on M3 Ultra uses the validated MXFP4 pair/block path for
+    // both Gate/Up and Down.  A 16K model chunk keeps that path saturated and
+    // removes three quarters of the graph/cache boundaries imposed by the
+    // old 4K NAX recommendation.  Explicitly disabling pair blocks retains
+    // the portable recommendation below.
+    constexpr int kM3UltraPairBlockChunk = 16384;
+    if (routed_gate_ && routed_up_
+        && config_.top_k > 0
+        && config_.top_k
+            <= std::numeric_limits<int>::max() / kM3UltraPairBlockChunk
+        && routed_gate_->supports_mxfp4_pair_blocks(*routed_up_)
+        && routed_down_->supports_mxfp4_blocks()
+        && mxfp4_pair_blocks_enabled(
+            static_cast<int>(config_.top_k) * kM3UltraPairBlockChunk)) {
+        return kM3UltraPairBlockChunk;
     }
     int recommendation =
         routed_down_->recommended_mxfp4_nax_prefill_tokens(
@@ -1572,11 +1588,21 @@ MlxDeepseekV4Moe::forward_branches(
                     mlx::core::int32));
             const auto* gate_source = split_resident ? gate : gate_up;
             const int route_count = rows * routes;
+            const bool pair_blocks =
+                split_resident
+                && mxfp4_pair_blocks_enabled(route_count)
+                && gate->supports_mxfp4_pair_blocks(*up);
+            const bool down_blocks =
+                pair_blocks && down->supports_mxfp4_blocks();
             const int gate_block_rows =
-                gate_source->recommended_grouped_mmq_block_rows(
-                    route_count);
+                pair_blocks
+                ? 32
+                : gate_source->recommended_grouped_mmq_block_rows(
+                      route_count);
             const int down_block_rows =
-                down->recommended_grouped_mmq_block_rows(route_count);
+                down_blocks
+                ? 32
+                : down->recommended_grouped_mmq_block_rows(route_count);
             auto gate_plan = gate_source->build_grouped_mmq_plan(
                 route_ids,
                 route_order,
@@ -1591,17 +1617,36 @@ MlxDeepseekV4Moe::forward_branches(
             }
             array routed_hidden = [&]() {
                 if (split_resident) {
+                    const bool shared_sorted_source =
+                        pair_blocks
+                        || (gate->prefers_mxfp4_nax_prefill(route_count)
+                            && up->prefers_mxfp4_nax_prefill(route_count));
+                    auto gate_up_source = shared_sorted_source
+                        ? mlx::core::contiguous(mlx::core::take(
+                              source,
+                              mlx::core::floor_divide(
+                                  route_order,
+                                  array(routes, mlx::core::int32)),
+                              0))
+                        : source;
+                    if (pair_blocks) {
+                        return gate->mxfp4_pair_swiglu_sorted(
+                            *up,
+                            gate_up_source,
+                            gate_plan,
+                            static_cast<float>(config_.swiglu_limit));
+                    }
                     auto gate_output = gate->forward_sorted(
-                        source,
+                        gate_up_source,
                         route_ids,
                         route_order,
-                        false,
+                        shared_sorted_source,
                         &gate_plan);
                     auto up_output = up->forward_sorted(
-                        source,
+                        gate_up_source,
                         route_ids,
                         route_order,
-                        false,
+                        shared_sorted_source,
                         &gate_plan);
                     return limited_swiglu_pair(
                         std::move(gate_output),
@@ -1624,13 +1669,16 @@ MlxDeepseekV4Moe::forward_branches(
                     "moe.routed_gate_up_swiglu",
                     routed_hidden);
             }
-            auto down_sorted =
-                down->forward_sorted(
-                    routed_hidden,
-                    route_ids,
-                    route_order,
-                    true,
-                    down_plan.has_value() ? &*down_plan : &gate_plan);
+            auto down_sorted = down_blocks
+                ? down->mxfp4_block_matmul_sorted(
+                      routed_hidden,
+                      gate_plan)
+                : down->forward_sorted(
+                      routed_hidden,
+                      route_ids,
+                      route_order,
+                      true,
+                      down_plan.has_value() ? &*down_plan : &gate_plan);
             if (detail::component_profile_active()) {
                 detail::profile_eval(
                     "moe.routed_down",

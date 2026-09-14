@@ -373,14 +373,20 @@ public:
     CudaContinuousBatcher(
             Model & model, std::mutex & model_mutex,
             int32_t max_sequences,
+            int64_t prefill_chunk_size = 2048,
             std::chrono::microseconds initial_batch_wait =
                 std::chrono::microseconds(1000))
         : model_(model), model_mutex_(model_mutex),
           max_sequences_(max_sequences),
+          prefill_chunk_size_(prefill_chunk_size),
           initial_batch_wait_(initial_batch_wait) {
         if (max_sequences_ < 1) {
             throw std::invalid_argument(
                 "continuous batching max sequences must be positive");
+        }
+        if (prefill_chunk_size_ < 1) {
+            throw std::invalid_argument(
+                "continuous batching prefill chunk size must be positive");
         }
         const auto incompatibility =
             qwen_continuous_batching_incompatibility(model_);
@@ -526,6 +532,8 @@ public:
                 static_cast<double>(max_batch_seen_.load())},
             {"continuous_batching_admissions",
                 static_cast<double>(admissions_.load())},
+            {"continuous_batching_prefill_chunks",
+                static_cast<double>(prefill_chunks_.load())},
             {"continuous_batching_interleaved_admissions",
                 static_cast<double>(interleaved_admissions_.load())},
             {"continuous_batching_compactions",
@@ -738,7 +746,15 @@ private:
                     .reshape({1, -1}).contiguous();
                 initialize_sampling(*request, ids);
                 ServerPrefillCudaTimer timer;
-                auto hidden = model_.hidden_forward(ids);
+                Tensor hidden;
+                for (int64_t offset = 0; offset < ids.size(1);
+                        offset += prefill_chunk_size_) {
+                    const int64_t count = std::min(
+                        prefill_chunk_size_, ids.size(1) - offset);
+                    hidden = model_.hidden_forward(
+                        ids.narrow(1, offset, count).contiguous());
+                    ++prefill_chunks_;
+                }
                 auto logits = qwen_logits_from_last_hidden(
                     model_, std::move(hidden));
                 MFQ_CUDA_CHECK(cudaEventRecord(
@@ -1255,6 +1271,7 @@ private:
     Model & model_;
     std::mutex & model_mutex_;
     int32_t max_sequences_ = 0;
+    int64_t prefill_chunk_size_ = 2048;
     std::chrono::microseconds initial_batch_wait_;
     std::thread worker_;
     mutable std::mutex queue_mutex_;
@@ -1269,6 +1286,7 @@ private:
     std::atomic<int64_t> decode_tokens_{0};
     std::atomic<int64_t> max_batch_seen_{0};
     std::atomic<int64_t> admissions_{0};
+    std::atomic<int64_t> prefill_chunks_{0};
     std::atomic<int64_t> interleaved_admissions_{0};
     std::atomic<int64_t> compactions_{0};
     std::atomic<int64_t> batched_greedy_batches_{0};
@@ -1337,7 +1355,7 @@ static int run_qwen_continuous_batching_check(Model & model) {
 
     std::mutex model_mutex;
     CudaContinuousBatcher batcher(
-        model, model_mutex, 4, std::chrono::milliseconds(100));
+        model, model_mutex, 4, 2048, std::chrono::milliseconds(100));
     std::mutex gate_mutex;
     std::condition_variable gate_ready;
     bool first_prefilled = false;

@@ -318,6 +318,8 @@ class NativeRuntime:
         return f"http://127.0.0.1:{self.port}"
 
     def command(self, port: int) -> list[str]:
+        if self.prefill_chunk_size < 1:
+            raise NativeRuntimeError("prefill chunk size must be positive")
         if self.continuous_batching < 0:
             raise NativeRuntimeError("continuous batching must be non-negative")
         if self.continuous_batching > 0 and self.backend != "cuda":
@@ -355,8 +357,7 @@ class NativeRuntime:
             "--model-name",
             self.model_name,
         ]
-        if self.backend == "metal":
-            command.extend(["--prefill-chunk-size", str(self.prefill_chunk_size)])
+        command.extend(["--prefill-chunk-size", str(self.prefill_chunk_size)])
         if self.context_size > 0:
             command.extend(["--ctx-size", str(self.context_size)])
         request_capacity = native_request_capacity(

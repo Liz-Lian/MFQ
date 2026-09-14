@@ -199,7 +199,7 @@ def test_native_cuda_worker_is_private_and_uses_a_loopback_port(tmp_path: Path) 
     assert command[command.index("--host") + 1] == "127.0.0.1"
     assert command[command.index("--port") + 1] == "43123"
     assert command[command.index("--ctx-size") + 1] == "32768"
-    assert "--prefill-chunk-size" not in command
+    assert command[command.index("--prefill-chunk-size") + 1] == "2048"
 
 
 def test_native_cuda_worker_enables_explicit_continuous_batching(
@@ -281,6 +281,20 @@ def test_native_metal_worker_receives_prefill_chunk_size(tmp_path: Path) -> None
         model=tmp_path / "model.mfq",
         model_name="model",
         backend="metal",
+        prefill_chunk_size=4096,
+    )
+
+    command = runtime.command(43123)
+
+    assert command[command.index("--prefill-chunk-size") + 1] == "4096"
+
+
+def test_native_cuda_worker_receives_prefill_chunk_size(tmp_path: Path) -> None:
+    runtime = NativeRuntime(
+        executable=tmp_path / "mfq-decode-cuda",
+        model=tmp_path / "model.mfq",
+        model_name="model",
+        backend="cuda",
         prefill_chunk_size=4096,
     )
 

@@ -2806,9 +2806,8 @@ class ManagedRuntimePool:
                 "--model-name",
                 artifact.resource.name,
             ]
-            if self.backend == "metal":
-                command.extend(["--prefill-chunk-size", str(request.prefill_chunk_size)])
-            elif request_capacity > 1:
+            command.extend(["--prefill-chunk-size", str(request.prefill_chunk_size)])
+            if self.backend == "cuda" and request_capacity > 1:
                 command.extend(
                     [
                         "--continuous-batching",

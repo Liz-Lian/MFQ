@@ -33,6 +33,15 @@ def test_continuous_batching_is_an_explicit_server_mode():
     assert "decode=target_only mtp=disabled" in DECODE
 
 
+def test_cuda_server_prefill_is_bounded_for_serial_mtp_and_batched_paths():
+    assert '"--prefill-chunk-size"' in DECODE
+    assert "server_prefill_tail(" in DECODE
+    assert "server_hidden_forward_chunked(" in DECODE
+    assert "prefill_chunk_size_" in BATCHING
+    assert "offset += prefill_chunk_size_" in BATCHING
+    assert "continuous_batching_prefill_chunks" in BATCHING
+
+
 def test_scheduler_supports_dynamic_join_retire_and_per_request_sampling():
     assert "take_qwen_batch_state" in BATCHING
     assert "restore_qwen_batch_states" in BATCHING

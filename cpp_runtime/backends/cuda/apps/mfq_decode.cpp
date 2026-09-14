@@ -22197,6 +22197,66 @@ static mfq_tensor_backend::Tensor sample_server_token(
         random_cuda, rng, token_constraint);
 }
 
+static mfq_tensor_backend::Tensor server_prefill_tail(
+    Model & model,
+    mfq_tensor_backend::Tensor ids,
+    int64_t chunk_size) {
+    MFQ_RUNTIME_CHECK(
+        chunk_size > 0,
+        "server prefill chunk size must be positive");
+    MFQ_RUNTIME_CHECK(
+        ids.dim() == 2 && ids.size(0) == 1 && ids.size(1) > 0,
+        "server prefill IDs must have shape [1, tokens]");
+    int64_t offset = 0;
+    while (ids.size(1) - offset > chunk_size) {
+        (void)model.hidden_forward(
+            ids.narrow(1, offset, chunk_size).contiguous());
+        offset += chunk_size;
+    }
+    return offset == 0
+        ? ids
+        : ids.narrow(1, offset, ids.size(1) - offset).contiguous();
+}
+
+static mfq_tensor_backend::Tensor server_hidden_forward_chunked(
+    Model & model,
+    const mfq_tensor_backend::Tensor & ids,
+    int64_t chunk_size,
+    mfq_tensor_backend::Tensor * raw_hidden = nullptr) {
+    MFQ_RUNTIME_CHECK(
+        chunk_size > 0,
+        "server prefill chunk size must be positive");
+    MFQ_RUNTIME_CHECK(
+        ids.dim() == 2 && ids.size(0) == 1 && ids.size(1) > 0,
+        "server prefill IDs must have shape [1, tokens]");
+    std::vector<mfq_tensor_backend::Tensor> raw_chunks;
+    if (raw_hidden != nullptr) {
+        raw_chunks.reserve(static_cast<std::size_t>(
+            (ids.size(1) + chunk_size - 1) / chunk_size));
+    }
+    mfq_tensor_backend::Tensor hidden;
+    for (int64_t offset = 0; offset < ids.size(1); offset += chunk_size) {
+        const int64_t count = std::min(chunk_size, ids.size(1) - offset);
+        mfq_tensor_backend::Tensor raw_chunk;
+        hidden = model.hidden_forward(
+            ids.narrow(1, offset, count).contiguous(),
+            mfq_nullopt,
+            mfq_nullopt,
+            nullptr,
+            mfq_nullopt,
+            raw_hidden != nullptr ? &raw_chunk : nullptr);
+        if (raw_hidden != nullptr) {
+            raw_chunks.push_back(std::move(raw_chunk));
+        }
+    }
+    if (raw_hidden != nullptr) {
+        *raw_hidden = raw_chunks.size() == 1
+            ? std::move(raw_chunks.front())
+            : mfq_tensor_backend::cat(raw_chunks, 1).contiguous();
+    }
+    return hidden;
+}
+
 class ServerPrefillCudaTimer {
 public:
     ServerPrefillCudaTimer()
@@ -22981,7 +23041,8 @@ private:
 static int32_t generate_mtp_tokens(
         Model& model, CudaMtpModule& mtp,
         const std::vector<int64_t>& prompt, const MfqSamplingParams& sampling,
-        const MfqTokenCallback& on_token, const MfqPrefillCallback& on_prefill) {
+        const MfqTokenCallback& on_token, const MfqPrefillCallback& on_prefill,
+        int64_t prefill_chunk_size = 2048) {
     using Tensor = mfq_tensor_backend::Tensor;
     using Clock = std::chrono::steady_clock;
     namespace policy = mfq::cuda::mtp;
@@ -23061,8 +23122,8 @@ static int32_t generate_mtp_tokens(
         mtp.reset(1);
         ServerPrefillCudaTimer timer;
         Tensor raw;
-        auto hidden = model.hidden_forward(input_ids, mfq_nullopt, mfq_nullopt, nullptr,
-            mfq_nullopt, &raw);
+        auto hidden = server_hidden_forward_chunked(
+            model, input_ids, prefill_chunk_size, &raw);
         auto logits = logits_for(hidden.narrow(1, hidden.size(1) - 1, 1));
         MFQ_CUDA_CHECK(cudaEventRecord(timer.finished_event(), mfq_get_current_cuda_stream()));
         int32_t pending = sample_normal(logits, counts);
@@ -23380,7 +23441,8 @@ static int32_t generate_server_tokens(
     const MfqPrefillCallback & on_prefill,
     const MfqPromptCachePlan & cache_plan,
     const MfqTokenConstraintPtr & token_constraint,
-    CudaMtpModule* mtp = nullptr)
+    CudaMtpModule* mtp = nullptr,
+    int64_t prefill_chunk_size = 2048)
 {
     std::lock_guard<std::mutex> lock(model_mutex);
     const char* mtp_reprefill = std::getenv("MFQ_SERVER_REPREFILL");
@@ -23389,7 +23451,9 @@ static int32_t generate_server_tokens(
         !(mtp_reprefill != nullptr && mtp_reprefill[0] == '1') &&
         !(mtp_trace != nullptr && mtp_trace[0] == '1')) {
         // Predictor state is not in the persistent session snapshot contract.
-        return generate_mtp_tokens(model, *mtp, prompt, sampling, on_token, on_prefill);
+        return generate_mtp_tokens(
+            model, *mtp, prompt, sampling, on_token, on_prefill,
+            prefill_chunk_size);
     }
     auto options = mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt64).device(mfq_tensor_backend::kCUDA);
     const size_t stable_prefix_tokens = std::min(
@@ -23448,6 +23512,8 @@ static int32_t generate_server_tokens(
                     1, static_cast<int64_t>(reused_tokens),
                     static_cast<int64_t>(
                         stable_prefix_tokens - reused_tokens)).contiguous();
+                stable_suffix = server_prefill_tail(
+                    model, std::move(stable_suffix), prefill_chunk_size);
                 MfqOptional<mfq_tensor_backend::Tensor> stable_seq_len = mfq_nullopt;
                 if (!model.c.is_minicpmo45() && model.cache_pos > 0 &&
                         stable_suffix.size(1) == 1) {
@@ -23463,6 +23529,8 @@ static int32_t generate_server_tokens(
                 static_cast<int64_t>(
                     prompt.size() - stable_prefix_tokens)).contiguous();
         }
+        ids = server_prefill_tail(
+            model, std::move(ids), prefill_chunk_size);
         auto next = sample_server_token(
             model, ids, sampling, counts, random_host, random_cuda, rng,
             token_constraint,
@@ -29017,6 +29085,7 @@ int main(int argc, char ** argv) {
         int cpu_threads = 0;
         int server_port = 8080;
         int continuous_batching = 0;
+        int64_t prefill_chunk_size = 2048;
         int64_t context_size = 0;
         int64_t minicpmo_tts_steps = 0;
         int64_t minicpmo_duplex_steps = 0;
@@ -29285,6 +29354,9 @@ int main(int argc, char ** argv) {
             else if (a == "--continuous-batching" && i + 1 < argc) {
                 continuous_batching = std::stoi(argv[++i]);
             }
+            else if (a == "--prefill-chunk-size" && i + 1 < argc) {
+                prefill_chunk_size = std::stoll(argv[++i]);
+            }
             else if (a == "--check-continuous-batching") {
                 check_continuous_batching = true;
             }
@@ -29354,7 +29426,7 @@ int main(int argc, char ** argv) {
                 std::cerr << "usage: mfq-decode --mfq model.mfq [--config config.json] "
                              "(--ids 1,2,3 --gen 128 | --check-qwen35-mtp | --check-continuous-batching | --bench-qwen35-mtp ordinary|mtp | --server "
                              "[--host 127.0.0.1 --port 8080 --ctx-size 32768 --model-name name "
-                             "--continuous-batching 8 "
+                             "--continuous-batching 8 --prefill-chunk-size 2048 "
                              "--tensor-parallel 0,1 --tensor-split 1,1 "
                              "--expert-parallel 0,1 --expert-split 1,1 "
                              "--layer-parallel 0,1 --layer-split 1,1 "
@@ -29379,6 +29451,10 @@ int main(int argc, char ** argv) {
         if (continuous_batching > 0 && !server_mode) {
             throw std::runtime_error(
                 "--continuous-batching requires --server");
+        }
+        if (prefill_chunk_size <= 0) {
+            throw std::runtime_error(
+                "--prefill-chunk-size must be positive");
         }
         if (cpu_threads > 0) {
             mfq_set_num_threads(cpu_threads);
@@ -30088,10 +30164,12 @@ int main(int argc, char ** argv) {
                 continuous_batcher = std::make_unique<
                     mfq::cuda::continuous::CudaContinuousBatcher>(
                         server_model, model_mutex,
-                        continuous_batching);
+                        continuous_batching,
+                        prefill_chunk_size);
                 std::cerr
                     << "continuous_batching enabled=1 max_sequences="
                     << continuous_batching
+                    << " prefill_chunk_size=" << prefill_chunk_size
                     << " decode=target_only mtp=disabled"
                     << " paged_kv="
                     << (continuous_batcher->paged_kv_enabled() ? 1 : 0)
@@ -30143,7 +30221,7 @@ int main(int argc, char ** argv) {
                     server_model, model_mutex, decode_graph_cache,
                     text_session_cache, prompt, sampling,
                     on_token, on_prefill, cache_plan, token_constraint,
-                    server_components.mtp.get());
+                    server_components.mtp.get(), prefill_chunk_size);
             }, {}, duplex_backend, {
                 [&](const std::string & source_session_id,
                         const std::string & target_session_id) {

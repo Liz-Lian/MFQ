@@ -36,6 +36,7 @@ from mfq.server.models import (
     RuntimeInstanceState,
     SamplingParams,
 )
+from mfq.server.native import RuntimeRoute
 from mfq.server.runtime_pool import ManagedRuntimePool, RuntimeConflictError, _ManagedRuntime
 from mfq.server.service import ServerService
 from mfq.server.storage import SessionStore
@@ -874,11 +875,61 @@ def test_managed_cuda_runtime_connects_explicit_request_concurrency(
         command, _environment = pool._launch_configuration(
             artifact,
             ModelLoadRequest(model="tiny"),
-            python_mlx_worker=False,
+            runtime_route=RuntimeRoute(
+                architecture_family="qwen3_5",
+                backbone="qwen3_5",
+                continuous_batching=True,
+            ),
             port=43123,
         )
 
         assert command[command.index("--continuous-batching") + 1] == "6"
+
+    asyncio.run(run())
+
+
+def test_managed_cuda_runtime_only_enables_supported_continuous_batching(
+    tmp_path: Path,
+) -> None:
+    async def run() -> None:
+        model = tmp_path / "tiny.mfq"
+        _model(model, architecture="qwen4_exp")
+        catalog = ModelCatalog([tmp_path], cache_seconds=0)
+        artifact = await catalog.resolve_path(model)
+        pool = ManagedRuntimePool(
+            catalog,
+            tmp_path / "mfq-decode",
+            backend="cuda",
+            max_requests_per_instance=6,
+        )
+        request = ModelLoadRequest(model="tiny")
+
+        unsupported, _environment = pool._launch_configuration(
+            artifact,
+            request,
+            runtime_route=RuntimeRoute(
+                architecture_family="qwen4_exp",
+                backbone="qwen4_exp",
+            ),
+            port=43123,
+        )
+        moe, _environment = pool._launch_configuration(
+            DiscoveredModel(
+                resource=artifact.resource,
+                path=artifact.path,
+                routed_expert_bytes=1,
+            ),
+            request,
+            runtime_route=RuntimeRoute(
+                architecture_family="qwen3_5",
+                backbone="qwen3_5",
+                continuous_batching=True,
+            ),
+            port=43124,
+        )
+
+        assert "--continuous-batching" not in unsupported
+        assert "--continuous-batching" not in moe
 
     asyncio.run(run())
 

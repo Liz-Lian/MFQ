@@ -43,17 +43,20 @@ class RuntimeRoute:
     backbone: str = ""
     python_mlx_worker: bool = False
     vision_available: bool = False
+    continuous_batching: bool = False
 
 
 @dataclass(frozen=True)
 class _RuntimeImplementationRegistration:
     backbone: str
     python_mlx_worker: bool = False
+    continuous_batching: bool = False
 
 
 _RUNTIME_IMPLEMENTATION_REGISTRY = (
     _RuntimeImplementationRegistration(
         backbone="qwen3_5",
+        continuous_batching=True,
     ),
     _RuntimeImplementationRegistration(
         backbone="qwen4_exp",
@@ -163,6 +166,7 @@ def resolve_runtime_route(architecture: str, model: str | Path) -> RuntimeRoute:
         backbone=backbone,
         python_mlx_worker=registration.python_mlx_worker,
         vision_available="vision" in component_kinds,
+        continuous_batching=registration.continuous_batching,
     )
 
 

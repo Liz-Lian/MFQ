@@ -39,6 +39,7 @@ from mfq.server.models import (
     UpdateRuntimeInstanceRequest,
 )
 from mfq.server.native import (
+    RuntimeRoute,
     find_native_runtime_resource,
     native_runtime_environment,
     native_tokenizer_arguments,
@@ -528,7 +529,7 @@ class ManagedRuntimePool:
             command, process_environment = self._launch_configuration(
                 artifact,
                 request,
-                python_mlx_worker=python_mlx_worker,
+                runtime_route=runtime_route,
                 port=port,
             )
             await context.progress(0.02, message="Starting runtime process")
@@ -2282,10 +2283,10 @@ class ManagedRuntimePool:
         artifact: DiscoveredModel,
         request: ModelLoadRequest,
         *,
-        python_mlx_worker: bool,
+        runtime_route: RuntimeRoute,
         port: int,
     ) -> tuple[list[str], dict[str, str]]:
-        if python_mlx_worker:
+        if runtime_route.python_mlx_worker:
             command = python_mlx_runtime_command(
                 self.controller_command,
                 model=artifact.path,
@@ -2312,7 +2313,11 @@ class ManagedRuntimePool:
             ]
             if self.backend == "metal":
                 command.extend(["--prefill-chunk-size", str(request.prefill_chunk_size)])
-            elif self.max_requests_per_instance > 1:
+            elif (
+                self.max_requests_per_instance > 1
+                and runtime_route.continuous_batching
+                and artifact.routed_expert_bytes == 0
+            ):
                 command.extend(
                     [
                         "--continuous-batching",

@@ -14,7 +14,7 @@ import sys
 from pathlib import Path
 
 from mfq.commands.build import BuildError, build_runtime, detect_backend, load_managed_build
-from mfq.server.network import install_system_proxy_environment
+from mfq.server.network import install_system_proxy_environment, network_auth_error
 
 
 def _positive_int(value: str) -> int:
@@ -214,6 +214,9 @@ def _avfoundation_video_library(executable: Path) -> Path | None:
 
 
 def _run(args: argparse.Namespace) -> int:
+    client_api_key = os.environ.get(args.api_key_env, "")
+    if error := network_auth_error(args.host, client_api_key):
+        raise ValueError(error)
     install_system_proxy_environment()
     try:
         import uvicorn
@@ -356,7 +359,6 @@ def _run(args: argparse.Namespace) -> int:
             cluster=backend,
             voice_component=voice_component,
         )
-        client_api_key = os.environ.get(args.api_key_env, "")
         api_keys = ApiKeyManager(store, client_api_key) if client_api_key else None
         public_url = f"http://{args.host}:{args.port}"
         print(f"MFQ Server ready: {public_url}")
@@ -393,7 +395,10 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
     parser.add_argument(
         "--host",
         default="127.0.0.1",
-        help="public API bind host (default: 127.0.0.1)",
+        help=(
+            "public API bind host (default: 127.0.0.1; non-loopback binds "
+            "require an API key)"
+        ),
     )
     parser.add_argument(
         "--port",
@@ -435,7 +440,14 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
     web.add_argument("--no-web-ui", action="store_true")
     parser.add_argument("--model-dir", action="append", type=Path, default=[])
     parser.add_argument("--work-dir", type=Path, default=Path.cwd())
-    parser.add_argument("--api-key-env", default="MFQ_SERVER_API_KEY")
+    parser.add_argument(
+        "--api-key-env",
+        default="MFQ_SERVER_API_KEY",
+        help=(
+            "environment variable containing the root API key "
+            "(required for non-loopback binds)"
+        ),
+    )
     parser.add_argument("--max-runtime-instances", type=_positive_int, default=2)
     parser.add_argument("--max-requests-per-runtime", type=_positive_int, default=1)
     parser.add_argument(

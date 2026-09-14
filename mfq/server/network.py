@@ -2,11 +2,47 @@
 
 from __future__ import annotations
 
+import ipaddress
 import os
 from collections.abc import Mapping
 from urllib.request import getproxies
 
 _LOCAL_BYPASS = ("127.0.0.1", "localhost", "::1")
+
+
+def is_loopback_bind_host(value: str) -> bool:
+    """Return whether a server bind target is explicitly loopback-only."""
+
+    candidate = value.strip()
+    if not candidate:
+        return False
+    if candidate.rstrip(".").casefold() == "localhost":
+        return True
+    try:
+        address = ipaddress.ip_address(candidate)
+    except ValueError:
+        return False
+    if address.is_loopback:
+        return True
+    return bool(
+        isinstance(address, ipaddress.IPv6Address)
+        and address.ipv4_mapped is not None
+        and address.ipv4_mapped.is_loopback
+    )
+
+
+def network_auth_error(host: str, api_key: str | None) -> str | None:
+    """Describe an unsafe unauthenticated network bind, if any."""
+
+    if is_loopback_bind_host(host):
+        return None
+    if isinstance(api_key, str) and api_key.strip():
+        return None
+    return (
+        f"an API key is required when binding MFQ Server to {host!r}; "
+        "configure the selected API-key environment variable or bind to "
+        "127.0.0.1"
+    )
 
 
 def system_proxy_environment(base: Mapping[str, str] | None = None) -> dict[str, str]:

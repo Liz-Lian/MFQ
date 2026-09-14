@@ -1,6 +1,56 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
+import pytest
+
+from mfq.commands import serve
 from mfq.server import network
+
+
+@pytest.mark.parametrize(
+    "host",
+    (
+        "127.0.0.1",
+        "127.23.45.67",
+        "::1",
+        "::ffff:127.0.0.1",
+        "localhost",
+        "LOCALHOST.",
+    ),
+)
+def test_loopback_bind_detection_accepts_only_local_targets(host: str) -> None:
+    assert network.is_loopback_bind_host(host)
+    assert network.network_auth_error(host, None) is None
+
+
+@pytest.mark.parametrize(
+    "host",
+    ("0.0.0.0", "::", "192.168.1.20", "mfq.internal", ""),
+)
+def test_network_bind_requires_an_api_key(host: str) -> None:
+    assert not network.is_loopback_bind_host(host)
+    assert network.network_auth_error(host, None) is not None
+    assert network.network_auth_error(host, "root-secret") is None
+
+
+def test_serve_rejects_an_unauthenticated_network_bind_before_startup(
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv("MFQ_TEST_SERVER_KEY", raising=False)
+    monkeypatch.setattr(
+        serve,
+        "install_system_proxy_environment",
+        lambda: pytest.fail("network startup ran before bind authentication validation"),
+    )
+
+    with pytest.raises(ValueError, match="API key is required"):
+        serve._run(
+            SimpleNamespace(
+                host="0.0.0.0",
+                api_key_env="MFQ_TEST_SERVER_KEY",
+            )
+        )
 
 
 def test_system_proxy_environment_discovers_os_proxy_and_bypasses_loopback(monkeypatch) -> None:

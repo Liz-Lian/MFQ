@@ -490,6 +490,7 @@ public:
             payload->size());
         {
             std::unique_lock<std::mutex> lock(mutex_);
+            writes_finished_.wait(lock, [this] { return !clearing_; });
             if (disk_.count(hash) != 0 || pending_.count(hash) != 0) {
                 ++metrics_.deduplicated_writes;
                 return hash;
@@ -538,6 +539,7 @@ public:
                 pending_[hash] = writes_.back().payload;
             }
             pending_write_bytes_ += payload_bytes;
+            if (write_inline) ++active_writes_;
             sync_metrics_locked();
         }
         if (write_inline) {
@@ -547,7 +549,18 @@ public:
                 static_cast<std::uint32_t>(token_count),
                 std::move(payload),
             };
-            finish_write(request, write_file(request));
+            bool success = false;
+            try {
+                success = write_file(request);
+            } catch (...) {
+                success = false;
+            }
+            finish_write(request, success);
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                --active_writes_;
+                writes_finished_.notify_all();
+            }
         } else {
             work_available_.notify_one();
         }
@@ -740,8 +753,12 @@ public:
     }
 
     std::size_t clear() {
-        flush();
-        std::lock_guard<std::mutex> lock(mutex_);
+        std::unique_lock<std::mutex> lock(mutex_);
+        writes_finished_.wait(lock, [this] { return !clearing_; });
+        clearing_ = true;
+        writes_finished_.wait(lock, [this] {
+            return writes_.empty() && active_writes_ == 0;
+        });
         std::size_t removed = 0;
         for (const auto& [hash, entry] : disk_) {
             (void)hash;
@@ -757,6 +774,9 @@ public:
         pending_write_bytes_ = 0;
         ++cache_epoch_;
         sync_metrics_locked();
+        clearing_ = false;
+        lock.unlock();
+        writes_finished_.notify_all();
         return removed;
     }
 
@@ -970,7 +990,12 @@ private:
                 writes_.pop_front();
                 ++active_writes_;
             }
-            const bool success = write_file(request);
+            bool success = false;
+            try {
+                success = write_file(request);
+            } catch (...) {
+                success = false;
+            }
             finish_write(request, success);
             {
                 std::lock_guard<std::mutex> lock(mutex_);
@@ -1223,6 +1248,7 @@ private:
     std::uint64_t cache_epoch_ = 0;
     std::size_t active_writes_ = 0;
     bool stopping_ = false;
+    bool clearing_ = false;
     PagedPrefixCacheMetrics metrics_;
     std::atomic<std::uint64_t> temp_counter_{0};
 };

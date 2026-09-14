@@ -150,6 +150,8 @@ def test_persistent_prefix_cache_is_content_addressed_and_restart_safe() -> None
     assert "read_header(input, header)" in PAGED_SOURCE
     assert "release_disk_read_pins_locked(requests)" in PAGED_SOURCE
     assert "iterator->second.pins != 0" in PAGED_SOURCE
+    assert "return !clearing_" in PAGED_SOURCE
+    assert "bool clearing_ = false" in PAGED_SOURCE
 
 
 def test_tiered_prefix_cache_can_release_only_its_hot_payloads() -> None:

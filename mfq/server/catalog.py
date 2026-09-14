@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import json
+import logging
 import os
 import re
 import struct
@@ -33,6 +35,7 @@ _ROUTED_EXPERT_RE = re.compile(
     r"(?:gate|up|down|gate_up)(?:_proj)?\."
     r"(?:weight|weight_scale)$"
 )
+_LOGGER = logging.getLogger(__name__)
 
 
 class ModelArtifactNotFoundError(LookupError):
@@ -91,7 +94,10 @@ class ModelCatalog:
         self.cache_seconds = max(0.0, cache_seconds)
         self._models: dict[str, DiscoveredModel] = {}
         self._last_scan = float("-inf")
+        self._last_scan_attempt = float("-inf")
         self._lock = asyncio.Lock()
+        self._refresh_task: asyncio.Task[dict[str, DiscoveredModel]] | None = None
+        self._refresh_is_background = False
         self._registration_lock = asyncio.Lock()
         self._directory_ids: dict[str, Path] = {}
         self._directory_secret = os.urandom(32)
@@ -434,11 +440,87 @@ class ModelCatalog:
         return (parsed[0] if parsed is not None else path).resolve()
 
     async def _snapshot(self, *, refresh: bool = False) -> dict[str, DiscoveredModel]:
+        if refresh or self.cache_seconds <= 0:
+            return await self._synchronous_snapshot()
+
         async with self._lock:
-            if refresh or monotonic() - self._last_scan >= self.cache_seconds:
-                self._models = await asyncio.to_thread(self._scan)
+            has_snapshot = self._last_scan != float("-inf")
+            if has_snapshot:
+                if (
+                    monotonic()
+                    - max(self._last_scan, self._last_scan_attempt)
+                    >= self.cache_seconds
+                    and self._refresh_task is None
+                ):
+                    self._start_refresh_locked(background=True)
+                # Model discovery may touch every shard on a slow external
+                # volume.  Keep serving the last complete snapshot while one
+                # shared refresh runs instead of blocking all readers on I/O.
+                return dict(self._models)
+            task = self._refresh_task
+            if task is None:
+                task = self._start_refresh_locked(background=False)
+        return dict(await asyncio.shield(task))
+
+    async def _synchronous_snapshot(self) -> dict[str, DiscoveredModel]:
+        while True:
+            async with self._lock:
+                task = self._refresh_task
+                background = self._refresh_is_background
+                if task is None:
+                    task = self._start_refresh_locked(background=False)
+                    background = False
+            if not background:
+                return dict(await asyncio.shield(task))
+            # A force refresh or registration must observe a scan that started
+            # after any opportunistic stale-cache refresh it encountered.
+            with contextlib.suppress(Exception):
+                await asyncio.shield(task)
+
+    def _start_refresh_locked(
+        self,
+        *,
+        background: bool,
+    ) -> asyncio.Task[dict[str, DiscoveredModel]]:
+        if self._refresh_task is not None:
+            raise RuntimeError("model catalog refresh already active")
+        task = asyncio.create_task(
+            self._refresh_snapshot(),
+            name="mfq-model-catalog-refresh",
+        )
+        self._last_scan_attempt = monotonic()
+        self._refresh_task = task
+        self._refresh_is_background = background
+        task.add_done_callback(self._observe_refresh)
+        return task
+
+    async def _refresh_snapshot(self) -> dict[str, DiscoveredModel]:
+        current = asyncio.current_task()
+        try:
+            models = await asyncio.to_thread(self._scan)
+        except BaseException:
+            async with self._lock:
+                if self._refresh_task is current:
+                    self._refresh_task = None
+                    self._refresh_is_background = False
+            raise
+        async with self._lock:
+            if self._refresh_task is current:
+                self._models = models
                 self._last_scan = monotonic()
-            return dict(self._models)
+                self._refresh_task = None
+                self._refresh_is_background = False
+        return dict(models)
+
+    @staticmethod
+    def _observe_refresh(
+        task: asyncio.Task[dict[str, DiscoveredModel]],
+    ) -> None:
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error is not None:
+            _LOGGER.warning("model catalog refresh failed: %s", error)
 
     def _scan(self) -> dict[str, DiscoveredModel]:
         result: dict[str, DiscoveredModel] = {}

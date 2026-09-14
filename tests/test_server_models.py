@@ -7,6 +7,7 @@ import stat
 import subprocess
 import sys
 import textwrap
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -189,6 +190,93 @@ def test_catalog_validates_complete_and_incomplete_shards(tmp_path: Path) -> Non
         assert not incomplete.data[0].loadable
         assert "missing MFQ shard" in (incomplete.data[0].error or "")
         assert str(model_dir) not in incomplete.model_dump_json()
+
+    asyncio.run(run())
+
+
+def test_catalog_serves_stale_snapshot_during_one_background_refresh(
+    tmp_path: Path,
+) -> None:
+    async def run() -> None:
+        _model(tmp_path / "first.mfq")
+        catalog = ModelCatalog([tmp_path], cache_seconds=60)
+        initial = await catalog.list()
+        assert [item.name for item in initial.data] == ["first"]
+
+        _model(tmp_path / "second.mfq")
+        entered = threading.Event()
+        release = threading.Event()
+        original_scan = catalog._scan
+        scan_count = 0
+
+        def blocking_scan() -> dict[str, DiscoveredModel]:
+            nonlocal scan_count
+            scan_count += 1
+            entered.set()
+            assert release.wait(timeout=2)
+            return original_scan()
+
+        catalog._scan = blocking_scan  # type: ignore[method-assign]
+        catalog._last_scan = 0.0
+        catalog._last_scan_attempt = 0.0
+        try:
+            stale = await asyncio.wait_for(catalog.list(), timeout=0.1)
+            await asyncio.sleep(0)
+            assert entered.wait(timeout=1)
+            another = await asyncio.wait_for(catalog.list(), timeout=0.1)
+            assert [item.name for item in stale.data] == ["first"]
+            assert [item.name for item in another.data] == ["first"]
+            assert scan_count == 1
+        finally:
+            release.set()
+
+        for _ in range(100):
+            if catalog._refresh_task is None:
+                break
+            await asyncio.sleep(0.01)
+        assert catalog._refresh_task is None
+        refreshed = await catalog.list()
+        assert [item.name for item in refreshed.data] == ["first", "second"]
+        assert scan_count == 1
+
+    asyncio.run(run())
+
+
+def test_catalog_force_refresh_waits_for_a_post_background_scan(
+    tmp_path: Path,
+) -> None:
+    async def run() -> None:
+        _model(tmp_path / "first.mfq")
+        catalog = ModelCatalog([tmp_path], cache_seconds=60)
+        await catalog.list()
+
+        entered = threading.Event()
+        release = threading.Event()
+        original_scan = catalog._scan
+        scan_count = 0
+
+        def blocking_scan() -> dict[str, DiscoveredModel]:
+            nonlocal scan_count
+            scan_count += 1
+            entered.set()
+            assert release.wait(timeout=2)
+            return original_scan()
+
+        catalog._scan = blocking_scan  # type: ignore[method-assign]
+        catalog._last_scan = 0.0
+        catalog._last_scan_attempt = 0.0
+        await catalog.list()
+        await asyncio.sleep(0)
+        assert entered.wait(timeout=1)
+
+        forced = asyncio.create_task(catalog.list(refresh=True))
+        await asyncio.sleep(0)
+        assert not forced.done()
+        release.set()
+
+        result = await asyncio.wait_for(forced, timeout=2)
+        assert [item.name for item in result.data] == ["first"]
+        assert scan_count == 2
 
     asyncio.run(run())
 

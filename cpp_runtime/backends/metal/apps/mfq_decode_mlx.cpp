@@ -54,13 +54,17 @@ constexpr std::size_t kMinimumServerCacheLimitBytes =
 constexpr std::size_t kMaximumServerCacheLimitBytes =
     std::size_t{8} << 30;
 
+void release_host_allocator_cache() {
+    malloc_zone_pressure_relief(nullptr, 0);
+}
+
 void release_model_load_staging_memory() {
     // Model conversion and MFE repacking leave large, now-unused buffers in
     // both the MLX cache and macOS malloc's large-object depot. Keeping those
     // pages makes a single fully resident model look tens of GiB larger and
     // can force useful weights into swap before the first request.
     mlx::core::clear_cache();
-    malloc_zone_pressure_relief(nullptr, 0);
+    release_host_allocator_cache();
 }
 
 struct Arguments {
@@ -869,7 +873,9 @@ public:
     std::uint64_t trim_hot(std::uint64_t target_bytes) {
         if constexpr (Codec::available) {
             if (paged_cache_) {
-                return paged_cache_->trim_hot(target_bytes);
+                const auto released = paged_cache_->trim_hot(target_bytes);
+                if (released > 0) release_host_allocator_cache();
+                return released;
             }
         }
         return 0;

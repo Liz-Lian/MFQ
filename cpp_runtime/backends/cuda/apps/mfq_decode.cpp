@@ -68,6 +68,10 @@
 #include <utility>
 #include <vector>
 
+#if defined(__GLIBC__)
+#include <malloc.h>
+#endif
+
 #if defined(__x86_64__) && defined(__GNUC__)
 #include <immintrin.h>
 #define MFQ_CPU_X86_GNU 1
@@ -110,6 +114,12 @@ static void mfq_set_env(const char * name, const char * value) {
             std::string("failed to update environment variable ") + name +
             ": " + std::strerror(errno));
     }
+#endif
+}
+
+static void mfq_release_host_allocator_cache() noexcept {
+#if defined(__GLIBC__)
+    (void)malloc_trim(0);
 #endif
 }
 
@@ -22688,7 +22698,10 @@ public:
     }
 
     uint64_t trim_hot(uint64_t target_bytes) {
-        return paged_cache_ ? paged_cache_->trim_hot(target_bytes) : 0;
+        if (!paged_cache_) return 0;
+        const auto released = paged_cache_->trim_hot(target_bytes);
+        if (released > 0) mfq_release_host_allocator_cache();
+        return released;
     }
 
 private:

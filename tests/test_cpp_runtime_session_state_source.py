@@ -159,6 +159,8 @@ def test_tiered_prefix_cache_can_release_only_its_hot_payloads() -> None:
     assert "session_control.trim_hot" in SERVER
     assert "session_control.trim_hot" in METAL_DECODE
     assert "text_session_cache.trim_hot(target_bytes)" in DECODE
+    assert "release_host_allocator_cache()" in METAL_DECODE
+    assert "mfq_release_host_allocator_cache()" in DECODE
 
 
 def test_metal_paged_codec_preserves_raw_kv_tensor_storage() -> None:

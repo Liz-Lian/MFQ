@@ -95,6 +95,8 @@ def test_processor_owned_prompts_bypass_cached_jinja_templates() -> None:
     assert "if (preformatted_prompt)" in parse_work
     assert "prompt = *preformatted_prompt;" in parse_work
     assert "work.chat_parser.parse_tool_calls = false;" in parse_work
+    assert "json_schema_to_grammar(json::parse(json_schema))" in parse_work
+    assert "make_token_constraint(tokenizer, constraint_params)" in parse_work
     assert parse_work.index("if (preformatted_prompt)") < parse_work.index(
         "apply_chat_template("
     )

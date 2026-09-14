@@ -6,6 +6,7 @@
 #include "mfq_text.h"
 #include "mfq_grammar.h"
 #include "chat.h"
+#include "json-schema-to-grammar.h"
 #include "common.h"
 
 #include <algorithm>
@@ -1361,6 +1362,14 @@ static RequestWork parse_work(const json & body, bool chat, const MfqTokenizer &
                 work.chat_parser.reasoning_format ==
                     COMMON_REASONING_FORMAT_DEEPSEEK_LEGACY;
             work.chat_parser.parse_tool_calls = false;
+            const std::string json_schema = request_json_schema(body);
+            if (!json_schema.empty()) {
+                common_chat_params constraint_params;
+                constraint_params.grammar =
+                    json_schema_to_grammar(json::parse(json_schema));
+                work.token_constraint =
+                    make_token_constraint(tokenizer, constraint_params);
+            }
         } else {
             if (templates == nullptr) {
                 throw ApiError(

@@ -564,6 +564,51 @@ int main() try {
     }
 
     {
+        const auto clear_root = root / "queued-clear-test";
+        PagedPrefixCache cache(PagedPrefixCacheConfig{
+            clear_root,
+            "queued-clear",
+            4,
+            8ULL * 1024ULL * 1024ULL,
+            0,
+            128,
+            8ULL * 1024ULL * 1024ULL,
+        });
+        const auto mutable_payload =
+            std::make_shared<std::vector<std::uint8_t>>(
+                64ULL * 1024ULL, 0x6b);
+        const std::shared_ptr<const std::vector<std::uint8_t>> queued_payload =
+            mutable_payload;
+        std::array<std::int64_t, 4> queued_tokens{};
+        std::size_t submitted = 0;
+        for (; submitted < 128; ++submitted) {
+            for (std::size_t token = 0; token < queued_tokens.size(); ++token) {
+                queued_tokens[token] = static_cast<std::int64_t>(
+                    submitted * queued_tokens.size() + token + 1000);
+            }
+            BlockHash parent{};
+            (void)cache.store(
+                parent,
+                queued_tokens.data(),
+                queued_tokens.size(),
+                queued_payload);
+            if (cache.metrics().pending_writes >= 4) {
+                ++submitted;
+                break;
+            }
+        }
+        require(cache.metrics().pending_writes >= 4,
+                "queued clear fixture did not build a write backlog");
+        (void)cache.clear();
+        const auto stats = cache.metrics();
+        require(stats.pending_writes == 0 && stats.pending_bytes == 0 &&
+                    stats.disk_blocks == 0 && stats.hot_blocks == 0,
+                "clear retained a queued prefix write");
+        require(stats.writes < submitted,
+                "clear flushed queued prefix writes before deleting them");
+    }
+
+    {
         const auto concurrent_root = root / "concurrent-load-test";
         std::vector<std::int64_t> concurrent_tokens(32);
         for (std::size_t index = 0; index < concurrent_tokens.size(); ++index) {

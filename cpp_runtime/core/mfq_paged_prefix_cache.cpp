@@ -329,6 +329,7 @@ private:
         BlockHash parent{};
         std::uint32_t token_count = 0;
         std::shared_ptr<const std::vector<std::uint8_t>> payload;
+        std::uint64_t epoch = 0;
     };
 
     struct ParsedHeader {
@@ -495,6 +496,7 @@ public:
         const auto hash = block_hash(
             parent, token_ids, token_count, extra_key);
         bool write_inline = false;
+        std::uint64_t write_epoch = 0;
         const auto payload_bytes = static_cast<std::uint64_t>(
             payload->size());
         {
@@ -529,6 +531,7 @@ public:
                 : pending_payloads + pending_headers;
             enforce_disk_budget_locked(reserved_bytes);
             put_hot_locked(hash, payload);
+            write_epoch = cache_epoch_;
             const bool pending_bytes_full =
                 config_.max_pending_bytes == 0 ||
                 payload_bytes > config_.max_pending_bytes ||
@@ -544,6 +547,7 @@ public:
                     parent,
                     static_cast<std::uint32_t>(token_count),
                     std::move(payload),
+                    write_epoch,
                 });
                 pending_[hash] = writes_.back().payload;
             }
@@ -557,6 +561,7 @@ public:
                 parent,
                 static_cast<std::uint32_t>(token_count),
                 std::move(payload),
+                write_epoch,
             };
             bool success = false;
             try {
@@ -765,9 +770,10 @@ public:
         std::unique_lock<std::mutex> lock(mutex_);
         writes_finished_.wait(lock, [this] { return !clearing_; });
         clearing_ = true;
-        writes_finished_.wait(lock, [this] {
-            return writes_.empty() && active_writes_ == 0;
-        });
+        ++cache_epoch_;
+        writes_.clear();
+        pending_.clear();
+        pending_write_bytes_ = 0;
         std::size_t removed = 0;
         for (const auto& [hash, entry] : disk_) {
             (void)hash;
@@ -780,9 +786,10 @@ public:
         pins_.clear();
         disk_bytes_ = 0;
         hot_bytes_ = 0;
-        pending_write_bytes_ = 0;
-        ++cache_epoch_;
         sync_metrics_locked();
+        writes_finished_.wait(lock, [this] {
+            return active_writes_ == 0;
+        });
         clearing_ = false;
         lock.unlock();
         writes_finished_.notify_all();
@@ -953,7 +960,7 @@ private:
                 : pending_write_bytes_ - bytes;
             pending_.erase(pending);
         }
-        if (success) {
+        if (success && request.epoch == cache_epoch_) {
             const auto path = path_for(request.hash);
             std::error_code error;
             const auto file_bytes = std::filesystem::file_size(path, error);
@@ -979,8 +986,13 @@ private:
             } else {
                 ++metrics_.failed_writes;
             }
-        } else {
+        } else if (!success) {
             ++metrics_.failed_writes;
+        } else {
+            std::error_code error;
+            const auto path = path_for(request.hash);
+            std::filesystem::remove(path, error);
+            sync_directory_best_effort(path.parent_path());
         }
         sync_metrics_locked();
         writes_finished_.notify_all();

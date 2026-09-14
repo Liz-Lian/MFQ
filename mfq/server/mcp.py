@@ -19,6 +19,8 @@ from mfq.server.models import (
 
 PROTOCOL_VERSION = "2025-06-18"
 MAX_MESSAGE_BYTES = 4 * 1024 * 1024
+PROCESS_TERMINATE_TIMEOUT_SECONDS = 2.0
+PROCESS_KILL_TIMEOUT_SECONDS = 2.0
 
 
 class McpError(RuntimeError):
@@ -85,6 +87,11 @@ class McpClient:
             env=os.environ.copy(),
             limit=MAX_MESSAGE_BYTES,
         )
+        assert process.stderr is not None
+        stderr_drain = asyncio.create_task(
+            self._drain_stream(process.stderr),
+            name=f"mfq-mcp-stderr-{self.server.name}",
+        )
         try:
             await self._stdio_exchange(
                 process,
@@ -109,13 +116,32 @@ class McpClient:
             )
             return self._result(response)
         finally:
-            if process.returncode is None:
-                process.terminate()
-                with suppress(asyncio.TimeoutError):
-                    await asyncio.wait_for(process.wait(), timeout=2.0)
-            if process.returncode is None:
-                process.kill()
-                await process.wait()
+            try:
+                if process.returncode is None:
+                    with suppress(ProcessLookupError):
+                        process.terminate()
+                    with suppress(asyncio.TimeoutError):
+                        await asyncio.wait_for(
+                            process.wait(),
+                            timeout=PROCESS_TERMINATE_TIMEOUT_SECONDS,
+                        )
+                if process.returncode is None:
+                    with suppress(ProcessLookupError):
+                        process.kill()
+                    with suppress(asyncio.TimeoutError):
+                        await asyncio.wait_for(
+                            process.wait(),
+                            timeout=PROCESS_KILL_TIMEOUT_SECONDS,
+                        )
+            finally:
+                if not stderr_drain.done():
+                    stderr_drain.cancel()
+                await asyncio.gather(stderr_drain, return_exceptions=True)
+
+    @staticmethod
+    async def _drain_stream(stream: asyncio.StreamReader) -> None:
+        while await stream.read(64 * 1024):
+            pass
 
     async def _stdio_send(
         self, process: asyncio.subprocess.Process, message: dict[str, Any]

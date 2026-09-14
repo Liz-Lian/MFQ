@@ -24,7 +24,13 @@ def _fake_mcp(path: Path) -> None:
             """\
             #!/usr/bin/env python3
             import json
+            import os
             import sys
+
+            noise = int(os.environ.get('MFQ_TEST_MCP_STDERR_BYTES', '0'))
+            if noise:
+                sys.stderr.write('x' * noise)
+                sys.stderr.flush()
 
             for line in sys.stdin:
                 request = json.loads(line)
@@ -78,6 +84,31 @@ def test_stdio_mcp_lists_and_calls_tools(tmp_path: Path) -> None:
         result = await McpClient(server).call_tool("echo", {"text": "MFQ"})
         assert result.structured_content == {"echo": "MFQ"}
 
+    asyncio.run(scenario())
+
+
+def test_stdio_mcp_drains_verbose_server_stderr(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def scenario() -> None:
+        executable = tmp_path / "verbose-mcp"
+        _fake_mcp(executable)
+        store = SessionStore(tmp_path / "mfq.server.sqlite3")
+        server = store.create_mcp_server(
+            CreateMcpServerRequest(
+                name="verbose",
+                transport=McpTransport.STDIO,
+                enabled=True,
+                command=str(executable),
+                timeout_seconds=5,
+            )
+        )
+
+        tools = await McpClient(server).list_tools()
+
+        assert tools[0].qualified_name == "verbose.echo"
+
+    monkeypatch.setenv("MFQ_TEST_MCP_STDERR_BYTES", str(1024 * 1024))
     asyncio.run(scenario())
 
 

@@ -75,6 +75,52 @@ def _model(path: Path) -> None:
     )
 
 
+def test_tool_process_retains_only_a_bounded_output_tail(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import mfq.server.tool_jobs as tool_jobs
+
+    class Context:
+        def __init__(self) -> None:
+            self.cleanup = []
+            self.logs: list[str] = []
+
+        def add_cleanup(self, callback) -> None:
+            self.cleanup.append(callback)
+
+        def raise_if_cancelled(self) -> None:
+            return None
+
+        async def log(self, message: str) -> None:
+            self.logs.append(message)
+
+        async def progress(self, _value: float, *, message: str) -> None:
+            return None
+
+    async def run() -> None:
+        executable = _executable(
+            tmp_path / "verbose-tool",
+            """\
+            #!/usr/bin/env python3
+            for index in range(6):
+                print(f'line-{index}')
+            """,
+        )
+        handlers = ToolJobHandlers(
+            ModelCatalog([]),
+            ToolJobPaths(tmp_path, executable, None, None, None, None),
+        )
+        context = Context()
+        lines = await handlers._run(context, [str(executable)])
+        assert lines == ["line-3", "line-4", "line-5"]
+        assert context.logs == [f"line-{index}" for index in range(6)]
+        for callback in context.cleanup:
+            await callback()
+
+    monkeypatch.setattr(tool_jobs, "_TOOL_OUTPUT_TAIL_LINES", 3)
+    asyncio.run(run())
+
+
 async def _wait(store: SessionStore, job_id) -> object:
     for _ in range(300):
         job = store.get_job(job_id)

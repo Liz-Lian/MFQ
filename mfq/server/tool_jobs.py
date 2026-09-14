@@ -10,6 +10,7 @@ import re
 import shutil
 import signal
 import sys
+from collections import deque
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from dataclasses import dataclass
@@ -24,6 +25,10 @@ from mfq.server.jobs import JobContext, JobExecutionError, TypedJobHandler
 from mfq.server.models import ErrorDetail
 from mfq.server.network import system_proxy_environment
 from mfq.server.storage import StorageError
+
+_TOOL_OUTPUT_TAIL_LINES = 4096
+_TOOL_TERMINATE_TIMEOUT_SECONDS = 10.0
+_TOOL_KILL_TIMEOUT_SECONDS = 5.0
 
 
 class _Payload(BaseModel):
@@ -909,14 +914,19 @@ class ToolJobHandlers:
             with suppress(ProcessLookupError):
                 os.killpg(process.pid, signal.SIGTERM)
             try:
-                await asyncio.wait_for(process.wait(), timeout=10)
+                await asyncio.wait_for(
+                    process.wait(), timeout=_TOOL_TERMINATE_TIMEOUT_SECONDS
+                )
             except asyncio.TimeoutError:
                 with suppress(ProcessLookupError):
                     os.killpg(process.pid, signal.SIGKILL)
-                await process.wait()
+                with suppress(asyncio.TimeoutError):
+                    await asyncio.wait_for(
+                        process.wait(), timeout=_TOOL_KILL_TIMEOUT_SECONDS
+                    )
 
         context.add_cleanup(stop)
-        lines: list[str] = []
+        lines: deque[str] = deque(maxlen=_TOOL_OUTPUT_TAIL_LINES)
         assert process.stdout is not None
         while True:
             raw = await process.stdout.readline()
@@ -947,7 +957,7 @@ class ToolJobHandlers:
                 retryable=status in {75, 130, 143},
             )
         await context.progress(final_progress, message=final_message)
-        return lines
+        return list(lines)
 
 
     @staticmethod

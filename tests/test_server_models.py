@@ -156,6 +156,59 @@ def test_automatic_memory_budget_tracks_current_reclaimable_memory(
     ) == 10
 
 
+def test_load_pressure_reclaims_shared_host_cache_before_model_memory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def run() -> None:
+        gib = 1 << 30
+        reclaimed = False
+        calls = 0
+
+        def snapshot() -> HostMemorySnapshot:
+            return HostMemorySnapshot(
+                total=128 * gib,
+                free=(40 if reclaimed else 2) * gib,
+                active=8 * gib,
+                inactive=2 * gib,
+                wired=40 * gib,
+            )
+
+        def reclaim() -> int:
+            nonlocal calls, reclaimed
+            calls += 1
+            reclaimed = True
+            return 512 << 20
+
+        monkeypatch.setattr(
+            "mfq.server.runtime_pool.total_physical_memory",
+            lambda: 128 * gib,
+        )
+        monkeypatch.setattr(
+            "mfq.server.runtime_pool.host_memory_snapshot",
+            snapshot,
+        )
+        pool = ManagedRuntimePool(
+            ModelCatalog([]),
+            "runtime",
+            backend="metal",
+            shared_cache_reclaimer=reclaim,
+        )
+        pool._load_bytes["resident"] = 30 * gib
+
+        assert await pool._reclaim_shared_cache_for_budget(
+            additional_bytes=10 * gib,
+        ) == 512 << 20
+        assert await pool._reclaim_shared_cache_for_budget(
+            additional_bytes=10 * gib,
+        ) == 0
+        assert calls == 1
+        assert pool._shared_cache_reclaims == 1
+        assert pool._shared_cache_released_bytes == 512 << 20
+        assert pool._shared_cache_reclaim_failures == 0
+
+    asyncio.run(run())
+
+
 def test_startup_models_use_the_managed_load_path(tmp_path: Path) -> None:
     async def run() -> None:
         model = tmp_path / "startup.mfq"
@@ -806,6 +859,9 @@ def test_empty_runtime_pool_reports_idle_state(tmp_path: Path) -> None:
             "runtime_memory_effective_budget_bytes": None,
             "runtime_memory_budget_mode": "disabled",
             "runtime_memory_committed_bytes": 0,
+            "runtime_memory_shared_cache_reclaims": 0,
+            "runtime_memory_shared_cache_released_bytes": 0,
+            "runtime_memory_shared_cache_reclaim_failures": 0,
             "runtime_state": "idle",
             "model": None,
             "active_requests": 0,

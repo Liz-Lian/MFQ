@@ -262,6 +262,9 @@ export interface RuntimeStatus {
   runtime_memory_effective_budget_bytes?: number | null;
   runtime_memory_budget_mode?: "automatic" | "explicit" | "disabled";
   runtime_memory_committed_bytes?: number;
+  runtime_memory_shared_cache_reclaims?: number;
+  runtime_memory_shared_cache_released_bytes?: number;
+  runtime_memory_shared_cache_reclaim_failures?: number;
   mlx_active_bytes?: number;
   mlx_cache_bytes?: number;
   mlx_peak_bytes?: number;

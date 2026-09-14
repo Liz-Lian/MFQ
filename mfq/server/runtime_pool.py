@@ -210,6 +210,7 @@ class ManagedRuntimePool:
         controller_command: Sequence[str] = (),
         startup_loads: Sequence[ModelLoadRequest] = (),
         automatic_memory_budget: bool = True,
+        shared_cache_reclaimer: Callable[[], int] | None = None,
     ) -> None:
         if max_instances < 1:
             raise ValueError("max_instances must be positive")
@@ -254,6 +255,10 @@ class ManagedRuntimePool:
         self.runtime_environment = dict(runtime_environment or {})
         self.controller_command = tuple(str(value) for value in controller_command)
         self._startup_loads = [request.model_copy(deep=True) for request in startup_loads]
+        self.shared_cache_reclaimer = shared_cache_reclaimer
+        self._shared_cache_reclaims = 0
+        self._shared_cache_released_bytes = 0
+        self._shared_cache_reclaim_failures = 0
         self.store = None
         self._instances: dict[UUID, _ManagedRuntime] = {}
         self._loading_model_names: set[str] = set()
@@ -486,6 +491,10 @@ class ManagedRuntimePool:
                     f"but the runtime memory budget is "
                     f"{self.max_runtime_memory_bytes} bytes",
                 )
+        await self._reclaim_shared_cache_for_budget(
+            additional_bytes=incoming_bytes,
+            prospective_model=model_name,
+        )
         await self._trim_idle_prefix_caches_for_budget(
             additional_bytes=incoming_bytes,
             prospective_model=model_name,
@@ -1228,6 +1237,13 @@ class ManagedRuntimePool:
                     else "disabled"
                 ),
                 "runtime_memory_committed_bytes": self._committed_pool_bytes_locked(),
+                "runtime_memory_shared_cache_reclaims": self._shared_cache_reclaims,
+                "runtime_memory_shared_cache_released_bytes": (
+                    self._shared_cache_released_bytes
+                ),
+                "runtime_memory_shared_cache_reclaim_failures": (
+                    self._shared_cache_reclaim_failures
+                ),
             }
         async with self._runtime_control_lease(
             instance_id,
@@ -1868,6 +1884,46 @@ class ManagedRuntimePool:
                 committed - self._committed_runtime_bytes(victim),
             )
         return victims
+
+    async def _reclaim_shared_cache_for_budget(
+        self,
+        *,
+        additional_bytes: int,
+        prospective_model: str | None = None,
+    ) -> int:
+        """Release server-process caches before trimming or evicting models."""
+
+        reclaimer = self.shared_cache_reclaimer
+        if reclaimer is None or not self.automatic_memory_budget:
+            return 0
+        async with self._lock:
+            if self._closed:
+                return 0
+            if prospective_model is not None and (
+                prospective_model in self._loading_model_names
+                or any(
+                    item.artifact.resource.name == prospective_model
+                    and item.state != RuntimeInstanceState.FAILED
+                    for item in self._instances.values()
+                )
+            ):
+                return 0
+            memory_ceiling = self._effective_runtime_memory_budget_locked()
+            if memory_ceiling is None:
+                return 0
+            committed = self._committed_pool_bytes_locked() + additional_bytes
+            if committed <= memory_ceiling:
+                return 0
+        try:
+            released = max(0, int(await asyncio.to_thread(reclaimer)))
+        except Exception:
+            async with self._lock:
+                self._shared_cache_reclaim_failures += 1
+            return 0
+        async with self._lock:
+            self._shared_cache_reclaims += 1
+            self._shared_cache_released_bytes += released
+        return released
 
     async def _trim_idle_prefix_caches_for_budget(
         self,

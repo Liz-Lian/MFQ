@@ -229,6 +229,7 @@ def _run(args: argparse.Namespace) -> int:
     from mfq.server.service import ServerService
     from mfq.server.storage import SessionStore
     from mfq.server.tool_jobs import ToolJobHandlers, ToolJobPaths
+    from mfq.server.vision import clear_image_decode_cache
 
     model = args.model.expanduser().resolve() if args.model is not None else None
     if model is not None and not (model.is_file() or model.is_dir()):
@@ -301,6 +302,7 @@ def _run(args: argparse.Namespace) -> int:
         runtime_environment=runtime_environment,
         controller_command=_controller_command(),
         startup_loads=startup_loads,
+        shared_cache_reclaimer=clear_image_decode_cache,
     )
     store = SessionStore(args.db.expanduser().resolve())
     backend = ClusterBackend(runtime_manager, store)

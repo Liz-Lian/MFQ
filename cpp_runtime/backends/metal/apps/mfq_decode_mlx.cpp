@@ -582,6 +582,19 @@ public:
         return false;
     }
 
+    std::size_t normalize_stable_prefix_tokens(
+        std::size_t requested) const noexcept {
+        if constexpr (requires {
+                Codec::requires_exact_block_boundary;
+            }) {
+            if (Codec::requires_exact_block_boundary && paged_cache_) {
+                const auto block_size = paged_cache_->block_size_tokens();
+                return requested / block_size * block_size;
+            }
+        }
+        return requested;
+    }
+
     std::size_t restore_best(
         Runtime& runtime,
         const std::string& requested_session,
@@ -922,22 +935,43 @@ private:
         std::vector<std::int64_t> candidate(
             prompt.begin(),
             prompt.begin() + static_cast<std::ptrdiff_t>(limit));
-        auto match = paged_cache_->match(candidate);
-        if (match.matched_tokens == 0) return 0;
+        auto match = paged_cache_->match(candidate, {}, false);
+        if (match.matched_tokens == 0) {
+            paged_cache_->record_match(0);
+            return 0;
+        }
 
         auto payloads = paged_cache_->load_prefix(match.blocks);
-        if (payloads.empty()) return 0;
+        if (payloads.empty()) {
+            paged_cache_->record_match(0);
+            return 0;
+        }
         if (payloads.size() != match.blocks.size()) {
             match.blocks.resize(payloads.size());
             match.matched_tokens =
                 payloads.size() * paged_cache_->block_size_tokens();
         }
-        std::vector<std::int64_t> matched_tokens(
-            prompt.begin(),
-            prompt.begin() + static_cast<std::ptrdiff_t>(
-                match.matched_tokens));
         std::optional<SessionState> decoded;
         try {
+            if constexpr (requires {
+                    Codec::decodable_blocks(payloads);
+                }) {
+                const auto decodable = Codec::decodable_blocks(payloads);
+                if (decodable == 0) {
+                    paged_cache_->record_match(0);
+                    return 0;
+                }
+                if (decodable < payloads.size()) {
+                    payloads.resize(decodable);
+                    match.blocks.resize(decodable);
+                    match.matched_tokens = decodable *
+                        paged_cache_->block_size_tokens();
+                }
+            }
+            std::vector<std::int64_t> matched_tokens(
+                prompt.begin(),
+                prompt.begin() + static_cast<std::ptrdiff_t>(
+                    match.matched_tokens));
             decoded.emplace(Codec::decode(
                 payloads,
                 matched_tokens,
@@ -946,6 +980,7 @@ private:
             if (!match.blocks.empty()) {
                 paged_cache_->invalidate(match.blocks.back());
             }
+            paged_cache_->record_match(0);
             reset_runtime(runtime);
             std::cerr
                 << "server_session_cache backend=metal "
@@ -960,6 +995,7 @@ private:
                 bind_paged_session(
                     requested_session, match.blocks, match.matched_tokens);
             }
+            paged_cache_->record_match(match.matched_tokens);
             if (trace_) {
                 std::cerr
                     << "server_session_cache backend=metal action=paged_hit "
@@ -970,6 +1006,7 @@ private:
             }
             return match.matched_tokens;
         } catch (const std::exception& error) {
+            paged_cache_->record_match(0);
             reset_runtime(runtime);
             std::cerr
                 << "server_session_cache backend=metal action=paged_restore_failed "
@@ -986,6 +1023,14 @@ private:
             return;
         }
         const auto block_size = paged_cache_->block_size_tokens();
+        if constexpr (requires {
+                Codec::requires_exact_block_boundary;
+            }) {
+            if (Codec::requires_exact_block_boundary &&
+                state.tokens.size() % block_size != 0) {
+                return;
+            }
+        }
         const auto full_blocks = state.tokens.size() / block_size;
         if (full_blocks == 0) return;
 
@@ -994,6 +1039,7 @@ private:
             throw std::runtime_error(
                 "paged prefix match exceeds the session state");
         }
+        const auto existing_blocks = existing.blocks.size();
         auto blocks = std::move(existing.blocks);
         mfq::cache::BlockHash parent{};
         if (!blocks.empty()) parent = blocks.back();
@@ -1007,6 +1053,37 @@ private:
                 block_size,
                 std::move(payload));
             blocks.push_back(parent);
+        }
+        if constexpr (requires {
+                Codec::refresh_final_block;
+                Codec::has_exact_boundary(
+                    std::declval<
+                        const mfq::metal::MlxPagedPayload&>());
+            }) {
+            if (Codec::refresh_final_block &&
+                existing_blocks == full_blocks && !blocks.empty()) {
+                auto final_payload = paged_cache_->load_prefix(
+                    {blocks.back()});
+                const bool exact = final_payload.size() == 1 &&
+                    Codec::has_exact_boundary(final_payload.front());
+                if (!exact) {
+                    const auto index = full_blocks - 1;
+                    const auto token_offset = index * block_size;
+                    const mfq::cache::BlockHash checkpoint_parent =
+                        index == 0
+                        ? mfq::cache::BlockHash{}
+                        : blocks[index - 1];
+                    const auto refreshed = paged_cache_->replace(
+                        checkpoint_parent,
+                        state.tokens.data() + token_offset,
+                        block_size,
+                        Codec::encode_block(state, block_size, index));
+                    if (refreshed != blocks[index]) {
+                        throw std::runtime_error(
+                            "paged prefix checkpoint changed block identity");
+                    }
+                }
+            }
         }
         if (!session_id.empty()) {
             bind_paged_session(
@@ -1487,8 +1564,9 @@ int serve_loaded_runtime(
                 sampling.mtp_max_draft_tokens;
             parameters.seed = sampling.seed;
             auto& loaded_runtime = runtime_holder->value();
-            const auto stable_prefix_tokens = std::min(
-                cache_plan.stable_prefix_tokens, prompt.size());
+            const auto stable_prefix_tokens =
+                session_cache->normalize_stable_prefix_tokens(std::min(
+                    cache_plan.stable_prefix_tokens, prompt.size()));
             const bool cache_enabled =
                 stable_prefix_tokens > 0 &&
                 (!cache_plan.session_id.empty() ||
@@ -1502,9 +1580,9 @@ int serve_loaded_runtime(
                     stable_prefix_tokens);
             }
             auto effective_cache_plan = cache_plan;
-            if (!cache_enabled) {
-                effective_cache_plan.stable_prefix_tokens = 0;
-            }
+            effective_cache_plan.stable_prefix_tokens = cache_enabled
+                ? stable_prefix_tokens
+                : 0;
             const auto generated = generate_with_prefill_metrics(
                 loaded_runtime,
                 prompt,

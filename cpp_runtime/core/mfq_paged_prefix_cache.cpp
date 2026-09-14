@@ -330,6 +330,7 @@ private:
         std::uint32_t token_count = 0;
         std::shared_ptr<const std::vector<std::uint8_t>> payload;
         std::uint64_t epoch = 0;
+        bool replace_existing = false;
     };
 
     struct ParsedHeader {
@@ -484,12 +485,22 @@ public:
         return result;
     }
 
+    void record_match(std::size_t matched_tokens) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        ++metrics_.queries;
+        if (matched_tokens > 0) {
+            ++metrics_.hits;
+            metrics_.hit_tokens += matched_tokens;
+        }
+    }
+
     BlockHash store(
         const BlockHash& parent,
         const std::int64_t* token_ids,
         std::size_t token_count,
         std::shared_ptr<const std::vector<std::uint8_t>> payload,
-        std::string_view extra_key) {
+        std::string_view extra_key,
+        bool replace_existing) {
         if (!payload) {
             throw std::invalid_argument("paged prefix payload is null");
         }
@@ -501,13 +512,17 @@ public:
             payload->size());
         {
             std::unique_lock<std::mutex> lock(mutex_);
-            writes_finished_.wait(lock, [this] { return !clearing_; });
-            if (disk_.count(hash) != 0 || pending_.count(hash) != 0) {
+            writes_finished_.wait(lock, [this, &hash, replace_existing] {
+                return !clearing_ &&
+                    (!replace_existing || pending_.count(hash) == 0);
+            });
+            if (!replace_existing &&
+                (disk_.count(hash) != 0 || pending_.count(hash) != 0)) {
                 ++metrics_.deduplicated_writes;
                 return hash;
             }
             if (config_.max_disk_bytes == 0) {
-                if (hot_.count(hash) != 0) {
+                if (!replace_existing && hot_.count(hash) != 0) {
                     ++metrics_.deduplicated_writes;
                     return hash;
                 }
@@ -548,6 +563,7 @@ public:
                     static_cast<std::uint32_t>(token_count),
                     std::move(payload),
                     write_epoch,
+                    replace_existing,
                 });
                 pending_[hash] = writes_.back().payload;
             }
@@ -562,6 +578,7 @@ public:
                 static_cast<std::uint32_t>(token_count),
                 std::move(payload),
                 write_epoch,
+                replace_existing,
             };
             bool success = false;
             try {
@@ -944,11 +961,38 @@ private:
             std::filesystem::perm_options::replace,
             error);
         error.clear();
+        if (!request.replace_existing) {
+            // Publish immutable blocks with create-if-absent semantics. A
+            // second MFQ process may already have upgraded this same token
+            // block with a recurrent checkpoint, which a plain POSIX rename
+            // would silently overwrite with the smaller base payload.
+            std::filesystem::create_hard_link(
+                temporary, final_path, error);
+            if (!error) {
+                std::filesystem::remove(temporary, error);
+                sync_directory_best_effort(final_path.parent_path());
+                return true;
+            }
+            if (std::filesystem::exists(final_path)) {
+                error.clear();
+                std::filesystem::remove(temporary, error);
+                return true;
+            }
+            std::filesystem::remove(temporary, error);
+            return false;
+        }
         std::filesystem::rename(temporary, final_path, error);
         if (error) {
             if (std::filesystem::exists(final_path)) {
-                std::filesystem::remove(temporary, error);
-                return true;
+                error.clear();
+                std::filesystem::remove(final_path, error);
+                if (!error) {
+                    std::filesystem::rename(temporary, final_path, error);
+                }
+                if (!error) {
+                    sync_directory_best_effort(final_path.parent_path());
+                    return true;
+                }
             }
             std::filesystem::remove(temporary, error);
             return false;
@@ -974,7 +1018,11 @@ private:
             const auto file_bytes = std::filesystem::file_size(path, error);
             if (!error) {
                 auto previous = disk_.find(request.hash);
+                std::size_t disk_pins = pins_.count(request.hash) == 0
+                    ? 0
+                    : pins_.at(request.hash);
                 if (previous != disk_.end()) {
+                    disk_pins = std::max(disk_pins, previous->second.pins);
                     disk_bytes_ -= previous->second.file_bytes;
                 }
                 disk_[request.hash] = DiskEntry{
@@ -984,9 +1032,7 @@ private:
                     request.payload->size(),
                     file_bytes,
                     ++clock_,
-                    pins_.count(request.hash) == 0
-                        ? 0
-                        : pins_.at(request.hash),
+                    disk_pins,
                 };
                 disk_bytes_ += file_bytes;
                 ++metrics_.writes;
@@ -1133,13 +1179,15 @@ private:
     void put_hot_locked(
         const BlockHash& hash,
         std::shared_ptr<const std::vector<std::uint8_t>> payload) {
-        if (config_.max_hot_bytes == 0 ||
-            payload->size() > config_.max_hot_bytes) {
-            return;
-        }
         auto previous = hot_.find(hash);
         if (previous != hot_.end()) {
             hot_bytes_ -= previous->second.payload->size();
+            hot_.erase(previous);
+        }
+        if (config_.max_hot_bytes == 0 ||
+            payload->size() > config_.max_hot_bytes) {
+            sync_metrics_locked();
+            return;
         }
         hot_[hash] = HotEntry{std::move(payload), ++clock_};
         hot_bytes_ += hot_[hash].payload->size();
@@ -1319,6 +1367,10 @@ PrefixMatch PagedPrefixCache::match(
     return implementation_->match(token_ids, extra_key, record_query);
 }
 
+void PagedPrefixCache::record_match(std::size_t matched_tokens) {
+    implementation_->record_match(matched_tokens);
+}
+
 BlockHash PagedPrefixCache::store(
     const BlockHash& parent,
     const std::int64_t* token_ids,
@@ -1330,7 +1382,23 @@ BlockHash PagedPrefixCache::store(
         token_ids,
         token_count,
         std::move(payload),
-        extra_key);
+        extra_key,
+        false);
+}
+
+BlockHash PagedPrefixCache::replace(
+    const BlockHash& parent,
+    const std::int64_t* token_ids,
+    std::size_t token_count,
+    std::shared_ptr<const std::vector<std::uint8_t>> payload,
+    std::string_view extra_key) {
+    return implementation_->store(
+        parent,
+        token_ids,
+        token_count,
+        std::move(payload),
+        extra_key,
+        true);
 }
 
 std::optional<std::vector<std::uint8_t>> PagedPrefixCache::load(

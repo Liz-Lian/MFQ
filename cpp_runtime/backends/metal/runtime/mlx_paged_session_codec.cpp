@@ -24,6 +24,7 @@ constexpr std::array<std::uint8_t, 8> kMagic{
 constexpr std::uint32_t kVersion = 1;
 constexpr std::uint8_t kKvLayer = 1;
 constexpr std::uint8_t kRecurrentLayer = 2;
+constexpr std::uint8_t kRecurrentUnavailableLayer = 3;
 constexpr std::uint32_t kMiniRuntime = 1;
 constexpr std::uint32_t kQwen35Runtime = 2;
 
@@ -269,6 +270,24 @@ void write_recurrent_layer(
     writer.tensor(snapshot.recurrent_state);
 }
 
+void write_recurrent_unavailable_layer(
+    Writer& writer,
+    const MlxQwen35LinearAttentionCacheSnapshot& snapshot,
+    int boundary) {
+    if (snapshot.batch != 1 || snapshot.position < boundary) {
+        throw std::runtime_error("invalid recurrent cache boundary");
+    }
+    writer.scalar<std::uint8_t>(kRecurrentUnavailableLayer);
+    writer.scalar<std::uint8_t>(0);
+    writer.scalar<std::uint16_t>(0);
+    writer.scalar<std::int32_t>(snapshot.batch);
+    writer.scalar<std::int32_t>(0);
+    writer.scalar<std::int32_t>(0);
+    writer.scalar<std::int32_t>(0);
+    writer.scalar<std::int32_t>(0);
+    writer.scalar<std::int32_t>(boundary);
+}
+
 DecodedBlock read_block(const std::vector<std::uint8_t>& payload) {
     Reader reader(payload);
     std::array<std::uint8_t, 8> magic{};
@@ -299,8 +318,10 @@ DecodedBlock read_block(const std::vector<std::uint8_t>& payload) {
             reader.scalar<std::int32_t>("head dimension");
         layer.capacity = reader.scalar<std::int32_t>("capacity");
         layer.position = reader.scalar<std::int32_t>("position");
-        layer.first = reader.tensor();
-        layer.second = reader.tensor();
+        if (layer.kind != kRecurrentUnavailableLayer) {
+            layer.first = reader.tensor();
+            layer.second = reader.tensor();
+        }
         if (layer.kind == kKvLayer) {
             if (dtype_value >
                 static_cast<std::uint8_t>(Dtype::Val::complex64)) {
@@ -309,6 +330,13 @@ DecodedBlock read_block(const std::vector<std::uint8_t>& payload) {
             layer.dtype = layer.first.dtype;
             if (layer.dtype.val() != static_cast<Dtype::Val>(dtype_value)) {
                 throw std::runtime_error("MLX KV layer dtype mismatch");
+            }
+        } else if (layer.kind == kRecurrentUnavailableLayer) {
+            if (dtype_value != 0 || layer.batch != 1 || layer.heads != 0 ||
+                layer.maximum_sequence != 0 || layer.head_dimension != 0 ||
+                layer.capacity != 0 || layer.position <= 0) {
+                throw std::runtime_error(
+                    "invalid unavailable recurrent cache marker");
             }
         } else if (layer.kind != kRecurrentLayer) {
             throw std::runtime_error("unknown MLX cache layer kind");
@@ -500,6 +528,8 @@ std::vector<MlxPagedPayload> encode_state(
     result.reserve(end_block - first_block);
     for (std::size_t block = first_block; block < end_block; ++block) {
         const auto start = block * block_size;
+        const bool exact_boundary = block + 1 == full_blocks &&
+            state.tokens.size() == (block + 1) * block_size;
         Writer writer;
         write_header(
             writer,
@@ -508,7 +538,12 @@ std::vector<MlxPagedPayload> encode_state(
             static_cast<std::uint32_t>(block_size),
             state.layers.size());
         for (const auto& layer : state.layers) {
-            write_layer(writer, layer, start, block_size);
+            write_layer(
+                writer,
+                layer,
+                start,
+                block_size,
+                exact_boundary);
         }
         result.push_back(std::move(writer).finish());
     }
@@ -529,7 +564,7 @@ MlxPagedSessionCodec<MlxMiniCPMO45TextSessionState>::encode(
         std::numeric_limits<std::size_t>::max(),
         kMiniRuntime,
         [](Writer& writer, const MlxKvCacheSnapshot& layer,
-           std::size_t start, std::size_t count) {
+           std::size_t start, std::size_t count, bool) {
             write_kv_layer(
                 writer,
                 layer,
@@ -550,7 +585,7 @@ MlxPagedSessionCodec<MlxMiniCPMO45TextSessionState>::encode_block(
         1,
         kMiniRuntime,
         [](Writer& writer, const MlxKvCacheSnapshot& layer,
-           std::size_t start, std::size_t count) {
+           std::size_t start, std::size_t count, bool) {
             write_kv_layer(
                 writer,
                 layer,
@@ -595,7 +630,7 @@ MlxPagedSessionCodec<MlxQwen35TextSessionState>::encode(
         std::numeric_limits<std::size_t>::max(),
         kQwen35Runtime,
         [](Writer& writer, const MlxQwen35LayerCacheSnapshot& layer,
-           std::size_t start, std::size_t count) {
+           std::size_t start, std::size_t count, bool exact_boundary) {
             std::visit(
                 [&](const auto& snapshot) {
                     using Snapshot = std::decay_t<decltype(snapshot)>;
@@ -605,8 +640,13 @@ MlxPagedSessionCodec<MlxQwen35TextSessionState>::encode(
                             snapshot,
                             static_cast<int>(start),
                             static_cast<int>(count));
-                    } else {
+                    } else if (exact_boundary) {
                         write_recurrent_layer(
+                            writer,
+                            snapshot,
+                            static_cast<int>(start + count));
+                    } else {
+                        write_recurrent_unavailable_layer(
                             writer,
                             snapshot,
                             static_cast<int>(start + count));
@@ -628,7 +668,7 @@ MlxPagedSessionCodec<MlxQwen35TextSessionState>::encode_block(
         1,
         kQwen35Runtime,
         [](Writer& writer, const MlxQwen35LayerCacheSnapshot& layer,
-           std::size_t start, std::size_t count) {
+           std::size_t start, std::size_t count, bool exact_boundary) {
             std::visit(
                 [&](const auto& snapshot) {
                     using Snapshot = std::decay_t<decltype(snapshot)>;
@@ -639,8 +679,13 @@ MlxPagedSessionCodec<MlxQwen35TextSessionState>::encode_block(
                             snapshot,
                             static_cast<int>(start),
                             static_cast<int>(count));
-                    } else {
+                    } else if (exact_boundary) {
                         write_recurrent_layer(
+                            writer,
+                            snapshot,
+                            static_cast<int>(start + count));
+                    } else {
+                        write_recurrent_unavailable_layer(
                             writer,
                             snapshot,
                             static_cast<int>(start + count));
@@ -678,6 +723,32 @@ MlxPagedSessionCodec<MlxQwen35TextSessionState>::decode(
         }
     }
     return state;
+}
+
+std::size_t
+MlxPagedSessionCodec<MlxQwen35TextSessionState>::decodable_blocks(
+    const std::vector<MlxPagedPayload>& payloads) {
+    for (std::size_t count = payloads.size(); count > 0; --count) {
+        if (has_exact_boundary(payloads[count - 1])) return count;
+    }
+    return 0;
+}
+
+bool MlxPagedSessionCodec<MlxQwen35TextSessionState>::has_exact_boundary(
+    const MlxPagedPayload& payload) {
+    if (!payload) {
+        throw std::runtime_error("MLX cache block payload is null");
+    }
+    const auto block = read_block(*payload);
+    if (block.runtime != kQwen35Runtime) {
+        throw std::runtime_error("incompatible Qwen3.5 cache block");
+    }
+    return std::none_of(
+        block.layers.begin(),
+        block.layers.end(),
+        [](const DecodedLayer& layer) {
+            return layer.kind == kRecurrentUnavailableLayer;
+        });
 }
 
 } // namespace mfq::metal

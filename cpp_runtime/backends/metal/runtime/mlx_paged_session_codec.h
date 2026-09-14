@@ -40,10 +40,13 @@ struct MlxPagedSessionCodec<MlxMiniCPMO45TextSessionState> {
 
 template <>
 struct MlxPagedSessionCodec<MlxQwen35TextSessionState> {
-    // Hybrid recurrent checkpoints must be captured at each block boundary.
-    // A final-state snapshot cannot safely reconstruct an earlier boundary.
-    static constexpr bool available = false;
-    static constexpr std::string_view name = "qwen35-hybrid-kv-v1";
+    // KV deltas are immutable content-addressed blocks. A block payload is
+    // upgraded with the exact recurrent state only when that block is the
+    // stable end of a prompt; restore backs off to the newest such boundary.
+    static constexpr bool available = true;
+    static constexpr bool refresh_final_block = true;
+    static constexpr bool requires_exact_block_boundary = true;
+    static constexpr std::string_view name = "qwen35-hybrid-kv-v2";
 
     static std::vector<MlxPagedPayload> encode(
         const MlxQwen35TextSessionState& state,
@@ -57,6 +60,9 @@ struct MlxPagedSessionCodec<MlxQwen35TextSessionState> {
         const std::vector<MlxPagedPayload>& payloads,
         const std::vector<std::int64_t>& tokens,
         std::size_t block_size);
+    static std::size_t decodable_blocks(
+        const std::vector<MlxPagedPayload>& payloads);
+    static bool has_exact_boundary(const MlxPagedPayload& payload);
 };
 
 } // namespace mfq::metal

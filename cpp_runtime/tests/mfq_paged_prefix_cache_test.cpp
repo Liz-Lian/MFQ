@@ -199,9 +199,21 @@ int main() try {
         const auto original = cache.load(second);
         require(original && *original == std::vector<std::uint8_t>({20, 21, 22, 23}),
                 "duplicate store replaced deterministic block content");
+        const auto replaced = cache.replace(
+            first,
+            tokens.data() + 4,
+            4,
+            payload({30, 31, 32, 33, 34}));
+        require(replaced == second,
+                "payload refresh changed the content-addressed block hash");
+        const auto refreshed = cache.load(second);
+        require(refreshed &&
+                    *refreshed ==
+                        std::vector<std::uint8_t>({30, 31, 32, 33, 34}),
+                "pending payload refresh was not immediately visible");
         cache.flush();
         const auto stats = cache.metrics();
-        require(stats.writes == 2, "unexpected physical write count");
+        require(stats.writes == 3, "unexpected physical write count");
         require(stats.deduplicated_writes == 1, "deduplication was not counted");
         require(stats.disk_blocks == 2, "disk block count mismatch");
     }
@@ -227,6 +239,11 @@ int main() try {
         const auto loaded = cache.load(first);
         require(loaded && *loaded == std::vector<std::uint8_t>({10, 11, 12}),
                 "restart disk load mismatch");
+        const auto replaced = cache.load(second);
+        require(replaced &&
+                    *replaced ==
+                        std::vector<std::uint8_t>({30, 31, 32, 33, 34}),
+                "refreshed payload did not survive restart");
         require(!std::filesystem::exists(stale_temporary),
                 "stale temporary write was not removed during recovery");
     }
@@ -269,6 +286,67 @@ int main() try {
                 "semantic invalidation metric was not stable");
     }
     std::filesystem::remove_all(semantic_root);
+
+    const auto effective_metrics_root = temporary_directory();
+    {
+        PagedPrefixCache cache(PagedPrefixCacheConfig{
+            effective_metrics_root,
+            "effective-match-metrics",
+            4,
+            0,
+            64,
+            2,
+        });
+        (void)cache.store(
+            BlockHash{}, tokens.data(), 4, payload({2, 4, 6, 8}));
+        require(
+            cache.match(tokens, {}, false).matched_tokens == 4,
+            "unrecorded prefix probe failed");
+        require(cache.metrics().queries == 0,
+                "unrecorded prefix probe changed query metrics");
+        cache.record_match(4);
+        cache.record_match(0);
+        const auto stats = cache.metrics();
+        require(stats.queries == 2 && stats.hits == 1 &&
+                    stats.hit_tokens == 4,
+                "effective prefix metrics were not recorded exactly");
+    }
+    std::filesystem::remove_all(effective_metrics_root);
+
+    const auto multiprocess_root = temporary_directory();
+    {
+        const PagedPrefixCacheConfig config{
+            multiprocess_root,
+            "cross-process-upgrade",
+            4,
+            4096,
+            0,
+            2,
+        };
+        PagedPrefixCache upgrading_writer(config);
+        PagedPrefixCache stale_writer(config);
+        const auto block = upgrading_writer.replace(
+            BlockHash{},
+            tokens.data(),
+            4,
+            payload({21, 22, 23, 24, 25}));
+        upgrading_writer.flush();
+        require(
+            stale_writer.store(
+                BlockHash{},
+                tokens.data(),
+                4,
+                payload({1, 2})) == block,
+            "stale writer changed the shared block identity");
+        stale_writer.flush();
+        PagedPrefixCache reader(config);
+        const auto loaded = reader.load(block);
+        require(
+            loaded &&
+                *loaded == std::vector<std::uint8_t>({21, 22, 23, 24, 25}),
+            "stale writer downgraded a cross-process checkpoint payload");
+    }
+    std::filesystem::remove_all(multiprocess_root);
 
     {
         const auto header_root = root / "header-chain-validation";
@@ -471,6 +549,17 @@ int main() try {
         const auto loaded = cache.load(hot);
         require(loaded && *loaded == std::vector<std::uint8_t>({5, 6, 7, 8}),
                 "RAM-only prefix block could not be loaded");
+        require(
+            cache.replace(
+                parent,
+                tokens.data(),
+                4,
+                payload({10, 11, 12, 13})) == hot,
+            "RAM-only payload refresh changed its block hash");
+        const auto refreshed = cache.load(hot);
+        require(refreshed &&
+                    *refreshed == std::vector<std::uint8_t>({10, 11, 12, 13}),
+                "RAM-only payload refresh was not visible");
         cache.pin({hot});
         require(cache.trim_hot() == 0,
                 "trim discarded a pinned RAM-only prefix block");

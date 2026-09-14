@@ -194,6 +194,26 @@ int main() {
     });
     const auto hybrid_encoded =
         MlxPagedSessionCodec<MlxQwen35TextSessionState>::encode(hybrid, 4);
+    require(MlxPagedSessionCodec<MlxQwen35TextSessionState>::available,
+            "hybrid SSD codec was not enabled");
+    require(
+        !MlxPagedSessionCodec<MlxQwen35TextSessionState>::has_exact_boundary(
+            hybrid_encoded[0]),
+        "non-final hybrid block captured a future recurrent state");
+    require(
+        MlxPagedSessionCodec<MlxQwen35TextSessionState>::has_exact_boundary(
+            hybrid_encoded[1]),
+        "stable hybrid boundary did not retain recurrent state");
+    require(hybrid_encoded[0]->size() < hybrid_encoded[1]->size(),
+            "non-boundary hybrid block retained recurrent payload bytes");
+    require(
+        MlxPagedSessionCodec<MlxQwen35TextSessionState>::decodable_blocks(
+            hybrid_encoded) == 2,
+        "hybrid codec did not select the newest exact boundary");
+    require(
+        MlxPagedSessionCodec<MlxQwen35TextSessionState>::decodable_blocks(
+            {hybrid_encoded[0]}) == 0,
+        "hybrid codec accepted a block without recurrent state");
     const auto hybrid_second =
         MlxPagedSessionCodec<MlxQwen35TextSessionState>::encode_block(
             hybrid, 4, 1);
@@ -213,6 +233,71 @@ int main() {
             "recurrent state bytes changed");
     require(decoded_recurrent.position == 8,
             "recurrent cache position mismatch");
+
+    auto unaligned_hybrid = hybrid;
+    unaligned_hybrid.tokens.resize(6);
+    unaligned_hybrid.cache_position = 6;
+    std::get<MlxKvCacheSnapshot>(unaligned_hybrid.layers[0]).position = 6;
+    std::get<MlxQwen35LinearAttentionCacheSnapshot>(
+        unaligned_hybrid.layers[1]).position = 6;
+    const auto unaligned_encoded =
+        MlxPagedSessionCodec<MlxQwen35TextSessionState>::encode(
+            unaligned_hybrid, 4);
+    require(
+        !MlxPagedSessionCodec<MlxQwen35TextSessionState>::has_exact_boundary(
+            unaligned_encoded[0]),
+        "unaligned final state was mislabeled as an exact block boundary");
+
+    MlxQwen35TextSessionState short_hybrid;
+    short_hybrid.tokens.assign(hybrid.tokens.begin(), hybrid.tokens.begin() + 4);
+    short_hybrid.cache_position = 4;
+    short_hybrid.cache_batch = 1;
+    auto short_kv = mini.layers.front();
+    short_kv.position = 4;
+    short_hybrid.layers.emplace_back(std::move(short_kv));
+    auto short_convolution = mlx::core::astype(
+        mlx::core::array({11.0f, 12.0f}, mlx::core::Shape{1, 2}),
+        mlx::core::float16);
+    auto short_recurrent = mlx::core::astype(
+        mlx::core::array({13.0f, 14.0f}, mlx::core::Shape{1, 2}),
+        mlx::core::float16);
+    short_hybrid.layers.emplace_back(MlxQwen35LinearAttentionCacheSnapshot{
+        short_convolution,
+        short_recurrent,
+        4,
+        1,
+    });
+    const auto short_encoded =
+        MlxPagedSessionCodec<MlxQwen35TextSessionState>::encode(
+            short_hybrid, 4);
+
+    auto long_hybrid = hybrid;
+    long_hybrid.tokens.insert(
+        long_hybrid.tokens.end(), {9, 10, 11, 12});
+    long_hybrid.cache_position = 12;
+    std::get<MlxKvCacheSnapshot>(long_hybrid.layers[0]).position = 12;
+    std::get<MlxQwen35LinearAttentionCacheSnapshot>(
+        long_hybrid.layers[1]).position = 12;
+    const auto non_final_second =
+        MlxPagedSessionCodec<MlxQwen35TextSessionState>::encode_block(
+            long_hybrid, 4, 1);
+    const std::vector<MlxPagedPayload> partial_chain{
+        short_encoded[0], non_final_second};
+    require(
+        MlxPagedSessionCodec<MlxQwen35TextSessionState>::decodable_blocks(
+            partial_chain) == 1,
+        "hybrid codec did not back off to the previous exact boundary");
+    const auto short_decoded =
+        MlxPagedSessionCodec<MlxQwen35TextSessionState>::decode(
+            {partial_chain[0]}, short_hybrid.tokens, 4);
+    const auto& restored_short_recurrent =
+        std::get<MlxQwen35LinearAttentionCacheSnapshot>(
+            short_decoded.layers[1]);
+    require(
+        byte_equal(
+            restored_short_recurrent.recurrent_state,
+            short_recurrent),
+        "hybrid fallback restored the wrong recurrent checkpoint");
 
     if (const auto* enabled = std::getenv("MFQ_PAGED_CODEC_BENCHMARK");
         enabled != nullptr && enabled[0] == '1') {

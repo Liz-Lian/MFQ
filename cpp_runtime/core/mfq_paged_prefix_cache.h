@@ -83,7 +83,22 @@ public:
         std::string_view extra_key = {},
         bool record_query = true);
 
+    // Record the effective prefix actually restored by a higher-level codec.
+    // Hybrid caches may need to back off from a structurally matched KV chain
+    // to the newest block carrying an exact recurrent-state checkpoint.
+    void record_match(std::size_t matched_tokens);
+
     BlockHash store(
+        const BlockHash& parent,
+        const std::int64_t* token_ids,
+        std::size_t token_count,
+        std::shared_ptr<const std::vector<std::uint8_t>> payload,
+        std::string_view extra_key = {});
+
+    // Atomically refresh the payload associated with an existing token-block
+    // hash. This is used to add an exact recurrent-state checkpoint when a
+    // previously stored KV block later becomes a stable prompt boundary.
+    BlockHash replace(
         const BlockHash& parent,
         const std::int64_t* token_ids,
         std::size_t token_count,

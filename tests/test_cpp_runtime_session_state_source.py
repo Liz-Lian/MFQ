@@ -29,6 +29,9 @@ PAGED_SOURCE = (ROOT / "cpp_runtime" / "core" / "mfq_paged_prefix_cache.cpp").re
 METAL_PAGED_CODEC = (
     ROOT / "cpp_runtime" / "backends" / "metal" / "runtime" / "mlx_paged_session_codec.cpp"
 ).read_text(encoding="utf-8")
+METAL_PAGED_CODEC_HEADER = (
+    ROOT / "cpp_runtime" / "backends" / "metal" / "runtime" / "mlx_paged_session_codec.h"
+).read_text(encoding="utf-8")
 METAL_COMPONENTS = (
     ROOT / "cpp_runtime" / "backends" / "metal" / "runtime" / "mlx_server_components.cpp"
 ).read_text(encoding="utf-8")
@@ -157,6 +160,18 @@ def test_supported_metal_text_graphs_capture_and_restore_prefix_state() -> None:
         assert "capture_text_session_state" in source
         assert "restore_text_session_state" in source
         assert "prompt.size() - reused_tokens" in source
+
+
+def test_qwen_hybrid_prefix_cache_uses_exact_recurrent_boundaries() -> None:
+    qwen_codec = METAL_PAGED_CODEC_HEADER.split(
+        "MlxPagedSessionCodec<MlxQwen35TextSessionState>", 1
+    )[1]
+    assert 'name = "qwen35-hybrid-kv-v2"' in qwen_codec
+    assert "kRecurrentUnavailableLayer" in METAL_PAGED_CODEC
+    assert "decodable_blocks" in METAL_PAGED_CODEC
+    assert "normalize_stable_prefix_tokens" in METAL_DECODE
+    assert "paged_cache_->replace(" in METAL_DECODE
+    assert "existing_blocks == full_blocks" in METAL_DECODE
 
 
 def test_persistent_prefix_cache_is_content_addressed_and_restart_safe() -> None:

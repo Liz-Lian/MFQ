@@ -63,6 +63,11 @@ class RuntimeConflictError(RuntimeManagementError):
     pass
 
 
+_AUTOMATIC_MEMORY_SOFT_RATIO = 0.90
+_AUTOMATIC_MEMORY_HARD_RATIO = 0.95
+_AUTOMATIC_MEMORY_TARGET_RATIO = 0.85
+
+
 def _job_error(code: str, message: str, *, retryable: bool = False) -> JobExecutionError:
     return JobExecutionError(ErrorDetail(code=code, message=message, retryable=retryable))
 
@@ -259,6 +264,7 @@ class ManagedRuntimePool:
         self._shared_cache_reclaims = 0
         self._shared_cache_released_bytes = 0
         self._shared_cache_reclaim_failures = 0
+        self._shared_cache_pressure_checked_at = 0.0
         self.store = None
         self._instances: dict[UUID, _ManagedRuntime] = {}
         self._loading_model_names: set[str] = set()
@@ -1224,11 +1230,15 @@ class ManagedRuntimePool:
         instance_id: UUID | None = None,
     ) -> dict[str, Any]:
         async with self._lock:
+            (
+                memory_pressure_level,
+                memory_pressure_ratio,
+                effective_memory_budget,
+                committed_memory,
+            ) = self._runtime_memory_pressure_locked()
             memory_status = {
                 "runtime_memory_budget_bytes": self.max_runtime_memory_bytes,
-                "runtime_memory_effective_budget_bytes": (
-                    self._effective_runtime_memory_budget_locked()
-                ),
+                "runtime_memory_effective_budget_bytes": effective_memory_budget,
                 "runtime_memory_budget_mode": (
                     "automatic"
                     if self.automatic_memory_budget
@@ -1236,7 +1246,14 @@ class ManagedRuntimePool:
                     if self.max_runtime_memory_bytes is not None
                     else "disabled"
                 ),
-                "runtime_memory_committed_bytes": self._committed_pool_bytes_locked(),
+                "runtime_memory_committed_bytes": committed_memory,
+                "runtime_memory_headroom_bytes": (
+                    max(0, effective_memory_budget - committed_memory)
+                    if effective_memory_budget is not None
+                    else None
+                ),
+                "runtime_memory_pressure_level": memory_pressure_level,
+                "runtime_memory_pressure_ratio": memory_pressure_ratio,
                 "runtime_memory_shared_cache_reclaims": self._shared_cache_reclaims,
                 "runtime_memory_shared_cache_released_bytes": (
                     self._shared_cache_released_bytes
@@ -1868,11 +1885,21 @@ class ManagedRuntimePool:
         self._mark_instance_unloading_locked(victim)
         return victim
 
-    def _claim_over_budget_instances_for_unload_locked(self) -> list[_ManagedRuntime]:
-        memory_ceiling = self._effective_runtime_memory_budget_locked()
+    def _claim_over_budget_instances_for_unload_locked(
+        self,
+        *,
+        memory_ceiling: int | None = None,
+        pending_releases: Sequence[_ManagedRuntime] = (),
+    ) -> list[_ManagedRuntime]:
+        if memory_ceiling is None:
+            memory_ceiling = self._effective_runtime_memory_budget_locked()
         if memory_ceiling is None:
             return []
-        committed = self._committed_pool_bytes_locked()
+        committed = max(
+            0,
+            self._committed_pool_bytes_locked()
+            - sum(self._committed_runtime_bytes(item) for item in pending_releases),
+        )
         victims = []
         while committed > memory_ceiling:
             victim = self._claim_lru_instance_for_unload_locked()
@@ -1884,6 +1911,22 @@ class ManagedRuntimePool:
                 committed - self._committed_runtime_bytes(victim),
             )
         return victims
+
+    async def _run_shared_cache_reclaimer(self) -> int:
+        reclaimer = self.shared_cache_reclaimer
+        if reclaimer is None:
+            return 0
+        try:
+            released = max(0, int(await asyncio.to_thread(reclaimer)))
+        except Exception:
+            async with self._lock:
+                self._shared_cache_reclaim_failures += 1
+            return 0
+        async with self._lock:
+            if released > 0:
+                self._shared_cache_reclaims += 1
+                self._shared_cache_released_bytes += released
+        return released
 
     async def _reclaim_shared_cache_for_budget(
         self,
@@ -1914,24 +1957,36 @@ class ManagedRuntimePool:
             committed = self._committed_pool_bytes_locked() + additional_bytes
             if committed <= memory_ceiling:
                 return 0
-        try:
-            released = max(0, int(await asyncio.to_thread(reclaimer)))
-        except Exception:
-            async with self._lock:
-                self._shared_cache_reclaim_failures += 1
+        return await self._run_shared_cache_reclaimer()
+
+    async def _reclaim_shared_cache_under_pressure(self) -> int:
+        if self.shared_cache_reclaimer is None or not self.automatic_memory_budget:
             return 0
         async with self._lock:
-            self._shared_cache_reclaims += 1
-            self._shared_cache_released_bytes += released
-        return released
+            if self._closed:
+                return 0
+            level, _ratio, _ceiling, _committed = (
+                self._runtime_memory_pressure_locked()
+            )
+            if level == "normal":
+                return 0
+            now = time.monotonic()
+            if now - self._shared_cache_pressure_checked_at < max(
+                1.0,
+                self.metric_interval_seconds * 2,
+            ):
+                return 0
+            self._shared_cache_pressure_checked_at = now
+        return await self._run_shared_cache_reclaimer()
 
     async def _trim_idle_prefix_caches_for_budget(
         self,
         *,
         additional_bytes: int = 0,
         prospective_model: str | None = None,
+        memory_target_bytes: int | None = None,
     ) -> None:
-        if self.max_runtime_memory_bytes is None:
+        if self.max_runtime_memory_bytes is None and memory_target_bytes is None:
             return
         async with self._lock:
             if self._closed:
@@ -1939,6 +1994,8 @@ class ManagedRuntimePool:
             memory_ceiling = self._effective_runtime_memory_budget_locked()
             if memory_ceiling is None:
                 return
+            if memory_target_bytes is not None:
+                memory_ceiling = min(memory_ceiling, memory_target_bytes)
             if prospective_model is not None and (
                 prospective_model in self._loading_model_names
                 or any(
@@ -2115,6 +2172,22 @@ class ManagedRuntimePool:
         )
         return max(1, min(ceiling, dynamic_ceiling))
 
+    def _runtime_memory_pressure_locked(
+        self,
+    ) -> tuple[str, float | None, int | None, int]:
+        committed = self._committed_pool_bytes_locked()
+        effective = self._effective_runtime_memory_budget_locked()
+        if not self.automatic_memory_budget or effective is None:
+            return "disabled", None, effective, committed
+        ratio = committed / max(1, effective)
+        if ratio >= _AUTOMATIC_MEMORY_HARD_RATIO:
+            level = "hard"
+        elif ratio >= _AUTOMATIC_MEMORY_SOFT_RATIO:
+            level = "soft"
+        else:
+            level = "normal"
+        return level, ratio, effective, committed
+
     def _estimated_load_bytes(
         self,
         artifact: DiscoveredModel,
@@ -2274,13 +2347,36 @@ class ManagedRuntimePool:
                     *(self._refresh_instance_usage(item) for item in refresh)
                 )
 
-            await self._trim_idle_prefix_caches_for_budget()
+            await self._reclaim_shared_cache_under_pressure()
+            async with self._lock:
+                pressure_level, _ratio, pressure_ceiling, _committed = (
+                    self._runtime_memory_pressure_locked()
+                )
+                pressure_target = (
+                    int(pressure_ceiling * _AUTOMATIC_MEMORY_TARGET_RATIO)
+                    if pressure_ceiling is not None
+                    and pressure_level in {"soft", "hard"}
+                    else None
+                )
+            await self._trim_idle_prefix_caches_for_budget(
+                memory_target_bytes=pressure_target,
+            )
 
             victims: list[tuple[_ManagedRuntime, str]] = []
             now = datetime.now(timezone.utc)
             async with self._lock:
                 if self._closed:
                     return
+                pressure_level, _ratio, pressure_ceiling, _committed = (
+                    self._runtime_memory_pressure_locked()
+                )
+                pressure_target = (
+                    int(pressure_ceiling * _AUTOMATIC_MEMORY_TARGET_RATIO)
+                    if pressure_ceiling is not None
+                    and pressure_level == "hard"
+                    else None
+                )
+                ttl_victims: list[_ManagedRuntime] = []
                 for instance in list(self._instances.values()):
                     if (
                         instance.idle_ttl_seconds is None
@@ -2296,10 +2392,14 @@ class ManagedRuntimePool:
                     if idle_seconds < instance.idle_ttl_seconds:
                         continue
                     self._mark_instance_unloading_locked(instance)
+                    ttl_victims.append(instance)
                     victims.append((instance, "idle_ttl"))
                 victims.extend(
                     (instance, "memory_budget")
-                    for instance in self._claim_over_budget_instances_for_unload_locked()
+                    for instance in self._claim_over_budget_instances_for_unload_locked(
+                        memory_ceiling=pressure_target,
+                        pending_releases=ttl_victims,
+                    )
                 )
             async def retire_victim(
                 instance: _ManagedRuntime,

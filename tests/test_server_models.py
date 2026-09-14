@@ -156,6 +156,42 @@ def test_automatic_memory_budget_tracks_current_reclaimable_memory(
     ) == 10
 
 
+def test_automatic_memory_pressure_uses_soft_and_hard_watermarks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gib = 1 << 30
+    reclaimable_gib = 4
+    monkeypatch.setattr(
+        "mfq.server.runtime_pool.total_physical_memory",
+        lambda: 128 * gib,
+    )
+    monkeypatch.setattr(
+        "mfq.server.runtime_pool.host_memory_snapshot",
+        lambda: HostMemorySnapshot(
+            total=128 * gib,
+            free=reclaimable_gib * gib,
+            active=0,
+            inactive=0,
+            wired=80 * gib,
+        ),
+    )
+    pool = ManagedRuntimePool(ModelCatalog([]), "runtime", backend="metal")
+    pool._load_bytes["resident"] = 40 * gib
+
+    level, ratio, ceiling, committed = pool._runtime_memory_pressure_locked()
+    assert level == "soft"
+    assert ratio == pytest.approx(40 / 44)
+    assert ceiling == 44 * gib
+    assert committed == 40 * gib
+
+    reclaimable_gib = 2
+    level, ratio, ceiling, committed = pool._runtime_memory_pressure_locked()
+    assert level == "hard"
+    assert ratio == pytest.approx(40 / 42)
+    assert ceiling == 42 * gib
+    assert committed == 40 * gib
+
+
 def test_load_pressure_reclaims_shared_host_cache_before_model_memory(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -859,6 +895,9 @@ def test_empty_runtime_pool_reports_idle_state(tmp_path: Path) -> None:
             "runtime_memory_effective_budget_bytes": None,
             "runtime_memory_budget_mode": "disabled",
             "runtime_memory_committed_bytes": 0,
+            "runtime_memory_headroom_bytes": None,
+            "runtime_memory_pressure_level": "disabled",
+            "runtime_memory_pressure_ratio": None,
             "runtime_memory_shared_cache_reclaims": 0,
             "runtime_memory_shared_cache_released_bytes": 0,
             "runtime_memory_shared_cache_reclaim_failures": 0,
@@ -1467,6 +1506,11 @@ def test_runtime_memory_enforcement_evicts_only_idle_unpinned_instances(
         assert victims == [older]
         assert list(pool._instances) == [older.id, newer.id]
         assert older.state == RuntimeInstanceState.UNLOADING
+        async with pool._lock:
+            assert pool._claim_over_budget_instances_for_unload_locked(
+                pending_releases=[older],
+            ) == []
+        assert newer.state == RuntimeInstanceState.READY
 
         newer.resident_bytes = 101
         newer.pinned = True

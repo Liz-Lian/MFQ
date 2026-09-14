@@ -1941,11 +1941,18 @@ class ManagedRuntimePool:
 
     @staticmethod
     def _committed_runtime_bytes(instance: _ManagedRuntime) -> int:
-        return (
-            instance.resident_bytes
-            or instance.reserved_bytes
-            or instance.artifact.resource.total_bytes
-        )
+        estimates = [
+            value
+            for value in (instance.resident_bytes, instance.reserved_bytes)
+            if value is not None and value > 0
+        ]
+        if estimates:
+            # RSS can be temporarily smaller than the model's committed
+            # capacity when mmap pages or an expert LRU have not been touched
+            # yet. Conversely KV/runtime allocations can push live residency
+            # beyond the load estimate. Admission must retain both ledgers.
+            return max(estimates)
+        return instance.artifact.resource.total_bytes
 
     def _committed_pool_bytes_locked(self) -> int:
         resident_names = {

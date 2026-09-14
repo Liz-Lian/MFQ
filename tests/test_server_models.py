@@ -325,6 +325,10 @@ def test_catalog_tracks_streamable_routed_expert_bytes(tmp_path: Path) -> None:
             reserved_bytes=estimated,
         )
         assert ManagedRuntimePool._committed_runtime_bytes(runtime) == estimated
+        runtime.resident_bytes = max(1, estimated // 2)
+        assert ManagedRuntimePool._committed_runtime_bytes(runtime) == estimated
+        runtime.resident_bytes = estimated + 17
+        assert ManagedRuntimePool._committed_runtime_bytes(runtime) == estimated + 17
 
     asyncio.run(run())
 

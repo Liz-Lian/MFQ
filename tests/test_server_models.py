@@ -10,7 +10,7 @@ import textwrap
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import httpx
 import numpy as np
@@ -2456,5 +2456,46 @@ def test_minicpmo_voice_component_activates_in_the_managed_runtime(
         client = object()
         assert await pool.realtime_serve(client)
         assert instance.realtime_gateway.served == [client]
+
+    asyncio.run(run())
+
+
+def test_runtime_pool_drains_startup_background_tasks_on_close(
+    tmp_path: Path,
+) -> None:
+    async def run() -> None:
+        started = asyncio.Event()
+        finished = asyncio.Event()
+        release = asyncio.Event()
+
+        class Component:
+            @staticmethod
+            def ready() -> bool:
+                return True
+
+        pool = ManagedRuntimePool(
+            ModelCatalog([tmp_path], cache_seconds=0),
+            tmp_path / "runtime",
+            voice_component=Component(),
+        )
+
+        async def enable_realtime(
+            _instance_id: UUID | None = None,
+        ) -> dict[str, object]:
+            started.set()
+            try:
+                await release.wait()
+                return {"active": True}
+            finally:
+                finished.set()
+
+        pool.enable_realtime = enable_realtime  # type: ignore[method-assign]
+        await pool.start()
+        await asyncio.wait_for(started.wait(), timeout=1)
+
+        await pool.aclose()
+
+        assert finished.is_set()
+        assert not pool._background_tasks
 
     asyncio.run(run())

@@ -254,6 +254,7 @@ class ManagedRuntimePool:
         self._realtime_activation_lock = asyncio.Lock()
         self._idle_reaper_task: asyncio.Task[None] | None = None
         self._idle_reaper_wakeup = asyncio.Event()
+        self._background_tasks: set[asyncio.Task[Any]] = set()
         self._lease_release_tasks: set[asyncio.Task[None]] = set()
         self._closed = False
 
@@ -275,11 +276,20 @@ class ManagedRuntimePool:
                     self._idle_reaper(),
                     name="mfq-server-runtime-idle-reaper",
                 )
-        if self.voice_component is not None and self.voice_component.ready():
-            asyncio.create_task(
-                self.enable_realtime(),
-                name="mfq-server-enable-voice-output",
-            )
+            if self.voice_component is not None and self.voice_component.ready():
+                task = asyncio.create_task(
+                    self.enable_realtime(),
+                    name="mfq-server-enable-voice-output",
+                )
+                self._background_tasks.add(task)
+                task.add_done_callback(self._background_task_done)
+
+    def _background_task_done(self, task: asyncio.Task[Any]) -> None:
+        self._background_tasks.discard(task)
+        if not task.cancelled():
+            # Retrieve unexpected failures so optional background work cannot
+            # produce an unobserved-task warning during server shutdown.
+            task.exception()
 
     def register_started(
         self,
@@ -1302,6 +1312,8 @@ class ManagedRuntimePool:
             instances = list(self._instances.values())
             idle_reaper = self._idle_reaper_task
             self._idle_reaper_task = None
+            background_tasks = tuple(self._background_tasks)
+            self._background_tasks.clear()
             self._idle_reaper_wakeup.set()
             for model, event in self._load_events.items():
                 self._load_errors[model] = ErrorDetail(
@@ -1319,6 +1331,11 @@ class ManagedRuntimePool:
             self._reserved_ports.clear()
         if idle_reaper is not None and idle_reaper is not asyncio.current_task():
             await idle_reaper
+        for task in background_tasks:
+            if task is not asyncio.current_task() and not task.done():
+                task.cancel()
+        if background_tasks:
+            await asyncio.gather(*background_tasks, return_exceptions=True)
         await self._drain_control_lease_releases()
         first_error: Exception | None = None
         for instance in instances:

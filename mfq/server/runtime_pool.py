@@ -401,6 +401,31 @@ class ManagedRuntimePool:
             if existing is not None and existing.state == RuntimeInstanceState.FAILED:
                 self._detach_instance_locked(existing)
                 existing = None
+            revision_changed = existing is not None and not self._same_artifact_revision(
+                existing.artifact,
+                artifact,
+            )
+            replace_named_revision = (
+                revision_changed
+                and request.artifact_uri is None
+                and request.model == model_name
+            )
+            if existing is not None and replace_named_revision:
+                if (
+                    existing.state != RuntimeInstanceState.READY
+                    or existing.active_requests
+                    or existing.queued_requests
+                    or existing.control_leases
+                ):
+                    raise _job_error(
+                        "runtime_revision_busy",
+                        "the model artifact changed while its current runtime is busy",
+                        retryable=True,
+                    )
+                existing.state = RuntimeInstanceState.UNLOADING
+                self._detach_instance_locked(existing)
+                evicted.append(existing)
+                existing = None
             if existing is not None:
                 raise _job_error(
                     "model_already_loaded",
@@ -1360,6 +1385,17 @@ class ManagedRuntimePool:
         resource = instance.artifact.resource
         return model == resource.name or model == resource.id
 
+    @staticmethod
+    def _same_artifact_revision(
+        left: DiscoveredModel,
+        right: DiscoveredModel,
+    ) -> bool:
+        return (
+            left.resource.id == right.resource.id
+            and left.resource.modified_at == right.resource.modified_at
+            and left.path == right.path
+        )
+
     async def _ensure_model_loaded(self, model: str) -> _ManagedRuntime | None:
         try:
             artifact = await self.catalog.resolve(model)
@@ -1374,7 +1410,7 @@ class ManagedRuntimePool:
                 (
                     item
                     for item in self._instances.values()
-                    if item.artifact.resource.id == artifact_id
+                    if self._same_artifact_revision(item.artifact, artifact)
                     and item.state in {
                         RuntimeInstanceState.READY,
                         RuntimeInstanceState.BUSY,
@@ -1398,7 +1434,7 @@ class ManagedRuntimePool:
             return ready
         if event is not None:
             await self._wait_for_model_ready(model_name)
-            return await self._select_loaded_artifact(model_name, artifact_id)
+            return await self._select_loaded_artifact(model_name, artifact)
         if cached_failure is not None:
             raise self._backend_load_error(cached_failure.detail)
 
@@ -1420,9 +1456,11 @@ class ManagedRuntimePool:
                 "model_already_loading",
             }:
                 await self._wait_for_model_ready(model_name)
-                return await self._select_loaded_artifact(model_name, artifact_id)
+                return await self._select_loaded_artifact(model_name, artifact)
             if error.detail.code == "model_artifact_not_found":
                 return None
+            if error.detail.code == "runtime_revision_busy":
+                raise self._backend_load_error(error.detail) from error
             async with self._lock:
                 self._load_errors[model_name] = error.detail
             raise self._backend_load_error(error.detail) from error
@@ -1433,17 +1471,17 @@ class ManagedRuntimePool:
             raise self._backend_load_error(detail) from error
         finally:
             await context.cleanup()
-        return await self._select_loaded_artifact(model_name, artifact_id)
+        return await self._select_loaded_artifact(model_name, artifact)
 
     async def _select_loaded_artifact(
         self,
         model_name: str,
-        artifact_id: str,
+        artifact: DiscoveredModel,
     ) -> _ManagedRuntime | None:
         selected = await self._select(model_name, session_id=None)
         if selected is None:
             return None
-        if selected.artifact.resource.id != artifact_id:
+        if not self._same_artifact_revision(selected.artifact, artifact):
             raise BackendError(
                 "model_name_conflict",
                 f"loaded model name {model_name!r} refers to a different artifact",
@@ -1750,6 +1788,7 @@ class ManagedRuntimePool:
             "model_artifact_incomplete": 409,
             "model_conversion_required": 409,
             "runtime_model_too_large": 413,
+            "runtime_revision_busy": 409,
             "unsupported_device": 422,
             "runtime_identity_mismatch": 502,
         }

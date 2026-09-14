@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import stat
 import subprocess
 import sys
@@ -1512,6 +1513,62 @@ def test_request_driven_model_loads_coalesce_and_restore_exact_settings(
             assert saved.prefill_chunk_size == 333
             assert saved.prefix_cache_disk_bytes == 123456
             assert saved.prefix_cache_block_tokens == 64
+
+    asyncio.run(run())
+
+
+def test_named_load_replaces_an_idle_stale_artifact_revision(
+    tmp_path: Path,
+) -> None:
+    async def run() -> None:
+        model_dir = tmp_path / "models"
+        model_dir.mkdir()
+        model = model_dir / "revision.mfq"
+        _model(model, architecture="qwen35")
+        executable = tmp_path / "fake-runtime"
+        _fake_runtime(executable)
+        pool = ManagedRuntimePool(
+            ModelCatalog([model_dir], cache_seconds=0),
+            executable,
+            startup_timeout_seconds=5,
+        )
+
+        try:
+            first = await pool._ensure_model_loaded("revision")
+            assert first is not None
+            first_mtime = first.artifact.resource.modified_at
+            stat_result = model.stat()
+            os.utime(
+                model,
+                ns=(stat_result.st_atime_ns, stat_result.st_mtime_ns + 1_000_000_000),
+            )
+
+            first.active_requests = 1
+            with pytest.raises(JobExecutionError) as busy:
+                await pool.load(
+                    _TestJobContext(),  # type: ignore[arg-type]
+                    {"model": "revision"},
+                )
+            assert busy.value.detail.code == "runtime_revision_busy"
+            assert first.process.returncode is None
+            first.active_requests = 0
+
+            context = _TestJobContext()
+            await pool.load(
+                context,  # type: ignore[arg-type]
+                {"model": "revision"},
+            )
+            await context.cleanup()
+            second = await pool._select("revision", session_id=None)
+
+            assert second is not None
+            assert second.id != first.id
+            assert second.artifact.resource.modified_at > first_mtime
+            assert first.process.returncode is not None
+            instances = (await pool.instances()).data
+            assert [instance.id for instance in instances] == [second.id]
+        finally:
+            await pool.aclose()
 
     asyncio.run(run())
 

@@ -450,20 +450,29 @@ public:
         }
         for (std::size_t index = 0; index < full_blocks; ++index) {
             const auto offset = index * config_.block_size_tokens;
-            parent = block_hash(
+            const auto expected_parent = parent;
+            const auto hash = block_hash(
                 parent,
                 token_ids.data() + offset,
                 config_.block_size_tokens,
                 extra_key);
+            bool available = false;
             {
                 std::lock_guard<std::mutex> lock(mutex_);
-                if (disk_.count(parent) == 0 &&
-                    pending_.count(parent) == 0 &&
-                    hot_.count(parent) == 0) {
-                    break;
+                auto disk = disk_.find(hash);
+                bool disk_available = disk != disk_.end();
+                if (disk != disk_.end() &&
+                    (disk->second.parent != expected_parent ||
+                     disk->second.token_count != config_.block_size_tokens)) {
+                    erase_corrupt_locked(hash);
+                    disk_available = false;
                 }
+                available = disk_available ||
+                    pending_.count(hash) != 0 || hot_.count(hash) != 0;
             }
-            result.blocks.push_back(parent);
+            if (!available) break;
+            parent = hash;
+            result.blocks.push_back(hash);
             result.matched_tokens += config_.block_size_tokens;
         }
         if (record_query && result.matched_tokens > 0) {

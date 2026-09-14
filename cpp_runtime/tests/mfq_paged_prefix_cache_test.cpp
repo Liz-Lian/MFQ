@@ -1,6 +1,7 @@
 #include "mfq_paged_prefix_cache.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
@@ -242,6 +243,62 @@ int main() try {
         require(
             incompatible.match(tokens).matched_tokens == 0,
             "compatibility namespace isolation failed");
+    }
+
+    {
+        const auto header_root = root / "header-chain-validation";
+        const std::vector<std::int64_t> header_tokens{61, 62, 63, 64};
+        BlockHash block{};
+        {
+            PagedPrefixCache cache(PagedPrefixCacheConfig{
+                header_root,
+                "header-chain-validation",
+                4,
+                4096,
+                0,
+                2,
+            });
+            BlockHash parent{};
+            block = cache.store(
+                parent,
+                header_tokens.data(),
+                4,
+                payload({31, 32, 33}));
+            cache.flush();
+        }
+        const auto block_text = block_hash_hex(block);
+        const auto block_path =
+            header_root /
+            block_hash_hex(sha256("header-chain-validation")) /
+            block_text.substr(0, 2) /
+            (block_text + ".mfqkv");
+        {
+            std::fstream file(
+                block_path,
+                std::ios::binary | std::ios::in | std::ios::out);
+            require(
+                static_cast<bool>(file),
+                "cannot open block header for corruption test");
+            constexpr std::streamoff token_count_offset =
+                8 + 4 + 32 + 32 + 32 + 4;
+            const std::array<char, 4> partial_count{1, 0, 0, 0};
+            file.seekp(token_count_offset);
+            file.write(partial_count.data(), partial_count.size());
+        }
+        PagedPrefixCache cache(PagedPrefixCacheConfig{
+            header_root,
+            "header-chain-validation",
+            4,
+            4096,
+            0,
+            2,
+        });
+        require(cache.match(header_tokens).matched_tokens == 0,
+                "a partial disk block was accepted as a full prefix block");
+        require(cache.metrics().corrupt_blocks == 1,
+                "invalid disk block metadata was not rejected on match");
+        require(!std::filesystem::exists(block_path),
+                "invalid disk block metadata was not removed");
     }
 
     {

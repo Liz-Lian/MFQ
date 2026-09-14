@@ -802,3 +802,188 @@ def test_cluster_never_replays_after_a_remote_delta(tmp_path: Path) -> None:
         await client.aclose()
 
     asyncio.run(run())
+
+
+def test_remote_node_reconfiguration_retires_bound_sessions(tmp_path: Path) -> None:
+    async def run() -> None:
+        requests: list[tuple[str, str, str]] = []
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            host = request.url.host
+            path = request.url.path
+            requests.append((host, request.method, path))
+            if path == "/health":
+                return httpx.Response(200)
+            if path == "/v1/models":
+                return httpx.Response(200, json={"data": [{"id": "remote-model"}]})
+            if path == "/api/v1/runtime/status":
+                return httpx.Response(200, json={})
+            if path == "/api/v1/sessions":
+                remote_id = (
+                    "11111111-1111-4111-8111-111111111111"
+                    if host == "old-worker"
+                    else "22222222-2222-4222-8222-222222222222"
+                )
+                return httpx.Response(201, json={"id": remote_id, "revision": 0})
+            if path.endswith("/responses"):
+                frames = [
+                    {"payload": {"type": "response.text.delta", "delta": host}},
+                    {"payload": {"type": "response.completed", "finish_reason": "stop"}},
+                    {"payload": {"type": "session.state", "revision": 2}},
+                ]
+                return httpx.Response(
+                    200,
+                    text="".join(f"data: {json.dumps(frame)}\n\n" for frame in frames),
+                    headers={"content-type": "text/event-stream"},
+                )
+            if request.method == "DELETE" and "/api/v1/sessions/" in path:
+                return httpx.Response(204)
+            return httpx.Response(404)
+
+        store = SessionStore(tmp_path / "mfq.server.sqlite3")
+        node = store.create_remote_node(
+            CreateRemoteNodeRequest(name="worker-a", url="http://old-worker:8090")
+        )
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        cluster = ClusterBackend(FakeBackend(), store, client=client)
+        session_id = UUID("33333333-3333-4333-8333-333333333333")
+
+        old = [
+            delta
+            async for delta in cluster.stream(
+                model="remote-model",
+                messages=[{"role": "user", "content": "hello"}],
+                sampling=SamplingParams(),
+                session_id=session_id,
+            )
+        ]
+        assert "".join(delta.content_delta for delta in old) == "old-worker"
+        assert cluster._sessions[(node.id, session_id)].node.url == (
+            "http://old-worker:8090"
+        )
+
+        await asyncio.to_thread(
+            store.update_remote_node,
+            node.id,
+            UpdateRemoteNodeRequest(
+                name="worker-a",
+                url="http://new-worker:8090",
+            ),
+        )
+        await cluster.nodes(force=True)
+        assert cluster._sessions == {}
+        assert (
+            "old-worker",
+            "DELETE",
+            "/api/v1/sessions/11111111-1111-4111-8111-111111111111",
+        ) in requests
+
+        new = [
+            delta
+            async for delta in cluster.stream(
+                model="remote-model",
+                messages=[{"role": "user", "content": "hello again"}],
+                sampling=SamplingParams(),
+                session_id=session_id,
+            )
+        ]
+        assert "".join(delta.content_delta for delta in new) == "new-worker"
+        assert cluster._sessions[(node.id, session_id)].node.url == (
+            "http://new-worker:8090"
+        )
+        await cluster.aclose()
+        await client.aclose()
+
+    asyncio.run(run())
+
+
+def test_session_creation_retries_after_node_reconfiguration(tmp_path: Path) -> None:
+    async def run() -> None:
+        old_creation_started = asyncio.Event()
+        release_old_creation = asyncio.Event()
+        requests: list[tuple[str, str, str]] = []
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            host = request.url.host
+            path = request.url.path
+            requests.append((host, request.method, path))
+            if path == "/health":
+                return httpx.Response(200)
+            if path == "/v1/models":
+                return httpx.Response(200, json={"data": [{"id": "remote-model"}]})
+            if path == "/api/v1/runtime/status":
+                return httpx.Response(200, json={})
+            if path == "/api/v1/sessions":
+                if host == "old-worker":
+                    old_creation_started.set()
+                    await release_old_creation.wait()
+                remote_id = (
+                    "11111111-1111-4111-8111-111111111111"
+                    if host == "old-worker"
+                    else "22222222-2222-4222-8222-222222222222"
+                )
+                return httpx.Response(201, json={"id": remote_id, "revision": 0})
+            if path.endswith("/responses"):
+                frames = [
+                    {"payload": {"type": "response.text.delta", "delta": host}},
+                    {"payload": {"type": "response.completed", "finish_reason": "stop"}},
+                    {"payload": {"type": "session.state", "revision": 2}},
+                ]
+                return httpx.Response(
+                    200,
+                    text="".join(f"data: {json.dumps(frame)}\n\n" for frame in frames),
+                    headers={"content-type": "text/event-stream"},
+                )
+            if request.method == "DELETE" and "/api/v1/sessions/" in path:
+                return httpx.Response(204)
+            return httpx.Response(404)
+
+        store = SessionStore(tmp_path / "mfq.server.sqlite3")
+        node = store.create_remote_node(
+            CreateRemoteNodeRequest(name="worker-a", url="http://old-worker:8090")
+        )
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        local = FakeBackend()
+        cluster = ClusterBackend(local, store, client=client)
+        await cluster.nodes(force=True)
+        session_id = UUID("33333333-3333-4333-8333-333333333333")
+
+        async def collect() -> list[BackendDelta]:
+            return [
+                delta
+                async for delta in cluster.stream(
+                    model="remote-model",
+                    messages=[{"role": "user", "content": "hello"}],
+                    sampling=SamplingParams(),
+                    session_id=session_id,
+                )
+            ]
+
+        response = asyncio.create_task(collect())
+        await old_creation_started.wait()
+        await asyncio.to_thread(
+            store.update_remote_node,
+            node.id,
+            UpdateRemoteNodeRequest(
+                name="worker-a",
+                url="http://new-worker:8090",
+            ),
+        )
+        await cluster.nodes(force=True)
+        release_old_creation.set()
+        received = await response
+
+        assert "".join(delta.content_delta for delta in received) == "new-worker"
+        assert local.calls == []
+        assert cluster._sessions[(node.id, session_id)].node.url == (
+            "http://new-worker:8090"
+        )
+        assert (
+            "old-worker",
+            "DELETE",
+            "/api/v1/sessions/11111111-1111-4111-8111-111111111111",
+        ) in requests
+        await cluster.aclose()
+        await client.aclose()
+
+    asyncio.run(run())

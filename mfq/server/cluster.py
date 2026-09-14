@@ -37,6 +37,8 @@ from mfq.server.models import (
 )
 from mfq.server.storage import SessionStore
 
+_NodeVersion = tuple[UUID, str, str | None, bool, datetime]
+
 
 @dataclass
 class _NodeState:
@@ -52,9 +54,11 @@ class _NodeState:
 
 @dataclass
 class _RemoteSession:
+    node: RemoteNodeResource
     remote_id: UUID
     revision: int
     synchronized_messages: int
+    busy: bool = False
 
 
 class ClusterBackend:
@@ -124,21 +128,15 @@ class ClusterBackend:
                     state = self._states.get(resource.id)
                     if state is None:
                         self._states[resource.id] = _NodeState(resource=resource)
-                    else:
-                        changed = state.resource != resource
-                        state.resource = resource
-                        if changed:
-                            state.checked_at = 0.0
-                            state.checked_at_wall = None
-                            state.healthy = False
-                            state.models = []
-                            state.status = {}
-                            state.error = None
-                        elif not resource.enabled:
-                            state.healthy = False
-                            state.models = []
-                            state.status = {}
-                            state.error = None
+                    elif state.resource != resource:
+                        self._states[resource.id] = _NodeState(resource=resource)
+                        if state.active_requests == 0:
+                            retired.append(state.resource)
+                    elif not resource.enabled:
+                        state.healthy = False
+                        state.models = []
+                        state.status = {}
+                        state.error = None
                 states = list(self._states.values())
             if retired:
                 await asyncio.gather(
@@ -236,11 +234,52 @@ class ClusterBackend:
             }
         )
 
+    def _node_is_current_locked(self, node: RemoteNodeResource) -> bool:
+        state = self._states.get(node.id)
+        return not self._closed and state is not None and state.resource == node
+
+    @staticmethod
+    def _node_version(node: RemoteNodeResource) -> _NodeVersion:
+        return (
+            node.id,
+            node.url,
+            node.api_key_env,
+            node.enabled,
+            node.updated_at,
+        )
+
+    @staticmethod
+    def _remote_session_from_payload(
+        node: RemoteNodeResource,
+        payload: dict[str, Any],
+        *,
+        synchronized_messages: int,
+        busy: bool = False,
+    ) -> _RemoteSession:
+        try:
+            remote_id = UUID(payload["id"])
+            revision = payload["revision"]
+            if not isinstance(revision, int) or isinstance(revision, bool):
+                raise TypeError("revision must be an integer")
+        except (KeyError, TypeError, ValueError) as error:
+            raise BackendError(
+                "remote_node_protocol_error",
+                f"remote session response is invalid: {error}",
+                status_code=502,
+            ) from error
+        return _RemoteSession(
+            node=node,
+            remote_id=remote_id,
+            revision=revision,
+            synchronized_messages=synchronized_messages,
+            busy=busy,
+        )
+
     async def _select(
         self,
         model: str,
         *,
-        exclude: set[UUID] | None = None,
+        exclude: set[_NodeVersion] | None = None,
     ) -> _NodeState | None:
         await self.refresh()
         excluded = exclude or set()
@@ -248,7 +287,7 @@ class ClusterBackend:
             matches = [
                 state
                 for state in self._states.values()
-                if state.resource.id not in excluded
+                if self._node_version(state.resource) not in excluded
                 and state.resource.enabled
                 and state.healthy
                 and model in state.models
@@ -270,13 +309,13 @@ class ClusterBackend:
         tool_choice: ToolChoice = "auto",
         response_format: ResponseFormat | None = None,
     ) -> AsyncIterator[BackendDelta]:
-        attempted: set[UUID] = set()
+        attempted: set[_NodeVersion] = set()
         last_remote_failure: BackendError | None = None
         while True:
             node = await self._select(model, exclude=attempted)
             if node is None:
                 break
-            node_id = node.resource.id
+            node_version = self._node_version(node.resource)
             claimed = False
             async with self._lock:
                 if (
@@ -285,7 +324,7 @@ class ClusterBackend:
                     or not node.healthy
                     or model not in node.models
                 ):
-                    attempted.add(node_id)
+                    attempted.add(node_version)
                 else:
                     node.active_requests += 1
                     claimed = True
@@ -327,7 +366,7 @@ class ClusterBackend:
 
             assert retryable_failure is not None
             last_remote_failure = retryable_failure
-            attempted.add(node_id)
+            attempted.add(node_version)
             await self._record_node_failure(node, retryable_failure)
             if session_id is not None:
                 await self._discard_remote_route(node.resource, session_id)
@@ -378,14 +417,15 @@ class ClusterBackend:
         session_id: UUID,
     ) -> None:
         async with self._lock:
-            remote = self._sessions.pop((node.id, session_id), None)
+            key = (node.id, session_id)
+            remote = self._sessions.get(key)
+            if remote is not None and remote.node == node:
+                self._sessions.pop(key, None)
+            else:
+                remote = None
         if remote is None:
             return
-        try:
-            headers = self._headers(node)
-        except BackendError:
-            return
-        await self._discard_remote_session(node, remote, headers)
+        await self._discard_routed_session(remote)
 
     async def _remote_stream(
         self,
@@ -402,33 +442,13 @@ class ClusterBackend:
         headers = self._headers(node)
         ephemeral = session_id is None
         key = (node.id, session_id or uuid4())
-        remote = self._sessions.get(key)
-        stale_remote = (
-            remote
-            if remote is not None
-            and remote.synchronized_messages > len(messages)
-            else None
+        remote = await self._acquire_remote_session(
+            node,
+            key=key,
+            model=model,
+            message_count=len(messages),
+            headers=headers,
         )
-        if remote is None or remote.synchronized_messages > len(messages):
-            created = await self._request_json(
-                node,
-                "POST",
-                "/api/v1/sessions",
-                {"model": model, "mode": "text"},
-                headers,
-            )
-            remote = _RemoteSession(
-                remote_id=UUID(created["id"]),
-                revision=int(created["revision"]),
-                synchronized_messages=0,
-            )
-            self._sessions[key] = remote
-            if stale_remote is not None:
-                await self._discard_remote_session(
-                    node,
-                    stale_remote,
-                    headers,
-                )
         completed = False
         try:
             async for delta in self._remote_session_stream(
@@ -445,12 +465,117 @@ class ClusterBackend:
             completed = True
         finally:
             reusable = remote.synchronized_messages == len(messages) + 1
-            if (
-                (ephemeral or not completed or not reusable)
-                and self._sessions.get(key) is remote
+            discard = False
+            async with self._lock:
+                if self._sessions.get(key) is remote:
+                    if ephemeral or not completed or not reusable:
+                        self._sessions.pop(key, None)
+                        discard = True
+                    else:
+                        remote.busy = False
+            if discard:
+                await self._discard_remote_session(node, remote, headers)
+
+    async def _acquire_remote_session(
+        self,
+        node: RemoteNodeResource,
+        *,
+        key: tuple[UUID, UUID],
+        model: str,
+        message_count: int,
+        headers: dict[str, str],
+    ) -> _RemoteSession:
+        stale: _RemoteSession | None = None
+        async with self._lock:
+            if not self._node_is_current_locked(node):
+                raise BackendError(
+                    "remote_node_retired",
+                    f"remote node changed before session acquisition: {node.name}",
+                    retryable=True,
+                    status_code=503,
+                )
+            remote = self._sessions.get(key)
+            if remote is not None and remote.busy:
+                raise BackendError(
+                    "remote_session_busy",
+                    "the remote session already has an active response",
+                    status_code=409,
+                )
+            if remote is not None and (
+                remote.node != node
+                or remote.synchronized_messages > message_count
             ):
                 self._sessions.pop(key, None)
-                await self._discard_remote_session(node, remote, headers)
+                stale = remote
+                remote = None
+            if remote is not None:
+                remote.busy = True
+                return remote
+
+        if stale is not None:
+            await self._discard_routed_session(stale)
+
+        created = await self._request_json(
+            node,
+            "POST",
+            "/api/v1/sessions",
+            {"model": model, "mode": "text"},
+            headers,
+        )
+        candidate = self._remote_session_from_payload(
+            node,
+            created,
+            synchronized_messages=0,
+            busy=True,
+        )
+        discard_candidate = True
+        displaced: _RemoteSession | None = None
+        acquisition_error: BackendError | None = None
+        try:
+            async with self._lock:
+                if not self._node_is_current_locked(node):
+                    acquisition_error = BackendError(
+                        "remote_node_retired",
+                        f"remote node changed during session acquisition: {node.name}",
+                        retryable=True,
+                        status_code=503,
+                    )
+                    remote = None
+                else:
+                    incumbent = self._sessions.get(key)
+                    if incumbent is None:
+                        self._sessions[key] = candidate
+                        remote = candidate
+                        discard_candidate = False
+                    elif incumbent.busy:
+                        acquisition_error = BackendError(
+                            "remote_session_busy",
+                            "the remote session already has an active response",
+                            status_code=409,
+                        )
+                        remote = None
+                    elif incumbent.node != node or (
+                        incumbent.synchronized_messages > message_count
+                    ):
+                        self._sessions[key] = candidate
+                        displaced = incumbent
+                        remote = candidate
+                        discard_candidate = False
+                    else:
+                        incumbent.busy = True
+                        remote = incumbent
+        except BaseException:
+            await self._discard_remote_session(node, candidate, headers)
+            raise
+
+        if discard_candidate:
+            await self._discard_remote_session(node, candidate, headers)
+        if displaced is not None:
+            await self._discard_routed_session(displaced)
+        if acquisition_error is not None:
+            raise acquisition_error
+        assert remote is not None
+        return remote
 
     async def _remote_session_stream(
         self,
@@ -691,16 +816,19 @@ class ClusterBackend:
             sessions = [
                 self._sessions.pop(key)
                 for key in list(self._sessions)
-                if key[0] == node.id
+                if key[0] == node.id and self._sessions[key].node == node
             ]
         if not sessions:
             return
+        for remote in sessions:
+            await self._discard_routed_session(remote)
+
+    async def _discard_routed_session(self, remote: _RemoteSession) -> None:
         try:
-            headers = self._headers(node)
+            headers = self._headers(remote.node)
         except BackendError:
             return
-        for remote in sessions:
-            await self._discard_remote_session(node, remote, headers)
+        await self._discard_remote_session(remote.node, remote, headers)
 
     async def _discard_remote_session(
         self,
@@ -894,37 +1022,73 @@ class ClusterBackend:
         return await self.refresh(force=force)
 
     async def fork_session(self, source_session_id: UUID, target_session_id: UUID) -> bool:
-        for node_id, state in list(self._states.items()):
-            source = self._sessions.get((node_id, source_session_id))
-            if source is not None:
-                created = await self._request_json(
-                    state.resource,
-                    "POST",
-                    f"/api/v1/sessions/{source.remote_id}/fork",
-                    {"include_message": True},
-                    self._headers(state.resource),
+        source: _RemoteSession | None = None
+        async with self._lock:
+            if not self._closed:
+                source = next(
+                    (
+                        remote
+                        for (node_id, local_id), remote in self._sessions.items()
+                        if local_id == source_session_id
+                        and node_id == remote.node.id
+                        and self._node_is_current_locked(remote.node)
+                    ),
+                    None,
                 )
-                self._sessions[(node_id, target_session_id)] = _RemoteSession(
-                    remote_id=UUID(created["id"]),
-                    revision=int(created["revision"]),
-                    synchronized_messages=source.synchronized_messages,
-                )
+        if source is not None:
+            headers = self._headers(source.node)
+            created = await self._request_json(
+                source.node,
+                "POST",
+                f"/api/v1/sessions/{source.remote_id}/fork",
+                {"include_message": True},
+                headers,
+            )
+            candidate = self._remote_session_from_payload(
+                source.node,
+                created,
+                synchronized_messages=source.synchronized_messages,
+            )
+            committed = False
+            already_present = False
+            try:
+                async with self._lock:
+                    current_source = self._sessions.get(
+                        (source.node.id, source_session_id)
+                    )
+                    target_key = (source.node.id, target_session_id)
+                    current_target = self._sessions.get(target_key)
+                    if (
+                        current_source is source
+                        and self._node_is_current_locked(source.node)
+                    ):
+                        if current_target is None:
+                            self._sessions[target_key] = candidate
+                            committed = True
+                        elif current_target.node == source.node:
+                            already_present = True
+            except BaseException:
+                await self._discard_remote_session(source.node, candidate, headers)
+                raise
+            if not committed:
+                await self._discard_remote_session(source.node, candidate, headers)
+            if committed or already_present:
                 return True
         return await self.local.fork_session(source_session_id, target_session_id)
 
     async def close_session(self, session_id: UUID) -> bool:
-        removed: list[tuple[_NodeState, _RemoteSession]] = []
-        for key in [item for item in self._sessions if item[1] == session_id]:
-            remote = self._sessions.pop(key, None)
-            state = self._states.get(key[0])
-            if remote is not None and state is not None:
-                removed.append((state, remote))
-        for state, remote in removed:
+        async with self._lock:
+            removed = [
+                self._sessions.pop(key)
+                for key in list(self._sessions)
+                if key[1] == session_id
+            ]
+        for remote in removed:
             response = await self._control_request(
-                state.resource,
+                remote.node,
                 "DELETE",
                 f"/api/v1/sessions/{remote.remote_id}",
-                headers=self._headers(state.resource),
+                headers=self._headers(remote.node),
             )
             if response.status_code not in {204, 404}:
                 raise BackendError(
@@ -936,17 +1100,18 @@ class ClusterBackend:
         return bool(removed) or await self.local.close_session(session_id)
 
     async def cancel_response(self, session_id: UUID) -> bool:
-        for (node_id, local_session_id), remote in list(self._sessions.items()):
-            if local_session_id != session_id:
-                continue
-            state = self._states.get(node_id)
-            if state is None:
-                continue
+        async with self._lock:
+            candidates = [
+                remote
+                for (_, local_session_id), remote in self._sessions.items()
+                if local_session_id == session_id
+            ]
+        for remote in candidates:
             response = await self._control_request(
-                state.resource,
+                remote.node,
                 "POST",
                 f"/api/v1/sessions/{remote.remote_id}/responses/cancel",
-                headers=self._headers(state.resource),
+                headers=self._headers(remote.node),
             )
             if response.status_code == 200:
                 return True

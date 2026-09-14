@@ -77,12 +77,19 @@ def test_serve_exposes_public_host_and_port_options(tmp_path: Path) -> None:
     assert defaults.access_log is True
     assert defaults.max_queued_requests_per_runtime is None
     assert defaults.max_runtime_memory is None
+    assert defaults.moe_gpu_cache_gb is None
     assert defaults.runtime_idle_timeout is None
     assert args.host == "0.0.0.0"
     assert args.port == 9001
     assert args.max_queued_requests_per_runtime == 7
     assert args.max_runtime_memory == 12 * 1024**3
     assert args.runtime_idle_timeout == 300
+
+
+def test_serve_accepts_an_explicit_expert_cache_budget() -> None:
+    args = _build_parser().parse_args(["serve", "--moe-gpu-cache-gb", "3.5"])
+
+    assert args.moe_gpu_cache_gb == 3.5
 
 
 def test_serve_accepts_an_empty_initial_model_catalog() -> None:
@@ -279,6 +286,20 @@ def test_native_metal_worker_receives_prefill_chunk_size(tmp_path: Path) -> None
     command = runtime.command(43123)
 
     assert command[command.index("--prefill-chunk-size") + 1] == "4096"
+
+
+def test_native_worker_receives_explicit_expert_cache_budget(tmp_path: Path) -> None:
+    runtime = NativeRuntime(
+        executable=tmp_path / "mfq-decode-metal",
+        model=tmp_path / "model.mfq",
+        model_name="model",
+        backend="metal",
+        moe_gpu_cache_gb=0.0,
+    )
+
+    command = runtime.command(43123)
+
+    assert command[command.index("--moe-gpu-cache-gb") + 1] == "0.0"
 
 
 def test_native_metal_worker_finds_release_resources(tmp_path: Path) -> None:

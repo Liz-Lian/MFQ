@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import socket
 import struct
@@ -302,6 +303,7 @@ class NativeRuntime:
     prefill_chunk_size: int = 2048
     continuous_batching: int = 0
     routed_expert_bytes: int = 0
+    moe_gpu_cache_gb: float | None = None
     startup_timeout: float = 1800.0
     environment: Mapping[str, str] | None = None
     architecture: str = ""
@@ -320,10 +322,18 @@ class NativeRuntime:
             raise NativeRuntimeError("continuous batching must be non-negative")
         if self.continuous_batching > 0 and self.backend != "cuda":
             raise NativeRuntimeError("continuous batching currently requires CUDA")
+        if self.moe_gpu_cache_gb is not None and (
+            not math.isfinite(self.moe_gpu_cache_gb) or self.moe_gpu_cache_gb < 0
+        ):
+            raise NativeRuntimeError("MoE expert cache size must be finite and non-negative")
         route = resolve_runtime_route(self.architecture, self.model)
         if route.python_mlx_worker:
             if self.backend != "metal":
                 raise NativeRuntimeError("the Python MLX worker currently requires Metal")
+            if self.moe_gpu_cache_gb not in (None, 0):
+                raise NativeRuntimeError(
+                    "the Python MLX worker does not support SSD-streamed experts"
+                )
             return python_mlx_runtime_command(
                 self.controller_command,
                 model=self.model,
@@ -359,6 +369,8 @@ class NativeRuntime:
             command.extend(
                 ["--continuous-batching", str(request_capacity)]
             )
+        if self.moe_gpu_cache_gb is not None:
+            command.extend(["--moe-gpu-cache-gb", str(self.moe_gpu_cache_gb)])
         command.extend(native_tokenizer_arguments(self.model))
         return command
 

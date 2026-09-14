@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import socket
 import subprocess
 import time
@@ -303,8 +304,7 @@ class ManagedRuntimePool:
         process: subprocess.Popen[bytes],
         backend: ChatBackend,
         port: int,
-        context_size: int,
-        prefill_chunk_size: int = 2048,
+        load_request: ModelLoadRequest,
     ) -> UUID:
         """Register a ready process started before the server event loop exists."""
 
@@ -335,25 +335,35 @@ class ManagedRuntimePool:
             routed_expert_bytes=artifact.routed_expert_bytes,
             requested=self.max_requests_per_instance,
         )
+        canonical_request = load_request.model_copy(
+            update={"model": artifact.resource.name}
+        )
         instance = _ManagedRuntime(
             id=uuid4(),
             artifact=artifact,
             process=process,
             backend=backend,
             port=port,
-            context_size=context_size,
+            context_size=canonical_request.context_size,
+            sampling_defaults=canonical_request.sampling_defaults,
             state=RuntimeInstanceState.READY,
             last_used_at=datetime.now(timezone.utc),
-            idle_ttl_seconds=self.default_idle_ttl_seconds,
+            idle_ttl_seconds=(
+                canonical_request.idle_ttl_seconds
+                if canonical_request.idle_ttl_seconds is not None
+                else self.default_idle_ttl_seconds
+            ),
+            pinned=canonical_request.pin,
             request_slots=asyncio.Semaphore(request_capacity),
             request_capacity=request_capacity,
+            reserved_bytes=self._estimated_load_bytes(
+                artifact,
+                canonical_request,
+                runtime_route=runtime_route,
+            ),
         )
         self._instances[instance.id] = instance
-        self._load_requests[artifact.resource.name] = ModelLoadRequest(
-            model=artifact.resource.name,
-            context_size=context_size,
-            prefill_chunk_size=prefill_chunk_size,
-        )
+        self._load_requests[artifact.resource.name] = canonical_request
         self._last_instance_id = instance.id
         return instance.id
 
@@ -399,8 +409,17 @@ class ManagedRuntimePool:
                 "runtime_launcher_missing",
                 "the Python MLX worker has no MFQ CLI launcher",
             )
+        if python_mlx_worker and request.moe_gpu_cache_gb not in (None, 0):
+            raise _job_error(
+                "unsupported_runtime_option",
+                "the Python MLX worker does not support SSD-streamed experts",
+            )
         model_name = artifact.resource.name
-        incoming_bytes = self._estimated_load_bytes(artifact, request)
+        incoming_bytes = self._estimated_load_bytes(
+            artifact,
+            request,
+            runtime_route=runtime_route,
+        )
         async with self._lock:
             if self._closed:
                 raise RuntimeManagementError("runtime pool is closed")
@@ -1910,6 +1929,7 @@ class ManagedRuntimePool:
             "runtime_model_too_large": 413,
             "runtime_revision_busy": 409,
             "unsupported_device": 422,
+            "unsupported_runtime_option": 422,
             "runtime_identity_mismatch": 502,
         }
         return BackendError(
@@ -1943,17 +1963,40 @@ class ManagedRuntimePool:
             if name not in resident_names
         )
 
-    @staticmethod
     def _estimated_load_bytes(
+        self,
         artifact: DiscoveredModel,
         request: ModelLoadRequest,
+        *,
+        runtime_route: RuntimeRoute | None = None,
     ) -> int:
         total_bytes = artifact.resource.total_bytes
         cache_gb = request.moe_gpu_cache_gb
         streamed_bytes = artifact.routed_expert_bytes
-        if cache_gb is None or cache_gb <= 0 or streamed_bytes <= 0:
+        if streamed_bytes <= 0:
             return total_bytes
-        cache_bytes = int(cache_gb * (1 << 30))
+        route = runtime_route or resolve_runtime_route(
+            artifact.resource.architecture,
+            artifact.path,
+        )
+        if route.python_mlx_worker:
+            return total_bytes
+        if cache_gb is None:
+            if self.backend != "metal" or artifact.resource.format != "hf":
+                return total_bytes
+            try:
+                physical_bytes = int(os.sysconf("SC_PHYS_PAGES")) * int(
+                    os.sysconf("SC_PAGE_SIZE")
+                )
+            except (AttributeError, OSError, TypeError, ValueError):
+                # Conservatively reserve the complete model when the host
+                # cannot reproduce the native Metal worker's automatic budget.
+                return total_bytes
+            cache_bytes = max(1 << 30, physical_bytes * 2 // 3)
+        elif cache_gb <= 0:
+            return total_bytes
+        else:
+            cache_bytes = int(cache_gb * (1 << 30))
         resident_expert_bytes = min(streamed_bytes, cache_bytes)
         return total_bytes - streamed_bytes + resident_expert_bytes
 

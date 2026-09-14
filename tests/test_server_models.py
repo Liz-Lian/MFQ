@@ -31,6 +31,7 @@ from mfq.server.catalog import (
 from mfq.server.jobs import JobExecutionError
 from mfq.server.models import (
     JobStatus,
+    ModelArtifactResource,
     ModelLoadRequest,
     RuntimeCapabilitiesResource,
     RuntimeInstanceState,
@@ -309,7 +310,8 @@ def test_catalog_tracks_streamable_routed_expert_bytes(tmp_path: Path) -> None:
             model=artifact.resource.name,
             moe_gpu_cache_gb=1 / (1 << 30),
         )
-        estimated = ManagedRuntimePool._estimated_load_bytes(artifact, request)
+        pool = ManagedRuntimePool(ModelCatalog([tmp_path]), tmp_path / "runtime")
+        estimated = pool._estimated_load_bytes(artifact, request)
         assert estimated == (
             artifact.resource.total_bytes - artifact.routed_expert_bytes + 1
         )
@@ -323,6 +325,85 @@ def test_catalog_tracks_streamable_routed_expert_bytes(tmp_path: Path) -> None:
             reserved_bytes=estimated,
         )
         assert ManagedRuntimePool._committed_runtime_bytes(runtime) == estimated
+
+    asyncio.run(run())
+
+
+def test_native_hf_metal_auto_streaming_reserves_its_expert_cache(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = tmp_path / "native-hf"
+    model.mkdir()
+    artifact = DiscoveredModel(
+        resource=ModelArtifactResource(
+            id="1" * 32,
+            name="native-hf",
+            architecture="qwen4-exp-hf-full-mfq",
+            format="hf",
+            shard_count=1,
+            total_bytes=10 << 30,
+            tensor_count=1,
+            record_count=2,
+            complete=True,
+            loadable=True,
+            modified_at=datetime.now(timezone.utc),
+        ),
+        path=model,
+        routed_expert_bytes=8 << 30,
+    )
+    values = {"SC_PHYS_PAGES": 6, "SC_PAGE_SIZE": 1 << 30}
+    monkeypatch.setattr(
+        "mfq.server.runtime_pool.os.sysconf",
+        lambda name: values[name],
+    )
+    request = ModelLoadRequest(model="native-hf")
+    route = RuntimeRoute(architecture_family="qwen4_exp", backbone="qwen4_exp")
+
+    metal = ManagedRuntimePool(ModelCatalog([tmp_path]), tmp_path / "runtime")
+    cuda = ManagedRuntimePool(
+        ModelCatalog([tmp_path]),
+        tmp_path / "runtime",
+        backend="cuda",
+    )
+
+    assert metal._estimated_load_bytes(
+        artifact,
+        request,
+        runtime_route=route,
+    ) == 6 << 30
+    assert cuda._estimated_load_bytes(
+        artifact,
+        request,
+        runtime_route=route,
+    ) == 10 << 30
+
+
+def test_python_worker_estimate_never_claims_native_expert_streaming(
+    tmp_path: Path,
+) -> None:
+    model = tmp_path / "python-worker.mfq"
+    _model(model)
+
+    async def run() -> None:
+        artifact = await ModelCatalog([tmp_path], cache_seconds=0).resolve_path(model)
+        artifact = DiscoveredModel(
+            resource=artifact.resource,
+            path=artifact.path,
+            routed_expert_bytes=max(1, artifact.resource.total_bytes // 2),
+        )
+        pool = ManagedRuntimePool(ModelCatalog([tmp_path]), tmp_path / "runtime")
+        request = ModelLoadRequest(model="python-worker", moe_gpu_cache_gb=1)
+
+        assert pool._estimated_load_bytes(
+            artifact,
+            request,
+            runtime_route=RuntimeRoute(
+                architecture_family="glm5_next",
+                backbone="glm5_next",
+                python_mlx_worker=True,
+            ),
+        ) == artifact.resource.total_bytes
 
     asyncio.run(run())
 
@@ -2223,7 +2304,15 @@ def test_started_runtime_is_registered_in_the_instances_api(tmp_path: Path) -> N
             process=process,
             backend=IdleBackend(),
             port=43123,
-            context_size=8192,
+            load_request=ModelLoadRequest(
+                model="initial",
+                context_size=8192,
+                prefill_chunk_size=333,
+                moe_gpu_cache_gb=0,
+                prefix_cache_disk_bytes=1234,
+                idle_ttl_seconds=120,
+                pin=True,
+            ),
         )
         store = SessionStore(tmp_path / "mfq.server.sqlite3")
         service = ServerService(
@@ -2243,6 +2332,8 @@ def test_started_runtime_is_registered_in_the_instances_api(tmp_path: Path) -> N
                 assert instances[0]["model"] == "initial"
                 assert instances[0]["state"] == "ready"
                 assert instances[0]["context_size"] == 8192
+                assert instances[0]["idle_ttl_seconds"] == 120
+                assert instances[0]["pinned"] is True
                 assert instances[0]["resident_bytes"] > 0
 
                 models = await client.get("/api/v1/runtime/models")
@@ -2253,6 +2344,10 @@ def test_started_runtime_is_registered_in_the_instances_api(tmp_path: Path) -> N
                 assert visible[0]["id"] != str(instances[0]["id"])
                 assert visible[0]["instance_id"] == str(instance_id)
                 assert visible[0]["instance_id"] == str(instances[0]["id"])
+                remembered = pool._load_requests["initial"]
+                assert remembered.prefill_chunk_size == 333
+                assert remembered.moe_gpu_cache_gb == 0
+                assert remembered.prefix_cache_disk_bytes == 1234
         assert process.poll() is not None
 
     asyncio.run(run())
@@ -2274,7 +2369,7 @@ def test_runtime_models_uses_catalog_name_when_no_alias_is_configured(tmp_path: 
             process=process,
             backend=IdleBackend(),
             port=43123,
-            context_size=8192,
+            load_request=ModelLoadRequest(model="catalog-name", context_size=8192),
         )
         duplicate = DiscoveredModel(
             resource=artifact.resource.model_copy(update={"id": "f" * 32}),
@@ -2289,7 +2384,10 @@ def test_runtime_models_uses_catalog_name_when_no_alias_is_configured(tmp_path: 
                     process=process,
                     backend=IdleBackend(),
                     port=43124,
-                    context_size=8192,
+                    load_request=ModelLoadRequest(
+                        model="catalog-name",
+                        context_size=8192,
+                    ),
                 )
             models = await pool.runtime_models()
             assert models["data"] == [
@@ -2327,7 +2425,7 @@ def test_started_runtime_monitor_reports_abnormal_exit(tmp_path: Path) -> None:
             process=process,
             backend=IdleBackend(),
             port=43123,
-            context_size=8192,
+            load_request=ModelLoadRequest(model="initial", context_size=8192),
         )
         session_id = uuid4()
         pool._session_routes[session_id] = instance_id

@@ -45,6 +45,13 @@ def _positive_float(value: str) -> float:
     return parsed
 
 
+def _nonnegative_float(value: str) -> float:
+    parsed = float(value)
+    if not math.isfinite(parsed) or parsed < 0:
+        raise argparse.ArgumentTypeError("value must be non-negative")
+    return parsed
+
+
 def _byte_size(value: str) -> int:
     text = value.strip().lower()
     multipliers = {
@@ -230,6 +237,7 @@ def _run(args: argparse.Namespace) -> int:
     from mfq.server.cluster import ClusterBackend
     from mfq.server.components import VoiceOutputComponent
     from mfq.server.jobs import JobManager
+    from mfq.server.models import ModelLoadRequest
     from mfq.server.native import NativeRuntime
     from mfq.server.runtime_pool import ManagedRuntimePool
     from mfq.server.service import ServerService
@@ -292,12 +300,22 @@ def _run(args: argparse.Namespace) -> int:
         )
         if model is not None:
             initial_artifact = asyncio.run(catalog.resolve_path(model))
+            initial_request = ModelLoadRequest(
+                model=initial_artifact.resource.name,
+                context_size=args.context_size or 32768,
+                prefill_chunk_size=args.prefill_chunk_size,
+                moe_gpu_cache_gb=args.moe_gpu_cache_gb,
+                prefix_cache_enabled=not args.no_prefix_cache,
+                prefix_cache_disk_bytes=args.prefix_cache_disk_size,
+                prefix_cache_hot_bytes=args.prefix_cache_hot_size,
+                prefix_cache_block_tokens=args.prefix_cache_block_tokens,
+            )
             runtime = NativeRuntime(
                 executable=executable,
                 model=model,
                 model_name=initial_artifact.resource.name,
                 backend=selected_backend,
-                context_size=args.context_size,
+                context_size=initial_request.context_size,
                 prefill_chunk_size=args.prefill_chunk_size,
                 continuous_batching=(
                     args.max_requests_per_runtime
@@ -306,6 +324,7 @@ def _run(args: argparse.Namespace) -> int:
                     else 0
                 ),
                 routed_expert_bytes=initial_artifact.routed_expert_bytes,
+                moe_gpu_cache_gb=initial_request.moe_gpu_cache_gb,
                 startup_timeout=args.runtime_startup_timeout,
                 environment=runtime_environment,
                 architecture=initial_artifact.resource.architecture,
@@ -324,8 +343,7 @@ def _run(args: argparse.Namespace) -> int:
                     model_type=initial_artifact.resource.architecture,
                 ),
                 port=runtime.port,
-                context_size=args.context_size,
-                prefill_chunk_size=args.prefill_chunk_size,
+                load_request=initial_request,
             )
         store = SessionStore(args.db.expanduser().resolve())
         backend = ClusterBackend(runtime_manager, store)
@@ -409,6 +427,14 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
     )
     parser.add_argument("--context-size", type=_nonnegative_int, default=0)
     parser.add_argument("--prefill-chunk-size", type=_positive_int, default=2048)
+    parser.add_argument(
+        "--moe-gpu-cache-gb",
+        type=_nonnegative_float,
+        help=(
+            "resident routed-expert cache in GiB; zero keeps experts resident, "
+            "while native HF Metal models otherwise choose an automatic budget"
+        ),
+    )
     parser.add_argument(
         "--prefix-cache-dir",
         type=Path,

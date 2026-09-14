@@ -929,12 +929,26 @@ private:
             prompt.begin(),
             prompt.begin() + static_cast<std::ptrdiff_t>(
                 match.matched_tokens));
+        std::optional<SessionState> decoded;
         try {
-            auto state = Codec::decode(
+            decoded.emplace(Codec::decode(
                 payloads,
                 matched_tokens,
-                paged_cache_->block_size_tokens());
-            runtime.restore_text_session_state(std::move(state));
+                paged_cache_->block_size_tokens()));
+        } catch (const std::exception& error) {
+            if (!match.blocks.empty()) {
+                paged_cache_->invalidate(match.blocks.back());
+            }
+            reset_runtime(runtime);
+            std::cerr
+                << "server_session_cache backend=metal "
+                << "action=paged_codec_invalidate "
+                << "session=" << requested_session
+                << " error=" << error.what() << std::endl;
+            return 0;
+        }
+        try {
+            runtime.restore_text_session_state(std::move(*decoded));
             if (!requested_session.empty()) {
                 bind_paged_session(
                     requested_session, match.blocks, match.matched_tokens);
@@ -951,7 +965,7 @@ private:
         } catch (const std::exception& error) {
             reset_runtime(runtime);
             std::cerr
-                << "server_session_cache backend=metal action=paged_invalidate "
+                << "server_session_cache backend=metal action=paged_restore_failed "
                 << "session=" << requested_session
                 << " error=" << error.what() << std::endl;
             return 0;

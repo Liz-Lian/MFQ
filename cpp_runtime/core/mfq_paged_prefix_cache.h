@@ -99,6 +99,11 @@ public:
     std::vector<PagedPrefixPayload> load_prefix(
         const std::vector<BlockHash>& blocks);
 
+    // Remove a block that passed file-integrity checks but failed the
+    // runtime codec's semantic validation. This rare path waits for an
+    // in-flight write of the same content-addressed block to settle first.
+    bool invalidate(const BlockHash& block);
+
     void pin(const std::vector<BlockHash>& blocks);
     void unpin(const std::vector<BlockHash>& blocks);
     // Reclaim the RAM tier without deleting durable SSD blocks or breaking

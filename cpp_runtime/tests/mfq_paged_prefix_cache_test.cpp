@@ -245,6 +245,31 @@ int main() try {
             "compatibility namespace isolation failed");
     }
 
+    const auto semantic_root = temporary_directory();
+    {
+        PagedPrefixCache cache(PagedPrefixCacheConfig{
+            semantic_root,
+            "semantic-invalidation",
+            4,
+            0,
+            64,
+            2,
+        });
+        const auto block = cache.store(
+            BlockHash{}, tokens.data(), 4, payload({1, 3, 5, 7}));
+        require(cache.match(tokens).matched_tokens == 4,
+                "hot-only block was not indexed");
+        require(cache.invalidate(block),
+                "semantic invalidation did not remove the block");
+        require(cache.match(tokens).matched_tokens == 0,
+                "semantically invalid block remained matchable");
+        require(!cache.invalidate(block),
+                "semantic invalidation reported a missing block");
+        require(cache.metrics().corrupt_blocks == 1,
+                "semantic invalidation metric was not stable");
+    }
+    std::filesystem::remove_all(semantic_root);
+
     {
         const auto header_root = root / "header-chain-validation";
         const std::vector<std::int64_t> header_tokens{61, 62, 63, 64};

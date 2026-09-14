@@ -728,6 +728,14 @@ public:
         }
     }
 
+    bool invalidate(const BlockHash& hash) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        writes_finished_.wait(lock, [this] {
+            return writes_.empty() && active_writes_ == 0;
+        });
+        return erase_corrupt_locked(hash);
+    }
+
     void pin(const std::vector<BlockHash>& blocks) {
         std::lock_guard<std::mutex> lock(mutex_);
         for (const auto& block : blocks) {
@@ -1164,20 +1172,27 @@ private:
         return before - hot_bytes_;
     }
 
-    void erase_corrupt_locked(const BlockHash& hash) {
+    bool erase_corrupt_locked(const BlockHash& hash) {
+        bool removed = false;
         auto found = disk_.find(hash);
-        if (found == disk_.end()) return;
-        std::error_code error;
-        std::filesystem::remove(found->second.path, error);
-        disk_bytes_ -= found->second.file_bytes;
-        disk_.erase(found);
+        if (found != disk_.end()) {
+            std::error_code error;
+            std::filesystem::remove(found->second.path, error);
+            disk_bytes_ -= found->second.file_bytes;
+            disk_.erase(found);
+            removed = true;
+        }
         auto hot = hot_.find(hash);
         if (hot != hot_.end()) {
             hot_bytes_ -= hot->second.payload->size();
             hot_.erase(hot);
+            removed = true;
         }
-        ++metrics_.corrupt_blocks;
-        sync_metrics_locked();
+        if (removed) {
+            ++metrics_.corrupt_blocks;
+            sync_metrics_locked();
+        }
+        return removed;
     }
 
     void release_disk_read_pins_locked(
@@ -1326,6 +1341,10 @@ std::optional<std::vector<std::uint8_t>> PagedPrefixCache::load(
 std::vector<PagedPrefixPayload> PagedPrefixCache::load_prefix(
     const std::vector<BlockHash>& blocks) {
     return implementation_->load_prefix(blocks);
+}
+
+bool PagedPrefixCache::invalidate(const BlockHash& block) {
+    return implementation_->invalidate(block);
 }
 
 void PagedPrefixCache::pin(const std::vector<BlockHash>& blocks) {

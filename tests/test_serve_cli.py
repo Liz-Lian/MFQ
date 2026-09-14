@@ -77,6 +77,7 @@ def test_serve_exposes_public_host_and_port_options(tmp_path: Path) -> None:
     assert defaults.access_log is True
     assert defaults.max_queued_requests_per_runtime is None
     assert defaults.max_runtime_memory is None
+    assert defaults.no_memory_guard is False
     assert defaults.moe_gpu_cache_gb is None
     assert defaults.runtime_idle_timeout is None
     assert args.host == "0.0.0.0"

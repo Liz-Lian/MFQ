@@ -86,6 +86,40 @@ def test_empty_runtime_pool_reports_an_idle_server() -> None:
     asyncio.run(run())
 
 
+def test_metal_runtime_pool_derives_a_safe_default_memory_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    values = {"SC_PHYS_PAGES": 128, "SC_PAGE_SIZE": 1 << 30}
+    monkeypatch.setattr(
+        "mfq.server.runtime_pool.os.sysconf",
+        lambda name: values[name],
+    )
+
+    automatic = ManagedRuntimePool(ModelCatalog([]), "runtime", backend="metal")
+    disabled = ManagedRuntimePool(
+        ModelCatalog([]),
+        "runtime",
+        backend="metal",
+        automatic_memory_budget=False,
+    )
+    explicit = ManagedRuntimePool(
+        ModelCatalog([]),
+        "runtime",
+        backend="metal",
+        max_runtime_memory_bytes=100 << 30,
+    )
+    cuda = ManagedRuntimePool(ModelCatalog([]), "runtime", backend="cuda")
+
+    assert automatic.max_runtime_memory_bytes == 122 << 30
+    assert automatic.automatic_memory_budget is True
+    assert disabled.max_runtime_memory_bytes is None
+    assert disabled.automatic_memory_budget is False
+    assert explicit.max_runtime_memory_bytes == 100 << 30
+    assert explicit.automatic_memory_budget is False
+    assert cuda.max_runtime_memory_bytes is None
+    assert cuda.automatic_memory_budget is False
+
+
 def test_startup_models_use_the_managed_load_path(tmp_path: Path) -> None:
     async def run() -> None:
         model = tmp_path / "startup.mfq"
@@ -485,6 +519,60 @@ def test_python_worker_estimate_never_claims_native_expert_streaming(
     asyncio.run(run())
 
 
+def test_oversized_mfq_moe_gets_an_automatic_metal_expert_budget(
+    tmp_path: Path,
+) -> None:
+    model = tmp_path / "oversized.mfq"
+    _model(model)
+    artifact = DiscoveredModel(
+        resource=ModelArtifactResource(
+            id="2" * 32,
+            name="oversized",
+            architecture="qwen4-exp-mfq",
+            format="mfq",
+            shard_count=1,
+            total_bytes=125 << 30,
+            tensor_count=1,
+            record_count=2,
+            complete=True,
+            loadable=True,
+            modified_at=datetime.now(timezone.utc),
+        ),
+        path=model,
+        routed_expert_bytes=110 << 30,
+    )
+    route = RuntimeRoute(architecture_family="qwen4_exp", backbone="qwen4_exp")
+    pool = ManagedRuntimePool(
+        ModelCatalog([tmp_path]),
+        tmp_path / "runtime",
+        max_runtime_memory_bytes=96 << 30,
+    )
+
+    automatic = pool._apply_automatic_expert_residency(
+        artifact,
+        ModelLoadRequest(model="oversized"),
+        runtime_route=route,
+    )
+    full_resident = pool._apply_automatic_expert_residency(
+        artifact,
+        ModelLoadRequest(model="oversized", moe_gpu_cache_gb=0),
+        runtime_route=route,
+    )
+
+    assert automatic.moe_gpu_cache_gb == 77
+    assert pool._estimated_load_bytes(
+        artifact,
+        automatic,
+        runtime_route=route,
+    ) == 92 << 30
+    assert full_resident.moe_gpu_cache_gb == 0
+    assert pool._estimated_load_bytes(
+        artifact,
+        full_resident,
+        runtime_route=route,
+    ) == 125 << 30
+
+
 def test_catalog_loads_registered_external_mfq_files(tmp_path: Path) -> None:
     async def run() -> None:
         model_dir = tmp_path / "catalog"
@@ -659,9 +747,16 @@ def test_empty_runtime_pool_reports_idle_state(tmp_path: Path) -> None:
     async def run() -> None:
         model_dir = tmp_path / "models"
         model_dir.mkdir()
-        pool = ManagedRuntimePool(ModelCatalog([model_dir]), tmp_path / "runtime")
+        pool = ManagedRuntimePool(
+            ModelCatalog([model_dir]),
+            tmp_path / "runtime",
+            automatic_memory_budget=False,
+        )
 
         assert await pool.runtime_status() == {
+            "runtime_memory_budget_bytes": None,
+            "runtime_memory_budget_mode": "disabled",
+            "runtime_memory_committed_bytes": 0,
             "runtime_state": "idle",
             "model": None,
             "active_requests": 0,

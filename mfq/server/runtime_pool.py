@@ -209,6 +209,7 @@ class ManagedRuntimePool:
         runtime_environment: dict[str, str] | None = None,
         controller_command: Sequence[str] = (),
         startup_loads: Sequence[ModelLoadRequest] = (),
+        automatic_memory_budget: bool = True,
     ) -> None:
         if max_instances < 1:
             raise ValueError("max_instances must be positive")
@@ -236,7 +237,13 @@ class ManagedRuntimePool:
             if max_queued_requests_per_instance is None
             else max_queued_requests_per_instance
         )
-        self.max_runtime_memory_bytes = max_runtime_memory_bytes
+        automatic_budget = (
+            self._default_runtime_memory_budget(backend)
+            if automatic_memory_budget and max_runtime_memory_bytes is None
+            else None
+        )
+        self.max_runtime_memory_bytes = max_runtime_memory_bytes or automatic_budget
+        self.automatic_memory_budget = automatic_budget is not None
         self.default_idle_ttl_seconds = default_idle_ttl_seconds
         self.load_failure_cooldown_seconds = load_failure_cooldown_seconds
         self.metric_interval_seconds = max(0.25, metric_interval_seconds)
@@ -267,6 +274,25 @@ class ManagedRuntimePool:
         self._background_tasks: set[asyncio.Task[Any]] = set()
         self._lease_release_tasks: set[asyncio.Task[None]] = set()
         self._closed = False
+
+    @staticmethod
+    def _default_runtime_memory_budget(backend: str) -> int | None:
+        """Return a conservative automatic residency ceiling for Metal."""
+
+        if backend != "metal":
+            return None
+        try:
+            total_bytes = int(os.sysconf("SC_PHYS_PAGES")) * int(
+                os.sysconf("SC_PAGE_SIZE")
+            )
+        except (AttributeError, OSError, TypeError, ValueError):
+            return None
+        if total_bytes <= 0:
+            return None
+        reserve = 4 << 30 if total_bytes < 24 << 30 else 6 << 30
+        if total_bytes <= reserve:
+            return max(1, total_bytes * 3 // 4)
+        return total_bytes - reserve
 
     async def start(self) -> None:
         """Start lifecycle monitors and configured startup models."""
@@ -411,6 +437,11 @@ class ManagedRuntimePool:
         runtime_route = resolve_runtime_route(
             artifact.resource.architecture,
             artifact.path,
+        )
+        request = self._apply_automatic_expert_residency(
+            artifact,
+            request,
+            runtime_route=runtime_route,
         )
         python_mlx_worker = runtime_route.python_mlx_worker
         request_capacity = native_request_capacity(
@@ -1182,6 +1213,18 @@ class ManagedRuntimePool:
         self,
         instance_id: UUID | None = None,
     ) -> dict[str, Any]:
+        async with self._lock:
+            memory_status = {
+                "runtime_memory_budget_bytes": self.max_runtime_memory_bytes,
+                "runtime_memory_budget_mode": (
+                    "automatic"
+                    if self.automatic_memory_budget
+                    else "explicit"
+                    if self.max_runtime_memory_bytes is not None
+                    else "disabled"
+                ),
+                "runtime_memory_committed_bytes": self._committed_pool_bytes_locked(),
+            }
         async with self._runtime_control_lease(
             instance_id,
             allow_unready=True,
@@ -1191,6 +1234,7 @@ class ManagedRuntimePool:
                 RuntimeInstanceState.BUSY,
             }:
                 return {
+                    **memory_status,
                     "instance_id": str(instance.id),
                     "runtime_state": instance.state.value,
                     "model": instance.artifact.resource.name,
@@ -1205,6 +1249,7 @@ class ManagedRuntimePool:
                 }
             if backend is None:
                 return {
+                    **memory_status,
                     "runtime_state": "idle",
                     "model": None,
                     "active_requests": 0,
@@ -1215,6 +1260,7 @@ class ManagedRuntimePool:
                     "reloading": False,
                 }
             status = dict(await backend.runtime_status())
+            status.update(memory_status)
             if instance is not None:
                 status["instance_id"] = str(instance.id)
                 status["runtime_state"] = instance.state.value
@@ -2026,6 +2072,46 @@ class ManagedRuntimePool:
             cache_bytes = int(cache_gb * (1 << 30))
         resident_expert_bytes = min(streamed_bytes, cache_bytes)
         return total_bytes - streamed_bytes + resident_expert_bytes
+
+    def _apply_automatic_expert_residency(
+        self,
+        artifact: DiscoveredModel,
+        request: ModelLoadRequest,
+        *,
+        runtime_route: RuntimeRoute,
+    ) -> ModelLoadRequest:
+        """Fit an oversized native MFQ MoE into the Metal residency budget."""
+
+        ceiling = self.max_runtime_memory_bytes
+        if (
+            request.moe_gpu_cache_gb is not None
+            or self.backend != "metal"
+            or ceiling is None
+            or artifact.resource.format != "mfq"
+            or artifact.routed_expert_bytes <= 0
+            or artifact.resource.total_bytes <= ceiling
+            or runtime_route.python_mlx_worker
+        ):
+            return request
+        dense_bytes = max(
+            0,
+            artifact.resource.total_bytes - artifact.routed_expert_bytes,
+        )
+        runtime_headroom = min(
+            4 << 30,
+            max(1 << 30, ceiling // 20),
+        )
+        resident_expert_bytes = min(
+            artifact.routed_expert_bytes,
+            max(0, ceiling - runtime_headroom - dense_bytes),
+        )
+        if resident_expert_bytes <= 0:
+            return request
+        return request.model_copy(
+            update={
+                "moe_gpu_cache_gb": resident_expert_bytes / float(1 << 30),
+            }
+        )
 
     @staticmethod
     def _observed_runtime_bytes(

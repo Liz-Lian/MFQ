@@ -258,6 +258,9 @@ export interface RuntimeStatus {
   context_capacity?: number;
   reloading?: boolean;
   process_resident_bytes?: number | null;
+  runtime_memory_budget_bytes?: number | null;
+  runtime_memory_budget_mode?: "automatic" | "explicit" | "disabled";
+  runtime_memory_committed_bytes?: number;
   mlx_active_bytes?: number;
   mlx_cache_bytes?: number;
   mlx_peak_bytes?: number;

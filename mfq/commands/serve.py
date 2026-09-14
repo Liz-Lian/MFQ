@@ -292,6 +292,9 @@ def _run(args: argparse.Namespace) -> int:
         max_requests_per_instance=args.max_requests_per_runtime,
         max_queued_requests_per_instance=args.max_queued_requests_per_runtime,
         max_runtime_memory_bytes=args.max_runtime_memory or None,
+        automatic_memory_budget=(
+            not args.no_memory_guard and args.max_runtime_memory is None
+        ),
         default_idle_ttl_seconds=args.runtime_idle_timeout,
         backend=selected_backend,
         voice_component=voice_component,
@@ -437,6 +440,11 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
         "--max-runtime-memory",
         type=_byte_size,
         help="aggregate resident-model admission budget, such as 96G",
+    )
+    parser.add_argument(
+        "--no-memory-guard",
+        action="store_true",
+        help="disable the automatic Metal model-residency budget",
     )
     parser.add_argument(
         "--runtime-idle-timeout",

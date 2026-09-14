@@ -38,8 +38,12 @@ def test_cuda_server_prefill_is_bounded_for_serial_mtp_and_batched_paths():
     assert "server_prefill_tail(" in DECODE
     assert "server_hidden_forward_chunked(" in DECODE
     assert "prefill_chunk_size_" in BATCHING
-    assert "offset += prefill_chunk_size_" in BATCHING
+    assert "std::optional<QwenBatchState> prefill_state" in BATCHING
+    assert "advance_prefills(incoming, contended)" in BATCHING
+    assert "request->prefill_offset += count" in BATCHING
+    assert "active_.size() + prefilling_.size()" in BATCHING
     assert "continuous_batching_prefill_chunks" in BATCHING
+    assert "continuous_batching_prefill_yields" in BATCHING
 
 
 def test_scheduler_supports_dynamic_join_retire_and_per_request_sampling():
@@ -75,7 +79,7 @@ def test_scheduler_supports_dynamic_join_retire_and_per_request_sampling():
 def test_scheduler_services_decode_before_contended_prefill_admission():
     decode_first = "if (decode_was_active) decode_active();"
     limited_join = "? size_t{1}"
-    admission = "admit_requests(incoming);"
+    admission = "advance_prefills(incoming, contended);"
     assert decode_first in BATCHING
     assert limited_join in BATCHING
     assert BATCHING.index(decode_first) < BATCHING.index(admission)

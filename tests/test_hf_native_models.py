@@ -336,6 +336,29 @@ def test_deepseek_v41_without_hf_template_uses_processor_bootstrap(
     )
 
 
+def test_processor_bootstrap_covers_text_variant_config(
+    tmp_path: Path,
+) -> None:
+    model = tmp_path / "DeepSeek-V4-Source-Identity-Test"
+    _hf_fixture(model, model_type="deepseek_v4", tensor_name="embed.weight")
+    config_path = model / "config.json"
+    config = json.loads(config_path.read_text())
+    config["model_type"] = "deepseek_v4_text"
+    config["architectures"] = ["DeepseekV4ForCausalLM"]
+    config_path.write_text(json.dumps(config))
+    tokenizer_config_path = model / "tokenizer_config.json"
+    tokenizer_config = json.loads(tokenizer_config_path.read_text())
+    tokenizer_config.pop("chat_template")
+    tokenizer_config_path.write_text(json.dumps(tokenizer_config))
+
+    tokenizer = ensure_hf_tokenizer_gguf(model, tmp_path / "cache")
+    reader = GGUFReader(tokenizer, "r")
+
+    assert reader.get_field("tokenizer.chat_template").contents() == (
+        DEEPSEEK_V4_CHAT_TEMPLATE
+    )
+
+
 def test_native_hf_uses_standalone_chat_template_and_fingerprints_it(
     tmp_path: Path,
 ) -> None:

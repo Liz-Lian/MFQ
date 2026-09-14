@@ -2,44 +2,12 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from collections.abc import Sequence
 from typing import Any
 
-from mfq.server.capabilities import (
-    capabilities_for_architecture,
-    normalize_architecture,
-)
-from mfq.server.deepseek_v4_prompt import render_deepseek_v4_prompt
-from mfq.server.deepseek_v41_prompt import render_deepseek_v41_prompt
 from mfq.server.models import ResponseFormat, ToolChoice, ToolDefinition
-
-PromptRenderer = Callable[..., str]
-
-
-@dataclass(frozen=True)
-class _InputProtocolRegistration:
-    families: frozenset[str]
-    aliases: frozenset[str]
-    prefixes: tuple[str, ...]
-    renderer: PromptRenderer
-
-
-_REGISTRY = (
-    _InputProtocolRegistration(
-        families=frozenset({"deepseek_v41"}),
-        aliases=frozenset(
-            {"deepseek_v41", "deepseek_v41_text", "deepseek_v41_vision"}
-        ),
-        prefixes=("deepseek_v41",),
-        renderer=render_deepseek_v41_prompt,
-    ),
-    _InputProtocolRegistration(
-        families=frozenset({"deepseek_v4"}),
-        aliases=frozenset({"deepseek_v4", "deepseek_v4_vision"}),
-        prefixes=("deepseek_v4",),
-        renderer=render_deepseek_v4_prompt,
-    ),
+from mfq.server.processor_prompt_protocols import (
+    processor_prompt_protocol_for_architecture,
 )
 
 
@@ -56,24 +24,18 @@ def render_preformatted_prompt(
 ) -> str | None:
     """Render processor-owned protocols; return ``None`` for Jinja models."""
 
-    identity = normalize_architecture(architecture)
-    family = capabilities_for_architecture(architecture).architecture_family
-    for registration in _REGISTRY:
-        if (
-            family in registration.families
-            or identity in registration.aliases
-            or identity.startswith(registration.prefixes)
-        ):
-            return registration.renderer(
-                messages,
-                tools=tools,
-                tool_choice=tool_choice,
-                response_format=response_format,
-                enable_thinking=enable_thinking,
-                reasoning_effort=reasoning_effort,
-                parallel_tool_calls=parallel_tool_calls,
-            )
-    return None
+    protocol = processor_prompt_protocol_for_architecture(architecture)
+    if protocol is None:
+        return None
+    return protocol.renderer(
+        messages,
+        tools=tools,
+        tool_choice=tool_choice,
+        response_format=response_format,
+        enable_thinking=enable_thinking,
+        reasoning_effort=reasoning_effort,
+        parallel_tool_calls=parallel_tool_calls,
+    )
 
 
 __all__ = ["render_preformatted_prompt"]

@@ -3,6 +3,11 @@ from __future__ import annotations
 from mfq.server.deepseek_v41_prompt import render_deepseek_v41_prompt
 from mfq.server.input_protocols import render_preformatted_prompt
 from mfq.server.models import ToolDefinition
+from mfq.server.processor_prompt_protocols import (
+    DEEPSEEK_V4_CHAT_TEMPLATE,
+    DEEPSEEK_V41_CHAT_TEMPLATE,
+    processor_prompt_protocol_for_architecture,
+)
 
 
 def _weather_tool() -> ToolDefinition:
@@ -113,3 +118,31 @@ def test_input_protocol_registry_separates_v4_and_v41() -> None:
     assert render_preformatted_prompt(
         "qwen3_5", [{"role": "user", "content": "hello"}]
     ) is None
+
+
+def test_processor_prompt_registry_covers_source_and_container_identities() -> None:
+    for identity in (
+        "deepseek_v4",
+        "deepseek_v4_text",
+        "deepseek_v4_vision",
+        "DeepseekV4ForCausalLM",
+        "deepseek-v4-tpq-mfq",
+    ):
+        protocol = processor_prompt_protocol_for_architecture(identity)
+        assert protocol is not None
+        assert protocol.name == "deepseek_v4"
+        assert protocol.bootstrap_chat_template == DEEPSEEK_V4_CHAT_TEMPLATE
+
+    for identity in (
+        "deepseek_v41",
+        "deepseek_v41_text",
+        "deepseek_v41_vision",
+        "DeepseekV41ForConditionalGeneration",
+        "deepseek-v41-mfq",
+    ):
+        protocol = processor_prompt_protocol_for_architecture(identity)
+        assert protocol is not None
+        assert protocol.name == "deepseek_v41"
+        assert protocol.bootstrap_chat_template == DEEPSEEK_V41_CHAT_TEMPLATE
+
+    assert processor_prompt_protocol_for_architecture("qwen3_5") is None

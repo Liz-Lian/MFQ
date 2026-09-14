@@ -181,7 +181,7 @@ def test_dsv4_server_uses_exact_stable_prefix_kv_reuse() -> None:
 
 def test_studio_can_reload_model_with_a_new_context() -> None:
     assert "async function reloadRuntime()" in STUDIO_APP
-    assert "api.reloadRuntime(contextSize)" in STUDIO_APP
+    assert "api.reloadRuntime(contextSize, runtime?.instance_id)" in STUDIO_APP
     assert 'request("/api/v1/runtime/reload"' in STUDIO_API
     assert 'server.Post("/api/reload"' in SERVER
     assert "context_size must be within the model context capacity" in SERVER

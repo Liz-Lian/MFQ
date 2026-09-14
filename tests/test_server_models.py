@@ -2108,6 +2108,46 @@ def test_runtime_pool_close_attempts_every_instance_before_reporting_error(
     asyncio.run(run())
 
 
+def test_runtime_pool_close_retires_instances_concurrently(tmp_path: Path) -> None:
+    async def run() -> None:
+        _model(tmp_path / "first.mfq")
+        _model(tmp_path / "second.mfq")
+        catalog = ModelCatalog([tmp_path], cache_seconds=0)
+        artifacts = [
+            await catalog.resolve("first"),
+            await catalog.resolve("second"),
+        ]
+        pool = ManagedRuntimePool(catalog, tmp_path / "runtime")
+        instances = [
+            _ManagedRuntime(
+                id=uuid4(),
+                artifact=artifact,
+                process=SimpleNamespace(returncode=0),
+                backend=IdleBackend(),
+                port=0,
+                context_size=4096,
+            )
+            for artifact in artifacts
+        ]
+        pool._instances = {instance.id: instance for instance in instances}
+        both_started = asyncio.Event()
+        started: set[UUID] = set()
+
+        async def stop(instance: _ManagedRuntime) -> None:
+            started.add(instance.id)
+            if len(started) == len(instances):
+                both_started.set()
+            await asyncio.wait_for(both_started.wait(), timeout=1)
+
+        pool._stop_process = stop  # type: ignore[method-assign]
+        await pool.aclose()
+
+        assert started == {instance.id for instance in instances}
+        assert pool._instances == {}
+
+    asyncio.run(run())
+
+
 def test_started_runtime_is_registered_in_the_instances_api(tmp_path: Path) -> None:
     async def run() -> None:
         model = tmp_path / "initial.mfq"

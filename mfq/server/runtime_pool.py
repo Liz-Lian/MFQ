@@ -1337,12 +1337,18 @@ class ManagedRuntimePool:
             await asyncio.gather(*background_tasks, return_exceptions=True)
         await self._drain_control_lease_releases()
         first_error: Exception | None = None
-        for instance in instances:
-            try:
-                await self._retire_instance(instance)
-            except Exception as error:
-                if first_error is None:
-                    first_error = error
+        retirements = await asyncio.gather(
+            *(self._retire_instance(instance) for instance in instances),
+            return_exceptions=True,
+        )
+        first_error = next(
+            (
+                result
+                for result in retirements
+                if isinstance(result, Exception)
+            ),
+            None,
+        )
         async with self._lock:
             self._instances.clear()
             self._session_routes.clear()
@@ -1959,7 +1965,10 @@ class ManagedRuntimePool:
                     (instance, "memory_budget")
                     for instance in self._claim_over_budget_instances_for_unload_locked()
                 )
-            for instance, reason in victims:
+            async def retire_victim(
+                instance: _ManagedRuntime,
+                reason: str,
+            ) -> None:
                 try:
                     await self._retire_instance(instance)
                     if self.store is not None:
@@ -1985,6 +1994,14 @@ class ManagedRuntimePool:
                             instance_id=instance.id,
                             fields={"source": "runtime.lifecycle", "reason": reason},
                         )
+
+            if victims:
+                await asyncio.gather(
+                    *(
+                        retire_victim(instance, reason)
+                        for instance, reason in victims
+                    )
+                )
 
     async def _retire_instance(self, instance: _ManagedRuntime) -> None:
         """Stop one registered runtime once and detach it only after success."""

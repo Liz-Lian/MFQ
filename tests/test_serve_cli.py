@@ -12,6 +12,8 @@ from mfq.commands.serve import _prepare_web_root, _resolve_runtime_executable, _
 from mfq.server.native import (
     NativeRuntime,
     NativeRuntimeError,
+    RuntimeRoute,
+    native_request_capacity,
     native_runtime_environment,
 )
 
@@ -194,7 +196,16 @@ def test_native_cuda_worker_is_private_and_uses_a_loopback_port(tmp_path: Path) 
 
 def test_native_cuda_worker_enables_explicit_continuous_batching(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(
+        "mfq.server.native.resolve_runtime_route",
+        lambda *_args: RuntimeRoute(
+            architecture_family="qwen3_5",
+            backbone="qwen3_5",
+            continuous_batching=True,
+        ),
+    )
     runtime = NativeRuntime(
         executable=tmp_path / "mfq-decode",
         model=tmp_path / "model.mfq",
@@ -206,6 +217,39 @@ def test_native_cuda_worker_enables_explicit_continuous_batching(
     command = runtime.command(43123)
 
     assert command[command.index("--continuous-batching") + 1] == "8"
+
+
+def test_native_request_capacity_rejects_unsupported_and_moe_workers() -> None:
+    route = RuntimeRoute(
+        architecture_family="qwen3_5",
+        backbone="qwen3_5",
+        continuous_batching=True,
+    )
+
+    assert native_request_capacity(
+        backend="cuda",
+        route=route,
+        routed_expert_bytes=0,
+        requested=8,
+    ) == 8
+    assert native_request_capacity(
+        backend="metal",
+        route=route,
+        routed_expert_bytes=0,
+        requested=8,
+    ) == 1
+    assert native_request_capacity(
+        backend="cuda",
+        route=route,
+        routed_expert_bytes=1,
+        requested=8,
+    ) == 1
+    assert native_request_capacity(
+        backend="cuda",
+        route=RuntimeRoute(architecture_family="qwen4_exp"),
+        routed_expert_bytes=0,
+        requested=8,
+    ) == 1
 
 
 def test_native_metal_worker_rejects_cuda_continuous_batching(

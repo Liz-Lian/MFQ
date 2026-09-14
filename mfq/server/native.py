@@ -170,6 +170,26 @@ def resolve_runtime_route(architecture: str, model: str | Path) -> RuntimeRoute:
     )
 
 
+def native_request_capacity(
+    *,
+    backend: str,
+    route: RuntimeRoute,
+    routed_expert_bytes: int,
+    requested: int,
+) -> int:
+    """Return concurrency actually supported by one native model worker."""
+
+    if requested < 1:
+        raise ValueError("requested runtime concurrency must be positive")
+    if (
+        backend == "cuda"
+        and route.continuous_batching
+        and routed_expert_bytes == 0
+    ):
+        return requested
+    return 1
+
+
 def python_mlx_runtime_command(
     controller_command: Sequence[str],
     *,
@@ -281,6 +301,7 @@ class NativeRuntime:
     context_size: int = 0
     prefill_chunk_size: int = 2048
     continuous_batching: int = 0
+    routed_expert_bytes: int = 0
     startup_timeout: float = 1800.0
     environment: Mapping[str, str] | None = None
     architecture: str = ""
@@ -328,9 +349,15 @@ class NativeRuntime:
             command.extend(["--prefill-chunk-size", str(self.prefill_chunk_size)])
         if self.context_size > 0:
             command.extend(["--ctx-size", str(self.context_size)])
-        if self.continuous_batching > 0:
+        request_capacity = native_request_capacity(
+            backend=self.backend,
+            route=route,
+            routed_expert_bytes=self.routed_expert_bytes,
+            requested=max(1, self.continuous_batching),
+        )
+        if self.continuous_batching > 0 and request_capacity > 1:
             command.extend(
-                ["--continuous-batching", str(self.continuous_batching)]
+                ["--continuous-batching", str(request_capacity)]
             )
         command.extend(native_tokenizer_arguments(self.model))
         return command

@@ -42,6 +42,7 @@ from mfq.server.models import (
 from mfq.server.native import (
     RuntimeRoute,
     find_native_runtime_resource,
+    native_request_capacity,
     native_runtime_environment,
     native_tokenizer_arguments,
     python_mlx_runtime_command,
@@ -83,6 +84,7 @@ class _ManagedRuntime:
     queued_requests: int = 0
     control_leases: int = 0
     request_slots: asyncio.Semaphore | None = None
+    request_capacity: int = 1
     error: ErrorDetail | None = None
     output_task: asyncio.Task[None] | None = None
     monitor_task: asyncio.Task[None] | None = None
@@ -323,6 +325,16 @@ class ManagedRuntimePool:
         )
         if active_count >= self.max_instances:
             raise RuntimeConflictError("managed runtime instance limit reached")
+        runtime_route = resolve_runtime_route(
+            artifact.resource.architecture,
+            artifact.path,
+        )
+        request_capacity = native_request_capacity(
+            backend=self.backend,
+            route=runtime_route,
+            routed_expert_bytes=artifact.routed_expert_bytes,
+            requested=self.max_requests_per_instance,
+        )
         instance = _ManagedRuntime(
             id=uuid4(),
             artifact=artifact,
@@ -333,7 +345,8 @@ class ManagedRuntimePool:
             state=RuntimeInstanceState.READY,
             last_used_at=datetime.now(timezone.utc),
             idle_ttl_seconds=self.default_idle_ttl_seconds,
-            request_slots=asyncio.Semaphore(self.max_requests_per_instance),
+            request_slots=asyncio.Semaphore(request_capacity),
+            request_capacity=request_capacity,
         )
         self._instances[instance.id] = instance
         self._load_requests[artifact.resource.name] = ModelLoadRequest(
@@ -370,6 +383,12 @@ class ManagedRuntimePool:
             artifact.path,
         )
         python_mlx_worker = runtime_route.python_mlx_worker
+        request_capacity = native_request_capacity(
+            backend=self.backend,
+            route=runtime_route,
+            routed_expert_bytes=artifact.routed_expert_bytes,
+            requested=self.max_requests_per_instance,
+        )
         if python_mlx_worker and self.backend != "metal":
             raise _job_error(
                 "unsupported_device",
@@ -588,7 +607,8 @@ class ManagedRuntimePool:
                 else self.default_idle_ttl_seconds
             ),
             pinned=request.pin,
-            request_slots=asyncio.Semaphore(self.max_requests_per_instance),
+            request_slots=asyncio.Semaphore(request_capacity),
+            request_capacity=request_capacity,
             reserved_bytes=incoming_bytes,
             # Keep TTL and memory-pressure eviction out of the load
             # transaction until the ready instance has been published.
@@ -901,7 +921,7 @@ class ManagedRuntimePool:
             process_exited = instance.process.returncode is not None
             queue_full = (
                 instance.active_requests + instance.queued_requests
-                >= self.max_requests_per_instance
+                >= instance.request_capacity
                 + self.max_queued_requests_per_instance
             )
         if not current or not ready or process_exited:
@@ -963,7 +983,7 @@ class ManagedRuntimePool:
                 raise BackendError("model_not_ready", f"model runtime is {instance.state.value}")
             if (
                 instance.active_requests + instance.queued_requests
-                >= self.max_requests_per_instance
+                >= instance.request_capacity
                 + self.max_queued_requests_per_instance
             ):
                 raise BackendError(
@@ -2382,6 +2402,12 @@ class ManagedRuntimePool:
         runtime_route: RuntimeRoute,
         port: int,
     ) -> tuple[list[str], dict[str, str]]:
+        request_capacity = native_request_capacity(
+            backend=self.backend,
+            route=runtime_route,
+            routed_expert_bytes=artifact.routed_expert_bytes,
+            requested=self.max_requests_per_instance,
+        )
         if runtime_route.python_mlx_worker:
             command = python_mlx_runtime_command(
                 self.controller_command,
@@ -2409,15 +2435,11 @@ class ManagedRuntimePool:
             ]
             if self.backend == "metal":
                 command.extend(["--prefill-chunk-size", str(request.prefill_chunk_size)])
-            elif (
-                self.max_requests_per_instance > 1
-                and runtime_route.continuous_batching
-                and artifact.routed_expert_bytes == 0
-            ):
+            elif request_capacity > 1:
                 command.extend(
                     [
                         "--continuous-batching",
-                        str(self.max_requests_per_instance),
+                        str(request_capacity),
                     ]
                 )
             command.extend(native_tokenizer_arguments(artifact.path))

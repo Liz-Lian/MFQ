@@ -305,6 +305,7 @@ def _run(args: argparse.Namespace) -> int:
                     and args.max_requests_per_runtime > 1
                     else 0
                 ),
+                routed_expert_bytes=initial_artifact.routed_expert_bytes,
                 startup_timeout=args.runtime_startup_timeout,
                 environment=runtime_environment,
                 architecture=initial_artifact.resource.architecture,

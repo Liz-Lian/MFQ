@@ -730,8 +730,8 @@ public:
 
     bool invalidate(const BlockHash& hash) {
         std::unique_lock<std::mutex> lock(mutex_);
-        writes_finished_.wait(lock, [this] {
-            return writes_.empty() && active_writes_ == 0;
+        writes_finished_.wait(lock, [this, &hash] {
+            return pending_.count(hash) == 0;
         });
         return erase_corrupt_locked(hash);
     }

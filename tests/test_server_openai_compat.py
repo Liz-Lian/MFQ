@@ -9,7 +9,7 @@ import httpx
 import pytest
 
 from mfq.server.api import create_app
-from mfq.server.backend import BackendDelta
+from mfq.server.backend import BackendDelta, BackendError
 from mfq.server.models import ResponsePerformance, SamplingParams, TokenUsage
 from mfq.server.openai_compat import (
     collect_chat_completion,
@@ -256,6 +256,40 @@ def test_public_openai_routes_have_readable_models_and_standard_messages() -> No
                 "content": "answer",
                 "reasoning_content": "plan",
             }
+
+    asyncio.run(run())
+
+
+def test_streaming_route_rejects_failed_preflight_before_committing_200() -> None:
+    class UnavailableBackend(_Backend):
+        async def preflight(self, **_: Any) -> None:
+            raise BackendError(
+                "model_not_ready",
+                "model worker exited",
+                retryable=True,
+                status_code=503,
+            )
+
+    async def run() -> None:
+        backend = UnavailableBackend()
+        app = create_app(_Service(backend))  # type: ignore[arg-type]
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://test",
+        ) as client:
+            response = await client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "DeepSeek-V4-Flash",
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "stream": True,
+                },
+            )
+        assert response.status_code == 503
+        assert response.headers["content-type"].startswith("application/json")
+        assert response.json()["error"]["type"] == "model_not_ready"
+        assert backend.requests == []
 
     asyncio.run(run())
 

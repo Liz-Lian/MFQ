@@ -19,7 +19,7 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from mfq.server.auth import ApiKeyManager, required_scope
-from mfq.server.backend import BackendError
+from mfq.server.backend import BackendError, preflight_backend_request
 from mfq.server.models import (
     SHA256_PATTERN,
     ApiKeyList,
@@ -296,6 +296,26 @@ def create_app(
             )
         backend = require_service().backend
         if parsed.stream:
+            try:
+                await preflight_backend_request(
+                    backend,
+                    model=parsed.model,
+                    messages=parsed.messages,
+                    sampling=parsed.sampling,
+                    session_id=parsed.session_id,
+                    tools=parsed.tools,
+                    tool_choice=parsed.tool_choice,
+                    response_format=parsed.response_format,
+                )
+            except BackendError as error:
+                return JSONResponse(
+                    status_code=backend_error_status(error),
+                    content=openai_error_body(
+                        str(error),
+                        error_type=error.code,
+                        code=error.status_code,
+                    ),
+                )
             return StreamingResponse(
                 stream_chat_completion(
                     backend,

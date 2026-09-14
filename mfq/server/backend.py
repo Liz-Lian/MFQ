@@ -80,6 +80,18 @@ class BackendDelta:
 
 
 class ChatBackend(Protocol):
+    async def preflight(
+        self,
+        *,
+        model: str,
+        messages: Sequence[dict[str, Any]],
+        sampling: SamplingParams,
+        session_id: UUID | None = None,
+        tools: Sequence[ToolDefinition] = (),
+        tool_choice: ToolChoice = "auto",
+        response_format: ResponseFormat | None = None,
+    ) -> None: ...
+
     def stream(
         self,
         *,
@@ -115,6 +127,33 @@ class ChatBackend(Protocol):
     def realtime_connect(self, *, mode: str = "audio") -> Any: ...
 
     async def aclose(self) -> None: ...
+
+
+async def preflight_backend_request(
+    backend: ChatBackend,
+    *,
+    model: str,
+    messages: Sequence[dict[str, Any]],
+    sampling: SamplingParams,
+    session_id: UUID | None = None,
+    tools: Sequence[ToolDefinition] = (),
+    tool_choice: ToolChoice = "auto",
+    response_format: ResponseFormat | None = None,
+) -> None:
+    """Run an optional cheap readiness gate before an HTTP stream commits."""
+
+    preflight = getattr(backend, "preflight", None)
+    if not callable(preflight):
+        return
+    await preflight(
+        model=model,
+        messages=messages,
+        sampling=sampling,
+        session_id=session_id,
+        tools=tools,
+        tool_choice=tool_choice,
+        response_format=response_format,
+    )
 
 
 @asynccontextmanager
@@ -192,6 +231,41 @@ class OpenAIChatBackend:
         self._avfoundation_video_library = avfoundation_video_library
         self._local_tensor_files = local_tensor_files and os.name in {"posix", "nt"}
         self._runtime_metric_overrides: dict[str, dict[str, float]] = {}
+
+    async def preflight(
+        self,
+        *,
+        model: str,
+        messages: Sequence[dict[str, Any]],
+        sampling: SamplingParams,
+        session_id: UUID | None = None,
+        tools: Sequence[ToolDefinition] = (),
+        tool_choice: ToolChoice = "auto",
+        response_format: ResponseFormat | None = None,
+    ) -> None:
+        del session_id, tools, tool_choice, response_format
+        if self._contains_visual_media(messages) and not sampling.enable_vision:
+            raise BackendError(
+                "vision_disabled",
+                "vision is disabled for this request; enable Vision to send images or video",
+                status_code=400,
+            )
+        capabilities = await self.capabilities()
+        if model == capabilities.model:
+            return
+        models = await self.runtime_models()
+        data = models.get("data", []) if isinstance(models, dict) else []
+        available = {
+            str(item.get("id"))
+            for item in data
+            if isinstance(item, dict) and item.get("id")
+        }
+        if model not in available:
+            raise BackendError(
+                "model_not_loaded",
+                f"model is not loaded: {model}",
+                status_code=404,
+            )
 
     async def stream(
         self,

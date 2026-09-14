@@ -24,6 +24,7 @@ from mfq.server.backend import (
     ChatBackend,
     closing_backend_stream,
     iter_sse_data,
+    preflight_backend_request,
 )
 from mfq.server.models import (
     RemoteNodeResource,
@@ -297,6 +298,30 @@ class ClusterBackend:
             min(matches, key=lambda item: (item.active_requests, item.resource.name))
             if matches
             else None
+        )
+
+    async def preflight(
+        self,
+        *,
+        model: str,
+        messages: Sequence[dict[str, Any]],
+        sampling: SamplingParams,
+        session_id: UUID | None = None,
+        tools: Sequence[ToolDefinition] = (),
+        tool_choice: ToolChoice = "auto",
+        response_format: ResponseFormat | None = None,
+    ) -> None:
+        if await self._select(model) is not None:
+            return
+        await preflight_backend_request(
+            self.local,
+            model=model,
+            messages=messages,
+            sampling=sampling,
+            session_id=session_id,
+            tools=tools,
+            tool_choice=tool_choice,
+            response_format=response_format,
         )
 
     async def stream(

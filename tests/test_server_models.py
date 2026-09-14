@@ -2404,6 +2404,40 @@ def test_artifact_id_request_waits_on_the_canonical_model_load(
     asyncio.run(run())
 
 
+def test_runtime_preflight_rejects_an_exited_worker_before_streaming(
+    tmp_path: Path,
+) -> None:
+    async def run() -> None:
+        model_path = tmp_path / "exited.mfq"
+        _model(model_path)
+        catalog = ModelCatalog([tmp_path], cache_seconds=0)
+        artifact = await catalog.resolve_path(model_path)
+        instance = _ManagedRuntime(
+            id=uuid4(),
+            artifact=artifact,
+            process=SimpleNamespace(returncode=9),
+            backend=IdleBackend(),
+            port=1,
+            context_size=4096,
+            state=RuntimeInstanceState.READY,
+            request_slots=asyncio.Semaphore(1),
+        )
+        pool = ManagedRuntimePool(catalog, tmp_path / "runtime")
+        pool._instances[instance.id] = instance
+
+        with pytest.raises(BackendError) as unavailable:
+            await pool.preflight(
+                model=artifact.resource.name,
+                messages=({"role": "user", "content": "hello"},),
+                sampling=SamplingParams(),
+            )
+
+        assert unavailable.value.code == "model_not_ready"
+        assert unavailable.value.status_code == 503
+
+    asyncio.run(run())
+
+
 def test_runtime_sampling_defaults_apply_only_to_omitted_request_fields(
     tmp_path: Path,
 ) -> None:

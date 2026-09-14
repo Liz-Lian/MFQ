@@ -20,6 +20,7 @@ from mfq.server.backend import (
     ChatBackend,
     OpenAIChatBackend,
     closing_backend_stream,
+    preflight_backend_request,
 )
 from mfq.server.catalog import DiscoveredModel, ModelArtifactNotFoundError, ModelCatalog
 from mfq.server.jobs import JobContext, JobExecutionError
@@ -851,6 +852,68 @@ class ManagedRuntimePool:
             )
             self._idle_reaper_wakeup.set()
         return resource
+
+    async def preflight(
+        self,
+        *,
+        model: str,
+        messages: Sequence[dict[str, Any]],
+        sampling: SamplingParams,
+        session_id: UUID | None = None,
+        tools: Sequence[ToolDefinition] = (),
+        tool_choice: ToolChoice = "auto",
+        response_format: ResponseFormat | None = None,
+    ) -> None:
+        instance = await self._select(model, session_id=session_id)
+        if instance is not None and instance.state == RuntimeInstanceState.LOADING:
+            await self._wait_for_model_ready(instance.artifact.resource.name)
+            instance = await self._select(model, session_id=session_id)
+        if instance is None:
+            instance = await self._ensure_model_loaded(model)
+        if instance is None:
+            if self.fallback is None:
+                raise BackendError(
+                    "model_not_loaded",
+                    f"model is not loaded: {model}",
+                    status_code=404,
+                )
+            await preflight_backend_request(
+                self.fallback,
+                model=model,
+                messages=messages,
+                sampling=sampling,
+                session_id=session_id,
+                tools=tools,
+                tool_choice=tool_choice,
+                response_format=response_format,
+            )
+            return
+        async with self._lock:
+            current = self._instances.get(instance.id) is instance
+            ready = instance.state in {
+                RuntimeInstanceState.READY,
+                RuntimeInstanceState.BUSY,
+            }
+            process_exited = instance.process.returncode is not None
+            queue_full = (
+                instance.active_requests + instance.queued_requests
+                >= self.max_requests_per_instance
+                + self.max_queued_requests_per_instance
+            )
+        if not current or not ready or process_exited:
+            raise BackendError(
+                "model_not_ready",
+                f"model runtime is {instance.state.value}",
+                retryable=True,
+                status_code=503,
+            )
+        if queue_full:
+            raise BackendError(
+                "runtime_queue_full",
+                f"model runtime queue is full: {model}",
+                retryable=True,
+                status_code=429,
+            )
 
     async def stream(
         self,

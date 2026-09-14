@@ -7,7 +7,9 @@ import json
 import os
 import stat
 import wave
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Event as ThreadEvent
 
 import httpx
 import numpy as np
@@ -15,11 +17,12 @@ import pytest
 import torch
 from PIL import Image
 
+from mfq.server import vision as vision_module
 from mfq.server.backend import OpenAIChatBackend
 from mfq.server.models import SamplingParams
 from mfq.server.vision import (
-    DeepseekV41VisionProcessor,
     DeepseekV4VisionProcessor,
+    DeepseekV41VisionProcessor,
     Glm5NextVisionProcessor,
     MiniCPMO45VisionProcessor,
     Qwen4ExpVisionProcessor,
@@ -35,6 +38,102 @@ def _data_url(image: Image.Image) -> str:
     image.save(output, format="PNG")
     encoded = base64.b64encode(output.getvalue()).decode("ascii")
     return f"data:image/png;base64,{encoded}"
+
+
+def test_decoded_images_are_cached_by_content(monkeypatch: pytest.MonkeyPatch) -> None:
+    vision_module.clear_image_decode_cache()
+    source = _data_url(Image.new("RGB", (24, 24), "red"))
+    data = MiniCPMO45VisionProcessor._decode_data_url(source, "image/")
+    real_open = Image.open
+    open_count = 0
+
+    def tracked_open(*args: object, **kwargs: object):
+        nonlocal open_count
+        open_count += 1
+        return real_open(*args, **kwargs)
+
+    monkeypatch.setattr(Image, "open", tracked_open)
+    try:
+        first = MiniCPMO45VisionProcessor._decode_image(data)
+        second = MiniCPMO45VisionProcessor._decode_image(data)
+        assert first is second
+        assert open_count == 1
+        assert vision_module.clear_image_decode_cache() > 0
+        MiniCPMO45VisionProcessor._decode_image(data)
+        assert open_count == 2
+    finally:
+        vision_module.clear_image_decode_cache()
+
+
+def test_clear_during_image_decode_does_not_repopulate_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    vision_module.clear_image_decode_cache()
+    source = _data_url(Image.new("RGB", (24, 24), "blue"))
+    data = MiniCPMO45VisionProcessor._decode_data_url(source, "image/")
+    entered = ThreadEvent()
+    resume = ThreadEvent()
+    real_open = Image.open
+
+    def blocked_open(*args: object, **kwargs: object):
+        entered.set()
+        assert resume.wait(5)
+        return real_open(*args, **kwargs)
+
+    monkeypatch.setattr(Image, "open", blocked_open)
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(MiniCPMO45VisionProcessor._decode_image, data)
+            assert entered.wait(5)
+            vision_module.clear_image_decode_cache()
+            resume.set()
+            decoded = future.result(timeout=5)
+        assert decoded.getpixel((0, 0)) == (0, 0, 255)
+        assert not vision_module._image_decode_cache
+        assert vision_module._image_decode_cache_bytes == 0
+    finally:
+        resume.set()
+        vision_module.clear_image_decode_cache()
+
+
+def test_decoded_image_cache_is_byte_bounded_lru(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    vision_module.clear_image_decode_cache()
+    red = MiniCPMO45VisionProcessor._decode_data_url(
+        _data_url(Image.new("RGB", (24, 24), "red")),
+        "image/",
+    )
+    green = MiniCPMO45VisionProcessor._decode_data_url(
+        _data_url(Image.new("RGB", (24, 24), "green")),
+        "image/",
+    )
+    cache_bytes = vision_module._decoded_pixel_bytes(
+        Image.new("RGB", (24, 24))
+    )
+    monkeypatch.setattr(
+        vision_module,
+        "_IMAGE_DECODE_CACHE_MAX_BYTES",
+        cache_bytes,
+    )
+    real_open = Image.open
+    open_count = 0
+
+    def tracked_open(*args: object, **kwargs: object):
+        nonlocal open_count
+        open_count += 1
+        return real_open(*args, **kwargs)
+
+    monkeypatch.setattr(Image, "open", tracked_open)
+    try:
+        MiniCPMO45VisionProcessor._decode_image(red)
+        MiniCPMO45VisionProcessor._decode_image(green)
+        MiniCPMO45VisionProcessor._decode_image(red)
+        assert open_count == 3
+        assert len(vision_module._image_decode_cache) == 1
+        assert vision_module._image_decode_cache_bytes == cache_bytes
+    finally:
+        vision_module.clear_image_decode_cache()
 
 
 def _decode_tensor(tensor: dict[str, object]) -> np.ndarray:

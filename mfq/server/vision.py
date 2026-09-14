@@ -10,12 +10,16 @@ from __future__ import annotations
 
 import base64
 import copy
+import hashlib
 import io
 import math
 import os
 import platform
 import secrets
+import struct
 import tempfile
+import threading
+from collections import OrderedDict
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
@@ -24,6 +28,69 @@ from typing import Any, Protocol
 import numpy as np
 
 from mfq.architectures.tensor_schema import GRID_VISION_INPUT_CONTRACT
+
+_IMAGE_DECODE_CACHE_MAX_BYTES = 512 * 1024 * 1024
+_image_decode_cache: OrderedDict[str, Any] = OrderedDict()
+_image_decode_cache_bytes = 0
+_image_decode_cache_generation = 0
+_image_decode_cache_lock = threading.Lock()
+
+
+def _decoded_pixel_bytes(image: Any) -> int:
+    width, height = image.size
+    return width * height * 4 + height * struct.calcsize("P")
+
+
+def clear_image_decode_cache() -> int:
+    """Drop shared decoded-image references and return accounted bytes."""
+
+    global _image_decode_cache_bytes, _image_decode_cache_generation
+    with _image_decode_cache_lock:
+        released = _image_decode_cache_bytes
+        _image_decode_cache.clear()
+        _image_decode_cache_bytes = 0
+        _image_decode_cache_generation += 1
+        return released
+
+
+def _decode_image_cached(data: bytes) -> Any:
+    from PIL import Image
+
+    key = hashlib.sha256(data).hexdigest()
+    with _image_decode_cache_lock:
+        generation = _image_decode_cache_generation
+        hit = _image_decode_cache.get(key)
+        if hit is not None:
+            _image_decode_cache.move_to_end(key)
+            return hit
+
+    try:
+        with Image.open(io.BytesIO(data)) as image:
+            image.load()
+            rgb = image.convert("RGB")
+    except Exception as error:
+        raise VisionProcessingError(f"unable to decode image: {error}") from error
+
+    size = _decoded_pixel_bytes(rgb)
+    if size > _IMAGE_DECODE_CACHE_MAX_BYTES:
+        return rgb
+
+    global _image_decode_cache_bytes
+    with _image_decode_cache_lock:
+        if generation != _image_decode_cache_generation:
+            return rgb
+        duplicate = _image_decode_cache.pop(key, None)
+        if duplicate is not None:
+            _image_decode_cache_bytes -= _decoded_pixel_bytes(duplicate)
+        while (
+            _image_decode_cache
+            and _image_decode_cache_bytes + size > _IMAGE_DECODE_CACHE_MAX_BYTES
+        ):
+            _, evicted = _image_decode_cache.popitem(last=False)
+            _image_decode_cache_bytes -= _decoded_pixel_bytes(evicted)
+        _image_decode_cache[key] = rgb
+        _image_decode_cache_bytes += size
+    return rgb
 
 
 class VisionProcessingError(ValueError):
@@ -472,14 +539,7 @@ class MiniCPMO45VisionProcessor:
 
     @staticmethod
     def _decode_image(data: bytes) -> Any:
-        from PIL import Image
-
-        try:
-            image = Image.open(io.BytesIO(data))
-            image.load()
-            return image.convert("RGB")
-        except Exception as error:
-            raise VisionProcessingError(f"unable to decode image: {error}") from error
+        return _decode_image_cached(data)
 
     @staticmethod
     def _decode_audio_data(value: Any) -> bytes:
@@ -547,7 +607,7 @@ class MiniCPMO45VisionProcessor:
             else:
                 waveform = np.frombuffer(payload, dtype="<i4").astype(np.float32) / 2147483648.0
             if waveform.size != frame_count * channels:
-                raise VisionProcessingError("audio WAV payload is truncated")
+                raise VisionProcessingError("audio WAV payload is truncated") from None
             waveform = waveform.reshape(frame_count, channels).mean(axis=1)
             if sample_rate != cls.audio_sample_rate:
                 source_positions = np.arange(frame_count, dtype=np.float64)
@@ -559,7 +619,7 @@ class MiniCPMO45VisionProcessor:
                 ).astype(np.float32)
             waveform = np.ascontiguousarray(waveform, dtype=np.float32)
             if not np.isfinite(waveform).all():
-                raise VisionProcessingError("audio input contains a non-finite sample")
+                raise VisionProcessingError("audio input contains a non-finite sample") from None
             return np.clip(waveform, -1.0, 1.0)
 
         chunks: list[np.ndarray] = []
@@ -2128,6 +2188,7 @@ def multimodal_processor_for_architecture(
 
 
 __all__ = [
+    "clear_image_decode_cache",
     "DeepseekV41VisionProcessor",
     "DeepseekV4VisionProcessor",
     "Glm5NextVisionProcessor",

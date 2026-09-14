@@ -156,6 +156,7 @@ from mfq.server.storage import (
     SessionStore,
     StorageError,
 )
+from mfq.server.vision import clear_image_decode_cache
 
 MAX_MEDIA_BYTES = 512 * 1024 * 1024
 
@@ -1379,8 +1380,13 @@ class ServerService:
         instance_id: UUID | None = None,
     ) -> dict[str, Any]:
         if instance_id is None:
-            return await self._runtime_request("clear_runtime_cache")
-        return await self._runtime_request("clear_runtime_cache", instance_id)
+            result = await self._runtime_request("clear_runtime_cache")
+        else:
+            result = await self._runtime_request("clear_runtime_cache", instance_id)
+        result["image_decode_cache_released_bytes"] = await asyncio.to_thread(
+            clear_image_decode_cache
+        )
+        return result
 
     async def trim_runtime_cache(
         self,

@@ -759,6 +759,7 @@ def test_executable_api_persists_nonstream_text_responses(tmp_path: Path) -> Non
             cleared = await client.post("/api/v1/runtime/cache/clear")
             assert cleared.status_code == 200
             assert cleared.json()["released_snapshots"] == 3
+            assert cleared.json()["image_decode_cache_released_bytes"] >= 0
             assert backend.cache_clears == 1
             trimmed = await client.post(
                 "/api/v1/runtime/cache/trim",

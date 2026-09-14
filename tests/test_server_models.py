@@ -1894,6 +1894,58 @@ def test_runtime_stop_closes_backend_after_process_control_failure(
     asyncio.run(run())
 
 
+def test_runtime_stop_uses_kill_after_terminate_failure(tmp_path: Path) -> None:
+    async def run() -> None:
+        _model(tmp_path / "model.mfq")
+        artifact = await ModelCatalog(
+            [tmp_path], cache_seconds=0
+        ).resolve("model")
+
+        class ClosingBackend(IdleBackend):
+            closed = False
+
+            async def aclose(self) -> None:
+                self.closed = True
+
+        class RecoverableProcess:
+            returncode = None
+            killed = False
+
+            def terminate(self) -> None:
+                raise RuntimeError("terminate failed")
+
+            def kill(self) -> None:
+                self.killed = True
+
+            async def wait(self) -> int:
+                assert self.killed
+                self.returncode = -9
+                return self.returncode
+
+        process = RecoverableProcess()
+        backend = ClosingBackend()
+        instance = _ManagedRuntime(
+            id=uuid4(),
+            artifact=artifact,
+            process=process,  # type: ignore[arg-type]
+            backend=backend,  # type: ignore[arg-type]
+            port=0,
+            context_size=4096,
+        )
+        pool = ManagedRuntimePool(
+            ModelCatalog([tmp_path], cache_seconds=0),
+            tmp_path / "runtime",
+        )
+
+        await pool._stop_process(instance)
+
+        assert process.killed
+        assert process.returncode == -9
+        assert backend.closed
+
+    asyncio.run(run())
+
+
 def test_runtime_pool_close_attempts_every_instance_before_reporting_error(
     tmp_path: Path,
 ) -> None:

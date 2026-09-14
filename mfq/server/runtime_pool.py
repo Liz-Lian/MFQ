@@ -2123,12 +2123,45 @@ class ManagedRuntimePool:
             if isinstance(process, subprocess.Popen):
                 await asyncio.to_thread(self._stop_popen, process)
             elif process.returncode is None:
-                process.terminate()
+                stopped = False
+                process_error: Exception | None = None
                 try:
-                    await asyncio.wait_for(process.wait(), timeout=10.0)
-                except TimeoutError:
-                    process.kill()
-                    await process.wait()
+                    process.terminate()
+                except ProcessLookupError:
+                    stopped = True
+                except Exception as error:
+                    process_error = error
+                if not stopped and process_error is None:
+                    try:
+                        await asyncio.wait_for(process.wait(), timeout=10.0)
+                        stopped = True
+                    except TimeoutError:
+                        pass
+                    except ProcessLookupError:
+                        stopped = True
+                    except Exception as error:
+                        process_error = error
+                if not stopped:
+                    try:
+                        process.kill()
+                    except ProcessLookupError:
+                        stopped = True
+                    except Exception as error:
+                        if process_error is None:
+                            process_error = error
+                    else:
+                        try:
+                            await asyncio.wait_for(process.wait(), timeout=5.0)
+                            stopped = True
+                        except ProcessLookupError:
+                            stopped = True
+                        except Exception as error:
+                            if process_error is None:
+                                process_error = error
+                if stopped:
+                    process_error = None
+                if process_error is not None:
+                    raise process_error
         except ProcessLookupError:
             pass
         except Exception as error:
@@ -2157,18 +2190,41 @@ class ManagedRuntimePool:
     def _stop_popen(process: subprocess.Popen[bytes]) -> None:
         if process.poll() is not None:
             return
+        first_error: Exception | None = None
         try:
             process.terminate()
         except ProcessLookupError:
             return
-        try:
-            process.wait(timeout=10.0)
-        except subprocess.TimeoutExpired:
+        except Exception as error:
+            first_error = error
+        if first_error is None:
             try:
-                process.kill()
+                process.wait(timeout=10.0)
+                return
+            except subprocess.TimeoutExpired:
+                pass
             except ProcessLookupError:
                 return
-            process.wait(timeout=5.0)
+            except Exception as error:
+                first_error = error
+        try:
+            process.kill()
+        except ProcessLookupError:
+            return
+        except Exception as error:
+            if first_error is None:
+                first_error = error
+        else:
+            try:
+                process.wait(timeout=5.0)
+                return
+            except ProcessLookupError:
+                return
+            except Exception as error:
+                if first_error is None:
+                    first_error = error
+        if first_error is not None:
+            raise first_error
 
     def _reserve_free_port_locked(self) -> int:
         for _ in range(128):

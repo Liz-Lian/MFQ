@@ -223,6 +223,18 @@ public:
     }
     bool prefers_mxfp4_smallm_nax(
         const mlx::core::array& expert_ids) const noexcept;
+    bool prefers_mxfp4_nax_prefill(int route_count) const noexcept;
+    bool supports_mxfp4_blocks() const noexcept;
+    bool supports_mxfp4_pair_blocks(
+        const MlxMfeWeight& other) const noexcept;
+    mlx::core::array mxfp4_block_matmul_sorted(
+        const mlx::core::array& sorted_input,
+        const MlxGroupedMmqPlan& plan) const;
+    mlx::core::array mxfp4_pair_swiglu_sorted(
+        const MlxMfeWeight& other,
+        const mlx::core::array& sorted_input,
+        const MlxGroupedMmqPlan& plan,
+        float limit = 0.0f) const;
     // Largest aligned token chunk within the native sorted-MXFP4 prefill row
     // limit, or zero when this representation/device cannot use that path.
     // The decision is derived from operator geometry rather than model ID.
@@ -278,6 +290,10 @@ private:
         const mlx::core::array& expert_ids,
         bool fused_swiglu,
         float swiglu_limit) const;
+    mlx::core::array mxfp4_blocks_sorted_impl(
+        const MlxMfeWeight* other,
+        const mlx::core::array& sorted_input,
+        const MlxGroupedMmqPlan& plan) const;
 
     std::shared_ptr<const Impl> impl_;
 };
@@ -343,6 +359,29 @@ public:
     bool prefers_mxfp4_smallm_nax(
         const mlx::core::array& expert_ids) const noexcept {
         return weight_.prefers_mxfp4_smallm_nax(expert_ids);
+    }
+    bool prefers_mxfp4_nax_prefill(int route_count) const noexcept {
+        return weight_.prefers_mxfp4_nax_prefill(route_count);
+    }
+    bool supports_mxfp4_blocks() const noexcept {
+        return weight_.supports_mxfp4_blocks();
+    }
+    bool supports_mxfp4_pair_blocks(
+        const MlxRoutedLinear& other) const noexcept {
+        return weight_.supports_mxfp4_pair_blocks(other.weight_);
+    }
+    mlx::core::array mxfp4_block_matmul_sorted(
+        const mlx::core::array& sorted_input,
+        const MlxGroupedMmqPlan& plan) const {
+        return weight_.mxfp4_block_matmul_sorted(sorted_input, plan);
+    }
+    mlx::core::array mxfp4_pair_swiglu_sorted(
+        const MlxRoutedLinear& other,
+        const mlx::core::array& sorted_input,
+        const MlxGroupedMmqPlan& plan,
+        float limit = 0.0f) const {
+        return weight_.mxfp4_pair_swiglu_sorted(
+            other.weight_, sorted_input, plan, limit);
     }
     int recommended_mxfp4_nax_prefill_tokens(
         int routes_per_token) const noexcept {

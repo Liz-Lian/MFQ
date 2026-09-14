@@ -2455,6 +2455,8 @@ array MlxDeepseekV4Attention::operator()(
     std::optional<std::pair<array, array>> plan;
     std::optional<array> direct_decode;
     std::optional<array> direct_multi;
+    std::optional<array> pending_local_values;
+    std::optional<array> pending_local_indices;
     if (tokens == 1) {
         const int slot = pos0 % window;
         auto local_index = mlx::core::full(
@@ -2605,12 +2607,10 @@ array MlxDeepseekV4Attention::operator()(
                 recent_slots,
                 Shape{1, recent}),
             Shape{batch, recent});
-        state.local_ = mlx_cache_write_inplace(
-            state.local_,
-            mlx::core::astype(
-                recent_values,
-                state.local_.dtype()),
-            local_indices);
+        pending_local_values = mlx::core::astype(
+            recent_values,
+            state.local_.dtype());
+        pending_local_indices = std::move(local_indices);
     }
 
     array attended = direct_decode
@@ -2632,6 +2632,20 @@ array MlxDeepseekV4Attention::operator()(
                       plan->first,
                       plan->second,
                       impl_->components.sinks);
+    if (pending_local_values.has_value()) {
+        // Multi-token attention must consume the previous ring contents
+        // before its in-place update can overwrite wrapped slots. This
+        // dependency permits several resident layers to share one eval
+        // boundary without relying on host submission order. Single-token
+        // decode intentionally keeps its write-before-attend ordering above.
+        auto ordered_local = mlx::core::depends(
+            std::vector<array>{state.local_},
+            std::vector<array>{attended});
+        state.local_ = mlx_cache_write_inplace(
+            ordered_local.front(),
+            *pending_local_values,
+            *pending_local_indices);
+    }
     if (detail::component_profile_active()) {
         if (direct_decode || direct_multi) {
             detail::profile_eval(

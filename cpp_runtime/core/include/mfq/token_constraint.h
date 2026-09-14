@@ -11,6 +11,9 @@ struct MfqTokenConstraint {
     std::function<bool(std::int64_t)> allows;
     std::function<void(float *, std::size_t)> apply;
     std::function<void(std::int64_t)> accept;
+    // Speculative decoding needs an independent cursor for validating a
+    // proposed token chain without advancing the committed grammar state.
+    std::function<std::shared_ptr<MfqTokenConstraint>()> clone;
 
     explicit operator bool() const noexcept {
         return static_cast<bool>(apply);

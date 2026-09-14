@@ -208,6 +208,46 @@ int main() try {
         "native developer role changed during system fallback");
     developer_templates.reset();
 
+    const std::string deepseek_single_turn_template =
+        "{{ bos_token }}"
+        "{% for message in messages %}"
+        "{% if message['role'] == 'user' %}"
+        "{{ '<｜User｜>' + message['content'] }}"
+        "{% endif %}"
+        "{% endfor %}"
+        "{% if add_generation_prompt %}"
+        "{{ '<｜Assistant｜>' }}"
+        "{% if enable_thinking %}{{ '<think>' }}"
+        "{% else %}{{ '</think>' }}{% endif %}"
+        "{% endif %}";
+    auto deepseek_templates =
+        common_chat_templates_init(context, deepseek_single_turn_template);
+    common_chat_templates_inputs deepseek_inputs;
+    deepseek_inputs.messages = {{"user", "hello"}};
+    deepseek_inputs.reasoning_format = COMMON_REASONING_FORMAT_AUTO;
+    deepseek_inputs.enable_thinking = true;
+    const auto deepseek_applied =
+        common_chat_templates_apply(deepseek_templates.get(), deepseek_inputs);
+    require(
+        deepseek_applied.generation_prompt == "<｜Assistant｜><think>",
+        "DeepSeek single-turn generation prompt mismatch");
+    common_chat_parser_params deepseek_parser(deepseek_applied);
+    deepseek_parser.reasoning_format = COMMON_REASONING_FORMAT_AUTO;
+    deepseek_parser.parser.load(deepseek_applied.parser);
+    const auto deepseek_partial =
+        common_chat_parse("analysis", true, deepseek_parser);
+    require(
+        deepseek_partial.reasoning_content == "analysis" &&
+            deepseek_partial.content.empty(),
+        "DeepSeek partial reasoning leaked into content");
+    const auto deepseek_complete = common_chat_parse(
+        "analysis</think>answer", false, deepseek_parser);
+    require(
+        deepseek_complete.reasoning_content == "analysis" &&
+            deepseek_complete.content == "answer",
+        "DeepSeek single-turn close marker was not parsed");
+    deepseek_templates.reset();
+
     mfq_text_grammar * grammar = mfq_text_grammar_init_impl(
         vocab, "root ::= \"h\"", "root", false, nullptr, 0, nullptr, 0);
     require(grammar != nullptr, "cannot create grammar");

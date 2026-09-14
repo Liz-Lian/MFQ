@@ -11,6 +11,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -51,6 +52,19 @@ constexpr int kIntermediate = 16;
 constexpr int kLayers = 3;
 constexpr int kContext = 32;
 constexpr int kNintGroup = 16;
+
+MfqTokenConstraintPtr permissive_cloneable_constraint() {
+    auto constraint = std::make_shared<MfqTokenConstraint>();
+    constraint->allows = [](std::int64_t) {
+        return true;
+    };
+    constraint->apply = [](float*, std::size_t) {};
+    constraint->accept = [](std::int64_t) {};
+    constraint->clone = [] {
+        return permissive_cloneable_constraint();
+    };
+    return constraint;
+}
 
 void require(
     bool condition,
@@ -938,10 +952,11 @@ MlxDeepseekV4Vision make_vision(const DeepseekV4Config& config) {
 
 MlxDeepseekV4CausalLm make_dspark_model(
     bool attach_dspark = true,
-    bool attach_vision = false) {
+    bool attach_vision = false,
+    int dspark_block_size = 2) {
     auto config = test_config(false, {0, 0, 0});
     config.n_mtp_layers = 1;
-    config.dspark_block_size = 2;
+    config.dspark_block_size = dspark_block_size;
     config.dspark_noise_token_id = kVocab - 1;
     config.dspark_target_layer_ids = {2};
     config.dspark_markov_rank = 4;
@@ -1530,6 +1545,38 @@ void test_dspark_generation_uses_common_mtp_engine() {
         model.cache_position() == 7 && stats.available && stats.used &&
             stats.cycles > 0 && stats.drafted_tokens > 0,
         "DeepSeek-V4 DSpark target transaction/statistics mismatch");
+
+    auto constrained_model = make_dspark_model();
+    (void)constrained_model.generate(
+        {1, 2},
+        sampling,
+        6,
+        {},
+        std::vector<std::int64_t>{},
+        512,
+        {},
+        std::nullopt,
+        permissive_cloneable_constraint());
+    require(
+        constrained_model.last_mtp_stats().used,
+        "DeepSeek-V4 cloneable token constraint disabled MTP");
+
+    auto capped_model = make_dspark_model(true, false, 5);
+    auto capped_sampling = sampling;
+    capped_sampling.mtp_max_draft_tokens = 5;
+    (void)capped_model.generate(
+        {1, 2},
+        capped_sampling,
+        16,
+        {},
+        std::vector<std::int64_t>{});
+    const auto& capped_stats = capped_model.last_mtp_stats();
+    require(
+        capped_stats.depth_cycles[2] > 0 &&
+            capped_stats.depth_cycles[3] == 0 &&
+            capped_stats.depth_cycles[4] == 0 &&
+            capped_stats.depth_cycles[5] == 0,
+        "DeepSeek-V4 MTP exceeded its two-position production cap");
 
     mfq::metal::MlxSamplingParams penalized = sampling;
     penalized.presence_penalty = 0.2;

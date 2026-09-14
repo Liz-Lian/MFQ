@@ -421,6 +421,17 @@ constexpr const char* kGluSplitSource = R"METAL(
     output[index] = T(activated * up);
 )METAL";
 
+constexpr const char* kGluPairSource = R"METAL(
+    uint index = thread_position_in_grid.x;
+    if (index >= uint(SIZE)) {
+        return;
+    }
+    float gate_value = min(float(gate[index]), params[0]);
+    float up_value = clamp(float(up[index]), -params[0], params[0]);
+    float activated = gate_value / (1.0f + exp(-gate_value));
+    output[index] = T(activated * up_value);
+)METAL";
+
 constexpr const char* kSharedGateSource = R"METAL(
     uint index = thread_position_in_grid.x;
     if (index >= uint(TOKENS * WIDTH)) {
@@ -609,6 +620,15 @@ const mlx::core::fast::CustomKernelFunction& glu_split_kernel() {
         {"gate_up", "params"},
         {"output"},
         kGluSplitSource);
+    return kernel;
+}
+
+const mlx::core::fast::CustomKernelFunction& glu_pair_kernel() {
+    static const auto kernel = make_kernel(
+        "mfq_cpp_moe_glu_pair",
+        {"gate", "up", "params"},
+        {"output"},
+        kGluPairSource);
     return kernel;
 }
 
@@ -1256,6 +1276,42 @@ array moe_limited_swiglu_split(
     const array& gate_up,
     float limit) {
     return glu_split(gate_up, false, limit);
+}
+
+array moe_limited_swiglu_pair(
+    const array& gate,
+    const array& up,
+    float limit) {
+    auto gate_values = floating_contiguous(gate);
+    auto up_values = floating_contiguous(up);
+    if (gate_values.ndim() < 2 || gate_values.size() == 0
+        || up_values.shape() != gate_values.shape()) {
+        throw std::invalid_argument(
+            "Gate and Up must have matching non-empty shapes");
+    }
+    if (!std::isfinite(limit) || limit <= 0.0f) {
+        throw std::invalid_argument(
+            "limited SwiGLU pair limit must be finite and positive");
+    }
+    if (up_values.dtype() != gate_values.dtype()) {
+        up_values = mlx::core::contiguous(
+            mlx::core::astype(up_values, gate_values.dtype()));
+    }
+    const int size = checked_int(
+        gate_values.size(),
+        "paired GLU element count");
+    const array params({limit}, mlx::core::float32);
+    auto outputs = glu_pair_kernel()(
+        {gate_values, up_values, params},
+        {gate_values.shape()},
+        {gate_values.dtype()},
+        {size, 1, 1},
+        {std::min(kThreads, size), 1, 1},
+        {{"T", gate_values.dtype()}, {"SIZE", size}},
+        std::nullopt,
+        false,
+        {});
+    return std::move(outputs.front());
 }
 
 array moe_geglu_split(const array& gate_up) {

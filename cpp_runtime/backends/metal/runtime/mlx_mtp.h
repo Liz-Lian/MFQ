@@ -1,5 +1,6 @@
 #pragma once
 
+#include "mfq/token_constraint.h"
 #include "mlx_sampling.h"
 
 #include <array>
@@ -134,6 +135,10 @@ struct MlxMtpEngineRequest {
     std::span<const std::int64_t> eos_token_ids;
     MlxGenerationTokenCallback callback;
     std::uint64_t sampler_draws_consumed = 0;
+    // The committed constraint and a cloneable speculative cursor. Drafts
+    // remain unconstrained; invalid accepted tokens are truncated and
+    // resampled from the corresponding target row under this constraint.
+    MfqTokenConstraintPtr token_constraint;
 };
 
 // Avoid allocating a vocabulary-sized count vector on the common no-penalty

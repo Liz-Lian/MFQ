@@ -2,7 +2,16 @@ MFQ
 ===
 
 MFQ's original code is licensed under the Apache License 2.0 in `LICENSE`.
-The following integrated components retain their original MIT terms.
+The following integrated components retain their original license terms.
+
+oMLX
+----
+Parts of MFQ's Metal scheduling and model-specific kernels are adapted from
+oMLX, with MFQ-specific model layouts and runtime integration.
+
+Copyright (c) 2026 Apple Inc.
+License: Apache License 2.0 (`LICENSE`)
+Source: https://github.com/jundot/omlx
 
 llama.cpp / GGML
 ----------------
@@ -46,5 +55,5 @@ Copyright (c) 2025 DeepSeek
 License: MIT (`LICENSES/DeepSelect-MIT.txt`)
 Source: https://github.com/deepseek-ai/DeepSelect
 
-The MIT license notices above must accompany source and binary distributions
-that contain these components or substantial portions of them.
+The third-party license notices above must accompany source and binary
+distributions that contain these components or substantial portions of them.

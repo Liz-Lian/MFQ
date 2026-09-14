@@ -104,11 +104,14 @@ file(TOUCH
 set(_MFQ_STEEL_ENTRY
     "${CMAKE_CURRENT_BINARY_DIR}/mfq_steel_mma_entry.h")
 file(WRITE "${_MFQ_STEEL_ENTRY}"
-    "#include \"mlx/backend/metal/kernels/complex.h\"\n"
-    "#include \"mlx/backend/metal/kernels/steel/gemm/mma.h\"\n")
+    "#include \"mlx/backend/metal/kernels/utils.h\"\n"
+    "#include \"mlx/backend/metal/kernels/steel/gemm/gemm.h\"\n"
+    "#include \"mlx/backend/metal/kernels/fp_quantized.h\"\n"
+    "#include \"mlx/backend/metal/kernels/quantized_utils.h\"\n")
 execute_process(
     COMMAND "${CMAKE_CXX_COMPILER}" -E -P -x c++
         -D__METAL_VERSION__=310
+        -DMLX_METAL_JIT
         "-I${MFQ_MLX_ROOT}/include"
         "-I${_MFQ_STEEL_STUB_DIR}"
         "${_MFQ_STEEL_ENTRY}"
@@ -201,7 +204,11 @@ set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
     "${_MFQ_NINT_PREFILL_METAL}"
     "${_MFQ_DSA_SPARSE_PREFILL_METAL}"
     "${_MFQ_SPARSE_BLOCK_GQA_METAL}"
+    "${MFQ_MLX_ROOT}/include/mlx/backend/metal/kernels/fp_quantized.h"
+    "${MFQ_MLX_ROOT}/include/mlx/backend/metal/kernels/quantized_utils.h"
+    "${MFQ_MLX_ROOT}/include/mlx/backend/metal/kernels/utils.h"
     "${MFQ_MLX_ROOT}/include/mlx/backend/metal/kernels/steel/attn/attn.h"
+    "${MFQ_MLX_ROOT}/include/mlx/backend/metal/kernels/steel/gemm/gemm.h"
     "${MFQ_MLX_ROOT}/include/mlx/backend/metal/kernels/steel/gemm/mma.h"
     "${MFQ_MLX_ROOT}/include/mlx/backend/metal/kernels/steel/gemm/nax.h")
 configure_file(

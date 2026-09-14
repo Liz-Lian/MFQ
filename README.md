@@ -48,20 +48,36 @@ memory, storage, and latency limits.
 > experts resident in unified memory while offloading only Engram storage to
 > the Mac's internal SSD.
 
-| Model / hardware | Placement | Model load | Prefill, 511 / 2,031 tokens | Token generation |
-| --- | --- | ---: | ---: | ---: |
-| DeepSeek V4.1 Flash raw-HF / Mac Studio M3 Ultra, 512 GB | Full resident; Engram only on internal SSD | **38.6 s** | **285.6 / 338.4 tok/s** | **18.20 tok/s** |
+| Model / hardware | Placement | Model load | Prefill, ~0.5K / ~2K / ~16K tokens | TG, MTP off | TG, high-acceptance MTP |
+| --- | --- | ---: | ---: | ---: | ---: |
+| DeepSeek V4.1 Flash raw-HF / Mac Studio M3 Ultra, 512 GB | Full resident; Engram only on internal SSD | **38.6 s** | **390.2 / 458.6 / 471.1 tok/s** | **18.29 tok/s** | **33.46 tok/s** (**+83.0%**) |
 
-*Measured locally at batch size 1 with a 4,096-token context, 512-token
-prefill chunks, temperature 0, warmed execution, and MTP disabled. These are
-observed local runtime results; OS memory pressure can affect them.*
+*Measured locally at batch size 1 with a 32,768-token context, temperature 0,
+and warmed execution. On this exact resident M3 Ultra geometry, MFQ now
+auto-selects a 5,440-token maximum prefill chunk; 5,440 × 6 routed experts
+stays just below MLX's 32,768-row sorted-MXFP4 boundary. It also fuses the
+window-KV RMSNorm, partial RoPE, and activation fake quantization; component
+A/B reduced `q_kv_prepare` by 1.18% and evaluated prefill time by 0.15%.
+Prefill figures are representative warmed measurements for 509-, 2,009-, and
+15,969-token deterministic repeated raw-completion prompts. The process used
+approximately 287 GiB RSS after load; the 440 GiB wired budget is a ceiling,
+not the steady-state footprint. The MTP result uses a deterministic numeric
+continuation and accepted 132/132 drafted tokens while producing exactly the
+same output as non-MTP decoding. MTP gains are workload-dependent, and OS
+memory pressure can affect results.*
+
+MTP adapts when speculation is not useful: on a lower-acceptance code case
+(50% acceptance), it measured **17.52 tok/s** versus **17.59 tok/s** with MTP
+off, then exited after two low-acceptance cycles while preserving deterministic
+output.
 
 ### DeepSeek V4.1 TODO
 
-- [ ] **Production MTP support and tuning.** Improve draft acceptance,
-  verification, and adaptive depth until MTP consistently exceeds the current
-  non-MTP **18.20 tok/s** baseline without compromising deterministic output;
-  then enable it by default.
+- [ ] **Broaden production MTP gains.** MTP now provides deterministic
+  verification, state snapshots, adaptive depth, and a low-acceptance fallback.
+  Continue improving verifier efficiency and acceptance on prose and code so
+  the high-acceptance speedup extends to representative workloads before MTP
+  is enabled by default.
 - [ ] **Continue M3 Ultra optimization.** Improve long-prompt prefill and token
   generation, reduce model-load and memory-pressure overhead, and further
   overlap Engram cache misses with internal-SSD I/O.

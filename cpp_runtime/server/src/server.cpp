@@ -304,6 +304,17 @@ public:
     MfqGrammarConstraint & operator=(
         const MfqGrammarConstraint &) = delete;
 
+    std::shared_ptr<MfqGrammarConstraint> clone() const {
+        if (grammar_ == nullptr) {
+            throw std::logic_error(
+                "cannot clone an uninitialized chat-template grammar");
+        }
+        return std::shared_ptr<MfqGrammarConstraint>(
+            new MfqGrammarConstraint(
+                vocab_, vocab_size_,
+                mfq_text_grammar_clone_impl(*grammar_)));
+    }
+
     bool allows(std::int64_t token) {
         if (token < 0 || token >= vocab_size_) return false;
         mfq_text_token_data candidate = {
@@ -350,18 +361,30 @@ public:
     }
 
 private:
+    MfqGrammarConstraint(
+            const mfq_text_vocab * vocab,
+            int32_t vocab_size,
+            mfq_text_grammar * grammar)
+        : vocab_(vocab),
+          vocab_size_(vocab_size),
+          grammar_(grammar) {
+        if (vocab_ == nullptr || vocab_size_ <= 0 || grammar_ == nullptr) {
+            if (grammar_ != nullptr) {
+                mfq_text_grammar_free_impl(grammar_);
+            }
+            throw std::invalid_argument(
+                "cannot clone an invalid chat-template grammar");
+        }
+    }
+
     const mfq_text_vocab * vocab_ = nullptr;
     int32_t vocab_size_ = 0;
     mfq_text_grammar * grammar_ = nullptr;
     std::vector<mfq_text_token_data> candidates_;
 };
 
-static MfqTokenConstraintPtr make_token_constraint(
-        const MfqTokenizer & tokenizer,
-        const common_chat_params & params) {
-    if (params.grammar.empty()) return {};
-    auto implementation =
-        std::make_shared<MfqGrammarConstraint>(tokenizer, params);
+static MfqTokenConstraintPtr wrap_token_constraint(
+        std::shared_ptr<MfqGrammarConstraint> implementation) {
     auto constraint = std::make_shared<MfqTokenConstraint>();
     constraint->allows = [implementation](std::int64_t token) {
         return implementation->allows(token);
@@ -372,7 +395,18 @@ static MfqTokenConstraintPtr make_token_constraint(
     constraint->accept = [implementation](std::int64_t token) {
         implementation->accept(token);
     };
+    constraint->clone = [implementation] {
+        return wrap_token_constraint(implementation->clone());
+    };
     return constraint;
+}
+
+static MfqTokenConstraintPtr make_token_constraint(
+        const MfqTokenizer & tokenizer,
+        const common_chat_params & params) {
+    if (params.grammar.empty()) return {};
+    return wrap_token_constraint(
+        std::make_shared<MfqGrammarConstraint>(tokenizer, params));
 }
 
 static bool request_enable_thinking(const json & body, bool fallback) {
@@ -787,7 +821,7 @@ static MfqRuntimeProfile architecture_runtime_profile(
         result.chat.top_p = 0.8;
         result.chat.repetition_penalty = 1.05;
         result.chat.presence_penalty = 0.0;
-        result.chat.mtp_max_draft_tokens = 5;
+        result.chat.mtp_max_draft_tokens = 2;
         result.source = "architecture-registry:deepseek_v4";
     }
     return result;

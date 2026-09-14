@@ -3,8 +3,41 @@
 #include <array>
 #include <cmath>
 #include <iostream>
+#include <limits>
+#include <memory>
 #include <stdexcept>
 #include <vector>
+
+namespace {
+
+MfqTokenConstraintPtr alternating_constraint(int position = 0) {
+    auto state = std::make_shared<int>(position);
+    auto constraint = std::make_shared<MfqTokenConstraint>();
+    constraint->allows = [state](std::int64_t token) {
+        return token == (*state % 2);
+    };
+    constraint->apply = [state](float* logits, std::size_t count) {
+        const auto allowed = static_cast<std::size_t>(*state % 2);
+        for (std::size_t token = 0; token < count; ++token) {
+            if (token != allowed) {
+                logits[token] = -std::numeric_limits<float>::infinity();
+            }
+        }
+    };
+    constraint->accept = [state](std::int64_t token) {
+        if (token != (*state % 2)) {
+            throw std::runtime_error(
+                "alternating constraint accepted an invalid token");
+        }
+        ++*state;
+    };
+    constraint->clone = [state] {
+        return alternating_constraint(*state);
+    };
+    return constraint;
+}
+
+} // namespace
 
 int main() {
     using mfq::metal::verify_greedy_mtp;
@@ -20,6 +53,7 @@ int main() {
             }
             controller.observe(3, 3, 30.0);
             controller.observe(3, 3, 29.0);
+            controller.observe(3, 3, 28.0);
             controller.observe(0, 0, 22.0);
             controller.observe(0, 0, 21.0);
             controller.observe(0, 0, 23.0);
@@ -34,6 +68,7 @@ int main() {
             mfq::metal::MlxMtpDepthController controller(1);
             controller.observe(1, 0, 80.0);
             controller.observe(1, 0, 75.0);
+            controller.observe(1, 0, 70.0);
             controller.observe(0, 0, 40.0);
             controller.observe(0, 0, 39.0);
             controller.observe(0, 0, 41.0);
@@ -47,6 +82,7 @@ int main() {
             mfq::metal::MlxMtpDepthController controller(3);
             controller.observe(3, 0, 70.0);
             controller.observe(3, 0, 65.0);
+            controller.observe(3, 0, 60.0);
             controller.observe(0, 0, 30.0);
             controller.observe(0, 0, 29.0);
             controller.observe(0, 0, 31.0);
@@ -72,6 +108,7 @@ int main() {
             mfq::metal::MlxMtpDepthController controller(3);
             controller.observe(3, 3, 45.0);
             controller.observe(3, 3, 44.0);
+            controller.observe(3, 3, 43.0);
             controller.observe(0, 0, 30.0);
             controller.observe(0, 0, 30.0);
             controller.observe(0, 0, 30.0);
@@ -83,6 +120,7 @@ int main() {
         {
             mfq::metal::MlxMtpDepthController controller(5);
             controller.observe(5, 5, 1104.0);
+            controller.observe(5, 5, 721.0);
             controller.observe(5, 5, 235.0);
             controller.observe(0, 0, 46.6);
             controller.observe(0, 0, 46.6);
@@ -367,6 +405,77 @@ int main() {
                 stats.drafted_tokens != 2 || stats.accepted_tokens != 2) {
                 throw std::runtime_error(
                     "architecture-independent MTP engine lifecycle mismatch");
+            }
+        }
+        {
+            int target_position = 0;
+            std::vector<std::int64_t> emitted;
+            mfq::metal::MlxMtpEngineCallbacks callbacks;
+            callbacks.target_cache_position = [&] {
+                return target_position;
+            };
+            callbacks.prepare_draft = [](
+                const mfq::metal::MlxMtpDraftContext& context,
+                const mfq::metal::MlxMtpTokenSelector& select_token) {
+                for (int position = 0;
+                     position < context.requested_depth;
+                     ++position) {
+                    (void)select_token(mlx::core::array(
+                        {10.0f, 0.0f, 0.0f},
+                        mlx::core::Shape{1, 3}));
+                }
+            };
+            callbacks.verify_target = [&] (
+                std::int32_t,
+                const mlx::core::array&,
+                int draft_count) {
+                target_position += draft_count + 1;
+                return mfq::metal::MlxMtpTargetBatch{
+                    mlx::core::broadcast_to(
+                        mlx::core::array(
+                            {10.0f, 0.0f, 0.0f},
+                            mlx::core::Shape{1, 3}),
+                        mlx::core::Shape{draft_count + 1, 3}),
+                    mlx::core::zeros(
+                        mlx::core::Shape{1, draft_count + 1, 1}),
+                };
+            };
+            callbacks.resolve_target = [&] (
+                int accepted,
+                int drafted) {
+                target_position -= drafted - accepted;
+            };
+            mfq::metal::MlxSamplingParams sampling;
+            sampling.temperature = 0.0;
+            sampling.mtp_max_draft_tokens = 2;
+            mfq::metal::MlxMtpGenerationStats stats;
+            const auto generated = mfq::metal::run_mlx_mtp_generation(
+                mfq::metal::MlxMtpEngineRequest{
+                    3,
+                    6,
+                    32,
+                    2,
+                    mlx::core::array(
+                        {10.0f, 0.0f, 0.0f},
+                        mlx::core::Shape{1, 3}),
+                    sampling,
+                    std::nullopt,
+                    {},
+                    [&](std::int64_t token) {
+                        emitted.push_back(token);
+                        return true;
+                    },
+                    0u,
+                    alternating_constraint(),
+                },
+                callbacks,
+                stats);
+            if (generated != 6 ||
+                emitted != std::vector<std::int64_t>({0, 1, 0, 1, 0, 1}) ||
+                !stats.available || !stats.used || stats.cycles == 0 ||
+                target_position != 5) {
+                throw std::runtime_error(
+                    "grammar-aware MTP constraint lifecycle mismatch");
             }
         }
         std::cout << "MFQ generic MTP verification tests passed\n";

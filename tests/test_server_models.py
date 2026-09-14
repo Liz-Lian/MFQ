@@ -1049,6 +1049,84 @@ def test_runtime_memory_enforcement_rechecks_when_a_busy_runtime_drains(
     asyncio.run(run())
 
 
+def test_runtime_control_lease_blocks_lru_eviction(tmp_path: Path) -> None:
+    async def run() -> None:
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        class BlockingBackend(IdleBackend):
+            async def clear_runtime_cache(self) -> dict[str, object]:
+                started.set()
+                await release.wait()
+                return {"cleared": True}
+
+        _model(tmp_path / "model.mfq")
+        catalog = ModelCatalog([tmp_path], cache_seconds=0)
+        artifact = await catalog.resolve("model")
+        instance = _ManagedRuntime(
+            id=uuid4(),
+            artifact=artifact,
+            process=SimpleNamespace(returncode=None),
+            backend=BlockingBackend(),
+            port=0,
+            context_size=4096,
+            state=RuntimeInstanceState.READY,
+            last_used_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        )
+        pool = ManagedRuntimePool(catalog, tmp_path / "runtime", max_instances=1)
+        pool._instances[instance.id] = instance
+        clearing = asyncio.create_task(pool.clear_runtime_cache(instance.id))
+        await asyncio.wait_for(started.wait(), timeout=1)
+
+        async with pool._lock:
+            assert instance.control_leases == 1
+            assert pool._detach_lru_instance_locked() is None
+
+        release.set()
+        assert await clearing == {"cleared": True}
+        async with pool._lock:
+            assert instance.control_leases == 0
+            assert pool._detach_lru_instance_locked() is instance
+
+    asyncio.run(run())
+
+
+def test_runtime_control_lease_release_survives_caller_cancellation(
+    tmp_path: Path,
+) -> None:
+    async def run() -> None:
+        _model(tmp_path / "model.mfq")
+        catalog = ModelCatalog([tmp_path], cache_seconds=0)
+        artifact = await catalog.resolve("model")
+        instance = _ManagedRuntime(
+            id=uuid4(),
+            artifact=artifact,
+            process=SimpleNamespace(returncode=None),
+            backend=IdleBackend(),
+            port=0,
+            context_size=4096,
+            state=RuntimeInstanceState.READY,
+            control_leases=1,
+        )
+        pool = ManagedRuntimePool(catalog, tmp_path / "runtime")
+        pool._instances[instance.id] = instance
+
+        await pool._lock.acquire()
+        releasing = asyncio.create_task(pool._release_control_lease(instance))
+        while not pool._lease_release_tasks:
+            await asyncio.sleep(0)
+        releasing.cancel()
+        pool._lock.release()
+        with pytest.raises(asyncio.CancelledError):
+            await releasing
+        await pool._drain_control_lease_releases()
+
+        assert instance.control_leases == 0
+        assert not pool._lease_release_tasks
+
+    asyncio.run(run())
+
+
 def test_runtime_memory_enforcement_trims_idle_hot_tiers_before_models(
     tmp_path: Path,
 ) -> None:
@@ -1871,7 +1949,7 @@ def test_started_runtime_monitor_reports_abnormal_exit(tmp_path: Path) -> None:
             assert "137" in instances.data[0].error.message
             assert session_id not in pool._session_routes
             assert await pool._select("initial", session_id=session_id) is None
-            assert await pool._current_backend() is None
+            assert (await pool.runtime_status())["runtime_state"] == "idle"
 
     asyncio.run(run())
 

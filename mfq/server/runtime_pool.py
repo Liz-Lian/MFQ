@@ -7,7 +7,7 @@ import socket
 import subprocess
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
-from contextlib import suppress
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -79,6 +79,7 @@ class _ManagedRuntime:
     last_used_at: datetime | None = None
     active_requests: int = 0
     queued_requests: int = 0
+    control_leases: int = 0
     request_slots: asyncio.Semaphore | None = None
     error: ErrorDetail | None = None
     output_task: asyncio.Task[None] | None = None
@@ -121,6 +122,54 @@ class _RuntimeLoadContext:
                 result = callback()
                 if result is not None:
                     await result
+
+
+class _LeasedRealtimeConnector:
+    """Hold a managed runtime resident for one upstream WebSocket lifetime."""
+
+    def __init__(
+        self,
+        pool: ManagedRuntimePool,
+        instance: _ManagedRuntime,
+        connector: Any,
+    ) -> None:
+        self.pool = pool
+        self.instance = instance
+        self.connector = connector
+        self.leased = False
+
+    async def __aenter__(self) -> Any:
+        async with self.pool._lock:
+            if (
+                self.pool._instances.get(self.instance.id) is not self.instance
+                or self.instance.state
+                not in {RuntimeInstanceState.READY, RuntimeInstanceState.BUSY}
+            ):
+                raise BackendError(
+                    "model_not_ready",
+                    "realtime runtime is no longer available",
+                    retryable=True,
+                    status_code=409,
+                )
+            self.instance.control_leases += 1
+            self.leased = True
+        try:
+            return await self.connector.__aenter__()
+        except BaseException:
+            await self._release()
+            raise
+
+    async def __aexit__(self, *error: object) -> bool | None:
+        try:
+            return await self.connector.__aexit__(*error)
+        finally:
+            await self._release()
+
+    async def _release(self) -> None:
+        if not self.leased:
+            return
+        self.leased = False
+        await self.pool._release_control_lease(self.instance)
 
 
 @dataclass(frozen=True)
@@ -205,6 +254,7 @@ class ManagedRuntimePool:
         self._realtime_activation_lock = asyncio.Lock()
         self._idle_reaper_task: asyncio.Task[None] | None = None
         self._idle_reaper_wakeup = asyncio.Event()
+        self._lease_release_tasks: set[asyncio.Task[None]] = set()
         self._closed = False
 
     async def start(self) -> None:
@@ -493,6 +543,9 @@ class ManagedRuntimePool:
             pinned=request.pin,
             request_slots=asyncio.Semaphore(self.max_requests_per_instance),
             reserved_bytes=incoming_bytes,
+            # Keep TTL and memory-pressure eviction out of the load
+            # transaction until the ready instance has been published.
+            control_leases=1,
         )
         try:
             async with self._lock:
@@ -611,6 +664,7 @@ class ManagedRuntimePool:
             )
             self._finish_model_load_locked(model_name, load_event, None)
             keep_process = True
+        await self._release_control_lease(instance)
         return {
             "instance_id": str(instance.id),
             "model_id": artifact.resource.name,
@@ -628,10 +682,14 @@ class ManagedRuntimePool:
                     "runtime_instance_not_found",
                     f"runtime instance was not found: {request.instance_id}",
                 )
-            if (instance.active_requests or instance.queued_requests) and not request.force:
+            if (
+                instance.active_requests
+                or instance.queued_requests
+                or instance.control_leases
+            ) and not request.force:
                 raise _job_error(
                     "runtime_busy",
-                    "runtime has active or queued requests",
+                    "runtime has active requests, queued requests, or control operations",
                     retryable=True,
                 )
             instance.state = RuntimeInstanceState.UNLOADING
@@ -890,17 +948,26 @@ class ManagedRuntimePool:
             }:
                 self._session_routes.pop(source_session_id, None)
                 instance = None
+            if instance is not None:
+                instance.control_leases += 1
         if instance is None:
             return (
                 await self.fallback.fork_session(source_session_id, target_session_id)
                 if self.fallback
                 else False
             )
-        succeeded = await instance.backend.fork_session(source_session_id, target_session_id)
-        if succeeded:
-            async with self._lock:
-                self._session_routes[target_session_id] = instance.id
-        return succeeded
+        try:
+            succeeded = await instance.backend.fork_session(
+                source_session_id,
+                target_session_id,
+            )
+            if succeeded:
+                async with self._lock:
+                    if self._instances.get(instance.id) is instance:
+                        self._session_routes[target_session_id] = instance.id
+            return succeeded
+        finally:
+            await self._release_control_lease(instance)
 
     async def close_session(self, session_id: UUID) -> bool:
         async with self._lock:
@@ -911,9 +978,14 @@ class ManagedRuntimePool:
                 RuntimeInstanceState.BUSY,
             }:
                 instance = None
+            if instance is not None:
+                instance.control_leases += 1
         if instance is None:
             return await self.fallback.close_session(session_id) if self.fallback else False
-        return await instance.backend.close_session(session_id)
+        try:
+            return await instance.backend.close_session(session_id)
+        finally:
+            await self._release_control_lease(instance)
 
     async def cancel_response(self, session_id: UUID) -> bool:
         async with self._lock:
@@ -925,41 +997,35 @@ class ManagedRuntimePool:
             }:
                 self._session_routes.pop(session_id, None)
                 instance = None
+            if instance is not None:
+                instance.control_leases += 1
         backend = instance.backend if instance is not None else self.fallback
         if backend is None:
             return False
         cancel = getattr(backend, "cancel_response", None)
-        return bool(await cancel(session_id)) if callable(cancel) else False
+        try:
+            return bool(await cancel(session_id)) if callable(cancel) else False
+        finally:
+            if instance is not None:
+                await self._release_control_lease(instance)
 
     async def capabilities(
         self,
         instance_id: UUID | None = None,
     ) -> RuntimeCapabilitiesResource:
-        if instance_id is None:
-            backend = await self._current_backend()
-        else:
-            _instance, backend = await self._runtime_control_target(instance_id)
-        if backend is None:
-            raise BackendError("model_not_loaded", "no runtime is available")
-        return await backend.capabilities()
+        async with self._runtime_control_lease(instance_id) as (_instance, backend):
+            if backend is None:
+                raise BackendError("model_not_loaded", "no runtime is available")
+            return await backend.capabilities()
 
     async def runtime_status(
         self,
         instance_id: UUID | None = None,
     ) -> dict[str, Any]:
-        async with self._lock:
-            instance = (
-                self._current_instance_locked()
-                if instance_id is None
-                else self._instances.get(instance_id)
-            )
-            if instance_id is not None and instance is None:
-                raise BackendError(
-                    "runtime_instance_not_found",
-                    f"runtime instance was not found: {instance_id}",
-                    status_code=404,
-                )
-            backend = instance.backend if instance is not None else self.fallback
+        async with self._runtime_control_lease(
+            instance_id,
+            allow_unready=True,
+        ) as (instance, backend):
             if instance is not None and instance.state not in {
                 RuntimeInstanceState.READY,
                 RuntimeInstanceState.BUSY,
@@ -977,45 +1043,47 @@ class ManagedRuntimePool:
                         else None
                     ),
                 }
-        if backend is None:
-            return {
-                "runtime_state": "idle",
-                "model": None,
-                "active_requests": 0,
-                "total_requests": 0,
-                "failed_requests": 0,
-                "total_prompt_tokens": 0,
-                "total_completion_tokens": 0,
-                "reloading": False,
-            }
-        status = dict(await backend.runtime_status())
-        if instance is not None:
-            status["instance_id"] = str(instance.id)
-            status["runtime_state"] = instance.state.value
-            if instance.sampling_defaults is not None:
-                status["sampling_defaults"] = instance.sampling_defaults.model_dump(mode="json")
-            pid = getattr(instance.process, "pid", None)
-            resident_bytes = (
-                await asyncio.to_thread(self._process_resident_bytes, pid)
-                if isinstance(pid, int) and pid > 0
-                else None
-            )
-            status["process_resident_bytes"] = resident_bytes
-            kv_value = status.get(
-                "prefix_cache_hot_bytes",
-                status.get("prefix_cache_bytes"),
-            )
-            observed_resident_bytes = self._observed_runtime_bytes(
-                resident_bytes,
-                status,
-            )
-            async with self._lock:
-                if self._instances.get(instance.id) is instance:
-                    if observed_resident_bytes is not None:
-                        instance.resident_bytes = observed_resident_bytes
-                    if isinstance(kv_value, (int, float)) and kv_value >= 0:
-                        instance.kv_bytes = int(kv_value)
-        return status
+            if backend is None:
+                return {
+                    "runtime_state": "idle",
+                    "model": None,
+                    "active_requests": 0,
+                    "total_requests": 0,
+                    "failed_requests": 0,
+                    "total_prompt_tokens": 0,
+                    "total_completion_tokens": 0,
+                    "reloading": False,
+                }
+            status = dict(await backend.runtime_status())
+            if instance is not None:
+                status["instance_id"] = str(instance.id)
+                status["runtime_state"] = instance.state.value
+                if instance.sampling_defaults is not None:
+                    status["sampling_defaults"] = (
+                        instance.sampling_defaults.model_dump(mode="json")
+                    )
+                pid = getattr(instance.process, "pid", None)
+                resident_bytes = (
+                    await asyncio.to_thread(self._process_resident_bytes, pid)
+                    if isinstance(pid, int) and pid > 0
+                    else None
+                )
+                status["process_resident_bytes"] = resident_bytes
+                kv_value = status.get(
+                    "prefix_cache_hot_bytes",
+                    status.get("prefix_cache_bytes"),
+                )
+                observed_resident_bytes = self._observed_runtime_bytes(
+                    resident_bytes,
+                    status,
+                )
+                async with self._lock:
+                    if self._instances.get(instance.id) is instance:
+                        if observed_resident_bytes is not None:
+                            instance.resident_bytes = observed_resident_bytes
+                        if isinstance(kv_value, (int, float)) and kv_value >= 0:
+                            instance.kv_bytes = int(kv_value)
+            return status
 
     async def runtime_models(self) -> dict[str, Any]:
         async with self._lock:
@@ -1042,10 +1110,16 @@ class ManagedRuntimePool:
     async def realtime_capabilities(self) -> dict[str, Any]:
         async with self._lock:
             instance = self._current_instance_locked()
+            gateway = instance.realtime_gateway if instance is not None else None
+            if gateway is not None:
+                instance.control_leases += 1
         if instance is not None:
-            if instance.realtime_gateway is None:
+            if gateway is None:
                 return {"available": False, "modes": []}
-            return await instance.realtime_gateway.capabilities()
+            try:
+                return await gateway.capabilities()
+            finally:
+                await self._release_control_lease(instance)
         if self.fallback is None:
             return {"available": False, "modes": []}
         return await self.fallback.realtime_capabilities()
@@ -1070,41 +1144,57 @@ class ManagedRuntimePool:
                     if instance_id is not None
                     else self._current_instance_locked()
                 )
+                if instance is not None and instance.state in {
+                    RuntimeInstanceState.READY,
+                    RuntimeInstanceState.BUSY,
+                }:
+                    instance.control_leases += 1
+                else:
+                    instance = None
             if instance is None:
                 return {"active": False, "reason": "model_not_loaded"}
-            if not self._supports_voice_output(instance.artifact.resource.architecture):
-                return {"active": False, "reason": "model_not_supported"}
-            if self.voice_component is None or not self.voice_component.ready():
-                return {"active": False, "reason": "component_not_ready"}
-            if instance.realtime_gateway is not None:
-                return {"active": True, "model": instance.artifact.resource.name}
-            base_url = getattr(instance.backend, "base_url", None)
-            if not isinstance(base_url, str) or not base_url:
-                return {"active": False, "reason": "backend_not_supported"}
             try:
-                from mfq.runtime.minicpmo45_realtime import (
-                    RealtimeGateway,
-                    _backend_token2wav_steps,
+                return await self._activate_realtime_instance(instance)
+            finally:
+                await self._release_control_lease(instance)
+
+    async def _activate_realtime_instance(
+        self,
+        instance: _ManagedRuntime,
+    ) -> dict[str, Any]:
+        if not self._supports_voice_output(instance.artifact.resource.architecture):
+            return {"active": False, "reason": "model_not_supported"}
+        if self.voice_component is None or not self.voice_component.ready():
+            return {"active": False, "reason": "component_not_ready"}
+        if instance.realtime_gateway is not None:
+            return {"active": True, "model": instance.artifact.resource.name}
+        base_url = getattr(instance.backend, "base_url", None)
+        if not isinstance(base_url, str) or not base_url:
+            return {"active": False, "reason": "backend_not_supported"}
+        try:
+            from mfq.runtime.minicpmo45_realtime import (
+                RealtimeGateway,
+                _backend_token2wav_steps,
+            )
+
+            def create_gateway() -> Any:
+                steps = _backend_token2wav_steps(base_url, "", None)
+                return RealtimeGateway(
+                    base_url,
+                    self.voice_component.root,
+                    token2wav_steps=steps,
                 )
 
-                def create_gateway() -> Any:
-                    steps = _backend_token2wav_steps(base_url, "", None)
-                    return RealtimeGateway(
-                        base_url,
-                        self.voice_component.root,
-                        token2wav_steps=steps,
-                    )
-
-                gateway = await asyncio.to_thread(create_gateway)
-            except Exception as error:
-                instance.realtime_error = str(error)
-                return {"active": False, "reason": "activation_failed", "error": str(error)}
-            async with self._lock:
-                if self._instances.get(instance.id) is not instance:
-                    return {"active": False, "reason": "model_unloaded"}
-                instance.realtime_gateway = gateway
-                instance.realtime_error = None
-            return {"active": True, "model": instance.artifact.resource.name}
+            gateway = await asyncio.to_thread(create_gateway)
+        except Exception as error:
+            instance.realtime_error = str(error)
+            return {"active": False, "reason": "activation_failed", "error": str(error)}
+        async with self._lock:
+            if self._instances.get(instance.id) is not instance:
+                return {"active": False, "reason": "model_unloaded"}
+            instance.realtime_gateway = gateway
+            instance.realtime_error = None
+        return {"active": True, "model": instance.artifact.resource.name}
 
     async def realtime_serve(self, client: Any, *, mode: str = "audio") -> bool:
         if mode != "audio":
@@ -1112,34 +1202,40 @@ class ManagedRuntimePool:
         async with self._lock:
             instance = self._current_instance_locked()
             gateway = instance.realtime_gateway if instance is not None else None
+            if gateway is not None:
+                instance.control_leases += 1
         if gateway is None:
             return False
-        await gateway.serve(client)
-        return True
+        try:
+            await gateway.serve(client)
+            return True
+        finally:
+            assert instance is not None
+            await self._release_control_lease(instance)
 
     async def reload_runtime(
         self,
         context_size: int,
         instance_id: UUID | None = None,
     ) -> dict[str, Any]:
-        instance, backend = await self._runtime_control_target(instance_id)
-        if backend is None:
-            raise BackendError("model_not_loaded", "no runtime is available")
-        result = await backend.reload_runtime(context_size)
-        if instance is not None:
-            async with self._lock:
-                if self._instances.get(instance.id) is instance:
-                    instance.context_size = context_size
-        return result
+        async with self._runtime_control_lease(instance_id) as (instance, backend):
+            if backend is None:
+                raise BackendError("model_not_loaded", "no runtime is available")
+            result = await backend.reload_runtime(context_size)
+            if instance is not None:
+                async with self._lock:
+                    if self._instances.get(instance.id) is instance:
+                        instance.context_size = context_size
+            return result
 
     async def clear_runtime_cache(
         self,
         instance_id: UUID | None = None,
     ) -> dict[str, Any]:
-        _instance, backend = await self._runtime_control_target(instance_id)
-        if backend is None:
-            raise BackendError("model_not_loaded", "no runtime is available")
-        return await backend.clear_runtime_cache()
+        async with self._runtime_control_lease(instance_id) as (_instance, backend):
+            if backend is None:
+                raise BackendError("model_not_loaded", "no runtime is available")
+            return await backend.clear_runtime_cache()
 
     async def trim_runtime_cache(
         self,
@@ -1148,25 +1244,29 @@ class ManagedRuntimePool:
     ) -> dict[str, Any]:
         if target_bytes < 0:
             raise ValueError("target_bytes must be non-negative")
-        instance, backend = await self._runtime_control_target(instance_id)
-        if backend is None:
-            raise BackendError("model_not_loaded", "no runtime is available")
-        trim = getattr(backend, "trim_runtime_cache", None)
-        if not callable(trim):
-            raise BackendError(
-                "unsupported_operation",
-                "this runtime does not expose a tiered prefix cache",
-                status_code=501,
-            )
-        result = await trim(target_bytes)
-        if instance is not None:
-            await self._refresh_instance_usage(instance)
-        return result
+        async with self._runtime_control_lease(instance_id) as (instance, backend):
+            if backend is None:
+                raise BackendError("model_not_loaded", "no runtime is available")
+            trim = getattr(backend, "trim_runtime_cache", None)
+            if not callable(trim):
+                raise BackendError(
+                    "unsupported_operation",
+                    "this runtime does not expose a tiered prefix cache",
+                    status_code=501,
+                )
+            result = await trim(target_bytes)
+            if instance is not None:
+                await self._refresh_instance_usage(instance)
+            return result
 
     def realtime_connect(self, *, mode: str = "audio") -> Any:
         instance = self._instances.get(self._last_instance_id) if self._last_instance_id else None
-        if instance is not None:
-            return instance.backend.realtime_connect(mode=mode)
+        if instance is not None and instance.state in {
+            RuntimeInstanceState.READY,
+            RuntimeInstanceState.BUSY,
+        }:
+            connector = instance.backend.realtime_connect(mode=mode)
+            return _LeasedRealtimeConnector(self, instance, connector)
         if self.fallback is not None:
             return self.fallback.realtime_connect(mode=mode)
         raise BackendError("model_not_loaded", "no runtime is available")
@@ -1194,6 +1294,7 @@ class ManagedRuntimePool:
             self._reserved_ports.clear()
         if idle_reaper is not None and idle_reaper is not asyncio.current_task():
             await idle_reaper
+        await self._drain_control_lease_releases()
         first_error: Exception | None = None
         for instance in instances:
             try:
@@ -1396,15 +1497,13 @@ class ManagedRuntimePool:
             raise self._backend_load_error(error)
         return False
 
-    async def _current_backend(self) -> ChatBackend | None:
-        async with self._lock:
-            instance = self._current_instance_locked()
-        return instance.backend if instance is not None else self.fallback
-
-    async def _runtime_control_target(
+    @asynccontextmanager
+    async def _runtime_control_lease(
         self,
         instance_id: UUID | None,
-    ) -> tuple[_ManagedRuntime | None, ChatBackend | None]:
+        *,
+        allow_unready: bool = False,
+    ) -> AsyncIterator[tuple[_ManagedRuntime | None, ChatBackend | None]]:
         async with self._lock:
             if instance_id is None:
                 instance = self._current_instance_locked()
@@ -1416,7 +1515,7 @@ class ManagedRuntimePool:
                         f"runtime instance was not found: {instance_id}",
                         status_code=404,
                     )
-                if instance.state not in {
+                if not allow_unready and instance.state not in {
                     RuntimeInstanceState.READY,
                     RuntimeInstanceState.BUSY,
                 }:
@@ -1427,7 +1526,44 @@ class ManagedRuntimePool:
                         status_code=409,
                     )
             backend = instance.backend if instance is not None else self.fallback
-        return instance, backend
+            leased = instance is not None and instance.state in {
+                RuntimeInstanceState.READY,
+                RuntimeInstanceState.BUSY,
+            }
+            if leased:
+                instance.control_leases += 1
+        try:
+            yield instance, backend
+        finally:
+            if leased and instance is not None:
+                await self._release_control_lease(instance)
+
+    async def _decrement_control_lease(self, instance: _ManagedRuntime) -> None:
+        async with self._lock:
+            instance.control_leases = max(0, instance.control_leases - 1)
+
+    def _finish_control_lease_release(self, task: asyncio.Task[None]) -> None:
+        self._lease_release_tasks.discard(task)
+        with suppress(asyncio.CancelledError):
+            task.result()
+
+    async def _release_control_lease(self, instance: _ManagedRuntime) -> None:
+        """Release a lease even if its caller is cancelled during cleanup."""
+
+        task = asyncio.create_task(
+            self._decrement_control_lease(instance),
+            name=f"mfq-server-runtime-lease-release-{instance.id}",
+        )
+        self._lease_release_tasks.add(task)
+        task.add_done_callback(self._finish_control_lease_release)
+        await asyncio.shield(task)
+
+    async def _drain_control_lease_releases(self) -> None:
+        while self._lease_release_tasks:
+            await asyncio.gather(
+                *tuple(self._lease_release_tasks),
+                return_exceptions=True,
+            )
 
     def _current_instance_locked(self) -> _ManagedRuntime | None:
         instance = (
@@ -1457,6 +1593,7 @@ class ManagedRuntimePool:
             and item.state == RuntimeInstanceState.READY
             and item.active_requests == 0
             and item.queued_requests == 0
+            and item.control_leases == 0
         ]
         if not candidates:
             return None
@@ -1525,6 +1662,7 @@ class ManagedRuntimePool:
                     if item.state == RuntimeInstanceState.READY
                     and item.active_requests == 0
                     and item.queued_requests == 0
+                    and item.control_leases == 0
                     and (item.kv_bytes or 0) > 0
                     and callable(getattr(item.backend, "trim_runtime_cache", None))
                 ),
@@ -1538,6 +1676,7 @@ class ManagedRuntimePool:
                     or instance.state != RuntimeInstanceState.READY
                     or instance.active_requests != 0
                     or instance.queued_requests != 0
+                    or instance.control_leases != 0
                 ):
                     continue
                 committed = self._committed_pool_bytes_locked() + additional_bytes
@@ -1547,13 +1686,17 @@ class ManagedRuntimePool:
                 hot_bytes = instance.kv_bytes or 0
                 target_bytes = max(0, hot_bytes - excess)
                 trim = getattr(instance.backend, "trim_runtime_cache", None)
-            if not callable(trim):
-                continue
+                if not callable(trim):
+                    continue
+                instance.control_leases += 1
             try:
                 await asyncio.wait_for(trim(target_bytes), timeout=2.0)
             except Exception:
-                continue
-            await self._refresh_instance_usage(instance)
+                pass
+            else:
+                await self._refresh_instance_usage(instance)
+            finally:
+                await self._release_control_lease(instance)
 
     def _finish_model_load_locked(
         self,
@@ -1742,6 +1885,7 @@ class ManagedRuntimePool:
                         or instance.state != RuntimeInstanceState.READY
                         or instance.active_requests != 0
                         or instance.queued_requests != 0
+                        or instance.control_leases != 0
                         or instance.last_used_at is None
                     ):
                         continue
@@ -1894,7 +2038,11 @@ class ManagedRuntimePool:
             if isinstance(value, (int, float)) and value >= 0:
                 kv_bytes = int(value)
         async with self._lock:
-            if self._instances.get(instance.id) is not instance:
+            if (
+                self._instances.get(instance.id) is not instance
+                or instance.state
+                not in {RuntimeInstanceState.READY, RuntimeInstanceState.BUSY}
+            ):
                 return
             if observed_resident is not None:
                 instance.resident_bytes = observed_resident

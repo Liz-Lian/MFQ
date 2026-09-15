@@ -97,6 +97,11 @@ public:
         const mlx::core::array& input,
         const mlx::core::array& token_ids,
         MlxSsdPrefetchedExpertLayer* prefetched) const;
+    MlxDeepseekV4MoeBranches forward_branches(
+        const mlx::core::array& input,
+        const mlx::core::array& token_ids,
+        MlxSsdPrefetchedExpertLayer* prefetched,
+        bool may_contain_visual_tokens) const;
 
     mlx::core::array forward(
         const mlx::core::array& input,

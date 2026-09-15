@@ -256,6 +256,7 @@ public:
 
     std::size_t cache_limit_bytes() const noexcept;
     std::size_t cache_slots() const noexcept;
+    bool has_full_residency_capacity() const noexcept;
     bool prefill_overlap_enabled() const noexcept;
     MlxSsdExpertCacheStats stats() const;
 

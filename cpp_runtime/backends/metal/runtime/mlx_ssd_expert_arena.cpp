@@ -77,7 +77,8 @@ MlxMxfp4SsdExpertArena::allocate_bank(
 MlxMxfp4SsdExpertArena::MlxMxfp4SsdExpertArena(
     std::size_t slots,
     std::size_t hidden_size,
-    std::size_t intermediate_size)
+    std::size_t intermediate_size,
+    std::size_t logical_experts)
     : slots_(slots),
       hidden_size_(hidden_size),
       intermediate_size_(intermediate_size),
@@ -107,7 +108,12 @@ MlxMxfp4SsdExpertArena::MlxMxfp4SsdExpertArena(
                     checked_dimension(hidden_size_, "hidden size"),
                     identity,
                     gate_up_weight_.array,
-                    gate_up_scale_.array)),
+                    gate_up_scale_.array,
+                    logical_experts == 0
+                        ? 0
+                        : checked_dimension(
+                              logical_experts,
+                              "logical expert count"))),
             .down = MlxRoutedLinear(
                 MlxMfeWeight::from_mxfp4_slots(
                     experts,
@@ -115,7 +121,12 @@ MlxMxfp4SsdExpertArena::MlxMxfp4SsdExpertArena(
                     checked_dimension(intermediate_size_, "intermediate size"),
                     identity,
                     w2_weight_.array,
-                    w2_scale_.array)),
+                    w2_scale_.array,
+                    logical_experts == 0
+                        ? 0
+                        : checked_dimension(
+                              logical_experts,
+                              "logical expert count"))),
         });
 }
 

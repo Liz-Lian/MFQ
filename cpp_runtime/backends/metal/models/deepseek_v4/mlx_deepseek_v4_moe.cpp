@@ -1193,6 +1193,19 @@ MlxDeepseekV4Moe::forward_branches(
     const array& input,
     const array& token_ids,
     MlxSsdPrefetchedExpertLayer* prefetched) const {
+    return forward_branches(
+        input,
+        token_ids,
+        prefetched,
+        visual_router_bias_.has_value());
+}
+
+MlxDeepseekV4MoeBranches
+MlxDeepseekV4Moe::forward_branches(
+    const array& input,
+    const array& token_ids,
+    MlxSsdPrefetchedExpertLayer* prefetched,
+    bool may_contain_visual_tokens) const {
     const int hidden = checked_int(
         static_cast<std::size_t>(config_.hidden),
         "hidden width");
@@ -1224,7 +1237,7 @@ MlxDeepseekV4Moe::forward_branches(
     flat_token_ids = mlx::core::reshape(
         flat_token_ids, Shape{rows});
     std::optional<array> image_mask;
-    if (visual_router_bias_.has_value()) {
+    if (visual_router_bias_.has_value() && may_contain_visual_tokens) {
         image_mask = mlx::core::greater_equal(
             flat_token_ids,
             array(
@@ -1237,11 +1250,18 @@ MlxDeepseekV4Moe::forward_branches(
         throw std::invalid_argument(
             "DeepSeek-V4 SSD prefetch layer mismatch");
     }
+    // Synthetic image rows exist only in multimodal prefill. Propagate that
+    // semantic fact from the model instead of inspecting token IDs on the CPU:
+    // MTP verification IDs are device-composed and must not force a sync or
+    // disable the fused Router+TopK path used by generated text.
+    const bool text_only_rows =
+        !visual_router_bias_.has_value() ||
+        !may_contain_visual_tokens;
     const auto* dense_router = router_.dense_weight_ref();
     const bool use_fused_dense_router =
         fused_dense_router_
         && !token_experts_.has_value()
-        && !visual_router_bias_.has_value()
+        && text_only_rows
         && dense_router != nullptr
         && config_.n_experts == 256
         && config_.top_k == 6
@@ -1370,7 +1390,7 @@ MlxDeepseekV4Moe::forward_branches(
             expert_ids,
             candidates.ids,
             available_);
-        if (visual_router_bias_.has_value()) {
+        if (image_mask.has_value()) {
             auto visual = moe_topk(
                 *logits,
                 checked_int(
@@ -1414,7 +1434,7 @@ MlxDeepseekV4Moe::forward_branches(
                 config_.routed_scaling));
         expert_ids = std::move(routing.ids);
         expert_weights = std::move(routing.weights);
-        if (visual_router_bias_.has_value()) {
+        if (image_mask.has_value()) {
             auto visual = moe_topk(
                 *logits,
                 checked_int(

@@ -163,7 +163,9 @@ std::int32_t run_mlx_mtp_generation(
 // speculation when acceptance or runtime conditions improve.
 class MlxMtpDepthController {
 public:
-    explicit MlxMtpDepthController(int maximum_depth = 3);
+    explicit MlxMtpDepthController(
+        int maximum_depth = 3,
+        int initial_depth = 2);
 
     int depth() const noexcept {
         return current_depth_;

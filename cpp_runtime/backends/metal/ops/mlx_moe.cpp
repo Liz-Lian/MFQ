@@ -188,7 +188,8 @@ bool mxfp4_nax_prefill_enabled(
 bool mxfp4_nax_smallm_preferred(
     const array& expert_ids,
     int tokens,
-    int experts,
+    int addressable_experts,
+    int logical_experts,
     int input_width,
     int output_width) noexcept {
     const char* value = std::getenv(
@@ -201,7 +202,7 @@ bool mxfp4_nax_smallm_preferred(
         || setting == "true"
         || setting == "on";
     const bool m3_ultra_native_geometry =
-        apple_m3_ultra() && experts == 256 && (
+        apple_m3_ultra() && logical_experts == 256 && (
             (input_width == 4096 &&
              (output_width == 2048 || output_width == 4096)) ||
             (input_width == 2048 && output_width == 4096));
@@ -219,7 +220,7 @@ bool mxfp4_nax_smallm_preferred(
     const auto* ids = expert_ids.data<std::int32_t>();
     bool has_duplicate = false;
     for (std::size_t index = 0; index < expert_ids.size(); ++index) {
-        if (ids[index] < 0 || ids[index] >= experts) {
+        if (ids[index] < 0 || ids[index] >= addressable_experts) {
             return false;
         }
         for (std::size_t previous = 0; previous < index; ++previous) {
@@ -7978,6 +7979,10 @@ struct MlxMfeWeight::Impl {
     int out_per_expert = 0;
     int neuron_len = 0;
     int projections = 0;
+    // Physical SSD arenas may contain many more rows than one model layer.
+    // Keep the logical expert geometry separately so hardware policy does not
+    // confuse cache capacity with the routed operator it is executing.
+    int logical_experts = 0;
     std::uint32_t family_mask = 0;
     std::uint32_t vq_profile_mask = 0;
     bool jsc_execution_layout = false;
@@ -8772,10 +8777,12 @@ MlxMfeWeight MlxMfeWeight::from_mxfp4_slots(
     int neuron_len,
     const std::vector<std::int32_t>& slot_for_expert,
     array packed_values,
-    array block_scales) {
+    array block_scales,
+    int logical_experts) {
     if (experts <= 0 || out_per_expert <= 0 || neuron_len <= 0 ||
         neuron_len % 32 != 0 ||
-        slot_for_expert.size() != static_cast<std::size_t>(experts)) {
+        slot_for_expert.size() != static_cast<std::size_t>(experts) ||
+        logical_experts < 0) {
         throw std::invalid_argument("invalid MXFP4 slot-view dimensions");
     }
     if (packed_values.dtype() != mlx::core::uint8 ||
@@ -8871,6 +8878,9 @@ MlxMfeWeight MlxMfeWeight::from_mxfp4_slots(
         out_per_expert,
         neuron_len,
         1);
+    impl->logical_experts = logical_experts > 0
+        ? logical_experts
+        : experts;
     return MlxMfeWeight(std::move(impl));
 }
 
@@ -9309,6 +9319,9 @@ MlxMfeWeight MlxMfeWeight::concatenate_projections(
         [](const MlxMfeWeight& weight) {
             return weight.impl_->automatic_mxfp4_nax_prefill;
         });
+    impl->logical_experts = first.logical_experts > 0
+        ? first.logical_experts
+        : first.experts;
     impl->projection_views.reserve(weights.size());
     const bool split_standalone_projections = std::any_of(
         weights.begin(),
@@ -9960,6 +9973,26 @@ array MlxMfeWeight::routed_matmul_reduce(
         });
 }
 
+array MlxMfeWeight::routed_matmul_reduce_packed(
+    const array& input,
+    const array& packed_expert_ids,
+    const array& route_weights) const {
+    // Packed cache routes store the physical arena slot in the upper bits.
+    // Decode the slots on device, then reuse the same fused MXFP4
+    // down-projection/reduction primitive as the host-remapped path.
+    auto physical_ids = mlx::core::subtract(
+        mlx::core::right_shift(
+            mlx::core::contiguous(mlx::core::astype(
+                packed_expert_ids,
+                mlx::core::int32)),
+            array(8, mlx::core::int32)),
+        array(1, mlx::core::int32));
+    return routed_matmul_reduce(
+        input,
+        mlx::core::contiguous(std::move(physical_ids)),
+        route_weights);
+}
+
 bool MlxMfeWeight::supports_grouped_mmq() const noexcept {
     // The block-list builder uses one Metal thread and one threadgroup-array
     // entry per addressable expert. Large shared SSD arenas can expose more
@@ -9979,6 +10012,9 @@ bool MlxMfeWeight::supports_grouped_mmq() const noexcept {
 
 bool MlxMfeWeight::prefers_mxfp4_smallm_nax(
     const array& expert_ids) const noexcept {
+    const int policy_experts = impl_->logical_experts > 0
+        ? impl_->logical_experts
+        : impl_->experts;
     return impl_->mxfp4_slot_ids.has_value()
         && impl_->projections == 1
         && impl_->rotations.empty()
@@ -9987,6 +10023,7 @@ bool MlxMfeWeight::prefers_mxfp4_smallm_nax(
             expert_ids,
             expert_ids.shape(0),
             impl_->experts,
+            policy_experts,
             impl_->neuron_len,
             impl_->out_per_expert);
 }
@@ -11478,8 +11515,9 @@ array MlxRoutedLinear::combine_packed(
     const array& input,
     const array& packed_expert_ids,
     const array& route_weights) const {
-    return moe_weighted_reduce(
-        forward_packed(input, packed_expert_ids),
+    return weight_.routed_matmul_reduce_packed(
+        input,
+        packed_expert_ids,
         route_weights);
 }
 

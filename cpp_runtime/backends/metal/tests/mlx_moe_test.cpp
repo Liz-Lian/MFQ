@@ -4191,6 +4191,34 @@ void test_mxfp4_smallm_nax_policy() {
     require(
         !weight.prefers_mxfp4_smallm_nax(short_ids),
         "small-M MXFP4 NAX must preserve the M<4 kernel");
+    constexpr int arena_slots = 300;
+    std::vector<std::int32_t> arena_slot_map(arena_slots);
+    std::iota(arena_slot_map.begin(), arena_slot_map.end(), 0);
+    std::vector<std::uint8_t> arena_packed(
+        static_cast<std::size_t>(arena_slots) * output * input / 2,
+        0x22);
+    std::vector<std::uint8_t> arena_scales(
+        static_cast<std::size_t>(arena_slots) * output * input / 32,
+        127);
+    const auto arena_weight = mfq::metal::MlxMoeWeight::from_mxfp4_slots(
+        arena_slots,
+        output,
+        input,
+        arena_slot_map,
+        mlx::core::array(
+            arena_packed.begin(),
+            mlx::core::Shape{arena_slots, output * input / 2}),
+        mlx::core::array(
+            arena_scales.begin(),
+            mlx::core::Shape{arena_slots, output * input / 32}),
+        256);
+    std::vector<std::int32_t> high_physical_ids(4 * routes, 299);
+    require(
+        arena_weight.prefers_mxfp4_smallm_nax(
+            mlx::core::array(
+                high_physical_ids.begin(),
+                mlx::core::Shape{4, routes})),
+        "logical expert geometry rejected a valid high SSD arena slot");
     setenv("MFQ_METAL_MFE_SMALLM_NAX", "0", 1);
     require(
         !weight.prefers_mxfp4_smallm_nax(repeated_ids),
@@ -4401,6 +4429,24 @@ void test_mxfp4_decode_down_reduce() {
         for (std::size_t index = 0; index < reference.size(); ++index) {
             require_close(reference[index], fused[index], 1e-4f);
         }
+    }
+    std::vector<std::int32_t> packed_ids;
+    packed_ids.reserve(ids.size());
+    for (const auto expert : ids) {
+        packed_ids.push_back(((expert + 1) << 8) | expert);
+    }
+    const auto packed_fused = evaluated_floats(
+        weight.routed_matmul_reduce_packed(
+            source,
+            mlx::core::array(
+                packed_ids.begin(),
+                mlx::core::Shape{1, routes}),
+            weights));
+    require(
+        packed_fused.size() == reference.size(),
+        "packed MXFP4 decode down-reduce output shape mismatch");
+    for (std::size_t index = 0; index < reference.size(); ++index) {
+        require_close(reference[index], packed_fused[index], 1e-4f);
     }
 
     if (saved.has_value()) {

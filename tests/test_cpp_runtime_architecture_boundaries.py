@@ -155,7 +155,8 @@ def test_metal_device_capability_detection_is_runtime_owned() -> None:
 
 def test_m3_ultra_small_m_mxfp4_dispatch_is_geometry_based() -> None:
     assert "const bool m3_ultra_native_geometry" in MOE_OPERATOR
-    assert "apple_m3_ultra() && experts == 256" in MOE_OPERATOR
+    assert "apple_m3_ultra() && logical_experts == 256" in MOE_OPERATOR
+    assert "ids[index] >= addressable_experts" in MOE_OPERATOR
     assert "input_width == 4096" in MOE_OPERATOR
     assert "output_width == 2048 || output_width == 4096" in MOE_OPERATOR
     assert "input_width == 2048 && output_width == 4096" in MOE_OPERATOR

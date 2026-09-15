@@ -182,9 +182,10 @@ constexpr double kDepthHysteresis = 1.03;
 } // namespace
 
 MlxMtpDepthController::MlxMtpDepthController(
-    int maximum_depth)
+    int maximum_depth,
+    int initial_depth)
     : maximum_depth_(std::clamp(maximum_depth, 1, 5)),
-      current_depth_(maximum_depth_),
+      current_depth_(std::clamp(initial_depth, 1, maximum_depth_)),
       acceptance_(
           static_cast<std::size_t>(maximum_depth_),
           0.6),
@@ -198,11 +199,11 @@ MlxMtpDepthController::MlxMtpDepthController(
           static_cast<std::size_t>(maximum_depth_ + 1)),
       cycle_age_ms_(
           static_cast<std::size_t>(maximum_depth_ + 1)) {
-    // A maximum-width verify observes every conditional acceptance position.
-    // Pair that with a plain-decode baseline and interpolate the intermediate
-    // widths; periodic probes refine any non-linearity later. This avoids
-    // forcing every request through all 1..N widths before useful decoding.
-    // Probe the maximum three times so update_time() can discard both cold
+    // Start at two look-ahead positions (or the model's smaller maximum), then
+    // pair that probe with a plain-decode baseline. Deeper widths remain in
+    // the search space and periodic exploration promotes them when their
+    // measured throughput wins; the initial depth is not a hard cap.
+    // Probe the initial depth three times so update_time() can discard both cold
     // graph shapes seen by recurrent predictors: the first proposal is built
     // from the prompt state, while the first continuation folds verified
     // hidden rows before proposing again.  On large models both shapes can
@@ -211,7 +212,7 @@ MlxMtpDepthController::MlxMtpDepthController(
     // to plain decoding.
     warmup_.insert(
         warmup_.end(),
-        {maximum_depth_, maximum_depth_, maximum_depth_});
+        {current_depth_, current_depth_, current_depth_});
     // Depth-one predictors still need a measured plain-decode reference.
     // Without it the controller can never discover that a valid but costly
     // one-token predictor loses to the target model alone.

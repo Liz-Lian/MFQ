@@ -23,11 +23,6 @@
 
 namespace mfq::metal {
 
-// DSpark exposes a wider recurrent block, but mlx-vlm limits production
-// speculative decoding to two look-ahead positions.  Deeper positions lose
-// too much acceptance under ordinary sampling to repay their verify cost.
-inline constexpr int kDeepseekV4MtpMaximumDraftTokens = 2;
-
 using MlxDeepseekV4PrefillCallback = std::function<void(
     std::size_t prompt_tokens,
     double llm_ms,

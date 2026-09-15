@@ -183,7 +183,8 @@ public:
         int neuron_len,
         const std::vector<std::int32_t>& slot_for_expert,
         mlx::core::array packed_values,
-        mlx::core::array block_scales);
+        mlx::core::array block_scales,
+        int logical_experts = 0);
 
     mlx::core::array routed_matmul(
         const mlx::core::array& input,
@@ -216,6 +217,10 @@ public:
     mlx::core::array routed_matmul_reduce(
         const mlx::core::array& input,
         const mlx::core::array& expert_ids,
+        const mlx::core::array& route_weights) const;
+    mlx::core::array routed_matmul_reduce_packed(
+        const mlx::core::array& input,
+        const mlx::core::array& packed_expert_ids,
         const mlx::core::array& route_weights) const;
     bool supports_grouped_mmq() const noexcept;
     bool supports_grouped_vq_mmq() const noexcept {

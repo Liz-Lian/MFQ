@@ -57,18 +57,18 @@ int main() {
         }
         {
             mfq::metal::MlxMtpDepthController controller(3);
-            if (controller.depth() != 3) {
+            if (controller.depth() != 2) {
                 throw std::runtime_error(
-                    "adaptive MTP controller did not start deep");
+                    "adaptive MTP controller did not start at depth two");
             }
-            controller.observe(3, 3, 30.0);
-            controller.observe(3, 3, 29.0);
-            controller.observe(3, 3, 28.0);
+            controller.observe(2, 2, 30.0);
+            controller.observe(2, 2, 29.0);
+            controller.observe(2, 2, 28.0);
             controller.observe(0, 0, 22.0);
             controller.observe(0, 0, 21.0);
             controller.observe(0, 0, 23.0);
-            if (controller.depth() != 3 ||
-                !controller.measured_cycle_ms(3) ||
+            if (controller.depth() < 2 ||
+                !controller.measured_cycle_ms(2) ||
                 controller.conditional_acceptance(0) <= 0.6) {
                 throw std::runtime_error(
                     "adaptive MTP controller warmup mismatch");
@@ -90,9 +90,9 @@ int main() {
         }
         {
             mfq::metal::MlxMtpDepthController controller(3);
-            controller.observe(3, 0, 70.0);
-            controller.observe(3, 0, 65.0);
-            controller.observe(3, 0, 60.0);
+            controller.observe(2, 0, 70.0);
+            controller.observe(2, 0, 65.0);
+            controller.observe(2, 0, 60.0);
             controller.observe(0, 0, 30.0);
             controller.observe(0, 0, 29.0);
             controller.observe(0, 0, 31.0);
@@ -115,7 +115,7 @@ int main() {
             }
         }
         {
-            mfq::metal::MlxMtpDepthController controller(3);
+            mfq::metal::MlxMtpDepthController controller(3, 3);
             controller.observe(3, 3, 45.0);
             controller.observe(3, 3, 44.0);
             controller.observe(3, 3, 43.0);
@@ -128,7 +128,7 @@ int main() {
             }
         }
         {
-            mfq::metal::MlxMtpDepthController controller(5);
+            mfq::metal::MlxMtpDepthController controller(5, 5);
             controller.observe(5, 5, 1104.0);
             controller.observe(5, 5, 721.0);
             controller.observe(5, 5, 235.0);

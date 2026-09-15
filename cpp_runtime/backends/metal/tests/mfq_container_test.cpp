@@ -793,7 +793,8 @@ void test_hf_virtual_mfe_experts(
         32);
     require(store.num_layers() == 2 && store.num_experts(0) == 2 &&
                 store.num_experts(1) == 1 &&
-                store.max_num_experts() == 2,
+                store.max_num_experts() == 2 &&
+                store.total_num_experts() == 3,
             "canonical MFE expert inventory mismatch");
     std::vector<std::byte> slot(store.slot_bytes());
     const auto stats = store.load(0, 1, slot);
@@ -817,6 +818,9 @@ void test_hf_virtual_mfe_experts(
         store.slot_bytes() * 8,
         2,
         false);
+    require(
+        cache.has_full_residency_capacity(),
+        "complete SSD expert capacity was not recognized");
     const std::array<std::int32_t, 1> active{1};
     {
         const auto prepared = cache.prepare(0, active);

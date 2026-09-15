@@ -151,8 +151,14 @@ struct MlxMoeSsdExpertCache::Impl {
           slot_count(total_slots > prefill_slots
               ? total_slots - prefill_slots
               : 0),
+          full_residency_capacity(
+              slot_count >= store.total_num_experts()),
           limit_bytes(total_slots * slot_bytes),
-          arena(total_slots, hidden_size, intermediate_size),
+          arena(
+              total_slots,
+              hidden_size,
+              intermediate_size,
+              store.max_num_experts()),
           slots(slot_count),
           page_tables(store.num_layers()),
           route_confidence(store.num_layers(), 0) {
@@ -785,6 +791,7 @@ struct MlxMoeSsdExpertCache::Impl {
     const std::size_t prefill_slots;
     const std::size_t total_slots;
     const std::size_t slot_count;
+    const bool full_residency_capacity;
     const std::size_t limit_bytes;
     MlxMxfp4SsdExpertArena arena;
     mutable std::mutex mutex;
@@ -1542,6 +1549,10 @@ std::size_t MlxMoeSsdExpertCache::cache_limit_bytes() const noexcept {
 
 std::size_t MlxMoeSsdExpertCache::cache_slots() const noexcept {
     return impl_->slot_count;
+}
+
+bool MlxMoeSsdExpertCache::has_full_residency_capacity() const noexcept {
+    return impl_->full_residency_capacity;
 }
 
 bool MlxMoeSsdExpertCache::prefill_overlap_enabled() const noexcept {

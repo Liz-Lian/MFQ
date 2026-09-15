@@ -1888,6 +1888,21 @@ void test_visual_tokens_use_visual_router_bias(
     require(
         ids[kTopK] == 3 && ids[kTopK + 1] == 1,
         "visual row did not use bias_vl");
+    const std::vector<std::int32_t> single_token{0};
+    auto text_only = moe.forward_branches(
+        array(
+            input.begin(),
+            Shape{1, kHidden}),
+        array(single_token.begin(), Shape{1}),
+        nullptr,
+        false);
+    compare(
+        {
+            text_only.routed + text_only.shared,
+            std::move(text_only.expert_ids),
+            std::move(text_only.expert_weights),
+        },
+        expected_text);
 }
 
 void test_split_gate_up_eager_load_and_forward() {

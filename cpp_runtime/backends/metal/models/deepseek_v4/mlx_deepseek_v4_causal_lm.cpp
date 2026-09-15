@@ -37,10 +37,14 @@ constexpr int kConnections = 4;
 constexpr int kHcProjectionWidth =
     2 * kConnections + kConnections * kConnections;
 
-bool ssd_route_transactions_enabled() noexcept {
+bool ssd_route_transactions_enabled(bool safe_default) noexcept {
     const char* value = std::getenv(
         "MFQ_SSD_DEVICE_ROUTE_TRANSACTION");
-    return value != nullptr && std::string_view(value) != "0";
+    if (value == nullptr) return safe_default;
+    const auto setting = std::string_view(value);
+    return setting != "0"
+        && setting != "false"
+        && setting != "off";
 }
 
 int ssd_route_transaction_layers() noexcept {
@@ -791,7 +795,8 @@ array MlxDeepseekV4Layer::forward(
     auto moe_branches = components_.moe.forward_branches(
         branch,
         token_ids,
-        routed_prefetch);
+        routed_prefetch,
+        visibility != nullptr);
     auto output = ffn_hc.packed_metadata.has_value()
         ? deepseek_v4_hc_post_sum_packed(
               moe_branches.routed,
@@ -1364,7 +1369,8 @@ array MlxDeepseekV4CausalLm::forward_chunk(
     }
     const bool grouped_route_transaction =
         !bounded_prefill && ssd_expert_cache_ &&
-        ssd_route_transactions_enabled() &&
+        ssd_route_transactions_enabled(
+            ssd_expert_cache_->has_full_residency_capacity()) &&
         dspark_hidden == nullptr;
     if (grouped_route_transaction) {
         const bool force_transactions = force_ssd_route_transactions();
@@ -2453,7 +2459,7 @@ std::int32_t MlxDeepseekV4CausalLm::generate_impl(
         auto mtp_sampling = sampling;
         mtp_sampling.mtp_max_draft_tokens = std::min(
             mtp_sampling.mtp_max_draft_tokens,
-            kDeepseekV4MtpMaximumDraftTokens);
+            dspark_->block_size());
 
         MlxMtpEngineCallbacks mtp_callbacks;
         mtp_callbacks.target_cache_position = [this] {

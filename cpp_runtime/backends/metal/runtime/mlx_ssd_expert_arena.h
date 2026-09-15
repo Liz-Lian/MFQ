@@ -28,7 +28,8 @@ public:
     MlxMxfp4SsdExpertArena(
         std::size_t slots,
         std::size_t hidden_size,
-        std::size_t intermediate_size);
+        std::size_t intermediate_size,
+        std::size_t logical_experts = 0);
 
     std::size_t slots() const noexcept;
     std::size_t bytes_per_slot() const noexcept;

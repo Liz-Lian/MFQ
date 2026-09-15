@@ -35,6 +35,7 @@ public:
     std::size_t num_layers() const noexcept;
     std::size_t num_experts(std::size_t layer) const;
     std::size_t max_num_experts() const noexcept;
+    std::size_t total_num_experts() const noexcept;
     std::size_t slot_bytes() const noexcept;
 
     MlxNativeMxfp4ExpertLoadStats load(

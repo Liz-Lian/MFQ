@@ -348,6 +348,10 @@ std::size_t MlxMfeMxfp4ExpertStore::max_num_experts() const noexcept {
     return max_num_experts_;
 }
 
+std::size_t MlxMfeMxfp4ExpertStore::total_num_experts() const noexcept {
+    return experts_.size();
+}
+
 std::size_t MlxMfeMxfp4ExpertStore::slot_bytes() const noexcept {
     return slot_bytes_;
 }

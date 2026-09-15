@@ -37,7 +37,7 @@ int main() {
 
     const auto deepseek_registry = resolve_mfq_runtime_profile(
         "", "deepseek-v4-flash", "deepseek_v4", "test");
-    require(deepseek_registry.chat.mtp_max_draft_tokens.value_or(-1) == 2,
+    require(deepseek_registry.chat.mtp_max_draft_tokens.value_or(-1) == 5,
             "DeepSeek-V4 registry MTP depth mismatch");
 
     const auto deepseek_v41_registry = resolve_mfq_runtime_profile(

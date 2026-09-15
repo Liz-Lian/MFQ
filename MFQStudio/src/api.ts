@@ -363,6 +363,8 @@ export interface RuntimeInstance {
   last_used_at?: string | null;
   idle_ttl_seconds?: number | null;
   pinned?: boolean;
+  mtp_supported?: boolean;
+  mtp_available?: boolean;
   error?: ApiErrorBody["error"] | null;
 }
 
@@ -508,6 +510,17 @@ export interface JobResource {
   error?: ApiErrorBody["error"] | null;
   created_at: string;
   updated_at: string;
+}
+
+export interface JobEventResource {
+  job_id: string;
+  sequence: number;
+  type: "state" | "progress" | "log" | "artifact";
+  level: RuntimeLogEntry["level"];
+  message?: string | null;
+  progress?: number | null;
+  data: Record<string, unknown>;
+  created_at: string;
 }
 
 export interface JsonSchemaProperty {
@@ -677,6 +690,34 @@ function authorizedHeaders(headers?: HeadersInit): Headers {
   const result = new Headers(headers);
   if (apiToken) result.set("Authorization", `Bearer ${apiToken}`);
   return result;
+}
+
+async function readEventStream<T>(response: Response, onEvent: (event: T) => void): Promise<void> {
+  if (!response.body || !response.headers.get("content-type")?.includes("text/event-stream")) {
+    throw new Error("MFQ Server returned an invalid streaming response");
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  for (;;) {
+    const { value, done } = await reader.read();
+    buffer = (buffer + decoder.decode(value, { stream: !done })).replaceAll("\r\n", "\n");
+    let boundary = buffer.indexOf("\n\n");
+    while (boundary >= 0) {
+      const block = buffer.slice(0, boundary);
+      buffer = buffer.slice(boundary + 2);
+      const data = block
+        .split("\n")
+        .filter((line) => line.startsWith("data:"))
+        .map((line) => line.slice(5).trimStart())
+        .join("\n");
+      if (data) onEvent(JSON.parse(data) as T);
+      boundary = buffer.indexOf("\n\n");
+    }
+    if (done) break;
+  }
+  if (buffer.trim()) throw new Error("MFQ Server stream ended with an incomplete event");
 }
 
 export const api = {
@@ -1175,6 +1216,19 @@ export const api = {
       }));
   },
 
+  async streamJobEvents(
+    id: string,
+    onEvent: (event: JobEventResource) => void,
+    signal: AbortSignal,
+  ): Promise<void> {
+    const response = await fetch(apiUrl(`/api/v1/jobs/${id}/events/stream`), {
+      headers: authorizedHeaders({ Accept: "text/event-stream" }),
+      signal,
+    });
+    if (!response.ok) throw await errorFromResponse(response);
+    await readEventStream(response, onEvent);
+  },
+
   realtimeCapabilities(): Promise<RealtimeCapabilities> {
     return request("/api/v1/runtime/realtime/capabilities");
   },
@@ -1239,37 +1293,12 @@ export async function streamResponse(
     signal,
   });
   if (!response.ok) throw await errorFromResponse(response);
-  if (!response.body || !response.headers.get("content-type")?.includes("text/event-stream")) {
-    throw new Error("MFQ Server returned an invalid streaming response");
-  }
-
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = "";
   let streamError: ApiError | null = null;
-  for (;;) {
-    const { value, done } = await reader.read();
-    buffer = (buffer + decoder.decode(value, { stream: !done })).replaceAll("\r\n", "\n");
-    let boundary = buffer.indexOf("\n\n");
-    while (boundary >= 0) {
-      const block = buffer.slice(0, boundary);
-      buffer = buffer.slice(boundary + 2);
-      const data = block
-        .split("\n")
-        .filter((line) => line.startsWith("data:"))
-        .map((line) => line.slice(5).trimStart())
-        .join("\n");
-      if (data) {
-        const frame = JSON.parse(data) as RealtimeFrame;
-        onFrame(frame);
-        if (frame.payload.type === "error") {
-          streamError = new ApiError(502, { error: frame.payload.error as ApiErrorBody["error"] });
-        }
-      }
-      boundary = buffer.indexOf("\n\n");
+  await readEventStream<RealtimeFrame>(response, (frame) => {
+    onFrame(frame);
+    if (frame.payload.type === "error") {
+      streamError = new ApiError(502, { error: frame.payload.error as ApiErrorBody["error"] });
     }
-    if (done) break;
-  }
-  if (buffer.trim()) throw new Error("MFQ Server stream ended with an incomplete event");
+  });
   if (streamError) throw streamError;
 }

@@ -172,7 +172,7 @@ class SessionStore:
         self.media_root = (
             Path(media_root)
             if media_root is not None
-            else self.path.with_name(f"{self.path.name}.media")
+            else self.path.parent / "media"
         )
         self.media_root.mkdir(parents=True, exist_ok=True)
         self._initialize()

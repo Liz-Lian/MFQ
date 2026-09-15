@@ -69,6 +69,7 @@ def test_media_is_content_addressed_deduplicated_and_persistent(tmp_path) -> Non
     resource, path = reopened.get_media_path(created.media.id)
     assert resource == created
     assert path.read_bytes() == data
+    assert reopened.media_root == tmp_path / "media"
     assert path.is_relative_to(reopened.media_root)
     with pytest.raises(MediaIntegrityError):
         store.put_media(data, "image/png", "0" * 64)

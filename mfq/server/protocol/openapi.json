@@ -4495,6 +4495,16 @@
             "title": "Model",
             "type": "string"
           },
+          "mtp_available": {
+            "default": false,
+            "title": "Mtp Available",
+            "type": "boolean"
+          },
+          "mtp_supported": {
+            "default": false,
+            "title": "Mtp Supported",
+            "type": "boolean"
+          },
           "pinned": {
             "default": false,
             "title": "Pinned",

@@ -233,6 +233,8 @@ def _run(args: argparse.Namespace) -> int:
     from mfq.server.storage import SessionStore
     from mfq.server.tool_jobs import ToolJobHandlers, ToolJobPaths
 
+    data_dir = args.data_dir.expanduser().resolve()
+    work_dir = args.work_dir.expanduser().resolve()
     model = args.model.expanduser().resolve() if args.model is not None else None
     if model is not None and not (model.is_file() or model.is_dir()):
         raise FileNotFoundError(model)
@@ -262,7 +264,7 @@ def _run(args: argparse.Namespace) -> int:
     if not configured_roots:
         configured_roots = _environment_paths("MFQ_SERVER_MODEL_DIRS")
     if not configured_roots:
-        configured_roots = [args.work_dir.expanduser().resolve() / "models"]
+        configured_roots = [data_dir / "models"]
     configured_roots = [path.expanduser().resolve() for path in configured_roots]
     if model is not None:
         model_catalog_root = model if model.is_dir() else model.parent
@@ -270,7 +272,7 @@ def _run(args: argparse.Namespace) -> int:
             configured_roots.append(model_catalog_root)
     configured_roots[0].mkdir(parents=True, exist_ok=True)
     catalog = ModelCatalog(configured_roots)
-    voice_component = VoiceOutputComponent(args.work_dir.expanduser().resolve())
+    voice_component = VoiceOutputComponent(data_dir)
     runtime = None
     try:
         runtime_manager = ManagedRuntimePool(
@@ -312,14 +314,14 @@ def _run(args: argparse.Namespace) -> int:
                 port=runtime.port,
                 context_size=args.context_size,
             )
-        store = SessionStore(args.db.expanduser().resolve())
+        store = SessionStore(data_dir / "server.sqlite3")
         backend = ClusterBackend(runtime_manager, store)
         binary_dir = _console_script_dir(sys.executable)
         perplexity = executable.with_name("mfq-perplexity")
         handlers = ToolJobHandlers(
             catalog,
             ToolJobPaths(
-                work_root=args.work_dir.expanduser().resolve(),
+                work_root=work_dir,
                 python=Path(sys.executable),
                 modelscope=(
                     (binary_dir / "modelscope") if (binary_dir / "modelscope").is_file() else None
@@ -418,7 +420,12 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
         help="disable persistent Session KV caching",
     )
     parser.add_argument("--runtime-startup-timeout", type=_positive_float, default=1800.0)
-    parser.add_argument("--db", type=Path, default=Path("mfq-server.sqlite3"))
+    parser.add_argument(
+        "--data-dir",
+        type=Path,
+        default=Path(".mfq"),
+        help="managed server data directory (default: ./.mfq)",
+    )
     web = parser.add_mutually_exclusive_group()
     web.add_argument("--web-root", type=Path)
     web.add_argument("--no-web-ui", action="store_true")

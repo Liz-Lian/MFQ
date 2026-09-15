@@ -62,6 +62,7 @@ def test_serve_exposes_public_host_and_port_options(tmp_path: Path) -> None:
     assert defaults.port == 8090
     assert defaults.model is None
     assert defaults.running_executable is None
+    assert defaults.data_dir == Path(".mfq")
     assert defaults.access_log is True
     assert args.host == "0.0.0.0"
     assert args.port == 9001
@@ -304,18 +305,17 @@ def test_serve_can_disable_web_ui_build(monkeypatch) -> None:
 def test_serve_starts_without_loading_an_initial_model(tmp_path: Path, monkeypatch) -> None:
     executable = tmp_path / "mfq-decode-metal"
     executable.write_bytes(b"runtime")
+    data_dir = tmp_path / ".mfq"
     args = _build_parser().parse_args(
         [
             "serve",
             "--no-web-ui",
             "--backend",
-            "metal",
+            "auto",
             "--running-executable",
             str(executable),
-            "--db",
-            str(tmp_path / "server.sqlite3"),
-            "--model-dir",
-            str(tmp_path / "models"),
+            "--data-dir",
+            str(data_dir),
             "--work-dir",
             str(tmp_path / "work"),
         ]
@@ -336,3 +336,6 @@ def test_serve_starts_without_loading_an_initial_model(tmp_path: Path, monkeypat
     assert captured["host"] == "127.0.0.1"
     assert captured["port"] == 8090
     assert captured["access_log"] is True
+    assert (data_dir / "server.sqlite3").is_file()
+    assert (data_dir / "media").is_dir()
+    assert (data_dir / "models").is_dir()

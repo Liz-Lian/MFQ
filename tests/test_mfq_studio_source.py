@@ -61,6 +61,8 @@ def test_studio_starts_the_unified_local_server_and_bundled_runtime():
     assert "Command::new" in RUST
     assert "studio_start_local" in RUST
     assert '.arg("serve")' in RUST
+    assert '.arg("--data-dir")' in RUST
+    assert '.arg("--db")' not in RUST
     assert 'command.arg("--running-executable")' in RUST
     assert "MFQ_MLX_METALLIB" in RUST
     assert "MFQ_AVFOUNDATION_VIDEO_LIBRARY" in RUST
@@ -106,7 +108,7 @@ def test_voice_component_prompt_requires_an_explicit_full_duplex_selection():
 def test_studio_handles_a_running_server_without_a_loaded_model():
     assert 'useState("")' in APP
     assert 'tr("尚未加载模型", "No model loaded")' in APP
-    assert "if (!selectedModel) return;" in APP
+    assert "if (!selectedModel || sessionTransitioning) return;" in APP
     assert 'runtime?.model || "Empty"' in APP
     assert 'runtime?.model || "MFQ Server"' not in APP
     assert 'statusResult.status === "fulfilled" ? statusResult.value : null' in APP
@@ -120,10 +122,43 @@ def test_studio_exposes_every_loaded_model_and_switches_chat_sessions_safely():
     assert "instances.map((instance) =>" in APP
     assert "artifacts.slice(0, 8)" not in APP
     assert "availableModelNames.map((name) =>" in APP
-    assert "api.forkSession(active.id, null, true, active.title, model)" in APP
+    assert "api.forkSession(activeSessionId, null, true, activeSessionTitle, model)" in APP
     assert "active.model === model" in APP
     assert "!conversationReady" in APP
     assert "model?: string" in API
+
+    select_session = APP[APP.index("function selectSession("):APP.index("async function createSession(")]
+    assert "sessions.find(" in select_session
+    assert "setModel(session.model)" in select_session
+    assert "setMode(session.mode)" in select_session
+    assert "setActiveId(session.id)" in select_session
+    assert 'aria-label={tr("会话", "Session")}' in APP
+    assert "sessions.map((session) => <option" in APP
+    assert 'aria-label={tr("新建会话", "New session")}' in APP
+    assert ".chat-session-select" in STYLES
+    assert "const [sessionTransitioning, setSessionTransitioning] = useState(false)" in APP
+    assert "busy || sessionTransitioning || !sessions.length" in APP
+    assert "busy || sessionTransitioning || !selectedModelAvailable" in APP
+
+    create_session = APP[APP.index("async function createSession("):APP.index("async function clearActiveConversation(")]
+    assert "setSessionTransitioning(true)" in create_session
+    assert "setSessionTransitioning(false)" in create_session
+
+    fork_effect = APP[APP.index("const activeSessionId = active?.id;"):APP.index("useEffect(() => {\n    setAttachments")]
+    assert "activeSessionModel === model" in fork_effect
+    assert "|| busy" not in fork_effect
+    assert "[activeSessionId, activeSessionModel, activeSessionTitle" in fork_effect
+
+
+def test_studio_uses_selected_runtime_mtp_availability():
+    assert "selectedRuntimeInstance?.mtp_supported" in APP
+    assert "selectedRuntimeInstance?.mtp_available" in APP
+    assert "capabilities?.model === model" in APP
+    assert "checked={mtpAvailable && settingsDraft.enableMtp}" in APP
+    assert "disabled={!mtpAvailable}" in APP
+    assert "enable_mtp: mtpSupported && mtpAvailable && effectiveSettings.enableMtp" in APP
+    assert "mtp_supported?: boolean" in API
+    assert "mtp_available?: boolean" in API
 
 
 def test_model_lifecycle_actions_stay_on_the_models_page():
@@ -313,7 +348,7 @@ def test_studio_overview_lists_every_loaded_model():
     assert 'className="overview-models-panel"' in APP
     assert 'availableModelNames.map((name) =>' in APP
     assert 'candidate.model === name && candidate.state !== "failed"' in APP
-    assert 'onClick={() => setModel(name)}' in APP
+    assert 'onClick={() => selectModel(name)}' in APP
     assert ".overview-model-grid {" in STYLES
     assert ".overview-model-card.selected {" in STYLES
 
@@ -437,6 +472,29 @@ def test_dashboard_uses_hivellm_style_static_backend_console_components():
     assert "api.clearCompletedJobs()" in APP
     assert "api.deleteJob(id)" in APP
     assert ".completed-jobs" in STYLES
+
+
+def test_studio_streams_active_job_updates_without_polling_the_runtime():
+    assert "api.streamJobEvents(" in APP
+    assert "/api/v1/jobs/${id}/events/stream" in API
+    assert "readEventStream(response, onEvent)" in API
+    assert "window.setInterval(() => void refreshRuntime(true), 2500)" not in APP
+
+
+def test_server_settings_are_available_while_local_startup_is_pending():
+    status = APP.index("let status = await studioStatus();")
+    credential = APP.index("token = await studioCredential();", status)
+    draft = APP.index("setStudioDraft({ ...status.config });", status)
+    startup = APP.index("await startLocalStudio();", status)
+    refreshed_status = APP.index("status = await studioStatus();", startup)
+    refreshed_credential = APP.index("token = await studioCredential();", startup)
+    assert status < credential < draft < startup < refreshed_status < refreshed_credential
+    assert "if (current && status)" in APP[status:draft]
+    assert "catch (cause)" in APP[credential:draft]
+    assert "if (studioCredentialWritable) await saveStudioCredential(studioToken)" in APP
+    assert "setStudioCredentialWritable(true)" in APP
+    assert "if (!studioDraft || sessionTransitioning) return" in APP
+    assert "busy || sessionTransitioning || !serverDraft" in APP
 
 
 def test_server_page_matches_hivellm_information_architecture():

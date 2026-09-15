@@ -208,6 +208,25 @@ def _select_backend(requested: str, running_executable: Path | None) -> str:
     raise BuildError(f"unsupported inference backend: {requested}")
 
 
+def _server_storage_paths(
+    data_dir: Path,
+    database: Path | None,
+) -> tuple[Path, Path]:
+    resolved_data_dir = data_dir.expanduser().resolve()
+    if database is not None:
+        database_path = database.expanduser().resolve()
+        return database_path, database_path.with_name(f"{database_path.name}.media")
+
+    database_path = resolved_data_dir / "server.sqlite3"
+    legacy_database_path = resolved_data_dir / "mfq-server.sqlite3"
+    if not database_path.exists() and legacy_database_path.exists():
+        return (
+            legacy_database_path,
+            legacy_database_path.with_name(f"{legacy_database_path.name}.media"),
+        )
+    return database_path, resolved_data_dir / "media"
+
+
 def _run(args: argparse.Namespace) -> int:
     client_api_key = os.environ.get(args.api_key_env, "")
     if error := network_auth_error(args.host, client_api_key):
@@ -231,6 +250,8 @@ def _run(args: argparse.Namespace) -> int:
     from mfq.server.tool_jobs import ToolJobHandlers, ToolJobPaths
     from mfq.server.vision import clear_image_decode_cache
 
+    data_dir = args.data_dir.expanduser().resolve()
+    work_dir = args.work_dir.expanduser().resolve()
     model = args.model.expanduser().resolve() if args.model is not None else None
     if model is not None and not (model.is_file() or model.is_dir()):
         raise FileNotFoundError(model)
@@ -260,7 +281,7 @@ def _run(args: argparse.Namespace) -> int:
     if not configured_roots:
         configured_roots = _environment_paths("MFQ_SERVER_MODEL_DIRS")
     if not configured_roots:
-        configured_roots = [args.work_dir.expanduser().resolve() / "models"]
+        configured_roots = [data_dir / "models"]
     configured_roots = [path.expanduser().resolve() for path in configured_roots]
     if model is not None:
         model_catalog_root = model if model.is_dir() else model.parent
@@ -268,7 +289,7 @@ def _run(args: argparse.Namespace) -> int:
             configured_roots.append(model_catalog_root)
     configured_roots[0].mkdir(parents=True, exist_ok=True)
     catalog = ModelCatalog(configured_roots)
-    voice_component = VoiceOutputComponent(args.work_dir.expanduser().resolve())
+    voice_component = VoiceOutputComponent(data_dir)
     startup_loads: list[ModelLoadRequest] = []
     if model is not None:
         initial_artifact = asyncio.run(catalog.resolve_path(model))
@@ -304,14 +325,15 @@ def _run(args: argparse.Namespace) -> int:
         startup_loads=startup_loads,
         shared_cache_reclaimer=clear_image_decode_cache,
     )
-    store = SessionStore(args.db.expanduser().resolve())
+    database_path, media_root = _server_storage_paths(data_dir, args.db)
+    store = SessionStore(database_path, media_root=media_root)
     backend = ClusterBackend(runtime_manager, store)
     binary_dir = _console_script_dir(sys.executable)
     perplexity = executable.with_name("mfq-perplexity")
     handlers = ToolJobHandlers(
         catalog,
         ToolJobPaths(
-            work_root=args.work_dir.expanduser().resolve(),
+            work_root=work_dir,
             python=Path(sys.executable),
             modelscope=(
                 (binary_dir / "modelscope") if (binary_dir / "modelscope").is_file() else None
@@ -417,7 +439,20 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
         help="disable persistent Session KV caching",
     )
     parser.add_argument("--runtime-startup-timeout", type=_positive_float, default=1800.0)
-    parser.add_argument("--db", type=Path, default=Path("mfq-server.sqlite3"))
+    parser.add_argument(
+        "--data-dir",
+        type=Path,
+        default=Path(".mfq"),
+        help="managed server data directory (default: ./.mfq)",
+    )
+    parser.add_argument(
+        "--db",
+        type=Path,
+        help=(
+            "deprecated explicit session database path; overrides "
+            "<data-dir>/server.sqlite3"
+        ),
+    )
     web = parser.add_mutually_exclusive_group()
     web.add_argument("--web-root", type=Path)
     web.add_argument("--no-web-ui", action="store_true")

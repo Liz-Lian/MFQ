@@ -749,6 +749,8 @@ class RuntimeInstanceResource(ProtocolModel):
     last_used_at: AwareDatetime | None = None
     idle_ttl_seconds: int | None = Field(default=None, ge=0)
     pinned: bool = False
+    mtp_supported: bool = False
+    mtp_available: bool = False
     identity: RuntimeIdentity | None = None
     error: ErrorDetail | None = None
 

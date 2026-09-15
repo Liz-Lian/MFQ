@@ -170,7 +170,8 @@ uv run mfq serve \
 ```
 
 If no `--model-dir` is supplied, `MFQ_SERVER_MODEL_DIRS` is read as an
-OS-separated path list. `--max-runtime-instances` limits managed workers and
+OS-separated path list. If neither is configured, models are discovered in
+`<data-dir>/models`. `--max-runtime-instances` limits managed workers and
 `--max-requests-per-runtime` limits concurrent inference requests accepted by
 each worker.
 
@@ -194,18 +195,20 @@ use the catalog name; a separate hash tracks the artifact and profile drift.
 
 ## Storage and workspace
 
-By default, persistent server state is stored in `./mfq-server.sqlite3`, and
-tool jobs are restricted to the current working directory.
+By default, managed server data is stored in `./.mfq`: `server.sqlite3` holds
+persistent state, while `media/`, `models/`, and `components/` hold managed
+files. User-selected tool-job paths remain restricted to the current working
+directory.
 
 ```shell
 uv run mfq serve \
   --model /models/model.mfq \
-  --db /var/lib/mfq/server.sqlite3 \
+  --data-dir /var/lib/mfq \
   --work-dir /srv/mfq-work
 ```
 
-For long-running servers, place the database and work directory on writable,
-persistent paths. MFQ resolves database, work, and model paths before startup.
+For long-running servers, place the data and work directories on writable,
+persistent paths. MFQ resolves data, work, and model paths before startup.
 
 ## Runtime controls
 
@@ -233,7 +236,8 @@ uv run mfq serve \
 | `--context-size N` | Native context size; `0` keeps the runtime default. | `0` |
 | `--prefill-chunk-size N` | Metal prefill chunk size. | `2048` |
 | `--runtime-startup-timeout SECONDS` | Time allowed for native startup. | `1800` |
-| `--db PATH` | SQLite server database. | `./mfq-server.sqlite3` |
+| `--data-dir PATH` | Managed database, media, models, and components. | `./.mfq` |
+| `--db PATH` | Deprecated explicit database override retained for compatibility. | None |
 | `--web-root PATH` | Prebuilt Web UI directory. | Auto-detect |
 | `--no-web-ui` | Disable Web UI discovery and building. | Off |
 | `--model-dir PATH` | Add a model discovery root; repeatable. | Environment/model parent |
@@ -243,6 +247,10 @@ uv run mfq serve \
 | `--max-requests-per-runtime N` | Concurrent requests per worker. | `1` |
 | `--log-level LEVEL` | Uvicorn log level. | `info` |
 | `--backend {auto,cuda,metal}` | Select or detect the native backend. | `auto` |
+
+When the current database does not yet exist, an existing legacy Studio
+database named `mfq-server.sqlite3` and its matching media directory are reused
+automatically from `--data-dir`.
 
 ## Troubleshooting
 

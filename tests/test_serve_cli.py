@@ -8,7 +8,13 @@ from types import SimpleNamespace
 import pytest
 
 from mfq.cli import _build_parser
-from mfq.commands.serve import _prepare_web_root, _resolve_runtime_executable, _run, _select_backend
+from mfq.commands.serve import (
+    _prepare_web_root,
+    _resolve_runtime_executable,
+    _run,
+    _select_backend,
+    _server_storage_paths,
+)
 from mfq.server.native import (
     NativeRuntime,
     NativeRuntimeError,
@@ -74,6 +80,8 @@ def test_serve_exposes_public_host_and_port_options(tmp_path: Path) -> None:
     assert defaults.port == 8090
     assert defaults.model is None
     assert defaults.running_executable is None
+    assert defaults.data_dir == Path(".mfq")
+    assert defaults.db is None
     assert defaults.access_log is True
     assert defaults.max_queued_requests_per_runtime is None
     assert defaults.max_runtime_memory is None
@@ -97,6 +105,36 @@ def test_serve_accepts_an_empty_initial_model_catalog() -> None:
     args = _build_parser().parse_args(["serve"])
 
     assert args.model is None
+
+
+def test_serve_storage_paths_preserve_explicit_database_layout(tmp_path: Path) -> None:
+    database = tmp_path / "custom.sqlite3"
+
+    assert _server_storage_paths(tmp_path / "data", database) == (
+        database.resolve(),
+        database.resolve().with_name("custom.sqlite3.media"),
+    )
+
+
+def test_serve_storage_paths_reuse_legacy_studio_data(tmp_path: Path) -> None:
+    legacy_database = tmp_path / "mfq-server.sqlite3"
+    legacy_database.touch()
+
+    assert _server_storage_paths(tmp_path, None) == (
+        legacy_database.resolve(),
+        tmp_path.resolve() / "mfq-server.sqlite3.media",
+    )
+
+
+def test_serve_storage_paths_prefer_current_layout(tmp_path: Path) -> None:
+    (tmp_path / "mfq-server.sqlite3").touch()
+    current_database = tmp_path / "server.sqlite3"
+    current_database.touch()
+
+    assert _server_storage_paths(tmp_path, None) == (
+        current_database.resolve(),
+        tmp_path.resolve() / "media",
+    )
 
 
 def test_serve_accepts_a_prebuilt_native_runtime(tmp_path: Path) -> None:
@@ -431,18 +469,17 @@ def test_serve_can_disable_web_ui_build(monkeypatch) -> None:
 def test_serve_starts_without_loading_an_initial_model(tmp_path: Path, monkeypatch) -> None:
     executable = tmp_path / "mfq-decode-metal"
     executable.write_bytes(b"runtime")
+    data_dir = tmp_path / ".mfq"
     args = _build_parser().parse_args(
         [
             "serve",
             "--no-web-ui",
             "--backend",
-            "metal",
+            "auto",
             "--running-executable",
             str(executable),
-            "--db",
-            str(tmp_path / "server.sqlite3"),
-            "--model-dir",
-            str(tmp_path / "models"),
+            "--data-dir",
+            str(data_dir),
             "--work-dir",
             str(tmp_path / "work"),
         ]
@@ -463,3 +500,6 @@ def test_serve_starts_without_loading_an_initial_model(tmp_path: Path, monkeypat
     assert captured["host"] == "127.0.0.1"
     assert captured["port"] == 8090
     assert captured["access_log"] is True
+    assert (data_dir / "server.sqlite3").is_file()
+    assert (data_dir / "media").is_dir()
+    assert (data_dir / "models").is_dir()

@@ -975,39 +975,8 @@ nint8_zero_moe_grouped_tile_persistent_kernel(
     }
 }
 
-static __device__ __forceinline__ int moe_mma168_i(int l) {
-    return ((l / 2) * 8) + (threadIdx.x / 4);
-}
-
-static __device__ __forceinline__ int moe_mma168_j(int l) {
-    return ((threadIdx.x % 4) * 2) + (l % 2);
-}
-
-static __device__ __forceinline__ void moe_load_mma_a_m16n8k32(
-        int (&a)[4], const int * ptr) {
-    asm volatile("ldmatrix.sync.aligned.m8n8.x4.b16 {%0, %1, %2, %3}, [%4];"
-        : "=r"(a[0]), "=r"(a[1]), "=r"(a[2]), "=r"(a[3]) : "l"(ptr));
-}
-
-static __device__ __forceinline__ void moe_load_mma_b_m16n8k32(
-        int (&b)[2], const int * ptr) {
-    asm volatile("ldmatrix.sync.aligned.m8n8.x2.b16 {%0, %1}, [%2];"
-        : "=r"(b[0]), "=r"(b[1]) : "l"(ptr));
-}
-
-static __device__ __forceinline__ void moe_mma_m16n8k32_s8(
-        int (&d)[4], const int (&a)[4], const int (&b)[2]) {
-    asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
-                 "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};"
-        : "+r"(d[0]), "+r"(d[1]), "+r"(d[2]), "+r"(d[3])
-        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
-}
-
 constexpr int kMoeMmaBn = 64;
 constexpr int kMoeMmaMaxBkStride = 120;
-
-template <int BM>
-constexpr int kMoeMmaBkStride = BM == 64 ? 120 : kMoeMmaMaxBkStride;
 
 template <int GROUPS_PER_CHUNK, int BM>
 __device__ __forceinline__ void nint8_zero_moe_mma_profile(
@@ -1315,41 +1284,6 @@ __global__ void moe_weighted_reduce_shared_gate_kernel(
 
 void check_same_device(const mfq_tensor_backend::Tensor & reference, const mfq_tensor_backend::Tensor & tensor, const char * name) {
     MFQ_RUNTIME_CHECK(tensor.device() == reference.device(), name, " must be on ", reference.device());
-}
-
-void check_nint_weight(
-        const mfq_tensor_backend::Tensor & q_packed,
-        const mfq_tensor_backend::Tensor & sub_scale,
-        const mfq_tensor_backend::Tensor & sub_min,
-        const mfq_tensor_backend::Tensor & neuron_scale,
-        const mfq_tensor_backend::Tensor & neuron_min,
-        int local_experts,
-        int out_per_expert,
-        int gs,
-        int bits) {
-    MFQ_RUNTIME_CHECK(q_packed.is_cuda() && q_packed.is_contiguous() && q_packed.scalar_type() == mfq_tensor_backend::kUInt8,
-        "q_packed must be contiguous CUDA uint8");
-    MFQ_RUNTIME_CHECK(q_packed.dim() == 3, "q_packed must have [experts*out, groups, qbytes] shape");
-    const int rows = local_experts * out_per_expert;
-    const int groups = static_cast<int>(q_packed.size(1));
-    const int qbytes = (gs * bits + 7) / 8;
-    MFQ_RUNTIME_CHECK(q_packed.size(0) == rows && q_packed.size(2) == qbytes,
-        "q_packed shape does not match experts/out/gs/bits");
-    MFQ_RUNTIME_CHECK(sub_scale.is_cuda() && sub_scale.is_contiguous() && sub_scale.scalar_type() == mfq_tensor_backend::kUInt8 &&
-        sub_scale.size(0) == rows && sub_scale.size(1) == groups,
-        "sub_scale must have contiguous CUDA uint8 [experts*out, groups] shape");
-    MFQ_RUNTIME_CHECK(sub_min.is_cuda() && sub_min.is_contiguous() && sub_min.scalar_type() == mfq_tensor_backend::kUInt8 &&
-        sub_min.sizes() == sub_scale.sizes(), "sub_min shape mismatch");
-    MFQ_RUNTIME_CHECK(neuron_scale.is_cuda() && neuron_scale.is_contiguous() &&
-        neuron_scale.scalar_type() == mfq_tensor_backend::kFloat32 && neuron_scale.numel() == rows,
-        "neuron_scale shape mismatch");
-    MFQ_RUNTIME_CHECK(neuron_min.is_cuda() && neuron_min.is_contiguous() &&
-        neuron_min.scalar_type() == mfq_tensor_backend::kFloat32 && neuron_min.numel() == rows,
-        "neuron_min shape mismatch");
-    check_same_device(q_packed, sub_scale, "sub_scale");
-    check_same_device(q_packed, sub_min, "sub_min");
-    check_same_device(q_packed, neuron_scale, "neuron_scale");
-    check_same_device(q_packed, neuron_min, "neuron_min");
 }
 
 void build_expert_map(

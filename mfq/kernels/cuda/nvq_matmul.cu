@@ -45,7 +45,6 @@ constexpr int kNvq2JscXLGroupExec = 16;
 constexpr int kNvq3JscLGroupExec = 17;
 constexpr int kGroupSize = 24;
 constexpr int kChunksPerGroup = 6;  // six dp4a chunks of four values
-constexpr int kGroupsPerWarp = 5;   // 5 * 6 <= 32
 constexpr int kJscMetadataBytes = 64;
 constexpr int kJscLutOffset = 4;
 constexpr int kJscBankMapOffset = 36;
@@ -637,80 +636,6 @@ __global__ void nvq_quantize_x_gate_gs24_kernel(
     if (lane < kGroupSize) {
         qx[(static_cast<int64_t>(m) * ng + group) * kGroupSize + lane] =
             valid ? static_cast<int8_t>(q) : static_cast<int8_t>(0);
-    }
-}
-
-template <int FORMAT, int MAX_M, int M_SPLIT>
-__global__ void __launch_bounds__(256) nvq_gemv_gs24_kernel(
-    const uint8_t * indices,
-    int64_t indices_nbytes,
-    const uint8_t * aux,
-    int64_t aux_nbytes,
-    const uint8_t * sub_scale,
-    int64_t sub_scale_nbytes,
-    const float * neuron_scale,
-    const int8_t * codebook,
-    const int8_t * qx,
-    const float * xscale,
-    __half * output,
-    int M,
-    int N,
-    int ng,
-    int nvec,
-    int nsign,
-    int sub_bits,
-    int sign_mode) {
-    constexpr int kRowsPerBlock = 4;
-    constexpr int kRowsPerSplit = (MAX_M + M_SPLIT - 1) / M_SPLIT;
-    const int warp = threadIdx.y;
-    const int row = blockIdx.x * kRowsPerBlock + warp / M_SPLIT;
-    const int msplit = warp % M_SPLIT;
-    const int lane = threadIdx.x;
-    if (row >= N) return;
-
-    float acc[kRowsPerSplit];
-#pragma unroll
-    for (int i = 0; i < kRowsPerSplit; ++i) acc[i] = 0.0f;
-
-    const int relative_group = lane / kChunksPerGroup;
-    const int chunk = lane - relative_group * kChunksPerGroup;
-    const bool active = relative_group < kGroupsPerWarp;
-    for (int group_base = 0; group_base < ng; group_base += kGroupsPerWarp) {
-        const int group = group_base + relative_group;
-        if (!active || group >= ng) continue;
-        const int64_t sub_linear = static_cast<int64_t>(row) * ng + group;
-        const uint32_t sub = load_packed_bits(
-            sub_scale, sub_linear * sub_bits, sub_bits, sub_scale_nbytes);
-        const int weights = decode_chunk4<FORMAT>(
-            indices, indices_nbytes, aux, aux_nbytes, codebook,
-            row, group, chunk, nvec, nsign, ng, sign_mode, sub);
-        const float weight_scale = format_scale<FORMAT>(neuron_scale[row], sub, codebook);
-        const int k = group * kGroupSize + chunk * 4;
-#pragma unroll
-        for (int i = 0; i < kRowsPerSplit; ++i) {
-            const int m = msplit * kRowsPerSplit + i;
-            if (m < M) {
-                const int activations = load_i8x4(qx + static_cast<int64_t>(m) * ng * kGroupSize + k);
-                const int dot = __dp4a(weights, activations, 0);
-                acc[i] += weight_scale * xscale[static_cast<int64_t>(m) * ng + group]
-                          * static_cast<float>(dot);
-            }
-        }
-    }
-
-#pragma unroll
-    for (int i = 0; i < kRowsPerSplit; ++i) {
-#pragma unroll
-        for (int offset = 16; offset > 0; offset >>= 1) {
-            acc[i] += __shfl_xor_sync(0xffffffff, acc[i], offset);
-        }
-    }
-    if (lane == 0) {
-#pragma unroll
-        for (int i = 0; i < kRowsPerSplit; ++i) {
-            const int m = msplit * kRowsPerSplit + i;
-            if (m < M) output[static_cast<int64_t>(m) * N + row] = __float2half(acc[i]);
-        }
     }
 }
 
@@ -7414,88 +7339,6 @@ mfq_tensor_backend::Tensor nvq_dequant_cuda(
 
 namespace {
 
-template <typename T>
-__device__ __forceinline__ float nvq_backward_to_float(T value) {
-    return static_cast<float>(value);
-}
-
-template <>
-__device__ __forceinline__ float nvq_backward_to_float(__half value) {
-    return __half2float(value);
-}
-
-template <>
-__device__ __forceinline__ float nvq_backward_to_float(__nv_bfloat16 value) {
-    return __bfloat162float(value);
-}
-
-template <typename T>
-__device__ __forceinline__ T nvq_backward_from_float(float value) {
-    return static_cast<T>(value);
-}
-
-template <>
-__device__ __forceinline__ __half nvq_backward_from_float(float value) {
-    return __float2half_rn(value);
-}
-
-template <>
-__device__ __forceinline__ __nv_bfloat16 nvq_backward_from_float(float value) {
-    return __float2bfloat16_rn(value);
-}
-
-template <int FORMAT, typename T>
-__global__ void nvq_backward_input_kernel(
-        const uint8_t * indices,
-        int64_t indices_nbytes,
-        const uint8_t * aux,
-        int64_t aux_nbytes,
-        const uint8_t * sub_scale,
-        int64_t sub_scale_nbytes,
-        const float * neuron_scale,
-        const int8_t * codebook,
-        const T * output_gradient,
-        T * input_gradient,
-        int M,
-        int N,
-        int K,
-        int ng,
-        int nvec,
-        int nsign,
-        int sub_bits,
-        int sign_mode) {
-    const int64_t total = static_cast<int64_t>(M) * K;
-    for (int64_t logical = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-         logical < total;
-         logical += static_cast<int64_t>(gridDim.x) * blockDim.x) {
-        const int row = static_cast<int>(logical / K);
-        const int column = static_cast<int>(logical - static_cast<int64_t>(row) * K);
-        const int group = column / kGroupSize;
-        const int chunk = (column - group * kGroupSize) / 4;
-        const int component = column & 3;
-        float accumulator = 0.0f;
-        for (int output = 0; output < N; ++output) {
-            const int64_t state_index = static_cast<int64_t>(output) * ng + group;
-            const uint32_t state = load_packed_bits(
-                sub_scale, state_index * sub_bits, sub_bits, sub_scale_nbytes);
-            const int packed = decode_chunk4<FORMAT>(
-                indices, indices_nbytes, aux, aux_nbytes, codebook,
-                output, group, chunk, nvec, nsign, ng, sign_mode, state);
-            const int value = static_cast<int>(static_cast<int8_t>(
-                (packed >> (8 * component)) & 0xff));
-            const float weight =
-                format_scale<FORMAT>(neuron_scale[output], state, codebook) *
-                static_cast<float>(value);
-            accumulator = fmaf(
-                nvq_backward_to_float(
-                    output_gradient[static_cast<int64_t>(row) * N + output]),
-                weight,
-                accumulator);
-        }
-        input_gradient[logical] = nvq_backward_from_float<T>(accumulator);
-    }
-}
-
 template <int FORMAT, int Rows>
 __global__ void __launch_bounds__(32) nvq_backward_quad_partial_kernel(
         const uint8_t * indices,
@@ -8060,62 +7903,6 @@ void launch_nepq_backward_mma_m8(
                 output_gradient.data_ptr<mfq_half>()),
             reinterpret_cast<__half *>(result.data_ptr<mfq_half>()),
             M, N, K, ng, nvec, nsign, nsuper, table_stride, state_bits);
-}
-
-template <int FORMAT, typename T>
-__global__ void nepq_backward_input_kernel(
-        const uint8_t * indices,
-        int64_t indices_nbytes,
-        const uint8_t * aux,
-        int64_t aux_nbytes,
-        const uint8_t * state_stream,
-        int64_t state_nbytes,
-        const float * neuron_scale,
-        const int8_t * table_pool,
-        const uint8_t * bank_ids,
-        const T * output_gradient,
-        T * input_gradient,
-        int M,
-        int N,
-        int K,
-        int ng,
-        int nvec,
-        int nsign,
-        int nsuper,
-        int table_stride,
-        int state_bits) {
-    const int64_t total = static_cast<int64_t>(M) * K;
-    for (int64_t logical = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-         logical < total;
-         logical += static_cast<int64_t>(gridDim.x) * blockDim.x) {
-        const int row = static_cast<int>(logical / K);
-        const int column = static_cast<int>(logical - static_cast<int64_t>(row) * K);
-        const int group = column / kGroupSize;
-        const int chunk = (column - group * kGroupSize) / 4;
-        const int component = column & 3;
-        float accumulator = 0.0f;
-        for (int output = 0; output < N; ++output) {
-            const int64_t state_index = static_cast<int64_t>(output) * ng + group;
-            const uint32_t state = load_packed_bits(
-                state_stream, state_index * state_bits, state_bits, state_nbytes);
-            const int8_t * table = nepq_active_table(
-                table_pool, bank_ids, output, group, nsuper, table_stride);
-            const int packed = decode_nepq_chunk4<FORMAT>(
-                indices, indices_nbytes, aux, aux_nbytes, table,
-                output, group, chunk, nvec, nsign, ng, 0, state);
-            const int value = static_cast<int>(static_cast<int8_t>(
-                (packed >> (8 * component)) & 0xff));
-            const float weight =
-                format_scale<FORMAT>(neuron_scale[output], state, table) *
-                static_cast<float>(value);
-            accumulator = fmaf(
-                nvq_backward_to_float(
-                    output_gradient[static_cast<int64_t>(row) * N + output]),
-                weight,
-                accumulator);
-        }
-        input_gradient[logical] = nvq_backward_from_float<T>(accumulator);
-    }
 }
 
 template <int FORMAT, int Rows>

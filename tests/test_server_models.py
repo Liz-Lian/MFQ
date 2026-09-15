@@ -352,10 +352,17 @@ def _fake_runtime(path: Path) -> None:
             class Handler(BaseHTTPRequestHandler):
                 def do_GET(self):
                     if self.path == '/health':
+                        has_mtp = args.model_name.endswith('-with-mtp')
                         payload = {
                             'status': 'ok',
                             'model': args.model_name,
                             'model_type': 'qwen35',
+                            'model_capabilities': {
+                                'architecture_family': 'qwen3_5',
+                                'source': 'fake-runtime',
+                                'features': {'text': True, 'mtp': has_mtp},
+                            },
+                            'mtp_available': has_mtp,
                             'max_context': args.ctx_size,
                         }
                     elif self.path == '/api/status':
@@ -1178,6 +1185,8 @@ def test_managed_runtime_loads_and_unloads_through_persistent_jobs(tmp_path: Pat
                 assert instances.status_code == 200
                 assert instances.json()["data"][0]["state"] == "ready"
                 assert instances.json()["data"][0]["context_size"] == 4096
+                assert instances.json()["data"][0]["mtp_supported"] is False
+                assert instances.json()["data"][0]["mtp_available"] is False
 
                 duplicate = await client.post(
                     "/api/v1/models/load", json={"model": artifact["name"]}
@@ -1327,6 +1336,45 @@ def test_managed_cuda_runtime_only_enables_supported_continuous_batching(
 
         assert "--continuous-batching" not in unsupported
         assert "--continuous-batching" not in moe
+
+    asyncio.run(run())
+
+
+def test_runtime_instances_keep_model_bound_mtp_capabilities(tmp_path: Path) -> None:
+    async def run() -> None:
+        model_dir = tmp_path / "models"
+        model_dir.mkdir()
+        _model(model_dir / "plain.mfq", architecture="qwen35")
+        _model(model_dir / "ready-with-mtp.mfq", architecture="qwen35")
+        executable = tmp_path / "fake-runtime"
+        _fake_runtime(executable)
+        catalog = ModelCatalog([model_dir], cache_seconds=0)
+        pool = ManagedRuntimePool(
+            catalog,
+            executable,
+            startup_timeout_seconds=5,
+            max_instances=2,
+        )
+        store = SessionStore(tmp_path / "mfq.server.sqlite3")
+        service = ServerService(store, pool, catalog=catalog, runtime_manager=pool)
+        transport = httpx.ASGITransport(app=create_app(service))
+        try:
+            async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+                for model in ("plain", "ready-with-mtp"):
+                    accepted = await client.post("/api/v1/models/load", json={"model": model})
+                    loaded = await _wait_for_job(client, accepted.json()["operation_id"])
+                    assert loaded["status"] == "succeeded", loaded
+
+                instances = {
+                    item["model"]: item
+                    for item in (await client.get("/api/v1/runtime/instances")).json()["data"]
+                }
+                assert instances["plain"]["mtp_supported"] is False
+                assert instances["plain"]["mtp_available"] is False
+                assert instances["ready-with-mtp"]["mtp_supported"] is True
+                assert instances["ready-with-mtp"]["mtp_available"] is True
+        finally:
+            await service.aclose()
 
     asyncio.run(run())
 

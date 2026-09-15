@@ -344,7 +344,7 @@ Tensor launch(
         name, ": meta workspace too small, need ", required_meta,
         " float elements");
 
-    auto out = mfq_tensor_backend::empty({B, M, heads, DV}, q.options());
+    Tensor out = mfq_tensor_backend::empty({B, M, heads, DV}, q.options());
     const auto stream = mfq_current_cuda_stream();
     kernel<<<rounded_blocks, dim3(32, nwarps, 1), shmem, stream>>>(
         q.data_ptr<float>(),

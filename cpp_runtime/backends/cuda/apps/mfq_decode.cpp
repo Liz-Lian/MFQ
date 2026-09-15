@@ -11740,19 +11740,17 @@ static mfq_tensor_backend::Tensor nint_matmul(const NintWeight & w, mfq_tensor_b
             ? result.index({Slice(0, original_m)}).contiguous()
             : result;
     }
-    if (w.q8_zero) {
-        if (M <= 8) {
-            Workspace & ws = w.workspace(M);
-            return g_profiler.measure("nint8_zero.gemv", [&]() {
-                return nint8_zero_gemv_ws_cuda(
-                    w.q_packed, w.q8_zero_scale, x, ws.qx, ws.xscale);
-            });
-        }
-        return g_profiler.measure("nint8_zero.packed_mmq", [&]() {
-            return nint8_zero_mmq_f16_packed_cuda(
-                w.q_packed, w.q8_zero_scale, x, w.neuron_len);
+    if (M <= 8) {
+        Workspace & ws = w.workspace(M);
+        return g_profiler.measure("nint8_zero.gemv", [&]() {
+            return nint8_zero_gemv_ws_cuda(
+                w.q_packed, w.q8_zero_scale, x, ws.qx, ws.xscale);
         });
     }
+    return g_profiler.measure("nint8_zero.packed_mmq", [&]() {
+        return nint8_zero_mmq_f16_packed_cuda(
+            w.q_packed, w.q8_zero_scale, x, w.neuron_len);
+    });
 }
 
 static mfq_tensor_backend::Tensor nint_matmul_bf16_output(

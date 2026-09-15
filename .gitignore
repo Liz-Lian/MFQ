@@ -63,8 +63,10 @@ tmp/
 runs/
 .remote_modelscope_parallel_download.sh
 .transfer_*
+.mfq/
 
 # ---- 模型、校准数据与实验工件 ----
+models/
 data/*
 !data/wikitext-2-raw/
 data/wikitext-2-raw/*
@@ -75,5 +77,6 @@ data/wikitext-2-raw/*
 *.safetensors
 *.logits
 *.sqlite
+*.sqlite3
 *.pt
 *.pth

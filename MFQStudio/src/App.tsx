@@ -1613,6 +1613,7 @@ export default function App() {
   const [attachments, setAttachments] = useState<PendingAttachment[]>([]);
   const [live, setLive] = useState<LiveOutput | null>(null);
   const [busy, setBusy] = useState(false);
+  const [sessionTransitioning, setSessionTransitioning] = useState(false);
   const [stopping, setStopping] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [capabilities, setCapabilities] = useState<RuntimeCapabilities | null>(null);
@@ -1639,6 +1640,7 @@ export default function App() {
   const [modelBrowserOpen, setModelBrowserOpen] = useState(false);
   const [modelDirectoryPath, setModelDirectoryPath] = useState("");
   const [studioToken, setStudioToken] = useState("");
+  const [studioCredentialWritable, setStudioCredentialWritable] = useState(false);
   const [endpointCopied, setEndpointCopied] = useState(false);
   const [editDraft, setEditDraft] = useState<EditDraft | null>(null);
   const [voiceState, setVoiceState] = useState<VoiceState>("idle");
@@ -1685,6 +1687,11 @@ export default function App() {
       && job.payload.model === model
       && ["queued", "running", "cancelling"].includes(job.status),
   );
+  const activeJobIds = jobs
+    .filter((job) => ["queued", "running", "cancelling"].includes(job.status))
+    .map((job) => job.id)
+    .sort()
+    .join(",");
   const currentVoiceMessages = useMemo(
     () => voiceMessages.filter((message) => message.sessionId === activeId),
     [activeId, voiceMessages],
@@ -1710,8 +1717,13 @@ export default function App() {
   const visionAvailable = Boolean(
     capabilities?.vision_available || visionSupported,
   );
-  const mtpSupported = capabilities?.model_capabilities.features.mtp === true;
-  const mtpAvailable = capabilities?.mtp_available === true;
+  const mtpSupported = typeof selectedRuntimeInstance?.mtp_supported === "boolean"
+    ? selectedRuntimeInstance.mtp_supported
+    : capabilities?.model === model
+      && capabilities.model_capabilities.features.mtp === true;
+  const mtpAvailable = typeof selectedRuntimeInstance?.mtp_available === "boolean"
+    ? selectedRuntimeInstance.mtp_available
+    : capabilities?.model === model && capabilities.mtp_available === true;
   const attachmentAccept = useMemo(() => {
     const features = capabilities?.model_capabilities.features;
     return [
@@ -1880,7 +1892,7 @@ export default function App() {
       return;
     }
     void api.jobEvents(selectedJobId).then(setJobLogs).catch(() => undefined);
-  }, [jobs, selectedJobId]);
+  }, [selectedJobId]);
 
   useEffect(() => {
     const stable = voiceMessages.filter(
@@ -1988,15 +2000,40 @@ export default function App() {
     async function initialize() {
       try {
         let status = await studioStatus();
+        let token: string | null = null;
+        if (status) {
+          try {
+            token = await studioCredential();
+          } catch (cause) {
+            if (current) setError(errorMessage(cause));
+          }
+        }
+        if (current && status) {
+          setStudio(status);
+          setStudioDraft({ ...status.config });
+          if (token !== null) {
+            setStudioToken(token);
+            setStudioCredentialWritable(true);
+          }
+        }
         if (status?.config.mode === "local" && !status.reachable) {
-          status = await startLocalStudio();
+          await startLocalStudio();
+          status = await studioStatus();
+          token = null;
+          try {
+            token = await studioCredential();
+          } catch (cause) {
+            if (current) setError(errorMessage(cause));
+          }
         }
         if (status) {
           setApiBaseUrl(status.service_url);
-          const token = await studioCredential();
-          setApiToken(token);
-          if (current) setStudioToken(token);
+          if (token !== null) setApiToken(token);
           if (current) {
+            if (token !== null) {
+              setStudioToken(token);
+              setStudioCredentialWritable(true);
+            }
             setStudio(status);
             setStudioDraft({ ...status.config });
           }
@@ -2098,9 +2135,39 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    const timer = window.setInterval(() => void refreshRuntime(true), 2500);
-    return () => window.clearInterval(timer);
-  }, [refreshRuntime]);
+    if (!activeJobIds) return;
+    const controller = new AbortController();
+    for (const id of activeJobIds.split(",")) {
+      void api.streamJobEvents(id, (event) => {
+        const status = event.type === "state" && typeof event.data.status === "string"
+          ? event.data.status as JobResource["status"]
+          : null;
+        setJobs((current) => current.map((job) => job.id === id ? {
+          ...job,
+          ...(status ? { status } : {}),
+          ...(typeof event.progress === "number" ? { progress: event.progress } : {}),
+          updated_at: event.created_at,
+        } : job));
+        if (event.job_id === selectedJobId && event.message) {
+          setJobLogs((current) => current.some((entry) => entry.sequence === event.sequence)
+            ? current
+            : [...current, {
+              sequence: event.sequence,
+              level: event.level,
+              message: event.message || "",
+              fields: event.data,
+              created_at: event.created_at,
+            }]);
+        }
+        if (status && ["succeeded", "failed", "cancelled", "interrupted"].includes(status)) {
+          void refreshRuntime(true);
+        }
+      }, controller.signal).catch((cause) => {
+        if (!controller.signal.aborted) setError(errorMessage(cause));
+      });
+    }
+    return () => controller.abort();
+  }, [activeJobIds, refreshRuntime, selectedJobId]);
 
   useEffect(() => {
     const instanceId = selectedRuntimeInstance?.id;
@@ -2153,15 +2220,22 @@ export default function App() {
     };
   }, [activeId]);
 
+  const activeSessionId = active?.id;
+  const activeSessionModel = active?.model;
+  const activeSessionTitle = active?.title;
   useEffect(() => {
-    if (!active || !selectedModelAvailable || active.model === model || busy) return;
-    const switchKey = `${active.id}:${model}`;
+    if (!activeSessionId || !selectedModelAvailable || activeSessionModel === model) return;
+    const switchKey = `${activeSessionId}:${model}`;
     if (sessionSwitchRef.current === switchKey) return;
     sessionSwitchRef.current = switchKey;
     let current = true;
-    void api.forkSession(active.id, null, true, active.title, model)
+    setSessionTransitioning(true);
+    void api.forkSession(activeSessionId, null, true, activeSessionTitle, model)
       .then((replacement) => {
-        if (!current) return;
+        if (!current) {
+          void refreshSessions();
+          return;
+        }
         setSessions((existing) => [replacement, ...existing]);
         setActiveId(replacement.id);
         setResponses({});
@@ -2170,12 +2244,13 @@ export default function App() {
         if (current) setError(errorMessage(cause));
       })
       .finally(() => {
+        setSessionTransitioning(false);
         if (sessionSwitchRef.current === switchKey) sessionSwitchRef.current = "";
       });
     return () => {
       current = false;
     };
-  }, [active, busy, model, selectedModelAvailable]);
+  }, [activeSessionId, activeSessionModel, activeSessionTitle, model, refreshSessions, selectedModelAvailable]);
 
   useEffect(() => {
     setAttachments((current) => {
@@ -2224,7 +2299,7 @@ export default function App() {
       seed: effectiveSettings.seed,
       enable_thinking: thinkingSupported && effectiveSettings.enableThinking,
       enable_vision: effectiveSettings.enableVision,
-      enable_mtp: effectiveSettings.enableMtp,
+      enable_mtp: mtpSupported && mtpAvailable && effectiveSettings.enableMtp,
       reasoning_effort: effectiveSettings.reasoningEffort || null,
     };
   }
@@ -2247,9 +2322,29 @@ export default function App() {
     setSidebarOpen(false);
   }
 
+  function selectModel(nextModel: string) {
+    if (!nextModel || nextModel === model || sessionTransitioning) return;
+    if (active) setSessionTransitioning(true);
+    setModel(nextModel);
+  }
+
+  function selectSession(id: string) {
+    const session = sessions.find((candidate) => candidate.id === id);
+    if (!session || session.id === activeId || busy || sessionTransitioning) return;
+    if (voiceRef.current?.active) void voiceRef.current.stop();
+    setModel(session.model);
+    setMode(session.mode);
+    setActiveId(session.id);
+    setMessages([]);
+    setResponses({});
+    setView("chat");
+    setSidebarOpen(false);
+  }
+
   async function createSession() {
     const selectedModel = model.trim();
-    if (!selectedModel) return;
+    if (!selectedModel || sessionTransitioning) return;
+    setSessionTransitioning(true);
     setError(null);
     try {
       const created = await api.createSession(selectedModel, mode);
@@ -2260,6 +2355,8 @@ export default function App() {
       setSidebarOpen(false);
     } catch (cause) {
       setError(errorMessage(cause));
+    } finally {
+      setSessionTransitioning(false);
     }
   }
 
@@ -3080,11 +3177,11 @@ export default function App() {
   }
 
   async function saveStudioSettings() {
-    if (!studioDraft) return;
+    if (!studioDraft || sessionTransitioning) return;
     setBusy(true);
     try {
       const status = await configureStudio(studioDraft);
-      await saveStudioCredential(studioToken);
+      if (studioCredentialWritable) await saveStudioCredential(studioToken);
       setApiBaseUrl(status.service_url);
       setApiToken(studioToken);
       setStudio(status);
@@ -3752,7 +3849,7 @@ export default function App() {
           <SettingRow
             title={tr("模型 ID", "Model ID")}
             detail={tr("由 /v1/models 公布，并用于对话补全请求。", "Advertised by /v1/models and accepted by chat completions.")}
-            trailing={<div className="server-row-actions server-model-control">{availableModelNames.length > 1 ? <select aria-label={tr("当前模型", "Current model")} disabled={busy} onChange={(event) => setModel(event.target.value)} value={model}>{availableModelNames.map((name) => <option key={name} value={name}>{name}</option>)}</select> : <strong title={model}>{model || tr("尚未加载", "Not loaded")}</strong>}<button onClick={() => openStudioPage("dashboard", "models")} type="button">{tr("选择…", "Choose…")}</button></div>}
+            trailing={<div className="server-row-actions server-model-control">{availableModelNames.length > 1 ? <select aria-label={tr("当前模型", "Current model")} disabled={busy || sessionTransitioning} onChange={(event) => selectModel(event.target.value)} value={model}>{availableModelNames.map((name) => <option key={name} value={name}>{name}</option>)}</select> : <strong title={model}>{model || tr("尚未加载", "Not loaded")}</strong>}<button onClick={() => openStudioPage("dashboard", "models")} type="button">{tr("选择…", "Choose…")}</button></div>}
           />
           <SettingRow
             title={tr("绑定地址", "Bind address")}
@@ -3768,7 +3865,7 @@ export default function App() {
             <SettingRow
               title={tr("API 密钥", "API key")}
               detail={tr("凭据只保存在系统凭据库中。", "The credential is stored only in the system credential vault.")}
-              trailing={<input aria-label={tr("API 密钥", "API key")} autoComplete="off" className="server-wide-input" disabled={busy} onChange={(event) => setStudioToken(event.target.value)} placeholder={tr("可选", "Optional")} type="password" value={studioToken} />}
+              trailing={<input aria-label={tr("API 密钥", "API key")} autoComplete="off" className="server-wide-input" disabled={busy} onChange={(event) => { setStudioToken(event.target.value); setStudioCredentialWritable(true); }} placeholder={tr("可选", "Optional")} type="password" value={studioToken} />}
             />
           </> : <SettingRow
             title={tr("端口", "Port")}
@@ -3864,7 +3961,7 @@ export default function App() {
 
       <div className="server-page-footer">
         <span>{tr("对话默认值会自动保存。", "Chat defaults are saved automatically.")}</span>
-        <button className="primary" disabled={busy || !serverDraft} onClick={() => void saveStudioSettings()} type="button">{tr("保存服务器设置", "Save server settings")}</button>
+        <button className="primary" disabled={busy || sessionTransitioning || !serverDraft} onClick={() => void saveStudioSettings()} type="button">{tr("保存服务器设置", "Save server settings")}</button>
       </div>
     </div>
   );
@@ -3904,8 +4001,10 @@ export default function App() {
         />
         <SettingRow
           title="MTP"
-          detail={tr("默认启用；模型不含完整 MTP 权重时自动回退普通 Decode。", "On by default; models without a complete MTP head fall back to ordinary Decode.")}
-          trailing={<input aria-label="MTP" checked={settingsDraft.enableMtp} onChange={(event) => setSettingsDraft((current) => ({ ...current, enableMtp: event.target.checked, inheritModelDefaults: false }))} type="checkbox" />}
+          detail={mtpAvailable
+            ? tr("当前模型支持 MTP 投机解码。", "The current model supports MTP speculative decoding.")
+            : tr("当前模型无法使用 MTP，将使用普通 Decode。", "MTP is unavailable for the current model; ordinary Decode will be used.")}
+          trailing={<input aria-label="MTP" checked={mtpAvailable && settingsDraft.enableMtp} disabled={!mtpAvailable} onChange={(event) => setSettingsDraft((current) => ({ ...current, enableMtp: event.target.checked, inheritModelDefaults: false }))} type="checkbox" />}
         />
       </TMPanel>
 
@@ -4084,10 +4183,15 @@ export default function App() {
             <header className="chat-screen-header">
               <div className="chat-screen-title">
                 <h1>{tr("对话", "Chat")}</h1>
+                <select aria-label={tr("会话", "Session")} className="chat-session-select" disabled={busy || sessionTransitioning || !sessions.length} onChange={(event) => selectSession(event.target.value)} value={activeId ?? ""}>
+                  {!sessions.length && <option value="">{tr("暂无会话", "No sessions")}</option>}
+                  {sessions.map((session) => <option key={session.id} value={session.id}>{session.title || tr("未命名会话", "Untitled session")} · {session.model}</option>)}
+                </select>
+                <button aria-label={tr("新建会话", "New session")} className="chat-icon-button" disabled={busy || sessionTransitioning || !selectedModelAvailable} onClick={() => void createSession()} title={tr("新建会话", "New session")} type="button"><Icon name="plus" size={14} /></button>
               </div>
               <div className="chat-screen-actions">
                 <div className="chat-model-summary">
-                  {availableModelNames.length > 1 ? <select aria-label={tr("对话模型", "Chat model")} disabled={busy} onChange={(event) => setModel(event.target.value)} value={model}>{availableModelNames.map((name) => <option key={name} value={name}>{name}</option>)}</select> : <strong>{model || tr("尚未加载模型", "No model loaded")}</strong>}
+                  {availableModelNames.length > 1 ? <select aria-label={tr("对话模型", "Chat model")} disabled={busy || sessionTransitioning} onChange={(event) => selectModel(event.target.value)} value={model}>{availableModelNames.map((name) => <option key={name} value={name}>{name}</option>)}</select> : <strong>{model || tr("尚未加载模型", "No model loaded")}</strong>}
                   <small>{tr(`最多 ${formatNumber(effectiveSettings.maxTokens)} tokens`, `${formatNumber(effectiveSettings.maxTokens)} max tokens`)} · {tr("温度", "temperature")} {formatNumber(effectiveSettings.temperature, 2)} · {tr("流式", "streaming")}</small>
                 </div>
                 <span className={`runtime-status-pill ${conversationReady ? "running" : "stopped"}`}><i />{conversationReady ? tr("就绪", "Ready") : selectedModelLoading ? tr("加载中", "Loading") : tr("空闲", "Idle")}</span>
@@ -4178,7 +4282,7 @@ export default function App() {
                       instance?.context_size ? `${formatNumber(instance.context_size)} ctx` : null,
                       instance ? tr(`${instance.active_sessions} 个会话`, `${instance.active_sessions} sessions`) : null,
                     ].filter(Boolean).join(" · ");
-                    return <button aria-pressed={selected} className={`overview-model-card${selected ? " selected" : ""}`} disabled={busy || selected} key={name} onClick={() => setModel(name)} type="button">
+                    return <button aria-pressed={selected} className={`overview-model-card${selected ? " selected" : ""}`} disabled={busy || sessionTransitioning || selected} key={name} onClick={() => selectModel(name)} type="button">
                       <ModelMonogram name={name} state="ready" />
                       <span className="overview-model-copy"><strong title={name}>{name}</strong><small>{details || stateLabel}</small></span>
                       <span className="runtime-status-pill ready"><i />{selected ? tr("当前", "Current") : stateLabel}</span>
@@ -4285,7 +4389,7 @@ export default function App() {
                 const ready = instance.state === "ready" || instance.state === "busy";
                 const selected = instance.model === model;
                 const stateLabel = instance.state === "loading" ? tr("加载中", "Loading") : instance.state === "unloading" ? tr("卸载中", "Unloading") : instance.state === "failed" ? tr("失败", "Failed") : instance.state === "busy" ? tr("使用中", "Busy") : tr("就绪", "Ready");
-                return <div className="model-row" key={instance.id}><span className={instance.state === "failed" ? "model-state failed" : ready ? "model-state active" : "model-state"} /><div><strong>{instance.model}</strong><small>{stateLabel} · {formatNumber(instance.context_size)} ctx{instance.pinned ? ` · ${tr("固定", "Pinned")}` : instance.idle_ttl_seconds != null ? ` · TTL ${instance.idle_ttl_seconds}s` : ""}</small></div><div className="model-row-actions">{ready && <button className={selected ? "selected" : ""} disabled={busy || selected} onClick={() => setModel(instance.model)} type="button">{selected ? tr("当前", "Current") : tr("用于对话", "Use in chat")}</button>}<button disabled={busy || !ready || instance.state === "busy"} onClick={() => void unloadInstance(instance.id)} type="button">{tr("卸载", "Unload")}</button></div></div>;
+                return <div className="model-row" key={instance.id}><span className={instance.state === "failed" ? "model-state failed" : ready ? "model-state active" : "model-state"} /><div><strong>{instance.model}</strong><small>{stateLabel} · {formatNumber(instance.context_size)} ctx{instance.pinned ? ` · ${tr("固定", "Pinned")}` : instance.idle_ttl_seconds != null ? ` · TTL ${instance.idle_ttl_seconds}s` : ""}</small></div><div className="model-row-actions">{ready && <button className={selected ? "selected" : ""} disabled={busy || sessionTransitioning || selected} onClick={() => selectModel(instance.model)} type="button">{selected ? tr("当前", "Current") : tr("用于对话", "Use in chat")}</button>}<button disabled={busy || !ready || instance.state === "busy"} onClick={() => void unloadInstance(instance.id)} type="button">{tr("卸载", "Unload")}</button></div></div>;
               })}</div></TMPanel> : <div className="inline-empty model-runtime-empty">{tr("当前没有已加载模型。", "No models are currently loaded.")}</div>}
               <TMPanel className="model-catalog-panel">
                 <div className="panel-heading"><div><h2>{tr("加载策略", "Load policy")}</h2><p>{tr("控制模型的驻留与自动卸载。", "Control model residency and automatic unloading.")}</p></div></div>

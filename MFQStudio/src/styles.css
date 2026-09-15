@@ -1151,7 +1151,7 @@ button.primary:hover { border-color: var(--accent-hover); color: var(--on-accent
   padding: 14px 24px;
   background: var(--surface-overlay);
 }
-.chat-screen-title { min-width: 0; }
+.chat-screen-title { display: flex; min-width: 0; align-items: center; gap: 8px; }
 .chat-screen-title h1 {
   overflow: hidden;
   margin: 0;
@@ -1174,7 +1174,7 @@ button.primary:hover { border-color: var(--accent-hover); color: var(--on-accent
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.chat-model-summary select {
+.chat-model-summary select, .chat-session-select {
   max-width: min(27vw, 350px);
   border: 1px solid var(--line);
   border-radius: 7px;
@@ -1185,7 +1185,7 @@ button.primary:hover { border-color: var(--accent-hover); color: var(--on-accent
   font-size: 11px;
   font-weight: 630;
 }
-.chat-model-summary select:focus { border-color: var(--line-strong); box-shadow: 0 0 0 3px var(--accent-soft); }
+.chat-model-summary select:focus, .chat-session-select:focus { border-color: var(--line-strong); box-shadow: 0 0 0 3px var(--accent-soft); }
 .chat-model-summary small { color: var(--muted); font-size: 10px; white-space: nowrap; }
 .chat-icon-button {
   display: grid;
@@ -1436,7 +1436,8 @@ button.primary:hover { border-color: var(--accent-hover); color: var(--on-accent
   .screen-header p { max-width: 70vw; }
   .chat-screen-header { align-items: flex-start; padding: 14px; }
   .chat-model-summary { display: none; }
-  .chat-screen-title h1 { max-width: 48vw; font-size: 17px; }
+  .chat-screen-title h1 { display: none; }
+  .chat-session-select { max-width: min(52vw, 260px); }
   .runtime-status-pill { display: none; }
   .metric-grid, .logs-grid { grid-template-columns: 1fr; }
   .logs-grid > .runtime-log-panel { grid-column: 1; }

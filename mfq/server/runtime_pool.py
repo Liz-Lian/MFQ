@@ -91,6 +91,8 @@ class _ManagedRuntime:
     control_leases: int = 0
     request_slots: asyncio.Semaphore | None = None
     request_capacity: int = 1
+    mtp_supported: bool = False
+    mtp_available: bool = False
     error: ErrorDetail | None = None
     output_task: asyncio.Task[None] | None = None
     monitor_task: asyncio.Task[None] | None = None
@@ -770,6 +772,8 @@ class ManagedRuntimePool:
                     "runtime_identity_mismatch",
                     "runtime health returned an unexpected model identity",
                 )
+            instance.mtp_supported = capabilities.model_capabilities.features.mtp
+            instance.mtp_available = capabilities.mtp_available
             break
         else:
             raise _job_error(
@@ -898,6 +902,8 @@ class ManagedRuntimePool:
                     last_used_at=item.last_used_at,
                     idle_ttl_seconds=item.idle_ttl_seconds,
                     pinned=item.pinned,
+                    mtp_supported=item.mtp_supported,
+                    mtp_available=item.mtp_available,
                     error=item.error,
                 )
                 for item in values
@@ -958,6 +964,8 @@ class ManagedRuntimePool:
                 last_used_at=instance.last_used_at,
                 idle_ttl_seconds=instance.idle_ttl_seconds,
                 pinned=instance.pinned,
+                mtp_supported=instance.mtp_supported,
+                mtp_available=instance.mtp_available,
                 error=instance.error,
             )
             self._idle_reaper_wakeup.set()

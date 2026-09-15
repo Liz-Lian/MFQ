@@ -235,6 +235,7 @@ class ToolJobHandlers:
         self.catalog = catalog
         self.paths = paths
         self.root = paths.work_root.expanduser().resolve()
+        self.model_root = catalog.roots[0] if catalog.roots else self.root / "models"
         self.voice_component = voice_component
         self.activate_voice_output = activate_voice_output
 
@@ -1061,15 +1062,22 @@ class ToolJobHandlers:
             raise self._failure(
                 "absolute_path_not_allowed", "tool job paths must be workspace-relative"
             )
-        resolved = (self.root / path).resolve()
-        if not resolved.is_relative_to(self.root):
+        model_path = path.parts[:1] == ("models",)
+        root = self.model_root if model_path else self.root
+        resolved = (root / Path(*path.parts[1:]) if model_path else root / path).resolve()
+        if not resolved.is_relative_to(root):
             raise self._failure(
                 "path_outside_workspace", "path is outside the configured workspace"
             )
         return resolved
 
     def _artifact_uri(self, path: Path) -> str:
-        return f"workspace://{path.relative_to(self.root).as_posix()}"
+        relative = (
+            Path("models") / path.relative_to(self.model_root)
+            if path.is_relative_to(self.model_root)
+            else path.relative_to(self.root)
+        )
+        return f"workspace://{relative.as_posix()}"
 
     def remove_workspace_artifact(self, artifact_uri: str) -> dict[str, int]:
         if not artifact_uri.startswith("workspace://"):

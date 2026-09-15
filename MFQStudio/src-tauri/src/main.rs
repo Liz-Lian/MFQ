@@ -8,11 +8,9 @@ use tokio::sync::Mutex;
 use url::Url;
 
 const CONFIG_FILE: &str = "studio.json";
-const DATABASE_FILE: &str = "mfq-server.sqlite3";
 const LOG_FILE: &str = "mfq-server.log";
 const LOG_ROTATE_BYTES: u64 = 16 * 1024 * 1024;
 const PID_FILE: &str = "mfq-server.pid";
-const MODEL_DIRECTORY: &str = "models";
 const CREDENTIAL_SERVICE: &str = "MFQ Studio";
 const CREDENTIAL_ACCOUNT: &str = "mfq-server-api-key";
 
@@ -295,8 +293,6 @@ async fn start_local(app: &AppHandle, config: StudioConfig) -> Result<StudioStat
     }
 
     let data_dir = app_data_dir(app)?;
-    let model_dir = data_dir.join(MODEL_DIRECTORY);
-    fs::create_dir_all(&model_dir).map_err(|error| error.to_string())?;
     let (program, python_module) = mfq_program(app)?;
     let stdout = open_log(&data_dir.join(LOG_FILE))?;
     let stderr = stdout.try_clone().map_err(|error| error.to_string())?;
@@ -308,10 +304,8 @@ async fn start_local(app: &AppHandle, config: StudioConfig) -> Result<StudioStat
         .arg("serve")
         .arg("--no-web-ui")
         .arg("--no-access-log")
-        .arg("--db")
-        .arg(data_dir.join(DATABASE_FILE))
-        .arg("--model-dir")
-        .arg(&model_dir)
+        .arg("--data-dir")
+        .arg(&data_dir)
         .arg("--work-dir")
         .arg(&data_dir)
         .arg("--host")

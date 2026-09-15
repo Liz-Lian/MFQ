@@ -434,10 +434,12 @@ def test_packaged_download_reinvokes_the_unified_cli(tmp_path: Path) -> None:
             (root / 'config.json').write_text('{}')
             """,
         )
+        model_root = tmp_path / "managed" / "models"
+        (tmp_path / "work").mkdir()
         handlers = ToolJobHandlers(
-            ModelCatalog([]),
+            ModelCatalog([model_root]),
             ToolJobPaths(
-                work_root=tmp_path,
+                work_root=tmp_path / "work",
                 python=cli,
                 modelscope=None,
                 huggingface=None,
@@ -459,6 +461,8 @@ def test_packaged_download_reinvokes_the_unified_cli(tmp_path: Path) -> None:
         result = await _wait(store, submitted.id)
         assert result.status == JobStatus.SUCCEEDED
         assert result.result["files"] == 1
+        assert result.result["artifact"] == "workspace://models/owner/model"
+        assert (model_root / "owner" / "model" / "config.json").is_file()
         await manager.close()
 
     asyncio.run(run())

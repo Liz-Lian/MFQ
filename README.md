@@ -53,34 +53,14 @@ memory, storage, and latency limits.
 | DeepSeek V4.1 Flash raw-HF / Mac Studio M3 Ultra, 512 GB | Full resident; Engram only on internal SSD | **38.6 s** | **390.2 / 458.6 / 471.1 tok/s** | **18.29 tok/s** | **33.46 tok/s** (**+83.0%**) |
 
 *Measured locally at batch size 1 with a 32,768-token context, temperature 0,
-and warmed execution. On this exact resident M3 Ultra geometry, MFQ now
-auto-selects a 5,440-token maximum prefill chunk; 5,440 × 6 routed experts
-stays just below MLX's 32,768-row sorted-MXFP4 boundary. It also fuses the
-window-KV RMSNorm, partial RoPE, and activation fake quantization; component
-A/B reduced `q_kv_prepare` by 1.18% and evaluated prefill time by 0.15%.
-Prefill figures are representative warmed measurements for 509-, 2,009-, and
-15,969-token deterministic repeated raw-completion prompts. The process used
-approximately 287 GiB RSS after load; the 440 GiB wired budget is a ceiling,
-not the steady-state footprint. The MTP result uses a deterministic numeric
-continuation and accepted 132/132 drafted tokens while producing exactly the
-same output as non-MTP decoding. MTP gains are workload-dependent, and OS
-memory pressure can affect results.*
+and warmed execution. Prefill uses representative 509-, 2,009-, and
+15,969-token prompts. The process used approximately 287 GiB RSS after load;
+the 440 GiB wired budget is a ceiling rather than steady-state usage. The
+high-acceptance MTP result accepted 132/132 drafted tokens and matched the
+non-MTP output exactly; gains remain workload-dependent.*
 
-MTP adapts when speculation is not useful: on a lower-acceptance code case
-(50% acceptance), it measured **17.52 tok/s** versus **17.59 tok/s** with MTP
-off, then exited after two low-acceptance cycles while preserving deterministic
-output.
-
-### DeepSeek V4.1 TODO
-
-- [ ] **Broaden production MTP gains.** MTP now provides deterministic
-  verification, state snapshots, adaptive depth, and a low-acceptance fallback.
-  Continue improving verifier efficiency and acceptance on prose and code so
-  the high-acceptance speedup extends to representative workloads before MTP
-  is enabled by default.
-- [ ] **Continue M3 Ultra optimization.** Improve long-prompt prefill and token
-  generation, reduce model-load and memory-pressure overhead, and further
-  overlap Engram cache misses with internal-SSD I/O.
+See the [full protocol, lower-acceptance fallback result, and current
+limitations](./docs/deepseek-v41-raw-hf.md).
 
 MFQ handles the full path from a source checkpoint to a deployable packed
 model. It measures activation and loss sensitivity, assigns precision at
@@ -177,80 +157,34 @@ sharded output. See
 
 ### Quantization
 
-- **Neuron-anchored SQ and VQ base formats.** Every short subgroup in NINT, NVQ,
-  NPQ, and NEPQ retains its own scale and bias. MFQ makes the common two-level
-  scaling scheme more rate-efficient by storing its high-precision scale and
-  bias parameters only once per neuron. At the same BPW, the saved bits can
-  instead support smaller group sizes or higher-precision subgroup parameters,
-  giving the base formats higher SNR and lower SSE independently of within-tensor
-  precision allocation and cross-tensor bit-width assignment. On real model
-  weights, they outperform mainstream alternative quantization formats in
-  nearly every tested case.
+- **Fine-Grained Quantization & Precision Virtualization.** MFQ virtualizes
+  Expert-Wise and Sub-Tensor precision choices inside a single logical tensor
+  container, producing clean, unified quantization formats instead of exposing
+  every internal configuration as another dtype. A descriptor-driven JIT
+  lowers these metadata-described tensors into compact execution plans and
+  production kernels, keeping the runtime robust, simple, and efficient.
+  Calibration and quantization can therefore search a much larger space—down
+  to each expert, projection, chunk, or neuron—without multiplying execution
+  paths.
 
-- **Highest-quality calibration-free, QAT-free quantization.** MFQ incorporates
-  modern, efficient methods such as DSQ to maximize the quality of one-command
-  quantization without calibration data or training.
-
-- **High-quality calibrated models.** MFQ provides high-quality, fine-grained
-  mixed-precision calibration and quantization to preserve as much source-model
-  quality as possible at each target size. Published calibrated models are
-  evaluated against the source model under consistent model-level protocols.
-
-- **Sub-expert and sub-tensor mixed precision.** MFQ can assign a distinct
-  precision to each tensor in each expert, split a single FFN into multiple
-  precision chunks, or preserve its N most important neurons at higher
-  precision.
-  Every choice is budgeted by its exact serialized size, and dedicated batched
-  and fused kernels execute all of these heterogeneous layouts efficiently.
-  This is implemented end to end for production inference, rather than
-  stopping at a theoretical allocation scheme or research prototype.
-
-- **Quantized-format backpropagation and trainers.** MFQ provides backward
-  operators for its quantized formats and ready-to-use training utilities for
-  convenient QAT and post-quantization model fine-tuning.
+- **High-Quality Calibrated Models & Rapid Architecture Support.** MFQ
+  publishes fine-grained mixed-precision models, evaluates them against their
+  source models under consistent model-level protocols, and rapidly extends
+  both quantization and runtime support to important new architectures.
 
 ### Inference
 
-- **High-efficiency packed-weight kernels.** Backend-specific GEMV, small-M
-  MMQ, and large-M paths consume packed MFQ storage without a persistent FP16
-  copy, reducing memory traffic across prefill, decode, and MTP workloads.
+- **Production Inference & Serving.** One native serving stack provides
+  Continuous Batching, tiered RAM/SSD Prefix and KV-cache management,
+  multi-model loading and lifecycle management with LRU, and SSD-streamed
+  expert execution for models beyond memory capacity. Scheduling, prefetch,
+  and cache policies remain shared runtime capabilities rather than separate
+  model-specific serving paths.
 
-- **Efficient heterogeneous MoE execution.** MFQ separates the logical
-  precision assigned to each expert projection from its physical kernel
-  implementation. The runtime compiles and dispatches a fused path for the
-  precision mix actually present, keeping heterogeneous Gate/Up/Down execution
-  efficient.
-
-- **Optimized CUDA and Metal backends.** A shared C++ model graph and runtime
-  contract drive backend-specific kernels for quantized linear algebra,
-  attention, convolution/recurrent state, and cache operations on NVIDIA and
-  Apple hardware.
-
-- **Broad, up-to-date architecture support.** MFQ covers diverse dense, MoE,
-  multimodal, recurrent, and sparse-attention model families, and follows major
-  model releases closely to support important new architectures as they appear.
-
-- **Continuous Batching.** Dynamic request admission and active-sequence
-  compaction keep concurrent generation efficient as requests arrive and
-  complete, with paged KV storage and reusable execution graphs where
-  supported.
-
-- **RAM/SSD Prefix KV Cache.** Exact prefix blocks stay in a hot memory tier or
-  a persistent SSD tier, allowing later requests and process restarts to reuse
-  completed prefill work.
-
-- **Composable multimodal and MTP execution.** Vision, audio, realtime duplex,
-  and draft components are enabled from the model graph and share one runtime
-  instead of requiring a separate serving stack for each architecture.
-
-- **SSD-streamed inference beyond memory capacity.** A hybrid LRU/LFU cache
-  keeps recently used and frequently routed experts resident, while route-aware
-  prefetch coalesces cold reads across parallel I/O workers. Double-buffered
-  staging and dependency-aware scheduling overlap SSD latency with useful
-  compute; a bandwidth-adaptive policy splits work among resident, prefetched,
-  and on-demand experts as hit rate and storage throughput change. This bounds
-  RAM or VRAM use without turning each routed layer into a synchronous disk
-  stall.
+- **High-Performance CUDA & Metal Backends.** Backend-specific packed-weight,
+  attention, cache, and I/O kernels sit behind a shared C++ model graph and
+  runtime contract. CUDA and Metal are supported today; optimized ROCm and CPU
+  backends are planned.
 
 | Model | Model size | Expert budget | Precision | Hardware | Prefill | Decode |
 | --- | ---: | ---: | --- | --- | ---: | ---: |
@@ -265,14 +199,6 @@ granularities:
 | Qwen3.8-Flash-Next | Independent precision for each expert's Gate/Up/Down | **5.79** | **1.12K tok/s** | **24.4 tok/s** |
 
 *Warm end-to-end throughput on Apple M5 Max (40-core GPU, 128 GB).*
-
-### What's next
-
-MFQ is an open project that evolves with the field. We continuously explore,
-validate, and integrate promising advances in quantization and inference to
-deliver higher-quality quantized models through rigorous calibration and a
-better local inference experience. Community contributions are warmly welcome.
-See [Contributing](./CONTRIBUTING.md) to get involved.
 
 ## Models
 
@@ -292,12 +218,12 @@ coverage depends on checkpoint revision, embedded components, and backend.
 
 | Architecture group | Backends |
 | --- | --- |
-| Qwen3.5–3.8 | CUDA, Metal |
-| Qwen Flash-Next / Qwen4-style | CUDA, Metal |
-| DeepSeek-V4-Flash Series | CUDA, Metal |
-| MiniCPM-o 4.5 | CUDA, Metal |
-| GLM5–5.3 | CUDA, Metal |
-| Gemma 4 | CUDA, Metal |
+| Qwen3.5–3.8 | CUDA C++, Metal C++ |
+| Qwen Flash-Next / Qwen4-style | CUDA C++, Metal C++ |
+| DeepSeek-V4-Flash Series | CUDA C++, Metal C++ |
+| MiniCPM-o 4.5 | CUDA C++, Metal C++ |
+| GLM5–5.3 | CUDA C++; Metal reference runtime |
+| Gemma 4 | CUDA C++; Metal reference runtime |
 
 See the [runtime support matrix](./docs/runtime-support.md) before deploying a
 specific artifact.

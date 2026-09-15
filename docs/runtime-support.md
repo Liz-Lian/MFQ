@@ -1,94 +1,93 @@
 # Runtime support
 
-MFQ runtime support is experimental. Coverage depends on the model revision and
-quantization recipe.
+MFQ uses one canonical model graph and shared runtime contracts across its CUDA
+and Metal backends. Support is checkpoint- and component-dependent: validate
+the exact artifact on its deployment backend before release.
 
-## Coverage terms
+## Status terms
 
-- **End-to-end**: native MFQ loading, prefill, decode, and generation are wired.
-- **Partial**: architecture-specific conversion, graph, or kernel components
-  exist, but there is no complete public model runtime.
-- **Dedicated**: the model uses a separate TPQ/MFQ execution path.
+- **Native C++** means the backend worker loads the model and performs prefill,
+  decode, sampling, and serving without a Python model runtime.
+- **Reference** means an MFQ runtime exists for correctness and integration
+  work, but the managed production path still uses Python/MLX.
+- **Optional** means a component is enabled only when the model graph declares
+  it, its weights are present, the backend has an adapter, and the user has not
+  disabled it.
 
-## Model and platform coverage
+## Model and backend matrix
 
-| Model or family | Conversion and packaging | Native CUDA | Metal | Scope or current limitation |
-|---|---|---|---|---|
-| Qwen3.5 | HF/GGUF/full-precision MFQ | End-to-end | End-to-end | Full/linear hybrid CausalLM |
-| Qwen3.6 | HF/GGUF/full-precision MFQ | Partial | Partial | Routed-MoE components; no public end-to-end runtime |
-| Gemma4 | HF/GGUF and sharded MFQ | End-to-end | End-to-end | Mixed full/sliding attention |
-| DeepSeek-V4-Flash | HF/GGUF, Expert-Wise MFQ, and TPQ | End-to-end | End-to-end | Compression, indexer, and sparse-attention paths |
-| MiniCPM-o 4.5 | Official composite HF graph to MFQ | End-to-end | End-to-end | Official model directory required at runtime |
-| GLM-MoE-DSA | Native MFQ and mixed precision | End-to-end | End-to-end | Dense/sparse MLA paths |
-| Kimi-K3 | TPQ/MFQ packaging | Dedicated | Dedicated | TPQ/MFQ execution path only |
+| Architecture family | CUDA C++ | Metal C++ | Current scope |
+| --- | --- | --- | --- |
+| Qwen3.5–3.8 | Native C++ | Native C++ | Hybrid full/GDN attention; graph-declared MTP when predictor weights are present |
+| Qwen Flash-Next / Qwen4-style | Native C++ | Native C++ | Routed MoE, PLE, sparse attention, and graph-declared MTP; bounded expert storage on Metal |
+| DeepSeek V4 Flash Series | Native C++ | Native C++ | Compression, indexer, sparse attention, mHC, and routed MoE; Vision and DSpark availability depends on the artifact and backend |
+| DeepSeek V4.1 Flash | Native C++ | Native C++ | Engram, routed MoE, mHC, and graph-declared DSpark; native Metal Vision and raw-HF loading |
+| MiniCPM-o 4.5 | Native C++ | Native C++ | Text, image, video, audio input, audio output, and duplex serving |
+| GLM5–5.3 | Native C++ | Reference | DSA/KDA and Flash-Next families; Metal production C++ worker integration remains open |
+| Gemma 4 | Native C++ | Reference | Mixed full/sliding attention and MoE; Metal production C++ worker integration remains open |
 
-Test each artifact on its target backend before deployment.
+The top-level architecture family is not used to force optional features on or
+off. Vision and MTP are resolved from the graph, declared weight roots, backend
+adapters, and per-load settings. A missing optional component does not prevent
+the backbone from loading.
 
-## Shared conversion, storage, and serving
+## Conversion and storage
 
-- Canonical MFE mixed-family HF/GGUF streaming conversion.
-- Self-contained MFQ files with embedded runtime configuration, tokenizer,
-  chat template, special-token metadata, and optional sampling profiles.
-- Numbered MFQ shards with direct quantizer output and Python/C++ loading.
-- OpenAI-compatible chat and completions APIs with server-sent events.
+- The quantizer accepts recognized Hugging Face Safetensors, GGUF, and
+  full-precision MFQ sources and writes canonical tensor names into a
+  self-contained `.mfq` container.
+- Model configuration, model graph, tokenizer data, chat templates,
+  special-token metadata, and sampling profiles can be embedded as runtime
+  assets. Numbered MFQ shards are loaded directly by both Python tooling and
+  C++ workers.
+- The native Metal storage layer can expose a supported Hugging Face
+  Safetensors directory through the same model-container interface. This path
+  is production-validated for DeepSeek V4/V4.1; other architecture/backend
+  combinations still require exact-artifact validation.
+- Legacy tensor names are normalized at the compatibility boundary. Current
+  quantization and runtime code use canonical semantic names internally.
 
-Related docs: [self-contained releases](release.md),
-[`mfq serve`](cli/serve.md), and the [HTTP API](api/http.md).
+## Shared runtime capabilities
 
-## CUDA status
+- Descriptor-driven NINTv2 and MFE execution keeps heterogeneous per-neuron,
+  per-projection, and per-expert precision inside unified logical containers.
+- The server provides OpenAI-compatible chat and completion APIs, streaming
+  responses, model-pool lifecycle management, and per-model capability
+  reporting.
+- Prefix reuse and tiered RAM/SSD cache storage are shared serving features.
+  Continuous Batching is active on supported native paths and is being expanded
+  across the remaining model graphs.
+- Metal supports bounded resident expert caches and SSD-streamed expert access
+  for supported large-MoE runtimes. Route-aware prefetch and cache policy are
+  runtime services rather than model-specific serving protocols.
+- One backend-wide MTP engine owns sampling, verification, cache snapshots,
+  adaptive depth, and accounting. Model modules provide only predictor math
+  and model-specific state adapters.
 
-The default CUDA path is a native C++/CUDA runtime with no Python, PyTorch,
-ATen, or LibTorch dependency at execution time. It currently runs on one GPU.
-The [native CUDA validation plan](cuda-native-runtime-validation.md) covers the
-optional migration A/B runtime.
+## Backend notes
 
-## Apple silicon and Metal
+### CUDA
 
-### Packed compute
+The default CUDA worker is a native C++/CUDA runtime with no Python, PyTorch,
+ATen, or LibTorch dependency during inference. It currently targets one GPU.
+Packed NINTv2, VQ-family, dense, routed-MoE, attention, recurrent-state, and
+sampling kernels are selected through the shared model graph and backend plan.
+See the [native CUDA validation plan](cuda-native-runtime-validation.md) for
+the release checklist.
 
-- One metadata-driven packed NINT kernel for dense, routed, and small-M
-  execution across all per-neuron q/k assignments.
-- Packed NVQ/NPQ/NEPQ group-vectorized GEMV.
-- `qmv_wide` small-M MMQ and online-decode `simdgroup_matrix` GEMM.
-- Temporary dequantization plus MLX GEMM beyond the measured large-M
-  crossover.
-- TPQ-I4G64, TPQ-X/W/V/VV, and three-projection TPQ-P kernels with p8-p16
-  indices.
+### Apple silicon and Metal
 
-### Fused and heterogeneous execution
+The native Metal worker uses C++ model graphs with MLX/Metal operations. Packed
+GEMV and small-M paths consume MFQ storage directly; large-M paths can
+temporarily dequantize for matrix multiplication without keeping a persistent
+FP16 weight copy. DeepSeek V4/V4.1 and Qwen Flash-Next runtimes also support
+bounded expert residency, while DeepSeek V4.1 can stream Engram storage from
+the internal SSD. See the
+[DeepSeek V4.1 raw-HF report](deepseek-v41-raw-hf.md) for a validated large-model
+configuration.
 
-- SwiGLU graph composition for NINT and fused execution for compatible
-  VQ-family gate/up projections.
-- MFE routing composes NINT through the ordinary NINT kernel with grouped
-  execution for the remaining formats.
-- Mixed-format QKV and FFN projection groups use grouped execution when their
-  formats support it; groups containing NINT reuse the ordinary NINT kernel.
-- GPU-resident greedy, softmax, top-k/top-p, and sampling-penalty kernels.
-
-### Attention and state
-
-- MHA/GQA/MQA with dynamic and sliding-window KV caches.
-- Fused SSM/GDN kernels and GLM DSA/sparse MLA.
-- DeepSeek-V4 compression, indexer, sparse-attention, and HC kernels.
-- Kimi-K3 KDA/MLA, Attention-Residual, SiTU MoE, cache, and generation graph.
-
-## End-to-end runtime details
-
-- **Qwen3.5:** full/linear hybrid CausalLM prefill, decode, and generation.
-- **DeepSeek-V4:** native MFQ loading; compressed, local, and indexer caches;
-  mmap-backed bounded expert residency; prefill; decode; and generation.
-- **Gemma4:** self-contained sharded-MFQ loading; mixed full/sliding attention;
-  fused norm/GeGLU/MoE; cache; and generation.
-- **GLM-MoE-DSA:** native loading, shared indexer state, dense/sparse MLA,
-  cache, and generation.
-- **MiniCPM-o 4.5:** text, image, video, audio, and duplex workflows are covered
-  in the [runtime guide](minicpmo45.md).
-
-## Partial and dedicated paths
-
-- **Qwen3.6:** conversion and routed-MoE graph/kernel components; no public
-  end-to-end runtime.
-- **Kimi-K3:** KDA/MLA, Attention-Residual, SiTU MoE, cache, and generation on
-  the TPQ/MFQ path.
+MiniCPM-o setup and modality details are in the
+[MiniCPM-o 4.5 runtime guide](minicpmo45.md).
 
 Build requirements and backend selection: [`mfq build`](cli/build.md).
+Serving and model-pool configuration: [`mfq serve`](cli/serve.md).

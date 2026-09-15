@@ -228,7 +228,7 @@ def test_profile_measurement_matches_direct_weighted_row_error() -> None:
     np.testing.assert_allclose(losses[:, 1], expected, rtol=1e-6, atol=1e-8)
 
 
-def test_naq_profile_measurement_separates_fit_and_neuron_allocation() -> None:
+def test_naq_profile_measurement_combines_channel_and_neuron_importance() -> None:
     rng = np.random.default_rng(419)
     weight = rng.normal(size=(5, 24)).astype(np.float32)
     importance = np.geomspace(0.05, 20.0, 24).astype(np.float32)
@@ -251,6 +251,7 @@ def test_naq_profile_measurement_separates_fit_and_neuron_allocation() -> None:
         )
         expected = (
             (dequantize(encoded) - weight).astype(np.float64) ** 2
+            * importance[None, :]
         ).sum(axis=1) * neuron_importance
         np.testing.assert_allclose(
             losses[:, index], expected, rtol=1e-6, atol=1e-8

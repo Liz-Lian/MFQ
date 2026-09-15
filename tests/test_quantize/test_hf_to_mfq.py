@@ -2054,7 +2054,7 @@ def test_hf_convert_passes_imatrix_rows_to_nint_writer(
             "model.block.0.mlp.down.weight": "blk.0.ffn_down.weight"
         }
         encoded = store["model.block.0.mlp.down.weight"]
-        assert encoded.has_mixed_sub_bits
+        assert encoded.format_version == 2
         actual_variable_bits = (
             int(encoded.row_q_bits.astype(np.int64).sum()) * 24
             + 2 * int(encoded.row_sub_bits.astype(np.int64).sum())

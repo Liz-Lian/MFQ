@@ -273,6 +273,37 @@ def test_imatrix_binds_mixed_nint_experts(tmp_path):
     )
 
 
+def test_imatrix_binds_nint_allocation_groups(tmp_path):
+    item = SimpleNamespace(
+        name="blk.0.attn_q.weight",
+        source_name="blk.0.attn_q.weight",
+        target_dtype="NINT4",
+        storage_shape=(4, 3),
+        original_shape=(4, 3),
+        expert_precisions=None,
+    )
+    imatrix = ImportanceMatrix(
+        path=tmp_path / "naq-imatrix.npz",
+        entries={
+            item.name: ImportanceEntry(
+                values=np.ones((1, 3), dtype=np.float32),
+                counts=np.asarray([8], dtype=np.int64),
+                row_importance=np.ones(4, dtype=np.float32),
+                allocation_groups=np.asarray([0, 1, 0, 1], dtype=np.int32),
+            )
+        },
+        datasets=(),
+        chunk_count=1,
+        chunk_size=4,
+        legacy=False,
+    )
+
+    binding = _bind_imatrix(imatrix, [item])[item.name]
+
+    assert binding.allocation_group_rows is not None
+    np.testing.assert_array_equal(binding.allocation_group_rows(1, 4), [1, 0, 1])
+
+
 def test_npq0_l_mode_only_replaces_nvq1_l_recipe_tensors():
     plan = [
         GgufTensorPlan(

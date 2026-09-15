@@ -195,13 +195,12 @@ def allocate_row_profiles(
 ) -> NintAllocation:
     """Choose one measured ``(q, k)`` candidate per row under one bit budget.
 
-    The supplied NAQ loss table uses output-neuron importance as its allocation
-    weight; ordinary input-channel importance has already served its separate
-    role while fitting each candidate reconstruction. Logical allocation
-    groups retain independent shares of the uniform preset budget, preventing
-    physically fused projections from transferring bits between semantics.
-    The corresponding uniform NINT preset is retained per group as a
-    non-regression fallback.
+    The supplied NAQ loss table combines input-channel-weighted reconstruction
+    distortion with the independent output-neuron importance factor. Logical
+    allocation groups retain independent shares of the uniform preset budget,
+    preventing physically fused projections from transferring bits between
+    semantics. The corresponding uniform NINT preset is retained per group as
+    a non-regression fallback.
     """
 
     losses = np.asarray(row_losses, dtype=np.float64)
@@ -243,12 +242,14 @@ def allocate_row_profiles(
                 f"NINT allocation groups must have shape {(rows,)}, got "
                 f"{raw_groups.shape}"
             )
-        if not np.issubdtype(raw_groups.dtype, np.integer):
-            if (
+        if (
+            not np.issubdtype(raw_groups.dtype, np.integer)
+            and (
                 not np.isfinite(raw_groups).all()
                 or np.any(raw_groups != np.rint(raw_groups))
-            ):
-                raise ValueError("NINT allocation groups must contain integers")
+            )
+        ):
+            raise ValueError("NINT allocation groups must contain integers")
         group_ids = np.asarray(raw_groups, dtype=np.int64)
         if np.any(group_ids < 0):
             raise ValueError("NINT allocation groups must be non-negative")
@@ -356,9 +357,10 @@ def measure_row_profile_losses(
 ) -> np.ndarray:
     """Fit every q+k candidate and measure its row-allocation objective.
 
-    ``importance`` is the ordinary input-channel imatrix used by the weight
-    fitter.  ``neuron_importance`` is the independent output-row factor used
-    only by precision allocation.
+    ``importance`` is the ordinary input-channel imatrix used by both the
+    weight fitter and the candidate distortion. ``neuron_importance`` is the
+    independent output-row factor applied to that distortion for precision
+    allocation.
     """
 
     target = torch.device(device)
@@ -395,7 +397,6 @@ def measure_row_profile_losses(
                 importance=importance,
                 return_row_sse=True,
                 row_sse_only=True,
-                row_sse_weighted_by_importance=(neuron_rows is None),
             )
             device_losses.append(row_loss)
         losses = (
@@ -436,7 +437,7 @@ def measure_row_profile_losses(
             importance=importance_rows,
         )
         error = (dequantize(encoded) - array).astype(np.float64) ** 2
-        if importance_rows is not None and neuron_rows is None:
+        if importance_rows is not None:
             error *= importance_rows
         losses[:, index] = error.sum(axis=1)
     if neuron_rows is not None:

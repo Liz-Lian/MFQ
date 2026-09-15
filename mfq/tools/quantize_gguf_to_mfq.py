@@ -356,6 +356,7 @@ class ImatrixBinding:
     selected: ImportanceSelection
     neuron_rows: ImportanceRows | None = None
     input_selected: ImportanceSelection | None = None
+    allocation_group_rows: ImportanceRows | None = None
     input_rows: ImportanceRows | None = None
 
 
@@ -487,6 +488,32 @@ def _bind_imatrix(
                     )
                 return resolved[1]
 
+        allocation_group_probe = imatrix.allocation_groups_for_rows(
+            names,
+            item.storage_shape,
+            slice(0, min(1, item.storage_shape[0])),
+        )
+        allocation_group_rows = None
+        if allocation_group_probe is not None:
+
+            def allocation_group_rows(
+                start: int,
+                end: int,
+                *,
+                _item=item,
+                _names=names,
+            ) -> np.ndarray:
+                resolved = imatrix.allocation_groups_for_rows(
+                    _names,
+                    _item.storage_shape,
+                    slice(start, end),
+                )
+                if resolved is None:
+                    raise RuntimeError(
+                        f"NAQ allocation-group binding disappeared for {_item.name}"
+                    )
+                return resolved[1]
+
         bindings[item.name] = ImatrixBinding(
             entry_name=entry_name,
             rows=rows,
@@ -494,6 +521,7 @@ def _bind_imatrix(
             input_rows=input_rows,
             neuron_rows=neuron_rows,
             input_selected=input_selected,
+            allocation_group_rows=allocation_group_rows,
         )
     if missing:
         preview = ", ".join(missing[:8])
@@ -2631,6 +2659,11 @@ def convert(args: argparse.Namespace) -> None:
                         None
                         if imatrix_binding is None
                         else imatrix_binding.neuron_rows
+                    ),
+                    allocation_group_rows=(
+                        None
+                        if imatrix_binding is None
+                        else imatrix_binding.allocation_group_rows
                     ),
                 )
             elif item.target_dtype.startswith("NVQ"):

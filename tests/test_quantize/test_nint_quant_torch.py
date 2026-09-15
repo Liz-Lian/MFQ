@@ -81,6 +81,25 @@ def test_nint_imatrix_cuda_matches_cpu_quality(spec: NintSpec):
     assert gpu_error <= cpu_error * 1.08 + 1e-5
 
 
+def test_nint_cuda_can_return_unweighted_sse_after_imatrix_fit():
+    rng = np.random.default_rng(29)
+    weight = rng.normal(0, 0.05, size=(17, 113)).astype(np.float32)
+    importance = np.geomspace(0.01, 100.0, weight.shape[1]).astype(np.float32)
+    encoded, row_sse = quantize_gpu(
+        torch.from_numpy(weight),
+        NintSpec(4, 24, 6),
+        device="cuda",
+        importance=importance,
+        return_row_sse=True,
+        row_sse_weighted_by_importance=False,
+    )
+
+    expected = ((dequantize(encoded) - weight).astype(np.float64) ** 2).sum(axis=1)
+    np.testing.assert_allclose(
+        row_sse.detach().cpu().numpy(), expected, rtol=2e-5, atol=1e-8
+    )
+
+
 @pytest.mark.parametrize(
     "spec",
     _NINT_IMATRIX_SPECS,

@@ -891,6 +891,7 @@ def quantize_axis0(
     priority_pair_chunk: int | None = None,
     use_metal_unweighted_kernels: bool = True,
     use_metal_imatrix_kernels: bool = True,
+    row_sse_weighted_by_importance: bool = True,
     row_sub_bits: np.ndarray | None = None,
     row_q_bits: np.ndarray | None = None,
     row_sse_only: bool = False,
@@ -953,6 +954,7 @@ def quantize_axis0(
                 priority_pair_chunk=priority_pair_chunk,
                 use_metal_unweighted_kernels=use_metal_unweighted_kernels,
                 use_metal_imatrix_kernels=use_metal_imatrix_kernels,
+                row_sse_weighted_by_importance=row_sse_weighted_by_importance,
             )
             if return_row_sse:
                 cohort, cohort_sse = cohort_result
@@ -1167,7 +1169,7 @@ def quantize_axis0(
             * sub_min[:, :, None].to(torch.float32)
         ).reshape(out, -1)[:, :neuron_len]
         error = (reconstruction - W[:, :neuron_len]).square()
-        if importance is not None:
+        if importance is not None and row_sse_weighted_by_importance:
             error = error * importance_rows
         row_sse = error.sum(dim=1)
 

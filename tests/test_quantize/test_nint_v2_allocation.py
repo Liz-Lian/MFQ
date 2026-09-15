@@ -95,6 +95,64 @@ def test_joint_qk_allocation_moves_budget_to_important_neurons() -> None:
     )
 
 
+def test_logical_groups_cannot_transfer_their_nominal_bit_budgets() -> None:
+    spec = NintSpec(4, 24, 6)
+    profiles = candidate_profiles(spec)
+    losses = np.zeros((4, len(profiles)), dtype=np.float64)
+    for row, importance in ((2, 1.0), (3, 100.0)):
+        losses[row] = np.asarray(
+            [
+                importance * (4.0 ** (-q_bits) + 0.2 * 4.0 ** (-sub_bits))
+                for q_bits, sub_bits in profiles
+            ]
+        )
+    allocation_groups = np.asarray([0, 0, 1, 1], dtype=np.int32)
+
+    grouped = allocate_row_profiles(
+        losses,
+        profiles,
+        spec,
+        values_per_row=24,
+        groups_per_row=1,
+        allocation_groups=allocation_groups,
+    )
+    ungrouped = allocate_row_profiles(
+        losses,
+        profiles,
+        spec,
+        values_per_row=24,
+        groups_per_row=1,
+    )
+
+    np.testing.assert_array_equal(grouped.row_q_bits[:2], [4, 4])
+    np.testing.assert_array_equal(grouped.row_sub_bits[:2], [6, 6])
+    per_group_budget = 2 * profile_variable_bits(
+        4,
+        6,
+        values_per_row=24,
+        groups_per_row=1,
+    )
+    for group in (0, 1):
+        selected = allocation_groups == group
+        actual = sum(
+            profile_variable_bits(
+                int(q_bits),
+                int(sub_bits),
+                values_per_row=24,
+                groups_per_row=1,
+            )
+            for q_bits, sub_bits in zip(
+                grouped.row_q_bits[selected],
+                grouped.row_sub_bits[selected],
+                strict=True,
+            )
+        )
+        assert actual <= per_group_budget
+    assert np.any(ungrouped.row_q_bits[:2] != 4)
+    assert grouped.actual_variable_bits <= grouped.target_variable_bits
+    assert grouped.solver.startswith("logical-groups:2[")
+
+
 def test_joint_qk_allocation_keeps_uniform_profile_without_signal() -> None:
     spec = NintSpec(4, 24, 6)
     profiles = candidate_profiles(spec)
@@ -168,3 +226,32 @@ def test_profile_measurement_matches_direct_weighted_row_error() -> None:
     ).sum(axis=1)
 
     np.testing.assert_allclose(losses[:, 1], expected, rtol=1e-6, atol=1e-8)
+
+
+def test_naq_profile_measurement_separates_fit_and_neuron_allocation() -> None:
+    rng = np.random.default_rng(419)
+    weight = rng.normal(size=(5, 24)).astype(np.float32)
+    importance = np.geomspace(0.05, 20.0, 24).astype(np.float32)
+    neuron_importance = np.asarray([0.25, 0.5, 1.0, 2.0, 4.0], dtype=np.float32)
+    spec = NintSpec(4, 24, 6)
+    profiles = ((3, 5), (4, 6), (5, 7))
+
+    losses = measure_row_profile_losses(
+        weight,
+        spec,
+        profiles,
+        importance=importance,
+        neuron_importance=neuron_importance,
+    )
+    for index, (q_bits, sub_bits) in enumerate(profiles):
+        encoded = quantize(
+            weight,
+            NintSpec(q_bits, spec.groupsize, sub_bits),
+            importance=importance,
+        )
+        expected = (
+            (dequantize(encoded) - weight).astype(np.float64) ** 2
+        ).sum(axis=1) * neuron_importance
+        np.testing.assert_allclose(
+            losses[:, index], expected, rtol=1e-6, atol=1e-8
+        )

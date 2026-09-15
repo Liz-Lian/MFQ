@@ -1837,6 +1837,8 @@ def test_hf_imatrix_binds_expert_wise_entries(tmp_path):
     np.testing.assert_array_equal(
         binding.rows(2, 5), values[[0, 1, 1]] * np.asarray([[3.0], [4.0], [5.0]])
     )
+    assert binding.input_rows is not None
+    np.testing.assert_array_equal(binding.input_rows(2, 5), values[[0, 1, 1]])
     np.testing.assert_array_equal(
         binding.selected(np.asarray([0, 3], dtype=np.int64)),
         values * np.asarray([[1.0], [4.0]]),
@@ -1910,6 +1912,7 @@ def test_hf_imatrix_slices_fused_source_neuron_rows_for_split_plans(tmp_path):
     )
     input_importance = np.asarray([[1.0, 2.0, 3.0, 4.0]], dtype=np.float32)
     neuron_importance = np.asarray([10.0, 20.0, 30.0, 40.0, 50.0], dtype=np.float32)
+    allocation_groups = np.asarray([0, 1, 2, 2, 2], dtype=np.int32)
     imatrix = ImportanceMatrix(
         path=tmp_path / "naq-imatrix.npz",
         entries={
@@ -1917,6 +1920,7 @@ def test_hf_imatrix_slices_fused_source_neuron_rows_for_split_plans(tmp_path):
                 values=input_importance,
                 counts=np.asarray([32], dtype=np.int64),
                 row_importance=neuron_importance,
+                allocation_groups=allocation_groups,
             )
         },
         datasets=("test",),
@@ -1939,6 +1943,14 @@ def test_hf_imatrix_slices_fused_source_neuron_rows_for_split_plans(tmp_path):
         bindings[value.name].selected(np.asarray([0, 2], dtype=np.int64)),
         input_importance * np.asarray([[30.0], [50.0]], dtype=np.float32),
     )
+    assert bindings[qk.name].input_rows is not None
+    assert bindings[value.name].input_rows is not None
+    np.testing.assert_array_equal(
+        bindings[qk.name].input_rows(0, 2), input_importance[0]
+    )
+    np.testing.assert_array_equal(
+        bindings[value.name].input_rows(0, 3), input_importance[0]
+    )
     np.testing.assert_array_equal(
         bindings[value.name].input_selected(np.asarray([0, 2], dtype=np.int64)),
         input_importance[0],
@@ -1948,6 +1960,12 @@ def test_hf_imatrix_slices_fused_source_neuron_rows_for_split_plans(tmp_path):
     )
     np.testing.assert_array_equal(
         bindings[value.name].neuron_rows(0, 3), [30.0, 40.0, 50.0]
+    )
+    np.testing.assert_array_equal(
+        bindings[qk.name].allocation_group_rows(0, 2), [0, 1]
+    )
+    np.testing.assert_array_equal(
+        bindings[value.name].allocation_group_rows(0, 3), [2, 2, 2]
     )
 
 
@@ -1960,8 +1978,8 @@ def test_hf_convert_passes_imatrix_rows_to_nint_writer(
     tensor_name = "model.language_model.layers.0.mlp.down_proj.weight"
     save_file(
         {
-            tensor_name: torch.linspace(-2.0, 2.0, steps=4 * 24, dtype=torch.float32)
-            .reshape(4, 24)
+            tensor_name: torch.linspace(-2.0, 2.0, steps=24, dtype=torch.float32)
+            .repeat(4, 1)
             .to(torch.bfloat16)
         },
         root / "model.safetensors",
@@ -1971,6 +1989,7 @@ def test_hf_convert_passes_imatrix_rows_to_nint_writer(
     imatrix_path.write_bytes(b"test")
     importance = np.linspace(0.25, 2.0, 24, dtype=np.float32).reshape(1, 24)
     neuron_importance = np.asarray([1.0, 2.0, 50.0, 100.0], dtype=np.float32)
+    allocation_groups = np.asarray([0, 0, 1, 1], dtype=np.int32)
     imatrix = ImportanceMatrix(
         path=imatrix_path,
         entries={
@@ -1978,6 +1997,7 @@ def test_hf_convert_passes_imatrix_rows_to_nint_writer(
                 values=importance,
                 counts=np.asarray([16], dtype=np.int64),
                 row_importance=neuron_importance,
+                allocation_groups=allocation_groups,
             )
         },
         datasets=("unit-test",),
@@ -1989,14 +2009,18 @@ def test_hf_convert_passes_imatrix_rows_to_nint_writer(
     original_writer = hf_to_mfq._write_nint_axis0_blob
     captured: list[np.ndarray] = []
     captured_neurons: list[np.ndarray] = []
+    captured_groups: list[np.ndarray] = []
 
     def recording_writer(*args, **kwargs):
         importance_rows = kwargs.get("importance_rows")
         neuron_importance_rows = kwargs.get("neuron_importance_rows")
+        allocation_group_rows = kwargs.get("allocation_group_rows")
         assert importance_rows is not None
         assert neuron_importance_rows is not None
-        captured.append(np.asarray(importance_rows(0, 1)).copy())
+        assert allocation_group_rows is not None
+        captured.append(np.asarray(importance_rows(1, 2)).copy())
         captured_neurons.append(np.asarray(neuron_importance_rows(0, 4)).copy())
+        captured_groups.append(np.asarray(allocation_group_rows(0, 4)).copy())
         return original_writer(*args, **kwargs)
 
     monkeypatch.setattr(hf_to_mfq, "_write_nint_axis0_blob", recording_writer)
@@ -2021,8 +2045,9 @@ def test_hf_convert_passes_imatrix_rows_to_nint_writer(
     convert(args)
 
     assert len(captured) == 1
-    np.testing.assert_array_equal(captured[0], importance)
+    np.testing.assert_array_equal(captured[0], importance[0])
     np.testing.assert_array_equal(captured_neurons[0], neuron_importance)
+    np.testing.assert_array_equal(captured_groups[0], allocation_groups)
     header, store = load_mmap(output)
     try:
         assert header.extra["imatrix"]["bindings"] == {
@@ -2030,8 +2055,6 @@ def test_hf_convert_passes_imatrix_rows_to_nint_writer(
         }
         encoded = store["model.block.0.mlp.down.weight"]
         assert encoded.has_mixed_sub_bits
-        assert encoded.has_mixed_q_bits
-        assert int(encoded.row_q_bits[-1]) > int(encoded.row_q_bits[0])
         actual_variable_bits = (
             int(encoded.row_q_bits.astype(np.int64).sum()) * 24
             + 2 * int(encoded.row_sub_bits.astype(np.int64).sum())

@@ -446,12 +446,18 @@ def test_naq_corrects_only_interleaved_attention_gate_neurons():
     ordinary = value.square().mean(0)
     downstream = layer.attention.o_proj.weight.float().square().sum(0)
     expected_gate = sensitivity.square().mean(0) * downstream
-    expected = layer.attention.q_proj(value).float().square().mean(0)
+    expected_gate /= expected_gate.mean()
+    expected_content = layer.attention.q_proj(value).float().square().mean(0)[[0, 2]]
+    expected_content /= expected_content.mean()
+    expected = torch.empty(4)
+    expected[[0, 2]] = expected_content
     expected[[1, 3]] = expected_gate
-    expected /= expected.mean()
     entry = collector.entries()[targets[0].name]
     np.testing.assert_allclose(entry.values, ordinary.detach().numpy()[None, :], rtol=1e-6)
     np.testing.assert_allclose(entry.row_importance, expected.detach().numpy(), rtol=1e-6)
+    np.testing.assert_array_equal(entry.allocation_groups, [0, 1, 0, 1])
+    np.testing.assert_allclose(entry.row_importance[[0, 2]].mean(), 1.0, rtol=1e-6)
+    np.testing.assert_allclose(entry.row_importance[[1, 3]].mean(), 1.0, rtol=1e-6)
     np.testing.assert_array_equal(entry.counts, [3])
 
 

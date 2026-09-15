@@ -254,7 +254,12 @@ def _binding(entry_name: str, values: np.ndarray) -> ImatrixBinding:
     def selected(_row_ids: np.ndarray) -> np.ndarray:
         return values
 
-    return ImatrixBinding(entry_name, rows, selected)
+    return ImatrixBinding(
+        entry_name=entry_name,
+        rows=rows,
+        selected=selected,
+        input_rows=rows,
+    )
 
 
 def _estimated_nbytes(

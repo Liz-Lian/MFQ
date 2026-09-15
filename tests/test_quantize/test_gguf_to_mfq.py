@@ -255,6 +255,8 @@ def test_imatrix_binds_mixed_nint_experts(tmp_path):
         binding.rows(2, 5),
         values[[0, 1, 1]] * np.asarray([[3.0], [4.0], [5.0]]),
     )
+    assert binding.input_rows is not None
+    np.testing.assert_array_equal(binding.input_rows(2, 5), values[[0, 1, 1]])
     np.testing.assert_array_equal(
         binding.selected(np.asarray([0, 3])),
         values * np.asarray([[1.0], [4.0]]),

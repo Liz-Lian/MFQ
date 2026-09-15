@@ -356,6 +356,7 @@ class ImatrixBinding:
     selected: ImportanceSelection
     neuron_rows: ImportanceRows | None = None
     input_selected: ImportanceSelection | None = None
+    input_rows: ImportanceRows | None = None
 
 
 @dataclass(frozen=True)
@@ -427,6 +428,23 @@ def _bind_imatrix(
                 raise RuntimeError(f"imatrix binding disappeared for {_item.name}")
             return resolved[1]
 
+        def input_rows(
+            start: int,
+            end: int,
+            *,
+            _item=item,
+            _names=names,
+        ) -> np.ndarray:
+            resolved = imatrix.input_for_rows(
+                _names,
+                _item.original_shape,
+                _item.storage_shape,
+                slice(start, end),
+            )
+            if resolved is None:
+                raise RuntimeError(f"imatrix binding disappeared for {_item.name}")
+            return resolved[1]
+
         def input_selected(
             row_ids: np.ndarray,
             *,
@@ -470,11 +488,12 @@ def _bind_imatrix(
                 return resolved[1]
 
         bindings[item.name] = ImatrixBinding(
-            entry_name,
-            rows,
-            selected,
-            neuron_rows,
-            input_selected,
+            entry_name=entry_name,
+            rows=rows,
+            selected=selected,
+            input_rows=input_rows,
+            neuron_rows=neuron_rows,
+            input_selected=input_selected,
         )
     if missing:
         preview = ", ".join(missing[:8])
@@ -2604,7 +2623,9 @@ def convert(args: argparse.Namespace) -> None:
                     quant_backend,
                     quant_device,
                     importance_rows=(
-                        None if imatrix_binding is None else imatrix_binding.rows
+                        None
+                        if imatrix_binding is None
+                        else imatrix_binding.input_rows or imatrix_binding.rows
                     ),
                     neuron_importance_rows=(
                         None
@@ -2735,7 +2756,9 @@ def convert(args: argparse.Namespace) -> None:
                     nvq1_l_anchor_multipliers=tuple(args.nvq1_l_anchor_multipliers),
                     nvq1_l_refine_steps=args.nvq1_l_refine_steps,
                     importance_rows=(
-                        None if imatrix_binding is None else imatrix_binding.rows
+                        None
+                        if imatrix_binding is None
+                        else imatrix_binding.input_rows or imatrix_binding.rows
                     ),
                     codebook=codebook,
                     search_steps=args.nvq_search_steps,

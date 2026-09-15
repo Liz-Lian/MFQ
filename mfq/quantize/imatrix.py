@@ -13,6 +13,7 @@ import numpy as np
 
 
 _NATIVE_FORMAT = "mfq.imatrix.v1"
+_NATIVE_GROUPED_FORMAT = "mfq.imatrix.v2"
 _NATIVE_METADATA = "__metadata_json__"
 
 
@@ -21,6 +22,7 @@ class ImportanceEntry:
     values: np.ndarray
     counts: np.ndarray
     row_importance: np.ndarray | None = None
+    allocation_groups: np.ndarray | None = None
 
     @property
     def matrices(self) -> int:
@@ -167,6 +169,36 @@ class ImportanceMatrix:
             )
         return name, np.ascontiguousarray(importance[row_ids], dtype=np.float32)
 
+    def allocation_groups_for_rows(
+        self,
+        names: Iterable[str],
+        storage_shape: tuple[int, int],
+        rows: slice | np.ndarray,
+    ) -> tuple[str, np.ndarray] | None:
+        """Return logical allocation-group ids for selected physical rows."""
+
+        match = self.find(names)
+        if match is None or match[1].allocation_groups is None:
+            return None
+        name, entry = match
+        if isinstance(rows, slice):
+            start = 0 if rows.start is None else int(rows.start)
+            stop = int(storage_shape[0]) if rows.stop is None else int(rows.stop)
+            row_ids = np.arange(start, stop, dtype=np.int64)
+        else:
+            row_ids = np.asarray(rows, dtype=np.int64).reshape(-1)
+        if row_ids.size and (
+            int(row_ids.min()) < 0 or int(row_ids.max()) >= int(storage_shape[0])
+        ):
+            raise IndexError(f"imatrix row selection is outside {storage_shape[0]} rows")
+        groups = np.asarray(entry.allocation_groups, dtype=np.int32).reshape(-1)
+        if groups.shape != (int(storage_shape[0]),):
+            raise ValueError(
+                f"NAQ allocation-group mismatch for {name}: "
+                f"{groups.shape} != {(int(storage_shape[0]),)}"
+            )
+        return name, np.ascontiguousarray(groups[row_ids], dtype=np.int32)
+
 
 def _load_gguf_reader():
     try:
@@ -277,11 +309,35 @@ def save_importance_matrix(
                 "key": row_key,
                 "rows": int(row_importance.size),
             }
+        allocation_groups = None
+        if raw.allocation_groups is not None:
+            if row_importance is None:
+                raise ValueError(
+                    f"NAQ allocation groups require neuron importance for {name!r}"
+                )
+            allocation_groups = np.ascontiguousarray(
+                raw.allocation_groups, dtype=np.int32
+            ).reshape(-1)
+            if (
+                allocation_groups.shape != row_importance.shape
+                or np.any(allocation_groups < 0)
+            ):
+                raise ValueError(f"invalid NAQ allocation groups for {name!r}")
+            group_key = f"{prefix}_allocation_groups"
+            arrays[group_key] = allocation_groups
+            entry_document[name]["allocation_groups"] = {
+                "key": group_key,
+                "rows": int(allocation_groups.size),
+            }
         normalized[name] = ImportanceEntry(
-            arrays[f"{prefix}_values"], counts, row_importance
+            arrays[f"{prefix}_values"], counts, row_importance, allocation_groups
         )
     document = {
-        "format": _NATIVE_FORMAT,
+        "format": (
+            _NATIVE_GROUPED_FORMAT
+            if any(entry.allocation_groups is not None for entry in normalized.values())
+            else _NATIVE_FORMAT
+        ),
         "datasets": [str(value) for value in datasets],
         "chunk_count": int(chunk_count),
         "chunk_size": int(chunk_size),
@@ -315,7 +371,7 @@ def _load_native(path: Path) -> ImportanceMatrix:
             document = json.loads(archive[_NATIVE_METADATA].tobytes().decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise ValueError(f"invalid native imatrix metadata: {path}") from exc
-        if document.get("format") != _NATIVE_FORMAT:
+        if document.get("format") not in {_NATIVE_FORMAT, _NATIVE_GROUPED_FORMAT}:
             raise ValueError(f"unsupported native imatrix format: {document.get('format')!r}")
         entries: dict[str, ImportanceEntry] = {}
         for name, item in document.get("entries", {}).items():
@@ -352,10 +408,35 @@ def _load_native(path: Path) -> ImportanceMatrix:
                     raise ValueError(
                         f"native NAQ-imatrix entry {name!r} is invalid"
                     )
+            allocation_groups = None
+            group_document = item.get("allocation_groups")
+            if group_document is not None:
+                if row_importance is None:
+                    raise ValueError(
+                        f"native NAQ-imatrix entry {name!r} has groups without importance"
+                    )
+                group_key = str(group_document["key"])
+                group_count = int(group_document["rows"])
+                if group_key not in archive.files:
+                    raise ValueError(
+                        f"native NAQ-imatrix entry {name!r} is missing {group_key}"
+                    )
+                allocation_groups = np.ascontiguousarray(
+                    archive[group_key], dtype=np.int32
+                ).reshape(-1)
+                if (
+                    allocation_groups.shape != (group_count,)
+                    or allocation_groups.shape != row_importance.shape
+                    or np.any(allocation_groups < 0)
+                ):
+                    raise ValueError(
+                        f"native NAQ-imatrix entry {name!r} has invalid groups"
+                    )
             entries[str(name)] = ImportanceEntry(
                 np.ascontiguousarray(values),
                 np.ascontiguousarray(counts),
                 row_importance,
+                allocation_groups,
             )
     if not entries:
         raise ValueError(f"native imatrix contains no entries: {path}")

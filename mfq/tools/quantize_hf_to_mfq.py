@@ -1839,6 +1839,8 @@ class HfImatrixBinding:
     selected: ImportanceSelection
     neuron_rows: ImportanceRows | None = None
     input_selected: ImportanceSelection | None = None
+    allocation_group_rows: ImportanceRows | None = None
+    input_rows: ImportanceRows | None = None
 
 
 def _hf_imatrix_names(item: TensorPlan) -> tuple[str, ...]:
@@ -1999,6 +2001,26 @@ def _bind_hf_imatrix(
                 raise RuntimeError(f"imatrix binding disappeared for {_item.name}")
             return resolved[1]
 
+        def input_rows(
+            start: int,
+            end: int,
+            *,
+            _names=names,
+            _original_shape=binding_original_shape,
+            _storage_shape=binding_storage_shape,
+            _row_offset=row_offset,
+            _item=item,
+        ) -> np.ndarray:
+            resolved = imatrix.input_for_rows(
+                _names,
+                _original_shape,
+                _storage_shape,
+                slice(_row_offset + start, _row_offset + end),
+            )
+            if resolved is None:
+                raise RuntimeError(f"imatrix binding disappeared for {_item.name}")
+            return resolved[1]
+
         def input_selected(
             row_ids: np.ndarray,
             *,
@@ -2046,12 +2068,42 @@ def _bind_hf_imatrix(
                     )
                 return resolved[1]
 
+        allocation_group_probe = imatrix.allocation_groups_for_rows(
+            names,
+            binding_storage_shape,
+            slice(row_offset, row_offset + min(1, local_rows)),
+        )
+        allocation_group_rows = None
+        if allocation_group_probe is not None:
+
+            def allocation_group_rows(
+                start: int,
+                end: int,
+                *,
+                _names=names,
+                _storage_shape=binding_storage_shape,
+                _row_offset=row_offset,
+                _item=item,
+            ) -> np.ndarray:
+                resolved = imatrix.allocation_groups_for_rows(
+                    _names,
+                    _storage_shape,
+                    slice(_row_offset + start, _row_offset + end),
+                )
+                if resolved is None:
+                    raise RuntimeError(
+                        f"NAQ allocation-group binding disappeared for {_item.name}"
+                    )
+                return resolved[1]
+
         bindings[item.name] = HfImatrixBinding(
-            entry_name,
-            rows,
-            selected,
-            neuron_rows,
-            input_selected,
+            entry_name=entry_name,
+            rows=rows,
+            selected=selected,
+            input_rows=input_rows,
+            neuron_rows=neuron_rows,
+            input_selected=input_selected,
+            allocation_group_rows=allocation_group_rows,
         )
     if missing:
         preview = ", ".join(missing[:8])
@@ -4073,39 +4125,52 @@ def _allocate_nint_v2_rows(
     device: str,
     importance_rows,
     neuron_importance_rows,
+    allocation_group_rows,
 ):
     """Measure and allocate one common SSE/NAQ-guided q+k profile map."""
 
     out, neuron_len = shape
     profiles = nint_candidate_profiles(spec)
     losses = np.empty((out, len(profiles)), dtype=np.float64)
+    allocation_groups = (
+        None if allocation_group_rows is None else np.empty(out, dtype=np.int32)
+    )
     for start in range(0, out, row_chunk):
         end = min(start + row_chunk, out)
         importance = None if importance_rows is None else importance_rows(start, end)
         if quant_backend in ACCELERATOR_BACKENDS and hasattr(source, "read_rows"):
             chunk = source.read_rows(start, end, device=device)
+            if importance is not None:
+                importance = torch.as_tensor(
+                    importance,
+                    dtype=torch.float32,
+                    device=device,
+                ).contiguous()
         else:
             chunk = source[start:end]
+        neuron_importance = (
+            None
+            if neuron_importance_rows is None
+            else neuron_importance_rows(start, end)
+        )
         losses[start:end] = measure_row_profile_losses(
             chunk,
             spec,
             profiles,
             importance=importance,
+            neuron_importance=neuron_importance,
             device=(device if quant_backend in ACCELERATOR_BACKENDS else "cpu"),
         )
-        if importance is None and neuron_importance_rows is not None:
-            neuron_importance = neuron_importance_rows(start, end)
-            if isinstance(neuron_importance, torch.Tensor):
-                neuron_importance = neuron_importance.detach().cpu().numpy()
-            neuron_importance = np.asarray(
-                neuron_importance, dtype=np.float64
+        if allocation_groups is not None:
+            groups = np.asarray(
+                allocation_group_rows(start, end), dtype=np.int32
             ).reshape(-1)
-            if neuron_importance.shape != (end - start,):
+            if groups.shape != (end - start,) or np.any(groups < 0):
                 raise ValueError(
-                    "NAQ neuron importance does not match the NINTv2 row chunk"
+                    "NAQ allocation groups do not match the NINTv2 row chunk"
                 )
-            losses[start:end] *= neuron_importance[:, None]
-        del chunk, importance
+            allocation_groups[start:end] = groups
+        del chunk, importance, neuron_importance
 
     groups = (neuron_len + int(spec.groupsize) - 1) // int(spec.groupsize)
     values_per_row = groups * int(spec.groupsize)
@@ -4122,6 +4187,7 @@ def _allocate_nint_v2_rows(
         values_per_row=values_per_row,
         groups_per_row=groups,
         target_variable_bits=uniform_variable_bits,
+        allocation_groups=allocation_groups,
     )
 
 
@@ -4135,6 +4201,7 @@ def _write_nint_axis0_blob(
     device: str,
     importance_rows=None,
     neuron_importance_rows=None,
+    allocation_group_rows=None,
     nint_data_free: bool = False,
     synthetic: bool = False,
     row_q_bits: np.ndarray | None = None,
@@ -4151,7 +4218,11 @@ def _write_nint_axis0_blob(
     if row_q_bits is not None:
         row_q_bits = normalize_row_q_bits(spec, row_q_bits, out)
         row_sub_bits = normalize_row_sub_bits(spec, row_sub_bits, out)
-    elif (nint_data_free or neuron_importance_rows is not None) and not synthetic:
+    elif (
+        nint_data_free
+        or neuron_importance_rows is not None
+        or allocation_group_rows is not None
+    ) and not synthetic:
         allocation = _allocate_nint_v2_rows(
             sl,
             (out, neuron_len),
@@ -4161,6 +4232,7 @@ def _write_nint_axis0_blob(
             device,
             importance_rows,
             neuron_importance_rows,
+            allocation_group_rows,
         )
         row_q_bits = allocation.row_q_bits
         row_sub_bits = allocation.row_sub_bits
@@ -4985,7 +5057,6 @@ def _write_mfe_nint_axis0_blob(
                     end: int,
                     *,
                     _importance=pool_importance,
-                    _neuron_importance=pool_neuron_importance,
                 ) -> np.ndarray | None:
                     if _importance is None:
                         return None
@@ -4999,11 +5070,6 @@ def _write_mfe_nint_axis0_blob(
                             // rows_per_expert
                         )
                         selected = _importance[expert_rows]
-                    if _neuron_importance is not None:
-                        selected = (
-                            selected
-                            * _neuron_importance[start:end, None]
-                        )
                     return np.ascontiguousarray(selected, dtype=np.float32)
 
                 def neuron_importance_rows(
@@ -5822,7 +5888,6 @@ def _write_mixed_moe_axis0_blob(
                         end: int,
                         *,
                         _importance=pool_importance,
-                        _neuron_importance=pool_neuron_importance,
                     ) -> np.ndarray | torch.Tensor | None:
                         if _importance is None:
                             return None
@@ -5842,12 +5907,6 @@ def _write_mixed_moe_axis0_blob(
                                         dtype=torch.int64,
                                     ),
                                 )
-                            if _neuron_importance is not None:
-                                selected = selected * torch.as_tensor(
-                                    _neuron_importance[start:end, None],
-                                    device=selected.device,
-                                    dtype=selected.dtype,
-                                )
                             return selected
                         if len(_importance.shape) == 1:
                             selected = np.broadcast_to(
@@ -5855,11 +5914,6 @@ def _write_mixed_moe_axis0_blob(
                             )
                         else:
                             selected = _importance[expert_rows]
-                        if _neuron_importance is not None:
-                            selected = (
-                                selected
-                                * _neuron_importance[start:end, None]
-                            )
                         return np.ascontiguousarray(selected, dtype=np.float32)
 
                     def neuron_importance_rows(
@@ -7227,12 +7281,20 @@ def convert(args: argparse.Namespace) -> None:
                             importance_rows=(
                                 None
                                 if item.name not in imatrix_bindings
-                                else imatrix_bindings[item.name].rows
+                                else (
+                                    imatrix_bindings[item.name].input_rows
+                                    or imatrix_bindings[item.name].rows
+                                )
                             ),
                             neuron_importance_rows=(
                                 None
                                 if item.name not in imatrix_bindings
                                 else imatrix_bindings[item.name].neuron_rows
+                            ),
+                            allocation_group_rows=(
+                                None
+                                if item.name not in imatrix_bindings
+                                else imatrix_bindings[item.name].allocation_group_rows
                             ),
                             nint_data_free=nint_data_free,
                         )
@@ -7345,7 +7407,9 @@ def convert(args: argparse.Namespace) -> None:
                             ),
                             nvq1_l_refine_steps=int(getattr(args, "nvq1_l_refine_steps", 2)),
                             importance_rows=(
-                                None if imatrix_binding is None else imatrix_binding.rows
+                                None
+                                if imatrix_binding is None
+                                else imatrix_binding.input_rows or imatrix_binding.rows
                             ),
                             codebook=codebook,
                             search_steps=int(getattr(args, "nvq_search_steps", 19)),

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import struct
 from pathlib import Path
 
@@ -24,6 +25,7 @@ def test_native_imatrix_round_trip_preserves_experts_and_metadata(tmp_path: Path
                 values=np.asarray([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32),
                 counts=np.asarray([11, 7], dtype=np.int64),
                 row_importance=np.asarray([0.5, 0.75, 1.25, 1.5], dtype=np.float32),
+                allocation_groups=np.asarray([0, 1, 0, 1], dtype=np.int32),
             )
         },
         datasets=("balanced-corpus",),
@@ -33,6 +35,10 @@ def test_native_imatrix_round_trip_preserves_experts_and_metadata(tmp_path: Path
     )
 
     loaded = load_importance_matrix(path)
+
+    with np.load(path, allow_pickle=False) as archive:
+        document = json.loads(archive["__metadata_json__"].tobytes().decode("utf-8"))
+    assert document["format"] == "mfq.imatrix.v2"
 
     assert saved.metadata == loaded.metadata == {
         "backend": "metal",
@@ -52,6 +58,10 @@ def test_native_imatrix_round_trip_preserves_experts_and_metadata(tmp_path: Path
     np.testing.assert_array_equal(
         loaded.entries["model.layers.0.experts.gate_up_proj"].row_importance,
         [0.5, 0.75, 1.25, 1.5],
+    )
+    np.testing.assert_array_equal(
+        loaded.entries["model.layers.0.experts.gate_up_proj"].allocation_groups,
+        [0, 1, 0, 1],
     )
 
 
@@ -188,6 +198,7 @@ def test_naq_imatrix_keeps_factors_compact_and_combines_only_for_selected_rows(
                 values=np.asarray([[1.0, 2.0, 4.0]], dtype=np.float32),
                 counts=np.asarray([10], dtype=np.int64),
                 row_importance=np.asarray([0.5, 1.0, 2.0, 4.0], dtype=np.float32),
+                allocation_groups=np.asarray([0, 1, 0, 1], dtype=np.int32),
             )
         },
         datasets=(),
@@ -203,13 +214,17 @@ def test_naq_imatrix_keeps_factors_compact_and_combines_only_for_selected_rows(
     neuron_name, neurons = matrix.neuron_importance_for_rows(
         ("proj.weight",), (4, 3), rows
     )
+    group_name, groups = matrix.allocation_groups_for_rows(
+        ("proj.weight",), (4, 3), rows
+    )
 
-    assert name == neuron_name == "proj.weight"
+    assert name == neuron_name == group_name == "proj.weight"
     np.testing.assert_array_equal(
         combined,
         np.asarray([[4.0, 8.0, 16.0], [1.0, 2.0, 4.0]], dtype=np.float32),
     )
     np.testing.assert_array_equal(neurons, [4.0, 1.0])
+    np.testing.assert_array_equal(groups, [1, 1])
 
 
 def test_gguf_imatrix_requires_llama_metadata(tmp_path: Path):

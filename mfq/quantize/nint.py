@@ -191,12 +191,17 @@ def allocate_row_profiles(
     values_per_row: int,
     groups_per_row: int,
     target_variable_bits: int | None = None,
+    allocation_groups: np.ndarray | None = None,
 ) -> NintAllocation:
     """Choose one measured ``(q, k)`` candidate per row under one bit budget.
 
-    The supplied loss table should already contain the complete NAQ objective:
-    input-channel weighting and output-neuron importance.  The corresponding
-    uniform NINT preset is always retained as a non-regression fallback.
+    The supplied NAQ loss table uses output-neuron importance as its allocation
+    weight; ordinary input-channel importance has already served its separate
+    role while fitting each candidate reconstruction. Logical allocation
+    groups retain independent shares of the uniform preset budget, preventing
+    physically fused projections from transferring bits between semantics.
+    The corresponding uniform NINT preset is retained per group as a
+    non-regression fallback.
     """
 
     losses = np.asarray(row_losses, dtype=np.float64)
@@ -230,6 +235,66 @@ def allocate_row_profiles(
     target = uniform_bits if target_variable_bits is None else int(target_variable_bits)
     if target <= 0:
         raise ValueError("NINT target bit budget must be positive")
+
+    if allocation_groups is not None:
+        raw_groups = np.asarray(allocation_groups)
+        if raw_groups.shape != (rows,):
+            raise ValueError(
+                f"NINT allocation groups must have shape {(rows,)}, got "
+                f"{raw_groups.shape}"
+            )
+        if not np.issubdtype(raw_groups.dtype, np.integer):
+            if (
+                not np.isfinite(raw_groups).all()
+                or np.any(raw_groups != np.rint(raw_groups))
+            ):
+                raise ValueError("NINT allocation groups must contain integers")
+        group_ids = np.asarray(raw_groups, dtype=np.int64)
+        if np.any(group_ids < 0):
+            raise ValueError("NINT allocation groups must be non-negative")
+        unique_groups = np.unique(group_ids)
+        if unique_groups.size > 1:
+            if target != uniform_bits:
+                raise ValueError(
+                    "grouped NINT allocation requires the matching uniform-profile "
+                    "budget so every logical group retains its own nominal share"
+                )
+            row_q_bits = np.empty(rows, dtype=np.uint8)
+            row_sub_bits = np.empty(rows, dtype=np.uint8)
+            actual = 0
+            selected_loss = 0.0
+            uniform_loss = 0.0
+            solvers: list[str] = []
+            for group_id in unique_groups:
+                row_ids = np.flatnonzero(group_ids == group_id)
+                group_budget = int(row_ids.size) * int(costs[uniform_index])
+                result = allocate_row_profiles(
+                    losses[row_ids],
+                    profiles,
+                    spec,
+                    values_per_row=values_per_row,
+                    groups_per_row=groups_per_row,
+                    target_variable_bits=group_budget,
+                )
+                row_q_bits[row_ids] = result.row_q_bits
+                row_sub_bits[row_ids] = result.row_sub_bits
+                actual += result.actual_variable_bits
+                selected_loss += result.selected_loss
+                uniform_loss += result.uniform_loss
+                solvers.append(result.solver)
+            return NintAllocation(
+                row_q_bits=np.ascontiguousarray(row_q_bits),
+                row_sub_bits=np.ascontiguousarray(row_sub_bits),
+                target_variable_bits=target,
+                actual_variable_bits=actual,
+                selected_loss=selected_loss,
+                uniform_loss=uniform_loss,
+                solver=(
+                    f"logical-groups:{unique_groups.size}["
+                    + ",".join(solvers)
+                    + "]"
+                ),
+            )
 
     selected_indices, actual, selected_loss = _allocate_separable_lp_rounded(
         losses,
@@ -286,22 +351,43 @@ def measure_row_profile_losses(
     profiles: tuple[tuple[int, int], ...],
     *,
     importance: torch.Tensor | np.ndarray | None = None,
+    neuron_importance: torch.Tensor | np.ndarray | None = None,
     device: str | torch.device = "cpu",
 ) -> np.ndarray:
-    """Measure the complete row objective for every legal q+k candidate."""
+    """Fit every q+k candidate and measure its row-allocation objective.
+
+    ``importance`` is the ordinary input-channel imatrix used by the weight
+    fitter.  ``neuron_importance`` is the independent output-row factor used
+    only by precision allocation.
+    """
 
     target = torch.device(device)
     value = torch.as_tensor(weight, dtype=torch.float32)
     if value.ndim != 2 or not value.shape[0] or not value.shape[1]:
         raise ValueError("NINTv2 profile measurement requires a non-empty matrix")
     rows, columns = map(int, value.shape)
-    losses = np.empty((rows, len(profiles)), dtype=np.float64)
+    if neuron_importance is None:
+        neuron_rows = None
+    else:
+        neuron_rows = np.asarray(
+            neuron_importance.detach().cpu().numpy()
+            if isinstance(neuron_importance, torch.Tensor)
+            else neuron_importance,
+            dtype=np.float64,
+        ).reshape(-1)
+        if neuron_rows.shape != (rows,):
+            raise ValueError("NINTv2 neuron importance must have shape [output]")
+        if not np.isfinite(neuron_rows).all() or np.any(neuron_rows < 0):
+            raise ValueError(
+                "NINTv2 neuron importance must be finite and non-negative"
+            )
 
     if target.type in {"cuda", "mps"}:
         from mfq.quantize.nint_quant_torch import quantize_axis0
 
         accelerated = value.to(device=target, dtype=torch.float32)
-        for index, (q_bits, sub_bits) in enumerate(profiles):
+        device_losses = []
+        for q_bits, sub_bits in profiles:
             row_loss = quantize_axis0(
                 accelerated,
                 NintSpec(q_bits, spec.groupsize, sub_bits),
@@ -309,12 +395,23 @@ def measure_row_profile_losses(
                 importance=importance,
                 return_row_sse=True,
                 row_sse_only=True,
+                row_sse_weighted_by_importance=(neuron_rows is None),
             )
-            losses[:, index] = row_loss.detach().cpu().to(torch.float64).numpy()
+            device_losses.append(row_loss)
+        losses = (
+            torch.stack(device_losses, dim=1)
+            .detach()
+            .cpu()
+            .to(torch.float64)
+            .numpy()
+        )
+        if neuron_rows is not None:
+            losses *= neuron_rows[:, None]
         return losses
 
     from mfq.quantize.nint_quant import dequantize, quantize
 
+    losses = np.empty((rows, len(profiles)), dtype=np.float64)
     array = np.ascontiguousarray(value.cpu().numpy(), dtype=np.float32)
     if importance is None:
         importance_rows = None
@@ -339,9 +436,11 @@ def measure_row_profile_losses(
             importance=importance_rows,
         )
         error = (dequantize(encoded) - array).astype(np.float64) ** 2
-        if importance_rows is not None:
+        if importance_rows is not None and neuron_rows is None:
             error *= importance_rows
         losses[:, index] = error.sum(axis=1)
+    if neuron_rows is not None:
+        losses *= neuron_rows[:, None]
     return losses
 
 

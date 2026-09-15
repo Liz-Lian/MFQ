@@ -314,15 +314,37 @@ class _AttentionGateNaqBinding(_NaqBinding):
                 f"invalid NAQ attention state for {self.target.name}: "
                 f"observations={self.observations}, count={count}, cache={sorted(self.cache)}"
             )
-        row_importance = self.collector.neuron_mean(self.target)
-        row_importance.index_copy_(
-            0, self.gate_indices, self.coupled / float(count)
+        # q_proj physically fuses query-content and sigmoid-gate rows.  They
+        # are separate logical projections with different sensitivity units,
+        # so normalize and budget them independently.  The row order remains
+        # unchanged and the runtime can retain one fused matrix multiply.
+        all_indices = torch.arange(
+            self.rows, device=self.collector.device, dtype=torch.int64
         )
-        row_importance = _normalized_naq_rows(row_importance, 1)
+        content_mask = torch.ones(
+            self.rows, device=self.collector.device, dtype=torch.bool
+        )
+        content_mask.index_fill_(0, self.gate_indices, False)
+        content_indices = all_indices[content_mask]
+        content_importance = _normalized_naq_rows(
+            self.collector.neuron_mean(self.target).index_select(0, content_indices),
+            1,
+        )
+        gate_importance = _normalized_naq_rows(self.coupled, count)
+        row_importance = torch.empty(
+            self.rows, device=self.collector.device, dtype=torch.float32
+        )
+        row_importance.index_copy_(0, content_indices, content_importance)
+        row_importance.index_copy_(0, self.gate_indices, gate_importance)
+        allocation_groups = torch.zeros(
+            self.rows, device=self.collector.device, dtype=torch.int32
+        )
+        allocation_groups.index_fill_(0, self.gate_indices, 1)
         return ImportanceEntry(
             np.ascontiguousarray(standard.detach().cpu().numpy()[None, :], dtype=np.float32),
             np.asarray([count], dtype=np.int64),
             np.ascontiguousarray(row_importance.detach().cpu().numpy(), dtype=np.float32),
+            np.ascontiguousarray(allocation_groups.detach().cpu().numpy(), dtype=np.int32),
         )
 
 
@@ -1196,6 +1218,11 @@ def collect_imatrix(
                         if entry.row_importance is None
                         else np.ascontiguousarray(entry.row_importance[:qk_rows])
                     ),
+                    (
+                        None
+                        if entry.allocation_groups is None
+                        else np.ascontiguousarray(entry.allocation_groups[:qk_rows])
+                    ),
                 )
                 entries[base + "in_proj_v.weight"] = ImportanceEntry(
                     entry.values,
@@ -1207,6 +1234,13 @@ def collect_imatrix(
                             entry.row_importance[qk_rows : qk_rows + value_rows]
                         )
                     ),
+                    (
+                        None
+                        if entry.allocation_groups is None
+                        else np.ascontiguousarray(
+                            entry.allocation_groups[qk_rows : qk_rows + value_rows]
+                        )
+                    ),
                 )
         metadata = {
             "objective": (
@@ -1216,6 +1250,11 @@ def collect_imatrix(
             ),
             "ordinary_objective": "mean_squared_linear_input_activation",
             "naq_entries": collector.naq_categories,
+            "naq_allocation_groups": {
+                name: {"query_content": 0, "query_gate": 1}
+                for name, category in collector.naq_categories.items()
+                if category == "attention_gate"
+            },
             "split": "train",
             "model": _model_identity(root),
             "model_type": model_type,

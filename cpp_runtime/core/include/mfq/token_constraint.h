@@ -21,3 +21,10 @@ struct MfqTokenConstraint {
 };
 
 using MfqTokenConstraintPtr = std::shared_ptr<MfqTokenConstraint>;
+
+inline bool mfq_token_constraint_supports_speculation(
+    const MfqTokenConstraintPtr& constraint) noexcept {
+    return !constraint ||
+        (constraint->allows && constraint->apply &&
+         constraint->accept && constraint->clone);
+}

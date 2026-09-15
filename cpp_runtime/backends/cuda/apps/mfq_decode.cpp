@@ -23041,7 +23041,8 @@ static int32_t generate_mtp_tokens(
         Model& model, CudaMtpModule& mtp,
         const std::vector<int64_t>& prompt, const MfqSamplingParams& sampling,
         const MfqTokenCallback& on_token, const MfqPrefillCallback& on_prefill,
-        int64_t prefill_chunk_size = 2048) {
+        int64_t prefill_chunk_size = 2048,
+        const MfqTokenConstraintPtr& token_constraint = {}) {
     using Tensor = mfq_tensor_backend::Tensor;
     using Clock = std::chrono::steady_clock;
     namespace policy = mfq::cuda::mtp;
@@ -23049,6 +23050,9 @@ static int32_t generate_mtp_tokens(
         "invalid MTP prompt length");
     for (auto token : prompt) MFQ_RUNTIME_CHECK(token >= 0 && token < model.c.vocab_size,
         "MTP prompt token outside vocabulary");
+    MFQ_RUNTIME_CHECK(
+        mfq_token_constraint_supports_speculation(token_constraint),
+        "CUDA MTP token constraint must support allows/apply/accept/clone");
     mtp.last_stats = {};
     mtp.last_stats.available = true;
     mtp.last_stats.used = true;
@@ -23076,6 +23080,12 @@ static int32_t generate_mtp_tokens(
         return static_cast<int32_t>(sample_server_logits(logits, sampling, token_counts,
             random_host, random_gpu, rng, {}).item<int64_t>());
     };
+    auto sample_constrained = [&](Tensor logits, Tensor token_counts,
+                                  const MfqTokenConstraintPtr& constraint) {
+        return static_cast<int32_t>(sample_server_logits(
+            logits, sampling, token_counts, random_host, random_gpu, rng,
+            constraint).item<int64_t>());
+    };
     auto probabilities = [&](Tensor logits, Tensor token_counts,
                              const MfqSamplingParams& parameters) {
         logits = logits.contiguous().reshape({1, -1});
@@ -23093,6 +23103,7 @@ static int32_t generate_mtp_tokens(
     int32_t generated = 0;
     auto emit = [&](int32_t token) {
         MFQ_RUNTIME_CHECK(token >= 0 && token < model.c.vocab_size, "MTP sampled token outside vocabulary");
+        if (token_constraint) token_constraint->accept(token);
         ++generated;
         if (penalties) sample_token_counts_add_cuda(counts, ids_for({token}));
         return !on_token || on_token(token);
@@ -23125,10 +23136,29 @@ static int32_t generate_mtp_tokens(
             model, input_ids, prefill_chunk_size, &raw);
         auto logits = logits_for(hidden.narrow(1, hidden.size(1) - 1, 1));
         MFQ_CUDA_CHECK(cudaEventRecord(timer.finished_event(), mfq_get_current_cuda_stream()));
-        int32_t pending = sample_normal(logits, counts);
+        auto initial_constraint = token_constraint
+            ? token_constraint->clone()
+            : MfqTokenConstraintPtr{};
+        MFQ_RUNTIME_CHECK(
+            !token_constraint ||
+                (initial_constraint &&
+                 mfq_token_constraint_supports_speculation(
+                     initial_constraint)),
+            "CUDA MTP token constraint clone is incomplete");
+        int32_t pending = sample_constrained(
+            logits, counts, initial_constraint);
         const double prefill_ms = timer.elapsed_ms();
         if (on_prefill) on_prefill(MfqPrefillTiming{prompt.size(), prefill_ms, 0., prefill_ms});
         if (!emit(pending) || generated == limit) return generated;
+        auto constraint_cursor = token_constraint
+            ? token_constraint->clone()
+            : MfqTokenConstraintPtr{};
+        MFQ_RUNTIME_CHECK(
+            !token_constraint ||
+                (constraint_cursor &&
+                 mfq_token_constraint_supports_speculation(
+                     constraint_cursor)),
+            "CUDA MTP token constraint cursor is incomplete");
 
         if (mtp.blockwise_drafting()) {
             mtp.append_target_context(raw, 0);
@@ -23156,7 +23186,9 @@ static int32_t generate_mtp_tokens(
             auto next_hidden = model.hidden_forward(
                 ids_for({pending}), mfq_nullopt, mfq_nullopt,
                 nullptr, mfq_nullopt, &raw);
-            pending = sample_normal(logits_for(next_hidden), counts);
+            pending = sample_constrained(
+                logits_for(next_hidden), counts, constraint_cursor);
+            if (constraint_cursor) constraint_cursor->accept(pending);
             if (!emit(pending) || generated == limit) return generated;
             initial_hidden = raw.narrow(1, raw.size(1) - 1, 1);
         }
@@ -23344,11 +23376,45 @@ static int32_t generate_mtp_tokens(
                     acceptance_uniforms, uniform(rng));
             }
 
-            const int accepted = static_cast<int>(result.accepted_drafts);
+            int accepted = static_cast<int>(result.accepted_drafts);
             MFQ_RUNTIME_CHECK(
                 accepted >= 0 && accepted <= draft_count &&
                     result.next_token >= 0 && result.next_token < model.c.vocab_size,
                 "CUDA MTP verification returned invalid data");
+            if (constraint_cursor) {
+                auto constraint_counts = penalties ? counts.clone() : Tensor{};
+                bool corrected = false;
+                for (int position = 0; position < accepted; ++position) {
+                    const int32_t token =
+                        draft.tokens[static_cast<size_t>(position)];
+                    if (!constraint_cursor->allows(token)) {
+                        accepted = position;
+                        result.next_token = sample_constrained(
+                            targets.narrow(0, position, 1),
+                            constraint_counts,
+                            constraint_cursor);
+                        result.bonus = false;
+                        corrected = true;
+                        break;
+                    }
+                    constraint_cursor->accept(token);
+                    if (penalties) {
+                        sample_token_counts_add_cuda(
+                            constraint_counts, ids_for({token}));
+                    }
+                }
+                if (!corrected) {
+                    if (!constraint_cursor->allows(result.next_token)) {
+                        result.next_token = sample_constrained(
+                            targets.narrow(0, accepted, 1),
+                            constraint_counts,
+                            constraint_cursor);
+                        result.bonus = false;
+                    }
+                }
+                constraint_cursor->accept(result.next_token);
+                result.accepted_drafts = static_cast<size_t>(accepted);
+            }
             mtp.last_stats.accepted_tokens += static_cast<uint64_t>(accepted);
             for (int position = 0; position < accepted; ++position) {
                 ++mtp.last_stats.position_accepted.at(static_cast<size_t>(position));
@@ -23446,13 +23512,14 @@ static int32_t generate_server_tokens(
     std::lock_guard<std::mutex> lock(model_mutex);
     const char* mtp_reprefill = std::getenv("MFQ_SERVER_REPREFILL");
     const char* mtp_trace = std::getenv("MFQ_SERVER_TRACE_INCREMENTAL");
-    if (mtp != nullptr && sampling.enable_mtp && sampling.max_tokens > 1 && !token_constraint &&
+    if (mtp != nullptr && sampling.enable_mtp && sampling.max_tokens > 1 &&
+        mfq_token_constraint_supports_speculation(token_constraint) &&
         !(mtp_reprefill != nullptr && mtp_reprefill[0] == '1') &&
         !(mtp_trace != nullptr && mtp_trace[0] == '1')) {
         // Predictor state is not in the persistent session snapshot contract.
         return generate_mtp_tokens(
             model, *mtp, prompt, sampling, on_token, on_prefill,
-            prefill_chunk_size);
+            prefill_chunk_size, token_constraint);
     }
     auto options = mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt64).device(mfq_tensor_backend::kCUDA);
     const size_t stable_prefix_tokens = std::min(

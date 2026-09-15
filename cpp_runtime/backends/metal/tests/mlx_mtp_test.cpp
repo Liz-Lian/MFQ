@@ -46,6 +46,16 @@ int main() {
     using mfq::metal::verify_stochastic_mtp_top_k_chain_device;
     try {
         {
+            auto incomplete = std::make_shared<MfqTokenConstraint>();
+            if (!mfq_token_constraint_supports_speculation({}) ||
+                !mfq_token_constraint_supports_speculation(
+                    alternating_constraint()) ||
+                mfq_token_constraint_supports_speculation(incomplete)) {
+                throw std::runtime_error(
+                    "MTP token constraint capability mismatch");
+            }
+        }
+        {
             mfq::metal::MlxMtpDepthController controller(3);
             if (controller.depth() != 3) {
                 throw std::runtime_error(

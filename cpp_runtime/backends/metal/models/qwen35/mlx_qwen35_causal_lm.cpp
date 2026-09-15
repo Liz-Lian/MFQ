@@ -1022,7 +1022,7 @@ std::int32_t MlxQwen35CausalLm::generate_prepared(
     }
     const bool mtp_candidate =
         mtp_.has_value() && sampling.enable_mtp &&
-        !token_constraint &&
+        mfq_token_constraint_supports_speculation(token_constraint) &&
         max_tokens > 1;
     // MTP head state is not yet part of the persistent session snapshot.
     // Prefer a complete MTP prefill over restoring only the backbone, which
@@ -1495,6 +1495,8 @@ std::int32_t MlxQwen35CausalLm::generate_prepared(
                 counts,
                 {},
                 callback,
+                0u,
+                token_constraint,
             },
             mtp_callbacks,
             last_mtp_stats_);

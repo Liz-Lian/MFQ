@@ -2055,11 +2055,10 @@ std::int32_t MlxDeepseekV4CausalLm::generate_impl(
         last_mtp_stats_ = {dspark_.has_value(), false, 0, 0, 0};
         return 0;
     }
-    const bool constraint_supports_mtp =
-        !token_constraint || static_cast<bool>(token_constraint->clone);
     const bool dspark_candidate =
         dspark_.has_value() && sampling.enable_mtp &&
-        constraint_supports_mtp && max_tokens > 1;
+        mfq_token_constraint_supports_speculation(token_constraint) &&
+        max_tokens > 1;
 
     const int prompt_count =
         static_cast<int>(

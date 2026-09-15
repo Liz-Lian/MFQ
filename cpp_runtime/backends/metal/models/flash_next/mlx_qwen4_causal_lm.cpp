@@ -2841,7 +2841,8 @@ std::int32_t MlxQwen4CausalLm::generate(
         impl_->maximum - static_cast<int>(prompt.size()) + 1);
     const bool mtp_active =
         impl_->mtp.has_value() && sampling.enable_mtp &&
-        !token_constraint && limit > 1;
+        mfq_token_constraint_supports_speculation(token_constraint) &&
+        limit > 1;
     impl_->last_mtp_stats = {
         impl_->mtp.has_value(), mtp_active, 0, 0, 0};
     reset_cache(1);
@@ -3074,6 +3075,7 @@ std::int32_t MlxQwen4CausalLm::generate(
                         : std::span<const std::int64_t>{},
                     callback,
                     0u,
+                    token_constraint,
                 },
                 mtp_callbacks,
                 impl_->last_mtp_stats);

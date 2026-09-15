@@ -723,11 +723,8 @@ std::int32_t run_mlx_mtp_generation(
         !callbacks.verify_target || !callbacks.resolve_target) {
         throw std::invalid_argument("invalid MTP engine configuration");
     }
-    if (request.token_constraint &&
-        (!request.token_constraint->allows ||
-         !request.token_constraint->apply ||
-         !request.token_constraint->accept ||
-         !request.token_constraint->clone)) {
+    if (!mfq_token_constraint_supports_speculation(
+            request.token_constraint)) {
         throw std::invalid_argument(
             "MTP token constraint must support allows/apply/accept/clone");
     }

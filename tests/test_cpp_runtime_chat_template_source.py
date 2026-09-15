@@ -115,7 +115,10 @@ def test_server_enforces_complete_chat_template_tool_calls() -> None:
     assert "token_constraint," in METAL_DECODE
     assert "CUDA constrained sampler returned an invalid token" in DECODE
     assert "masked.to(logits.device())" in DECODE
-    assert "!token_constraint &&" in DECODE
+    assert "mfq_token_constraint_supports_speculation(token_constraint)" in DECODE
+    assert "prefill_chunk_size, token_constraint" in DECODE
+    assert "if (constraint_cursor) constraint_cursor->accept(pending);" in DECODE
+    assert "constraint_cursor->accept(result.next_token);" in DECODE
 
 
 def test_native_server_cancels_active_session_generation_per_token() -> None:

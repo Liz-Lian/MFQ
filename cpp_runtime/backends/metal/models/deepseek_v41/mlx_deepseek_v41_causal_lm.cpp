@@ -874,7 +874,8 @@ std::int32_t MlxDeepseekV41CausalLm::generate_from_prefill(
     }
     const bool mtp_active = dspark_.has_value() &&
         dspark_state_.has_value() && sampling.enable_mtp &&
-        !token_constraint && limit > 1;
+        mfq_token_constraint_supports_speculation(token_constraint) &&
+        limit > 1;
     last_mtp_stats_ = {
         dspark_.has_value(),
         mtp_active,
@@ -973,6 +974,8 @@ std::int32_t MlxDeepseekV41CausalLm::generate_from_prefill(
                 counts,
                 std::span<const std::int64_t>(config_.eos_token_ids),
                 callback,
+                0u,
+                token_constraint,
             },
             callbacks,
             last_mtp_stats_);
@@ -1064,7 +1067,8 @@ std::int32_t MlxDeepseekV41CausalLm::generate(
         values.begin(), Shape{1, static_cast<int>(values.size())},
         mlx::core::int32);
     const bool mtp_candidate = supports_mtp() && sampling.enable_mtp &&
-        !token_constraint && max_tokens > 1;
+        mfq_token_constraint_supports_speculation(token_constraint) &&
+        max_tokens > 1;
     mtp_context_requested_ = mtp_candidate;
     const std::size_t requested_stable_count = stable_prefix_tokens
         ? std::min(*stable_prefix_tokens, prompt.size())
@@ -1301,7 +1305,8 @@ std::int32_t MlxDeepseekV41CausalLm::generate_multimodal(
     }
     const auto started = std::chrono::steady_clock::now();
     mtp_context_requested_ = supports_mtp() && sampling.enable_mtp &&
-        !token_constraint && max_tokens > 1;
+        mfq_token_constraint_supports_speculation(token_constraint) &&
+        max_tokens > 1;
     array logits(0.0f);
     try {
         logits = prefill_multimodal(prompt, images);

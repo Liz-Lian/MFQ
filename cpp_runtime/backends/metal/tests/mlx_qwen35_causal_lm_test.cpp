@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <iostream>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <random>
 #include <stdexcept>
@@ -36,6 +37,33 @@ void require(bool condition, const std::string& message) {
     if (!condition) {
         throw std::runtime_error(message);
     }
+}
+
+MfqTokenConstraintPtr alternating_constraint(int position = 0) {
+    auto state = std::make_shared<int>(position);
+    auto constraint = std::make_shared<MfqTokenConstraint>();
+    constraint->allows = [state](std::int64_t token) {
+        return token == (*state % 2);
+    };
+    constraint->apply = [state](float* logits, std::size_t count) {
+        const auto allowed = static_cast<std::size_t>(*state % 2);
+        for (std::size_t token = 0; token < count; ++token) {
+            if (token != allowed) {
+                logits[token] = -std::numeric_limits<float>::infinity();
+            }
+        }
+    };
+    constraint->accept = [state](std::int64_t token) {
+        if (token != (*state % 2)) {
+            throw std::runtime_error(
+                "alternating constraint accepted an invalid token");
+        }
+        ++*state;
+    };
+    constraint->clone = [state] {
+        return alternating_constraint(*state);
+    };
+    return constraint;
 }
 
 std::vector<float> patterned(
@@ -1010,6 +1038,44 @@ void test_mtp_greedy_identity() {
         "MTP stochastic generation is invalid or non-deterministic");
 }
 
+void test_mtp_constrained_identity() {
+    mfq::metal::MlxSamplingParams sampling;
+    sampling.temperature = 0.0;
+    const std::vector<std::int64_t> prompt{1, 4, 2};
+
+    auto baseline = make_model();
+    auto speculative = make_model(false, false, true);
+    std::vector<std::int64_t> expected;
+    std::vector<std::int64_t> actual;
+    const auto expected_count = baseline.generate(
+        prompt,
+        sampling,
+        8,
+        [&](std::int64_t token) {
+            expected.push_back(token);
+            return true;
+        },
+        {},
+        alternating_constraint());
+    const auto actual_count = speculative.generate(
+        prompt,
+        sampling,
+        8,
+        [&](std::int64_t token) {
+            actual.push_back(token);
+            return true;
+        },
+        {},
+        alternating_constraint());
+    const auto& stats = speculative.last_mtp_stats();
+    require(
+        expected_count == 8 && actual_count == 8 &&
+            actual == expected &&
+            actual == std::vector<std::int64_t>({0, 1, 0, 1, 0, 1, 0, 1}) &&
+            stats.available && stats.used && stats.cycles > 0,
+        "Qwen3.5 constrained generation bypassed MTP or changed output");
+}
+
 void test_mtp_prepared_mrope_generation() {
     auto model = make_model(false, false, true);
     const auto ids = token_ids({1, 4, 2});
@@ -1557,6 +1623,7 @@ int main(int argc, char** argv) {
         test_embedding_validation();
         test_prefill_decode_and_reset();
         test_mtp_greedy_identity();
+        test_mtp_constrained_identity();
         test_mtp_prepared_mrope_generation();
         test_text_session_snapshot_restore();
         test_tied_embedding_forward_cache_and_generate();

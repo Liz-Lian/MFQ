@@ -1,4 +1,5 @@
 #include "mlx_grouped_linear.h"
+#include "mlx_staging_allocator.h"
 
 #include <mlx/allocator.h>
 
@@ -539,12 +540,14 @@ array make_raw_array(
         throw std::runtime_error(
             "grouped linear packed stream is misaligned");
     }
-    const auto elements = checked_int(
-        bytes.size() / dtype.size(),
-        "packed stream");
+    const auto layout = detail::packed_storage_layout(
+        bytes.size() / dtype.size());
+    const Shape shape = layout.is_matrix()
+        ? Shape{layout.rows, layout.columns}
+        : Shape{layout.columns};
     auto result = array(
         mlx::core::allocator::malloc(bytes.size()),
-        Shape{elements},
+        shape,
         dtype);
     std::memcpy(
         result.data<std::uint8_t>(),

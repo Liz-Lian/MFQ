@@ -1542,14 +1542,19 @@ MlxDeepseekV4Moe::forward_branches(
             rows >= 32
             && gate_up_grouped
             && down->supports_grouped_mmq();
-        const bool smallm_nax =
-            !split_resident
-            && precomputed_hidden == nullptr
+        const bool gate_up_smallm_gather_qmm = split_resident
+            ? gate->prefers_mxfp4_smallm_nax(route_ids)
+                && up->prefers_mxfp4_smallm_nax(route_ids)
+            : gate_up->prefers_mxfp4_smallm_nax(route_ids);
+        const bool smallm_gather_qmm =
+            precomputed_hidden == nullptr
             && expert_map == nullptr
             && !packed_expert_ids
-            && gate_up->prefers_mxfp4_smallm_nax(route_ids)
+            && gate_up_smallm_gather_qmm
             && down->prefers_mxfp4_smallm_nax(route_ids);
-        if (smallm_nax) {
+        if (smallm_gather_qmm) {
+            detail::profile_marker(
+                "moe.dispatch.resident_smallm_gather_qmm");
             const int routes = route_ids.shape(1);
             auto route_order = mlx::core::contiguous(
                 mlx::core::astype(
@@ -1558,12 +1563,32 @@ MlxDeepseekV4Moe::forward_branches(
                             route_ids,
                             Shape{rows * routes})),
                     mlx::core::int32));
-            auto routed_hidden = gate_up->swiglu_sorted(
-                source,
-                route_ids,
-                route_order,
-                static_cast<float>(config_.swiglu_limit),
-                true);
+            auto routed_hidden = [&]() {
+                if (split_resident) {
+                    return limited_swiglu_pair(
+                        gate->forward_sorted(
+                            source,
+                            route_ids,
+                            route_order,
+                            false,
+                            nullptr,
+                            true),
+                        up->forward_sorted(
+                            source,
+                            route_ids,
+                            route_order,
+                            false,
+                            nullptr,
+                            true),
+                        static_cast<float>(config_.swiglu_limit));
+                }
+                return gate_up->swiglu_sorted(
+                    source,
+                    route_ids,
+                    route_order,
+                    static_cast<float>(config_.swiglu_limit),
+                    true);
+            }();
             if (detail::component_profile_active()) {
                 detail::profile_eval(
                     "moe.routed_gate_up_swiglu",
@@ -1592,6 +1617,7 @@ MlxDeepseekV4Moe::forward_branches(
             }
             return output;
         } else if (grouped_prefill) {
+            detail::profile_marker("moe.dispatch.resident_grouped_prefill");
             const int routes = route_ids.shape(1);
             auto route_order = mlx::core::contiguous(
                 mlx::core::astype(
@@ -1709,6 +1735,7 @@ MlxDeepseekV4Moe::forward_branches(
             }
             return output;
         } else {
+            detail::profile_marker("moe.dispatch.resident_direct");
             array routed_hidden = precomputed_hidden != nullptr
                 ? *precomputed_hidden
                 : [&]() {

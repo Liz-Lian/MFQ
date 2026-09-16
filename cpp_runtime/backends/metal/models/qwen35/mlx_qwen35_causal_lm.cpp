@@ -1361,6 +1361,7 @@ std::int32_t MlxQwen35CausalLm::generate_prepared(
         int predictor_history_position = mtp_->cache_position();
 
         MlxMtpEngineCallbacks mtp_callbacks;
+        mtp_callbacks.predictor = mtp_->mtp_descriptor();
         mtp_callbacks.target_cache_position = [this] {
             return cache_position_;
         };
@@ -1489,7 +1490,6 @@ std::int32_t MlxQwen35CausalLm::generate_prepared(
                 vocab,
                 generation_limit,
                 maximum_sequence,
-                kQwen35MtpMaximumDraftDepth,
                 logits,
                 sampling,
                 counts,

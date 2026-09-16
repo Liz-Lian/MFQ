@@ -75,6 +75,26 @@ int main() {
             }
         }
         {
+            mfq::metal::MlxMtpDepthController controller(
+                5,
+                2,
+                mfq::metal::MlxMtpDepthPolicy::AcceptanceOnly);
+            if (controller.depth() != 5) {
+                throw std::runtime_error(
+                    "acceptance-driven MTP did not start at model depth");
+            }
+            controller.observe(5, 1, 1000.0);
+            if (controller.depth() != 2) {
+                throw std::runtime_error(
+                    "acceptance-driven MTP did not retain one lookahead");
+            }
+            controller.observe(2, 2, 1.0e6);
+            if (controller.depth() != 3) {
+                throw std::runtime_error(
+                    "acceptance-driven MTP incorrectly used wall time");
+            }
+        }
+        {
             mfq::metal::MlxMtpDepthController controller(1);
             controller.observe(1, 0, 80.0);
             controller.observe(1, 0, 75.0);
@@ -351,6 +371,8 @@ int main() {
             int resolved_cycles = 0;
             std::vector<std::int64_t> emitted;
             mfq::metal::MlxMtpEngineCallbacks callbacks;
+            callbacks.predictor =
+                mfq::metal::MlxMtpPredictorDescriptor::recurrent(2);
             callbacks.target_cache_position = [&] {
                 return target_position;
             };
@@ -395,7 +417,6 @@ int main() {
                     3,
                     5,
                     32,
-                    2,
                     mlx::core::array(
                         {10.0f, 0.0f, 0.0f},
                         mlx::core::Shape{1, 3}),
@@ -421,6 +442,8 @@ int main() {
             int target_position = 0;
             std::vector<std::int64_t> emitted;
             mfq::metal::MlxMtpEngineCallbacks callbacks;
+            callbacks.predictor =
+                mfq::metal::MlxMtpPredictorDescriptor::recurrent(2);
             callbacks.target_cache_position = [&] {
                 return target_position;
             };
@@ -464,7 +487,6 @@ int main() {
                     3,
                     6,
                     32,
-                    2,
                     mlx::core::array(
                         {10.0f, 0.0f, 0.0f},
                         mlx::core::Shape{1, 3}),

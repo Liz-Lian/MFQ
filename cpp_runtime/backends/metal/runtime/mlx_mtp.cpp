@@ -183,9 +183,14 @@ constexpr double kDepthHysteresis = 1.03;
 
 MlxMtpDepthController::MlxMtpDepthController(
     int maximum_depth,
-    int initial_depth)
+    int initial_depth,
+    MlxMtpDepthPolicy policy)
     : maximum_depth_(std::clamp(maximum_depth, 1, 5)),
-      current_depth_(std::clamp(initial_depth, 1, maximum_depth_)),
+      current_depth_(
+          policy == MlxMtpDepthPolicy::AcceptanceOnly
+              ? maximum_depth_
+              : std::clamp(initial_depth, 1, maximum_depth_)),
+      policy_(policy),
       acceptance_(
           static_cast<std::size_t>(maximum_depth_),
           0.6),
@@ -210,6 +215,9 @@ MlxMtpDepthController::MlxMtpDepthController(
     // compile independently, so two samples can still leave the controller
     // with a cold timing and incorrectly pin an otherwise profitable request
     // to plain decoding.
+    if (policy_ == MlxMtpDepthPolicy::AcceptanceOnly) {
+        return;
+    }
     warmup_.insert(
         warmup_.end(),
         {current_depth_, current_depth_, current_depth_});
@@ -263,6 +271,15 @@ void MlxMtpDepthController::observe(
     }
     milliseconds_since_probe_ += cycle_ms;
     milliseconds_since_explore_ += cycle_ms;
+
+    if (policy_ == MlxMtpDepthPolicy::AcceptanceOnly) {
+        // DeepSeek DSpark follows the block predictor's accepted prefix: an
+        // early rejection retains one lookahead and a full accept grows by
+        // one. It never burns short responses benchmarking plain decode.
+        current_depth_ = std::min(
+            maximum_depth_, accepted_drafts + 1);
+        return;
+    }
 
     if (!warmup_.empty()) {
         warmup_.erase(warmup_.begin());
@@ -718,8 +735,9 @@ std::int32_t run_mlx_mtp_generation(
     MlxMtpGenerationStats& stats) {
     if (request.vocab <= 0 || request.generation_limit <= 0 ||
         request.maximum_context <= 0 ||
-        request.predictor_maximum_depth <= 0 ||
-        request.predictor_maximum_depth > kMlxMtpEngineMaximumDraftDepth ||
+        callbacks.predictor.maximum_depth <= 0 ||
+        callbacks.predictor.maximum_depth >
+            kMlxMtpEngineMaximumDraftDepth ||
         !callbacks.target_cache_position || !callbacks.prepare_draft ||
         !callbacks.verify_target || !callbacks.resolve_target) {
         throw std::invalid_argument("invalid MTP engine configuration");
@@ -810,7 +828,9 @@ std::int32_t run_mlx_mtp_generation(
         !request.sampling.greedy() && request.sampling.top_k > 0 &&
         request.sampling.top_k <= 128;
     MlxSamplingParams draft_sampling = request.sampling;
-    if (compact_stochastic) {
+    if (compact_stochastic &&
+        callbacks.predictor.draft_sampling_policy ==
+            MlxMtpDraftSamplingPolicy::Sharpened) {
         // The proposal may be sharper than the target distribution because
         // exact p/q verification preserves the target sampler.
         draft_sampling.temperature = 0.6;
@@ -820,9 +840,10 @@ std::int32_t run_mlx_mtp_generation(
         (!request.sampling.greedy() && !compact_stochastic)
         ? 1
         : std::min(
-              request.predictor_maximum_depth,
+              callbacks.predictor.maximum_depth,
               std::clamp(request.sampling.mtp_max_draft_tokens, 1, 5));
-    MlxMtpDepthController depth_controller(maximum_depth);
+    MlxMtpDepthController depth_controller(
+        maximum_depth, 2, callbacks.predictor.depth_policy);
 
     auto pending = sample_token(
         request.initial_logits, counts, request.token_constraint);

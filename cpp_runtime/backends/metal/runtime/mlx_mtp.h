@@ -19,6 +19,47 @@ namespace mfq::metal {
 // Each predictor adapter supplies its own maximum depth in the request.
 inline constexpr int kMlxMtpEngineMaximumDraftDepth = 5;
 
+// The state machine remains common. Predictors select only the scheduling
+// objective: generic heads optimize measured throughput, while block-trained
+// predictors can keep their width driven solely by accepted-prefix length.
+enum class MlxMtpDepthPolicy {
+    AdaptiveThroughput,
+    AcceptanceOnly,
+};
+
+// Generic one-layer predictors can benefit from a sharper proposal. A block
+// predictor trained with the target sampler must preserve that distribution.
+enum class MlxMtpDraftSamplingPolicy {
+    Sharpened,
+    MatchTarget,
+};
+
+// Predictor behavior belongs to the predictor contract, not to a model-family
+// branch in the common generation engine. Recurrent heads use measured
+// throughput scheduling; block predictors retain their trained block sampling
+// semantics and follow the accepted prefix.
+struct MlxMtpPredictorDescriptor {
+    int maximum_depth = 0;
+    MlxMtpDepthPolicy depth_policy =
+        MlxMtpDepthPolicy::AdaptiveThroughput;
+    MlxMtpDraftSamplingPolicy draft_sampling_policy =
+        MlxMtpDraftSamplingPolicy::Sharpened;
+
+    static constexpr MlxMtpPredictorDescriptor recurrent(
+        int maximum_depth) noexcept {
+        return {maximum_depth};
+    }
+
+    static constexpr MlxMtpPredictorDescriptor block(
+        int maximum_depth) noexcept {
+        return {
+            maximum_depth,
+            MlxMtpDepthPolicy::AcceptanceOnly,
+            MlxMtpDraftSamplingPolicy::MatchTarget,
+        };
+    }
+};
+
 struct MlxMtpVerification {
     std::size_t accepted_drafts = 0;
     std::int32_t next_token = -1;
@@ -101,6 +142,8 @@ struct MlxMtpTargetBatch {
 };
 
 struct MlxMtpEngineCallbacks {
+    MlxMtpPredictorDescriptor predictor;
+
     // Current number of tokens committed in the target-model cache.
     std::function<int()> target_cache_position;
 
@@ -128,7 +171,6 @@ struct MlxMtpEngineRequest {
     int vocab = 0;
     int generation_limit = 0;
     int maximum_context = 0;
-    int predictor_maximum_depth = 0;
     mlx::core::array initial_logits;
     MlxSamplingParams sampling;
     std::optional<mlx::core::array> token_counts;
@@ -165,7 +207,9 @@ class MlxMtpDepthController {
 public:
     explicit MlxMtpDepthController(
         int maximum_depth = 3,
-        int initial_depth = 2);
+        int initial_depth = 2,
+        MlxMtpDepthPolicy policy =
+            MlxMtpDepthPolicy::AdaptiveThroughput);
 
     int depth() const noexcept {
         return current_depth_;
@@ -192,6 +236,8 @@ private:
 
     int maximum_depth_ = 1;
     int current_depth_ = 1;
+    MlxMtpDepthPolicy policy_ =
+        MlxMtpDepthPolicy::AdaptiveThroughput;
     int cycles_ = 0;
     int probe_left_ = 0;
     double milliseconds_since_probe_ = 0.0;

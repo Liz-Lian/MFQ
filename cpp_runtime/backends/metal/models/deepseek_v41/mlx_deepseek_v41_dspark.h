@@ -95,6 +95,9 @@ public:
         int width = 0) const;
 
     int block_size() const noexcept;
+    MlxMtpPredictorDescriptor mtp_descriptor() const noexcept {
+        return MlxMtpPredictorDescriptor::block(block_size());
+    }
     std::size_t stage_count() const noexcept;
 
 private:

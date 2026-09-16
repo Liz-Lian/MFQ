@@ -6,6 +6,7 @@
 #include "mlx_nint8_zero.h"
 #include "mlx_mx.h"
 #include "mlx_fp8_sq.h"
+#include "mlx_eval_timing.h"
 #include "mlx_mxfp4_sq.h"
 #include "mlx_platform.h"
 #include "mlx_reference.h"
@@ -192,6 +193,10 @@ bool mxfp4_nax_smallm_preferred(
     int logical_experts,
     int input_width,
     int output_width) noexcept {
+    // Historical naming: this policy selects MLX gather_qmm, not an
+    // unconditional hardware-NAX kernel. MLX dispatches the ordinary
+    // fp_gather_qmm kernels on pre-NAX devices (including M3 Ultra) and may
+    // select its NAX implementation only on hardware that supports it.
     const char* value = std::getenv(
         "MFQ_METAL_MFE_SMALLM_NAX");
     const auto setting = value == nullptr
@@ -2478,12 +2483,14 @@ array make_raw_array(
         throw std::runtime_error(
             "MFE packed stream is misaligned");
     }
-    const auto elements = checked_int(
-        bytes.size() / dtype.size(),
-        "packed stream");
+    const auto layout = detail::packed_storage_layout(
+        bytes.size() / dtype.size());
+    const Shape shape = layout.is_matrix()
+        ? Shape{layout.rows, layout.columns}
+        : Shape{layout.columns};
     auto result = array(
         mlx::core::allocator::malloc(bytes.size()),
-        Shape{elements},
+        shape,
         dtype);
     std::memcpy(
         result.data<std::uint8_t>(),
@@ -5338,6 +5345,41 @@ bool is_ascii(
 
 array concatenate_1d(
     std::vector<array> values) {
+    const bool all_vectors = std::all_of(
+        values.begin(),
+        values.end(),
+        [](const array& value) {
+            return value.ndim() == 1;
+        });
+    if (!all_vectors) {
+        if (values.empty()) {
+            throw std::invalid_argument(
+                "cannot concatenate an empty packed stream list");
+        }
+        const auto dtype = values.front().dtype();
+        std::size_t total_bytes = 0;
+        for (auto& value : values) {
+            if (value.dtype() != dtype || !value.flags().row_contiguous) {
+                throw std::invalid_argument(
+                    "packed stream concatenation requires contiguous matching dtypes");
+            }
+            value.eval();
+            total_bytes = checked_add(
+                total_bytes,
+                value.nbytes(),
+                "packed concatenation bytes");
+        }
+        detail::StagingVector<std::uint8_t> bytes(total_bytes);
+        std::size_t offset = 0;
+        for (const auto& value : values) {
+            std::memcpy(
+                bytes.data() + offset,
+                value.data<std::uint8_t>(),
+                value.nbytes());
+            offset += value.nbytes();
+        }
+        return make_raw_array(std::move(bytes), dtype);
+    }
     return mlx::core::contiguous(
         mlx::core::concatenate(
             std::move(values),
@@ -10302,8 +10344,11 @@ array MlxMfeWeight::routed_swiglu_pair(
             == static_cast<std::size_t>(up.impl_->experts)
                 * kDescriptorSize;
     if (!native_pair || mlx_reference_enabled()) {
+        detail::profile_marker("mfe.dispatch.mxfp4_pair_fallback");
         return fallback();
     }
+
+    detail::profile_marker("mfe.dispatch.mxfp4_pair_native");
 
     auto source = input;
     if (source.dtype() != mlx::core::float16
@@ -10397,8 +10442,11 @@ array MlxMfeWeight::routed_matmul_reduce(
         || impl_->descriptor_values.size()
             != static_cast<std::size_t>(impl_->experts)
                 * kDescriptorSize) {
+        detail::profile_marker("mfe.dispatch.mxfp4_down_reduce_fallback");
         return fallback();
     }
+
+    detail::profile_marker("mfe.dispatch.mxfp4_down_reduce_native");
 
     auto source = input;
     if (source.dtype() != mlx::core::float16
@@ -10933,6 +10981,9 @@ array MlxMfeWeight::routed_matmul_sorted(
             "routed input must have [tokens,K] or [tokens,routes,K] shape");
     }
 
+    // This is a native MLX gather-QMM route. The old "NAX" identifiers are
+    // retained at the public/internal compatibility boundary, but do not
+    // imply that the current device must provide hardware NAX instructions.
     const bool use_mxfp4_nax =
         (mxfp4_nax_prefill_enabled(
              route_count,

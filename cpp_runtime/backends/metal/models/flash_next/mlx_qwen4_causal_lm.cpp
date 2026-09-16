@@ -2267,6 +2267,11 @@ struct Qwen4MtpForward {
 
 class Qwen4Mtp {
 public:
+    MlxMtpPredictorDescriptor mtp_descriptor() const noexcept {
+        return MlxMtpPredictorDescriptor::recurrent(
+            kQwen4MtpMaximumDraftDepth);
+    }
+
     static std::optional<Qwen4Mtp> load_if_present(
         const MfqContainer& model,
         const Qwen4Config& config,
@@ -3091,6 +3096,7 @@ std::int32_t MlxQwen4CausalLm::generate(
                 impl_->mtp->cache_position();
 
             MlxMtpEngineCallbacks mtp_callbacks;
+            mtp_callbacks.predictor = impl_->mtp->mtp_descriptor();
             mtp_callbacks.target_cache_position = [&] {
                 return impl_->cache_position;
             };
@@ -3211,7 +3217,6 @@ std::int32_t MlxQwen4CausalLm::generate(
                     vocab,
                     limit,
                     impl_->maximum,
-                    kQwen4MtpMaximumDraftDepth,
                     std::move(logits),
                     sampling,
                     std::move(counts),

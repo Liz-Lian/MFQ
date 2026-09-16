@@ -2539,6 +2539,7 @@ std::int32_t MlxDeepseekV4CausalLm::generate_impl(
             dspark_->block_size());
 
         MlxMtpEngineCallbacks mtp_callbacks;
+        mtp_callbacks.predictor = dspark_->mtp_descriptor();
         mtp_callbacks.target_cache_position = [this] {
             return cache_position_;
         };
@@ -2616,7 +2617,6 @@ std::int32_t MlxDeepseekV4CausalLm::generate_impl(
                 vocab,
                 max_tokens,
                 max_context_,
-                dspark_->block_size(),
                 logits,
                 mtp_sampling,
                 counts,

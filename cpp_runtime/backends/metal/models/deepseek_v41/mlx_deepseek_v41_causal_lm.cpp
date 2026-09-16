@@ -885,6 +885,7 @@ std::int32_t MlxDeepseekV41CausalLm::generate_from_prefill(
     };
     if (mtp_active) {
         MlxMtpEngineCallbacks callbacks;
+        callbacks.predictor = dspark_->mtp_descriptor();
         callbacks.target_cache_position = [this] {
             return cache_position_;
         };
@@ -968,7 +969,6 @@ std::int32_t MlxDeepseekV41CausalLm::generate_from_prefill(
                 vocab,
                 limit,
                 max_context_,
-                dspark_->block_size(),
                 logits,
                 sampling,
                 counts,

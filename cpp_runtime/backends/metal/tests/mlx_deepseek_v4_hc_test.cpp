@@ -135,7 +135,11 @@ GenericV41Metadata generic_v41_metadata(
     auto combination = softmax_last(
         reshape(
             slice_last(mixes, 2 * kConnections, kMixWidth),
-            Shape{1, 1, kConnections, kConnections}) *
+            Shape{
+                mixes.shape(0),
+                mixes.shape(1),
+                kConnections,
+                kConnections}) *
             slice_last(scale, 2, 3) +
         reshape(
             slice_last(base, 2 * kConnections, kMixWidth),
@@ -989,6 +993,51 @@ void test_v41_metadata_matches_generic_graph() {
                 << '\n';
         }
     }
+
+    constexpr int verifier_rows = 6;
+    std::vector<float> verifier_mixes(
+        verifier_rows * kMixWidth);
+    std::vector<float> verifier_base(kMixWidth);
+    for (std::size_t index = 0;
+         index < verifier_mixes.size();
+         ++index) {
+        verifier_mixes[index] =
+            std::sin(static_cast<float>(index * 7 + 3) * 0.041f) *
+                0.83f +
+            static_cast<float>(static_cast<int>(index % 9) - 4) * 0.013f;
+    }
+    for (int index = 0; index < kMixWidth; ++index) {
+        verifier_base[static_cast<std::size_t>(index)] =
+            std::cos(static_cast<float>(index * 5 + 1) * 0.037f) * 0.23f;
+    }
+    const array mixes(
+        verifier_mixes.begin(),
+        Shape{1, verifier_rows, kMixWidth});
+    const array scale(
+        {0.57f, 0.91f, 1.23f},
+        Shape{3});
+    const array base(
+        verifier_base.begin(),
+        Shape{kMixWidth});
+    auto expected = generic_v41_metadata(mixes, scale, base);
+    auto actual = mfq::metal::deepseek_v41_hc_metadata_exact(
+        mixes,
+        scale,
+        base,
+        20,
+        kEps);
+    require_float_bits_equal(
+        actual.pre,
+        expected.pre,
+        "V4.1 HC exact M=6 metadata pre");
+    require_float_bits_equal(
+        actual.post,
+        expected.post,
+        "V4.1 HC exact M=6 metadata post");
+    require_float_bits_equal(
+        actual.combination,
+        expected.combination,
+        "V4.1 HC exact M=6 Sinkhorn");
 }
 
 void test_v41_collapse_norm_matches_generic_graph() {

@@ -8,6 +8,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdlib>
 #include <deque>
 #include <exception>
 #include <future>
@@ -16,6 +17,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <unordered_map>
 #include <utility>
@@ -47,6 +49,14 @@ std::size_t prefill_slot_count(
 }
 
 } // namespace
+
+bool mlx_ssd_route_transactions_enabled() noexcept {
+    const char* value = std::getenv(
+        "MFQ_SSD_DEVICE_ROUTE_TRANSACTION");
+    if (value == nullptr) return true;
+    const auto setting = std::string_view(value);
+    return setting != "0" && setting != "false" && setting != "off";
+}
 
 struct MlxMoeSsdExpertCache::Impl {
     enum class State {
@@ -1478,8 +1488,15 @@ bool MlxMoeSsdExpertCache::route_transaction_active() const noexcept {
 bool MlxMoeSsdExpertCache::route_layer_likely_hit(
     std::size_t layer) const noexcept {
     std::scoped_lock lock(impl_->mutex);
+    // A full-capacity cache never evicts a resident expert. After the first
+    // confirmed hit, exact route transactions are therefore the lower-cost
+    // path; a later cold expert is still detected and replayed by the
+    // transaction. Bounded caches keep the conservative confidence window
+    // because ordinary LRU churn can invalidate the previous observation.
+    const std::uint8_t threshold =
+        impl_->full_residency_capacity ? 1 : 8;
     return layer < impl_->route_confidence.size() &&
-        impl_->route_confidence[layer] >= 8;
+        impl_->route_confidence[layer] >= threshold;
 }
 
 MlxSsdExpertRouteTransactionResult

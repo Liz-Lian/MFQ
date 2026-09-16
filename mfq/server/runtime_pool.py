@@ -42,6 +42,7 @@ from mfq.server.models import (
 )
 from mfq.server.native import (
     RuntimeRoute,
+    append_native_prefill_chunk_override,
     find_native_runtime_resource,
     native_request_capacity,
     native_runtime_environment,
@@ -448,6 +449,11 @@ class ManagedRuntimePool:
             artifact.resource.architecture,
             artifact.path,
         )
+        # Keep the caller's residency intent separate from the decision made
+        # for this launch.  In particular, an automatically selected 0-GiB
+        # (fully resident) cache must not become an explicit setting when an
+        # idle model is later reloaded under a different memory budget.
+        replay_request = request.model_copy(deep=True)
         async with self._lock:
             if self._closed:
                 raise RuntimeManagementError("runtime pool is closed")
@@ -813,7 +819,7 @@ class ManagedRuntimePool:
                     "runtime exited before model activation completed",
                     retryable=True,
                 )
-            self._load_requests[model_name] = request.model_copy(
+            self._load_requests[model_name] = replay_request.model_copy(
                 update={"model": model_name}
             )
             self._finish_model_load_locked(model_name, load_event, None)
@@ -2238,7 +2244,7 @@ class ManagedRuntimePool:
         runtime_route: RuntimeRoute,
         memory_ceiling: int | None = None,
     ) -> ModelLoadRequest:
-        """Fit an oversized native MFQ MoE into the Metal residency budget."""
+        """Choose native Metal expert residency within the runtime budget."""
 
         ceiling = (
             memory_ceiling
@@ -2249,11 +2255,18 @@ class ManagedRuntimePool:
             request.moe_gpu_cache_gb is not None
             or self.backend != "metal"
             or ceiling is None
-            or artifact.resource.format != "mfq"
+            or artifact.resource.format not in {"hf", "mfq"}
             or artifact.routed_expert_bytes <= 0
-            or artifact.resource.total_bytes <= ceiling
             or runtime_route.python_mlx_worker
         ):
+            return request
+        if artifact.resource.total_bytes <= ceiling:
+            if artifact.resource.format == "hf":
+                # Native-HF workers interpret an omitted cache budget as
+                # "stream experts".  Make the opposite decision explicit
+                # when the complete checkpoint fits; otherwise a 512-GiB
+                # host needlessly starts a cold SSD LRU for a ~160-GiB MoE.
+                return request.model_copy(update={"moe_gpu_cache_gb": 0.0})
             return request
         dense_bytes = max(
             0,
@@ -2814,7 +2827,10 @@ class ManagedRuntimePool:
                 "--model-name",
                 artifact.resource.name,
             ]
-            command.extend(["--prefill-chunk-size", str(request.prefill_chunk_size)])
+            append_native_prefill_chunk_override(
+                command,
+                request.prefill_chunk_size,
+            )
             if self.backend == "cuda" and request_capacity > 1:
                 command.extend(
                     [

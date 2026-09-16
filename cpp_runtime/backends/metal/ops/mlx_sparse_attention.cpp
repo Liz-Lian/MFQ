@@ -314,8 +314,9 @@ class SparseSelectedMlaPrimitive final
 public:
     SparseSelectedMlaPrimitive(
         mlx::core::Stream stream,
-        SparseSelectedMlaParams params)
-        : UnaryPrimitive(stream), params_(params) {}
+        SparseSelectedMlaParams params,
+        Dtype dtype)
+        : UnaryPrimitive(stream), params_(params), dtype_(dtype) {}
 
     void eval_cpu(const std::vector<array>&, array&) override {
         throw std::runtime_error(
@@ -354,9 +355,10 @@ public:
                 source += detail::kSparseBlockGqaSource;
                 return source;
             });
-        auto* kernel = device.get_kernel(
-            "mfq_dsa_sparse_prefill_f16_bk256_dc32",
-            library);
+        const char* kernel_name = dtype_ == mlx::core::bfloat16
+            ? "mfq_dsa_sparse_prefill_bf16_bk256_dc32"
+            : "mfq_dsa_sparse_prefill_f16_bk256_dc32";
+        auto* kernel = device.get_kernel(kernel_name, library);
         auto& encoder =
             mlx::core::metal::get_command_encoder(selected_stream);
         encoder.set_compute_pipeline_state(kernel);
@@ -380,6 +382,7 @@ public:
         const auto* primitive = dynamic_cast<
             const SparseSelectedMlaPrimitive*>(&other);
         return primitive != nullptr
+            && primitive->dtype_ == dtype_
             && primitive->params_.batch == params_.batch
             && primitive->params_.queries == params_.queries
             && primitive->params_.keys == params_.keys
@@ -399,6 +402,7 @@ public:
 
 private:
     SparseSelectedMlaParams params_;
+    Dtype dtype_;
 };
 
 class SparseCircularMlaPrimitive final
@@ -406,8 +410,9 @@ class SparseCircularMlaPrimitive final
 public:
     SparseCircularMlaPrimitive(
         mlx::core::Stream stream,
-        SparseCircularMlaParams params)
-        : UnaryPrimitive(stream), params_(params) {}
+        SparseCircularMlaParams params,
+        Dtype dtype)
+        : UnaryPrimitive(stream), params_(params), dtype_(dtype) {}
 
     void eval_cpu(const std::vector<array>&, array&) override {
         throw std::runtime_error(
@@ -446,9 +451,10 @@ public:
                 source += detail::kSparseBlockGqaSource;
                 return source;
             });
-        auto* kernel = device.get_kernel(
-            "mfq_dsa_sparse_circular_f16_bk256_dc32",
-            library);
+        const char* kernel_name = dtype_ == mlx::core::bfloat16
+            ? "mfq_dsa_sparse_circular_bf16_bk256_dc32"
+            : "mfq_dsa_sparse_circular_f16_bk256_dc32";
+        auto* kernel = device.get_kernel(kernel_name, library);
         auto& encoder =
             mlx::core::metal::get_command_encoder(selected_stream);
         encoder.set_compute_pipeline_state(kernel);
@@ -472,6 +478,7 @@ public:
         const auto* primitive = dynamic_cast<
             const SparseCircularMlaPrimitive*>(&other);
         return primitive != nullptr
+            && primitive->dtype_ == dtype_
             && primitive->params_.batch == params_.batch
             && primitive->params_.queries == params_.queries
             && primitive->params_.local_length == params_.local_length
@@ -496,6 +503,7 @@ public:
 
 private:
     SparseCircularMlaParams params_;
+    Dtype dtype_;
 };
 
 } // namespace
@@ -651,8 +659,11 @@ array mlx_sparse_selected_mla_attention(
     const array& selected_mask,
     const array& sinks,
     std::optional<float> scale) {
+    const Dtype cache_dtype = kv_cache.dtype() == mlx::core::bfloat16
+        ? mlx::core::bfloat16
+        : mlx::core::float16;
     auto selected_query = typed_contiguous(query, mlx::core::float32);
-    auto selected_cache = typed_contiguous(kv_cache, mlx::core::float16);
+    auto selected_cache = typed_contiguous(kv_cache, cache_dtype);
     auto indices = typed_contiguous(selected_indices, mlx::core::int32);
     auto mask = typed_contiguous(selected_mask, mlx::core::float16);
     auto sink_logits = typed_contiguous(sinks, mlx::core::float32);
@@ -743,8 +754,8 @@ array mlx_sparse_selected_mla_attention(
                 {});
         return std::move(outputs.front());
     }
-    auto half_query = typed_contiguous(selected_query, mlx::core::float16);
-    auto half_sinks = typed_contiguous(sink_logits, mlx::core::float16);
+    auto attention_query = typed_contiguous(selected_query, cache_dtype);
+    auto attention_sinks = typed_contiguous(sink_logits, cache_dtype);
     auto stream = mlx::core::default_stream(mlx::core::default_device());
     if (stream.device != mlx::core::Device::gpu) {
         throw std::invalid_argument(
@@ -752,21 +763,24 @@ array mlx_sparse_selected_mla_attention(
     }
     return array(
         Shape{params.batch, params.queries, kHeads, kDimension},
-        mlx::core::float16,
-        std::make_shared<SparseSelectedMlaPrimitive>(stream, params),
+        cache_dtype,
+        std::make_shared<SparseSelectedMlaPrimitive>(
+            stream,
+            params,
+            cache_dtype),
         std::vector<array>{
-            std::move(half_query),
+            std::move(attention_query),
             std::move(selected_cache),
             std::move(indices),
             std::move(mask),
-            std::move(half_sinks),
+            std::move(attention_sinks),
         });
 }
 
 array mlx_sparse_circular_mla_attention(
     const array& query,
     const array& local_kv,
-    const array& pooled_kv,
+    const std::optional<array>& pooled_kv,
     int pool_len,
     const array& topk,
     const array& sinks,
@@ -776,11 +790,18 @@ array mlx_sparse_circular_mla_attention(
     std::optional<float> scale) {
     constexpr int kHeads = 64;
     constexpr int kDimension = 512;
-    auto selected_query = typed_contiguous(query, mlx::core::float16);
-    auto local = typed_contiguous(local_kv, mlx::core::float16);
-    auto pool = typed_contiguous(pooled_kv, mlx::core::float16);
+    const Dtype cache_dtype =
+        local_kv.dtype() == mlx::core::bfloat16 &&
+        (!pooled_kv || pooled_kv->dtype() == mlx::core::bfloat16)
+            ? mlx::core::bfloat16
+            : mlx::core::float16;
+    auto selected_query = typed_contiguous(query, cache_dtype);
+    auto local = typed_contiguous(local_kv, cache_dtype);
+    auto pool = pooled_kv
+        ? typed_contiguous(*pooled_kv, cache_dtype)
+        : local;
     auto selected_topk = typed_contiguous(topk, mlx::core::int32);
-    auto sink_logits = typed_contiguous(sinks, mlx::core::float16);
+    auto sink_logits = typed_contiguous(sinks, cache_dtype);
     if (selected_query.ndim() != 4 || selected_query.shape(0) <= 0 ||
         selected_query.shape(1) != kHeads ||
         selected_query.shape(2) < 2 ||
@@ -789,12 +810,13 @@ array mlx_sparse_circular_mla_attention(
         local.shape(1) < selected_query.shape(2) ||
         local.shape(2) != kDimension || pool.ndim() != 3 ||
         pool.shape(0) != selected_query.shape(0) ||
-        pool.shape(1) <= 0 || pool.shape(2) != kDimension ||
-        pool_len <= 0 || pool_len > pool.shape(1) ||
+        pool.shape(2) != kDimension || pool_len < 0 ||
+        pool_len > pool.shape(1) ||
         selected_topk.ndim() != 3 ||
         selected_topk.shape(0) != selected_query.shape(0) ||
         selected_topk.shape(1) != selected_query.shape(2) ||
-        selected_topk.shape(2) <= 0 || sink_logits.size() != kHeads ||
+        (pool_len > 0 && selected_topk.shape(2) <= 0) ||
+        sink_logits.size() != kHeads ||
         query_offset < 0 || pool_ratio <= 0 || local_window <= 0) {
         throw std::invalid_argument(
             "unsupported circular multi-query sparse MLA geometry");
@@ -824,8 +846,11 @@ array mlx_sparse_circular_mla_attention(
     }
     return array(
         Shape{params.batch, params.queries, kHeads, kDimension},
-        mlx::core::float16,
-        std::make_shared<SparseCircularMlaPrimitive>(stream, params),
+        cache_dtype,
+        std::make_shared<SparseCircularMlaPrimitive>(
+            stream,
+            params,
+            cache_dtype),
         std::vector<array>{
             std::move(selected_query),
             std::move(local),
@@ -848,12 +873,17 @@ array mlx_sparse_circular_mla_decode_attention(
     std::optional<float> scale) {
     constexpr int kHeads = 64;
     constexpr int kDimension = 512;
+    const Dtype cache_dtype =
+        local_kv.dtype() == mlx::core::bfloat16 &&
+        (!pooled_kv || pooled_kv->dtype() == mlx::core::bfloat16)
+            ? mlx::core::bfloat16
+            : mlx::core::float16;
     auto selected_query = typed_contiguous(query, mlx::core::float32);
-    auto local = typed_contiguous(local_kv, mlx::core::float16);
+    auto local = typed_contiguous(local_kv, cache_dtype);
     auto selected_topk = typed_contiguous(topk, mlx::core::int32);
     auto sink_logits = typed_contiguous(sinks, mlx::core::float32);
     auto pool = pooled_kv
-        ? typed_contiguous(*pooled_kv, mlx::core::float16)
+        ? typed_contiguous(*pooled_kv, cache_dtype)
         : local;
     if (selected_query.ndim() != 4 || selected_query.shape(0) <= 0 ||
         selected_query.shape(1) != kHeads || selected_query.shape(2) != 1 ||

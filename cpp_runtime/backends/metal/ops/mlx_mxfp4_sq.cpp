@@ -5,10 +5,14 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cctype>
 #include <limits>
+#include <mutex>
 #include <optional>
 #include <stdexcept>
+#include <string>
 #include <tuple>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -690,6 +694,141 @@ const mlx::core::fast::CustomKernelFunction& backward_matrix_kernel() {
     return kernel;
 }
 
+bool identifier_character(char value) noexcept {
+    return std::isalnum(static_cast<unsigned char>(value)) != 0 ||
+        value == '_';
+}
+
+void replace_identifier(
+    std::string& source,
+    std::string_view from,
+    std::string_view to) {
+    std::size_t position = 0;
+    while ((position = source.find(from, position)) != std::string::npos) {
+        const bool left_boundary = position == 0 ||
+            !identifier_character(source[position - 1]);
+        const auto end = position + from.size();
+        const bool right_boundary = end == source.size() ||
+            !identifier_character(source[end]);
+        if (left_boundary && right_boundary) {
+            source.replace(position, from.size(), to);
+            position += to.size();
+        } else {
+            position = end;
+        }
+    }
+}
+
+void replace_all(
+    std::string& source,
+    std::string_view from,
+    std::string_view to) {
+    std::size_t position = 0;
+    while ((position = source.find(from, position)) != std::string::npos) {
+        source.replace(position, from.size(), to);
+        position += to.size();
+    }
+}
+
+std::vector<std::string> projection_group_input_names(
+    std::size_t projections) {
+    std::vector<std::string> names;
+    names.reserve(projections * 4 + 4);
+    for (std::size_t projection = 0;
+         projection < projections;
+         ++projection) {
+        const auto suffix = std::to_string(projection);
+        names.push_back("blob_" + suffix);
+        names.push_back("row_q_" + suffix);
+        names.push_back("row_symbol_byte_offsets_" + suffix);
+        names.push_back("row_auxiliary_" + suffix);
+    }
+    names.emplace_back("palette");
+    names.emplace_back("x");
+    names.emplace_back("expert_ids");
+    names.emplace_back("expert_map");
+    return names;
+}
+
+std::string make_projection_group_source(std::size_t projections) {
+    std::string source;
+    for (std::size_t projection = 0;
+         projection < projections;
+         ++projection) {
+        const auto suffix = std::to_string(projection);
+        const auto prefix = "P" + suffix + "_";
+        source += projection == 0 ? "    if (" : "    else if (";
+        source += "threadgroup_position_in_grid.y < uint(" + prefix
+            + "TILE_END)) {\n";
+
+        std::string body(kSqMatmul);
+        replace_all(
+            body,
+            "threadgroup_position_in_grid.y",
+            "(threadgroup_position_in_grid.y - uint(" + prefix
+                + "TILE_BEGIN))");
+        for (const auto name : {
+                 "MATRIX_SCALE_BASE",
+                 "SYMBOLS_OFFSET",
+                 "SELECTORS_OFFSET",
+                 "SCALES_OFFSET",
+                 "PALETTES_OFFSET",
+                 "NATIVE_SCALES_OFFSET",
+                 "OUT_PER_EXPERT",
+                 "LOGICAL_OUT",
+                 "BLOCKS",
+                 "OUT",
+             }) {
+            replace_identifier(body, name, prefix + name);
+        }
+        replace_identifier(body, "blob", "blob_" + suffix);
+        replace_identifier(body, "row_q", "row_q_" + suffix);
+        replace_identifier(
+            body,
+            "row_symbol_byte_offsets",
+            "row_symbol_byte_offsets_" + suffix);
+        replace_identifier(
+            body,
+            "row_auxiliary",
+            "row_auxiliary_" + suffix);
+        replace_all(
+            body,
+            "y[row * uint(" + prefix
+                + "LOGICAL_OUT) + output_index]",
+            "y[row * uint(TOTAL_OUT) + uint(" + prefix
+                + "OUT_OFFSET) + output_index]");
+        source += body;
+        source += "    }\n";
+    }
+    return source;
+}
+
+mlx::core::fast::CustomKernelFunction projection_group_kernel(
+    std::size_t projections) {
+    static std::mutex mutex;
+    static std::unordered_map<
+        std::size_t,
+        mlx::core::fast::CustomKernelFunction> kernels;
+    std::lock_guard<std::mutex> lock(mutex);
+    if (const auto found = kernels.find(projections); found != kernels.end()) {
+        return found->second;
+    }
+    CompileOptions options;
+    options.math_mode = MathMode::Fast;
+    auto kernel = mlx::core::fast::metal_kernel(
+        "mfq_cpp_mxfp4_sq_projection_group_p"
+            + std::to_string(projections),
+        projection_group_input_names(projections),
+        {"y"},
+        make_projection_group_source(projections),
+        kSqHeader,
+        true,
+        false,
+        options);
+    kernels.emplace(projections, kernel);
+    return kernel;
+}
+
 std::vector<std::pair<std::string, mlx::core::fast::TemplateArg>>
 templates(const MlxMxfp4SqWeight& weight, Dtype dtype) {
     const auto& layout = weight.wire_layout();
@@ -915,6 +1054,176 @@ array MlxMxfp4SqWeight::matmul(const array& input) const {
     return mlx::core::reshape(
         std::move(outputs.front()),
         std::move(output_shape));
+}
+
+std::vector<array> MlxMxfp4SqWeight::projection_group_matmul(
+    std::span<const MlxMxfp4SqWeight> weights,
+    const array& input) {
+    if (weights.size() < 2 || weights.size() > 5) {
+        throw std::invalid_argument(
+            "MXFP4-SQ projection group requires two through five weights");
+    }
+    const int input_size = weights.front().input_size();
+    if (input.ndim() == 0 || input.shape(-1) != input_size) {
+        throw std::invalid_argument(
+            "MXFP4-SQ projection group input width mismatch");
+    }
+    if (input.dtype() != mlx::core::float16 &&
+        input.dtype() != mlx::core::float32) {
+        throw std::invalid_argument(
+            "MXFP4-SQ projection group requires FP16 or FP32 input");
+    }
+    for (const auto& weight : weights) {
+        if (weight.input_size() != input_size) {
+            throw std::invalid_argument(
+                "MXFP4-SQ projection group requires one input width");
+        }
+    }
+    if (input.dtype() == mlx::core::float32) {
+        std::vector<array> outputs;
+        outputs.reserve(weights.size());
+        for (const auto& weight : weights) {
+            outputs.push_back(weight.matmul(input));
+        }
+        return outputs;
+    }
+
+    const auto checked_int = [](std::size_t value, const char* name) {
+        if (value > static_cast<std::size_t>(
+                std::numeric_limits<int>::max())) {
+            throw std::runtime_error(
+                std::string("MXFP4-SQ ") + name + " exceeds MLX limits");
+        }
+        return static_cast<int>(value);
+    };
+    const auto rows = input.size() / static_cast<std::size_t>(input_size);
+    if (rows < 1 || rows > 16) {
+        throw std::invalid_argument(
+            "MXFP4-SQ projection group supports one through sixteen rows");
+    }
+
+    std::vector<int> output_sizes;
+    output_sizes.reserve(weights.size());
+    int total_output = 0;
+    bool mixed_q = false;
+    for (const auto& weight : weights) {
+        total_output = checked_int(
+            static_cast<std::size_t>(total_output) +
+                static_cast<std::size_t>(weight.output_size()),
+            "projection-group output width");
+        output_sizes.push_back(weight.output_size());
+        mixed_q = mixed_q || !weight.has_uniform_q();
+    }
+
+    const bool first_bucket = rows <= 6;
+    const int k_lanes = mixed_q
+        ? 32
+        : (first_bucket && rows <= 3 ? 16 : 8);
+    const int simd_groups = mixed_q
+        ? 4
+        : (first_bucket && rows <= 3 ? 4 : 2);
+    const int threads = simd_groups * 32;
+    const int row_tiles = first_bucket
+        ? 1
+        : (static_cast<int>(rows) + 7) / 8;
+    const int tile_rows =
+        (static_cast<int>(rows) + row_tiles - 1) / row_tiles;
+    const int outputs_per_threadgroup =
+        simd_groups * 32 / k_lanes;
+
+    Shape prefix(input.shape().begin(), input.shape().end() - 1);
+    auto source = mlx::core::contiguous(mlx::core::reshape(
+        input,
+        Shape{checked_int(rows, "projection-group row count"), input_size}));
+    std::vector<array> inputs;
+    inputs.reserve(weights.size() * 4 + 4);
+    std::vector<std::pair<std::string, mlx::core::fast::TemplateArg>> arguments{
+        {"T", source.dtype()},
+        {"M", checked_int(rows, "projection-group row count")},
+        {"TILE_M", tile_rows},
+        {"K", input_size},
+        {"K_LANES", k_lanes},
+        {"SIMD_GROUPS", simd_groups},
+        {"ROUTED", 0},
+        {"ROUTES", 1},
+        {"SHARED_INPUT", 0},
+        {"EXPERT_MAP_SIZE", 1},
+        {"TOTAL_OUT", total_output},
+    };
+    int output_offset = 0;
+    int tile_offset = 0;
+    for (std::size_t projection = 0;
+         projection < weights.size();
+         ++projection) {
+        const auto& weight = weights[projection];
+        const auto& layout = weight.layout_;
+        const auto prefix_name = "P" + std::to_string(projection) + "_";
+        inputs.push_back(weight.blob_);
+        inputs.push_back(weight.row_q_);
+        inputs.push_back(weight.row_symbol_byte_offsets_);
+        inputs.push_back(weight.row_auxiliary_);
+        arguments.emplace_back(prefix_name + "MATRIX_SCALE_BASE", layout.base);
+        arguments.emplace_back(prefix_name + "OUT", weight.output_size());
+        arguments.emplace_back(prefix_name + "BLOCKS", input_size / 32);
+        arguments.emplace_back(
+            prefix_name + "SYMBOLS_OFFSET",
+            checked_int(layout.symbols, "symbol offset"));
+        arguments.emplace_back(
+            prefix_name + "SELECTORS_OFFSET",
+            checked_int(layout.selectors, "selector offset"));
+        arguments.emplace_back(
+            prefix_name + "SCALES_OFFSET",
+            checked_int(layout.scales, "scale offset"));
+        arguments.emplace_back(
+            prefix_name + "PALETTES_OFFSET",
+            checked_int(layout.palettes, "palette offset"));
+        arguments.emplace_back(
+            prefix_name + "NATIVE_SCALES_OFFSET",
+            checked_int(layout.native_scales, "native-scale offset"));
+        arguments.emplace_back(
+            prefix_name + "OUT_PER_EXPERT", weight.output_size());
+        arguments.emplace_back(
+            prefix_name + "LOGICAL_OUT", weight.output_size());
+        arguments.emplace_back(prefix_name + "OUT_OFFSET", output_offset);
+        arguments.emplace_back(prefix_name + "TILE_BEGIN", tile_offset);
+        output_offset += weight.output_size();
+        tile_offset +=
+            (weight.output_size() + outputs_per_threadgroup - 1) /
+            outputs_per_threadgroup;
+        arguments.emplace_back(prefix_name + "TILE_END", tile_offset);
+    }
+    const auto unused = mlx::core::zeros(Shape{1}, mlx::core::int32);
+    inputs.push_back(palette_catalog());
+    inputs.push_back(source);
+    inputs.push_back(unused);
+    inputs.push_back(unused);
+    auto combined = projection_group_kernel(weights.size())(
+        std::move(inputs),
+        {Shape{checked_int(rows, "projection-group row count"), total_output}},
+        {source.dtype()},
+        {row_tiles * threads, tile_offset, 1},
+        {threads, 1, 1},
+        std::move(arguments),
+        std::nullopt,
+        false,
+        {}).front();
+
+    std::vector<array> outputs;
+    outputs.reserve(output_sizes.size());
+    int offset = 0;
+    for (const int width : output_sizes) {
+        auto shape = prefix;
+        shape.push_back(width);
+        outputs.push_back(mlx::core::reshape(
+            mlx::core::slice(
+                combined,
+                Shape{0, offset},
+                Shape{checked_int(rows, "projection-group row count"),
+                      offset + width}),
+            std::move(shape)));
+        offset += width;
+    }
+    return outputs;
 }
 
 array MlxMxfp4SqWeight::routed_matmul(

@@ -53,7 +53,11 @@ std::size_t packed_bytes(const MlxLinear& linear) {
     require(ref.has_value(), "benchmark tensor cannot use grouped linear");
     return std::visit(
         [](const auto* weight) {
-            return weight->packed_nbytes();
+            if constexpr (requires { weight->packed_nbytes(); }) {
+                return weight->packed_nbytes();
+            } else {
+                return weight->nbytes();
+            }
         },
         *ref);
 }

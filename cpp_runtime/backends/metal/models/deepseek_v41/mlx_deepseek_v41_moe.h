@@ -54,7 +54,9 @@ private:
         MlxLinear shared_gate,
         MlxLinear shared_up,
         MlxLinear shared_down,
-        std::optional<MlxRoutedLinear> routed_gate_up,
+        std::optional<MlxMoeWeight> routed_gate_up,
+        std::optional<MlxRoutedLinear> routed_gate,
+        std::optional<MlxRoutedLinear> routed_up,
         std::optional<MlxRoutedLinear> routed_down,
         std::shared_ptr<MlxMoeSsdExpertCache> ssd_expert_cache,
         std::shared_ptr<MlxMfeOffloadCache> mfe_offload_cache,
@@ -76,9 +78,14 @@ private:
     MlxLinear shared_gate_;
     MlxLinear shared_up_;
     MlxLinear shared_down_;
-    std::optional<MlxGroupedLinear> grouped_projections_;
-    std::optional<MlxGroupedLinear> grouped_shared_gate_up_;
-    std::optional<MlxRoutedLinear> routed_gate_up_;
+    std::optional<MlxProjectionBatch> projection_batch_;
+    std::optional<MlxProjectionBatch> shared_gate_up_batch_;
+    // Canonical split Gate/Up records keep their original storage pools;
+    // routed_swiglu_pair provides the common zero-copy execution path. The
+    // legacy fused gate_up record remains a read-only compatibility input.
+    std::optional<MlxMoeWeight> routed_gate_up_;
+    std::optional<MlxRoutedLinear> routed_gate_;
+    std::optional<MlxRoutedLinear> routed_up_;
     std::optional<MlxRoutedLinear> routed_down_;
     std::shared_ptr<MlxMoeSsdExpertCache> ssd_expert_cache_;
     std::shared_ptr<MlxMfeOffloadCache> mfe_offload_cache_;

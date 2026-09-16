@@ -1,8 +1,10 @@
 #include "mlx_mx.h"
 #include "mlx_grouped_linear.h"
 #include "mlx_nint8_zero.h"
+#include "mlx_tensor.h"
 #include "mlx_transformer.h"
 
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -151,6 +153,34 @@ mfq::metal::MlxMxWeight make_patterned_block32_mxfp8_weight(
         "MXFP8",
         array(values.begin(), Shape{outputs, inputs}),
         array(scales.begin(), Shape{scale_rows, scale_columns}),
+        inputs,
+        outputs);
+}
+
+mfq::metal::MlxMxWeight make_patterned_row1x32_mxfp8_weight(
+    int outputs,
+    int inputs,
+    int salt) {
+    using namespace mlx::core;
+    std::vector<std::uint8_t> values(
+        static_cast<std::size_t>(outputs) * inputs);
+    for (std::size_t index = 0; index < values.size(); ++index) {
+        const auto magnitude = static_cast<std::uint8_t>(
+            1 + (index * 19 + static_cast<std::size_t>(salt)) % 119);
+        values[index] = static_cast<std::uint8_t>(
+            magnitude | (((index + salt) & 11u) == 0u ? 0x80u : 0u));
+    }
+    const int scale_columns = inputs / 32;
+    std::vector<std::uint8_t> scales(
+        static_cast<std::size_t>(outputs) * scale_columns);
+    for (std::size_t index = 0; index < scales.size(); ++index) {
+        scales[index] = static_cast<std::uint8_t>(
+            123 + (index * 7 + static_cast<std::size_t>(salt)) % 7);
+    }
+    return mfq::metal::MlxMxWeight::from_arrays(
+        "MXFP8",
+        array(values.begin(), Shape{outputs, inputs}),
+        array(scales.begin(), Shape{outputs, scale_columns}),
         inputs,
         outputs);
 }
@@ -482,7 +512,8 @@ void test_grouped_mx_small_m(const std::string& dtype) {
     const auto second = mfq::metal::MlxMxWeight::from_blob(
         dtype, make_blob(bits, second_outputs, inputs));
     const mfq::metal::MlxGroupedLinear grouped({&first, &second});
-    for (int rows = 2; rows <= 6; ++rows) {
+    for (const auto activation_dtype : {float16, bfloat16}) {
+      for (int rows = 1; rows <= 6; ++rows) {
         std::vector<float> values(
             static_cast<std::size_t>(rows) * inputs);
         for (int row = 0; row < rows; ++row) {
@@ -492,17 +523,55 @@ void test_grouped_mx_small_m(const std::string& dtype) {
                     / 16.0f;
             }
         }
-        auto actual = grouped(astype(
+        auto source = astype(
             array(values.begin(), Shape{rows, inputs}),
-            float16));
+            activation_dtype);
+        require(
+            grouped.supports(source),
+            dtype + " grouped BF16/FP16 input was rejected");
+        auto actual = grouped(source);
         for (auto& projection : actual) {
             projection = astype(projection, float32);
         }
-        eval(actual);
+        std::vector<std::vector<array>> serial_rows(2);
+        for (int row = 0; row < rows; ++row) {
+            auto row_source = slice(
+                source,
+                Shape{row, 0},
+                Shape{row + 1, inputs});
+            serial_rows[0].push_back(first.matmul(row_source));
+            serial_rows[1].push_back(second.matmul(row_source));
+        }
+        std::vector<array> serial{
+            astype(concatenate(serial_rows[0], 0), float32),
+            astype(concatenate(serial_rows[1], 0), float32),
+        };
+        std::vector<array> evaluated = actual;
+        evaluated.insert(evaluated.end(), serial.begin(), serial.end());
+        eval(std::move(evaluated));
         require(
             actual[0].shape() == Shape({rows, first_outputs}) &&
                 actual[1].shape() == Shape({rows, second_outputs}),
             dtype + " grouped small-M output shape mismatch");
+        for (std::size_t projection = 0;
+             projection < actual.size();
+             ++projection) {
+            float maximum_difference = 0.0f;
+            for (std::size_t index = 0;
+                 index < actual[projection].size();
+                 ++index) {
+                maximum_difference = std::max(
+                    maximum_difference,
+                    std::fabs(
+                        actual[projection].data<float>()[index] -
+                        serial[projection].data<float>()[index]));
+            }
+            if (maximum_difference != 0.0f) {
+                throw std::runtime_error(
+                    dtype + " grouped small-M differs from serial decode: " +
+                    std::to_string(maximum_difference));
+            }
+        }
         for (int row = 0; row < rows; ++row) {
             float expected = 0.0f;
             for (int column = 0; column < inputs; ++column) {
@@ -519,6 +588,56 @@ void test_grouped_mx_small_m(const std::string& dtype) {
                         dtype + " grouped small-M value mismatch");
                 }
             }
+        }
+      }
+    }
+}
+
+void test_mxfp4_projection_batch_bf16() {
+    using namespace mlx::core;
+    constexpr int projections = 7;
+    constexpr int inputs = 96;
+    constexpr int outputs = 17;
+    std::vector<mfq::metal::MlxLinear> linears;
+    linears.reserve(projections);
+    for (int projection = 0; projection < projections; ++projection) {
+        linears.emplace_back(mfq::metal::MlxMxWeight::from_blob(
+            "MXFP4", make_blob(4, outputs, inputs)));
+    }
+    std::vector<const mfq::metal::MlxLinear*> references;
+    references.reserve(linears.size());
+    for (const auto& linear : linears) {
+        references.push_back(&linear);
+    }
+    const mfq::metal::MlxProjectionBatch batch(
+        std::move(references));
+    require(
+        batch.projection_count() == projections &&
+            batch.grouped_projection_count() == projections,
+        "MXFP4 projection batch did not partition all projections");
+
+    std::vector<float> values(inputs);
+    for (int column = 0; column < inputs; ++column) {
+        values[static_cast<std::size_t>(column)] =
+            static_cast<float>((column * 3) % 19 - 9) / 16.0f;
+    }
+    auto source = astype(
+        array(values.begin(), Shape{1, inputs}),
+        bfloat16);
+    auto actual = batch(source);
+    require(
+        actual.size() == projections,
+        "MXFP4 projection batch output count mismatch");
+    for (int projection = 0; projection < projections; ++projection) {
+        auto expected = astype(linears[projection](source), float32);
+        auto value = astype(actual[projection], float32);
+        eval(expected, value);
+        for (std::size_t index = 0; index < value.size(); ++index) {
+            require(
+                std::fabs(
+                    value.data<float>()[index] -
+                    expected.data<float>()[index]) < 0.05f,
+                "MXFP4 BF16 projection batch value mismatch");
         }
     }
 }
@@ -652,6 +771,53 @@ void test_grouped_mxfp8_swiglu_small_m_matches_decode() {
                 "grouped MXFP8 small-M SwiGLU differs from decode");
         }
     }
+}
+
+void test_projection_batch_mxfp8_swiglu() {
+    using namespace mlx::core;
+    constexpr int rows = 4;
+    constexpr int inputs = 128;
+    constexpr int outputs = 32;
+    const mfq::metal::MlxLinear gate(
+        mfq::metal::MlxMxWeight::from_blob(
+            "MXFP8", make_patterned_mxfp8_blob(outputs, inputs, 41)));
+    const mfq::metal::MlxLinear up(
+        mfq::metal::MlxMxWeight::from_blob(
+            "MXFP8", make_patterned_mxfp8_blob(outputs, inputs, 47)));
+    const mfq::metal::MlxProjectionBatch batch(
+        std::vector<const mfq::metal::MlxLinear*>{&gate, &up});
+    require(
+        batch.projections_share_group(0, 2),
+        "MXFP8 SwiGLU projections were not registered as one group");
+
+    std::vector<float> values(
+        static_cast<std::size_t>(rows) * inputs);
+    for (int row = 0; row < rows; ++row) {
+        for (int column = 0; column < inputs; ++column) {
+            values[static_cast<std::size_t>(row) * inputs + column] =
+                static_cast<float>(((row * 23 + column * 11) % 37) - 18) /
+                96.0f;
+        }
+    }
+    auto input = astype(
+        array(values.begin(), Shape{rows, inputs}),
+        bfloat16);
+    auto actual = contiguous(batch.swiglu(input, 1.75f));
+    const auto gate_ref = gate.grouped_weight_ref();
+    const auto up_ref = up.grouped_weight_ref();
+    require(
+        gate_ref.has_value() && up_ref.has_value(),
+        "MXFP8 SwiGLU grouped references are unavailable");
+    const mfq::metal::MlxGroupedLinear grouped({*gate_ref, *up_ref});
+    auto expected = contiguous(grouped.small_m_swiglu(input, 1.75f));
+    eval(actual, expected);
+    require(
+        actual.shape() == expected.shape() &&
+            std::memcmp(
+                actual.data<std::uint8_t>(),
+                expected.data<std::uint8_t>(),
+                actual.nbytes()) == 0,
+        "projection-batch MXFP8 SwiGLU differs from the native kernel");
 }
 
 void test_grouped_mxfp8_q8() {
@@ -1280,6 +1446,103 @@ void test_grouped_mxfp8_small_m_matches_decode() {
     }
 }
 
+void test_block32_mxfp8_projection_batch() {
+    using namespace mlx::core;
+    constexpr int inputs = 512;
+    const std::array<int, 7> widths{64, 32, 96, 16, 48, 80, 24};
+    std::vector<mfq::metal::MlxLinear> linears;
+    linears.reserve(widths.size());
+    for (std::size_t projection = 0;
+         projection < widths.size();
+         ++projection) {
+        auto weight = projection % 2 == 0
+            ? make_patterned_row1x32_mxfp8_weight(
+                  widths[projection],
+                  inputs,
+                  53 + static_cast<int>(projection) * 3)
+            : make_patterned_block32_mxfp8_weight(
+                  widths[projection],
+                  inputs,
+                  53 + static_cast<int>(projection) * 3);
+        linears.emplace_back(std::move(weight));
+    }
+    std::vector<const mfq::metal::MlxLinear*> references;
+    references.reserve(linears.size());
+    for (const auto& linear : linears) {
+        references.push_back(&linear);
+    }
+    const mfq::metal::MlxProjectionBatch batch(std::move(references));
+    require(
+        batch.grouped_projection_count() == linears.size() &&
+            batch.projections_share_group(0, linears.size()),
+        "column-32 MXFP8 projections did not register as one group");
+
+    for (const auto dtype : {float16, bfloat16}) {
+        for (int rows = 1; rows <= 6; ++rows) {
+            std::vector<float> values(
+                static_cast<std::size_t>(rows) * inputs);
+            for (int row = 0; row < rows; ++row) {
+                for (int column = 0; column < inputs; ++column) {
+                    values[static_cast<std::size_t>(row) * inputs + column] =
+                        static_cast<float>(
+                            ((row * 31 + column * 13) % 47) - 23) /
+                        256.0f;
+                }
+            }
+            auto input = astype(
+                array(values.begin(), Shape{rows, inputs}),
+                dtype);
+            auto actual = batch(input);
+            require(
+                actual.size() == linears.size(),
+                "column-32 MXFP8 projection output count mismatch");
+
+            std::vector<std::vector<array>> row_outputs(linears.size());
+            for (int row = 0; row < rows; ++row) {
+                auto values_for_row = batch(slice(
+                    input,
+                    Shape{row, 0},
+                    Shape{row + 1, inputs}));
+                for (std::size_t projection = 0;
+                     projection < values_for_row.size();
+                     ++projection) {
+                    row_outputs[projection].push_back(
+                        std::move(values_for_row[projection]));
+                }
+            }
+            for (std::size_t projection = 0;
+                 projection < actual.size();
+                 ++projection) {
+                auto grouped = contiguous(actual[projection]);
+                auto rowwise = contiguous(concatenate(
+                    row_outputs[projection], 0));
+                auto serial = contiguous(linears[projection](input));
+                auto grouped_f32 = astype(grouped, float32);
+                auto serial_f32 = astype(serial, float32);
+                eval(grouped, rowwise, grouped_f32, serial_f32);
+                require(
+                    grouped.shape() == Shape{rows, widths[projection]} &&
+                        grouped.shape() == rowwise.shape() &&
+                        std::memcmp(
+                            grouped.data<std::uint8_t>(),
+                            rowwise.data<std::uint8_t>(),
+                            grouped.nbytes()) == 0,
+                    "column-32 MXFP8 grouped M differs from row-wise decode");
+                const float tolerance = dtype == bfloat16 ? 0.5f : 0.125f;
+                for (std::size_t index = 0;
+                     index < grouped_f32.size();
+                     ++index) {
+                    require(
+                        std::fabs(
+                            grouped_f32.data<float>()[index] -
+                            serial_f32.data<float>()[index]) <= tolerance,
+                        "column-32 MXFP8 projection differs from standalone QMM");
+                }
+            }
+        }
+    }
+}
+
 } // namespace
 
 int main() {
@@ -1305,8 +1568,10 @@ int main() {
         test_grouped_mxfp8();
         test_grouped_mx_small_m("MXFP4");
         test_grouped_mx_small_m("MXFP8");
+        test_mxfp4_projection_batch_bf16();
         test_grouped_mxfp8_swiglu();
         test_grouped_mxfp8_swiglu_small_m_matches_decode();
+        test_projection_batch_mxfp8_swiglu();
         test_grouped_mxfp8_q8();
         test_grouped_mxfp8_inverse_rope();
         test_grouped_mxfp8_inverse_rope_small_m_matches_decode();
@@ -1316,6 +1581,7 @@ int main() {
         test_grouped_row_block32_mxfp8_batched_qmm();
         test_grouped_row_mxfp8_verify();
         test_grouped_mxfp8_small_m_matches_decode();
+        test_block32_mxfp8_projection_batch();
         std::cout << "MFQ MXFP4/MXFP8 Metal GEMV/MMQ/GEMM/grouped/embedding passed\n";
         return 0;
     } catch (const std::exception& error) {

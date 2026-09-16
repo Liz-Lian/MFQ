@@ -237,7 +237,7 @@ def test_native_cuda_worker_is_private_and_uses_a_loopback_port(tmp_path: Path) 
     assert command[command.index("--host") + 1] == "127.0.0.1"
     assert command[command.index("--port") + 1] == "43123"
     assert command[command.index("--ctx-size") + 1] == "32768"
-    assert command[command.index("--prefill-chunk-size") + 1] == "2048"
+    assert "--prefill-chunk-size" not in command
 
 
 def test_native_cuda_worker_enables_explicit_continuous_batching(

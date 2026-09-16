@@ -459,10 +459,52 @@ int main() {
                 sequence.first.data<float>()[index],
                 expected_sequence[index]);
         }
+        auto sequence_view = sequence_cache.view();
+        sequence_view.eval();
+        if (sequence_view.shape() != Shape{1, 3, 2}) {
+            throw std::runtime_error("sequence cache view mismatch");
+        }
+        sequence_cache.trim(1);
+        auto trimmed_sequence = sequence_cache.view();
+        trimmed_sequence.eval();
+        if (trimmed_sequence.shape() != Shape{1, 2, 2}) {
+            throw std::runtime_error("sequence cache trimmed view mismatch");
+        }
         sequence_cache.clear();
         if (sequence_cache.position() != 0) {
             throw std::runtime_error("sequence cache clear mismatch");
         }
+
+        const array circular_cache(
+            {
+                4.0f, 40.0f,
+                5.0f, 50.0f,
+                2.0f, 20.0f,
+                3.0f, 30.0f,
+            },
+            Shape{1, 4, 2});
+        auto circular_history =
+            mfq::metal::mlx_circular_cache_history(circular_cache, 6);
+        require_array_close(
+            circular_history,
+            array(
+                {
+                    2.0f, 20.0f,
+                    3.0f, 30.0f,
+                    4.0f, 40.0f,
+                    5.0f, 50.0f,
+                },
+                Shape{1, 4, 2}));
+        auto partial_circular_history =
+            mfq::metal::mlx_circular_cache_history(circular_cache, 2);
+        require_array_close(
+            partial_circular_history,
+            array(
+                {
+                    4.0f, 40.0f,
+                    5.0f, 50.0f,
+                },
+                Shape{1, 2, 2}));
 
         const array query(
             {0.0f, 0.0f, 0.0f, 0.0f},

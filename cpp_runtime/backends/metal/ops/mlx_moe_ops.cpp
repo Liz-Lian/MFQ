@@ -151,6 +151,7 @@ constexpr const char* kDenseRouterTopKSource = R"METAL(
     uint tid = thread_index_in_threadgroup;
     uint lane = thread_index_in_simdgroup;
     uint simd_group = simdgroup_index_in_threadgroup;
+    uint row = threadgroup_position_in_grid.x;
     threadgroup activation_t cached_input[K];
     threadgroup float route_weights[EXPERTS];
     threadgroup float scores[EXPERTS];
@@ -160,9 +161,10 @@ constexpr const char* kDenseRouterTopKSource = R"METAL(
 
     // All router rows consume the same activation. Load it once instead of
     // issuing identical device reads from every SIMD group.
+    device const activation_t* row_input = input + row * uint(K);
     for (uint column = tid * 4u; column < uint(K); column += 4096u) {
         *(threadgroup activation4_t*)(cached_input + column) =
-            *(device const activation4_t*)(input + column);
+            *(device const activation4_t*)(row_input + column);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -252,9 +254,10 @@ constexpr const char* kDenseRouterTopKSource = R"METAL(
             }
 #if MFQ_HAS_EXPERT_MAP
             int slot = expert_map[best_expert];
-            ids[rank] = int(best_expert) | ((slot + 1) << 8);
+            ids[row * TOP_K + rank] =
+                int(best_expert) | ((slot + 1) << 8);
 #else
-            ids[rank] = int(best_expert);
+            ids[row * TOP_K + rank] = int(best_expert);
 #endif
             topk_weights[rank] = route_weights[best_expert];
             scores[best_expert] = -INFINITY;
@@ -269,8 +272,89 @@ constexpr const char* kDenseRouterTopKSource = R"METAL(
         }
         denominator = max(denominator, params[0]);
         for (uint rank = 0u; rank < TOP_K; ++rank) {
-            weights[rank] =
+            weights[row * TOP_K + rank] =
                 topk_weights[rank] / denominator * params[1];
+        }
+    }
+)METAL";
+
+constexpr const char* kDenseHashRouterSource = R"METAL(
+    uint row = threadgroup_position_in_grid.x;
+    uint tid = thread_index_in_threadgroup;
+    uint lane = thread_index_in_simdgroup;
+    uint route = simdgroup_index_in_threadgroup;
+    threadgroup activation_t cached_input[K];
+    threadgroup int selected_ids[TOP_K];
+    threadgroup float selected_weights[TOP_K];
+
+    device const activation_t* row_input =
+        input + row * uint(K);
+    for (uint column = tid * 4u; column < uint(K); column += 1024u) {
+        *(threadgroup activation4_t*)(cached_input + column) =
+            *(device const activation4_t*)(row_input + column);
+    }
+    if (tid < uint(TOP_K)) {
+        int token = token_ids[row];
+        selected_ids[tid] = token >= 0 && token < int(VOCAB)
+            ? token_experts[uint(token) * uint(TOP_K) + tid]
+            : -1;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (
+        uint selected_route = route;
+        selected_route < uint(TOP_K);
+        selected_route += 8u
+    ) {
+        int expert = selected_ids[selected_route];
+        bool valid = expert >= 0 && expert < int(N_EXPERTS);
+        float accumulator = 0.0f;
+        if (valid) {
+            uint weight_base = uint(expert) * uint(K);
+            for (
+                uint column = lane * 4u;
+                column < uint(K);
+                column += 128u
+            ) {
+                float4 activation = float4(
+                    *(threadgroup activation4_t*)(
+                        cached_input + column));
+                float4 values = float4(
+                    *(device const activation4_t*)(
+                        weight + weight_base + column));
+                accumulator += dot(activation, values);
+            }
+        }
+        float raw = simd_sum(accumulator);
+        if (lane == 0u) {
+            raw = valid && !isnan(raw) ? raw : -FLT_MAX;
+            float softplus = raw > 20.0f ? raw : log1p(exp(raw));
+            selected_weights[selected_route] = sqrt(softplus);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid == 0u) {
+        float denominator = 1.0f;
+        if (NORMALIZE != 0) {
+            denominator = 0.0f;
+            for (uint rank = 0u; rank < uint(TOP_K); ++rank) {
+                denominator += selected_weights[rank];
+            }
+            denominator = max(denominator, params[0]);
+        }
+        uint output_base = row * uint(TOP_K);
+        for (uint rank = 0u; rank < uint(TOP_K); ++rank) {
+            int expert = selected_ids[rank];
+#if MFQ_HAS_EXPERT_MAP
+            int slot = expert >= 0 ? expert_map[uint(expert)] : -1;
+            ids[output_base + rank] =
+                expert | ((slot + 1) << 8);
+#else
+            ids[output_base + rank] = expert;
+#endif
+            weights[output_base + rank] =
+                selected_weights[rank] / denominator * params[1];
         }
     }
 )METAL";
@@ -556,6 +640,52 @@ dense_router_top_k_kernel(mlx::core::Dtype dtype, bool mapped) {
             "using activation_t = bfloat;\n"
             "using activation4_t = bfloat4;\n") +
             kDenseRouterTopKSource);
+    if (mapped) {
+        return dtype == mlx::core::bfloat16
+            ? mapped_bf16_kernel
+            : mapped_fp16_kernel;
+    }
+    return dtype == mlx::core::bfloat16 ? bf16_kernel : fp16_kernel;
+}
+
+const mlx::core::fast::CustomKernelFunction&
+dense_hash_router_kernel(mlx::core::Dtype dtype, bool mapped) {
+    static const auto fp16_kernel = make_kernel(
+        "mfq_cpp_moe_dense_hash_router_f16",
+        {"input", "weight", "token_ids", "token_experts", "params"},
+        {"ids", "weights"},
+        std::string(
+            "#define MFQ_HAS_EXPERT_MAP 0\n"
+            "using activation_t = half;\n"
+            "using activation4_t = half4;\n") +
+            kDenseHashRouterSource);
+    static const auto bf16_kernel = make_kernel(
+        "mfq_cpp_moe_dense_hash_router_bf16",
+        {"input", "weight", "token_ids", "token_experts", "params"},
+        {"ids", "weights"},
+        std::string(
+            "#define MFQ_HAS_EXPERT_MAP 0\n"
+            "using activation_t = bfloat;\n"
+            "using activation4_t = bfloat4;\n") +
+            kDenseHashRouterSource);
+    static const auto mapped_fp16_kernel = make_kernel(
+        "mfq_cpp_moe_dense_hash_router_packed_f16",
+        {"input", "weight", "token_ids", "token_experts", "params", "expert_map"},
+        {"ids", "weights"},
+        std::string(
+            "#define MFQ_HAS_EXPERT_MAP 1\n"
+            "using activation_t = half;\n"
+            "using activation4_t = half4;\n") +
+            kDenseHashRouterSource);
+    static const auto mapped_bf16_kernel = make_kernel(
+        "mfq_cpp_moe_dense_hash_router_packed_bf16",
+        {"input", "weight", "token_ids", "token_experts", "params", "expert_map"},
+        {"ids", "weights"},
+        std::string(
+            "#define MFQ_HAS_EXPERT_MAP 1\n"
+            "using activation_t = bfloat;\n"
+            "using activation4_t = bfloat4;\n") +
+            kDenseHashRouterSource);
     if (mapped) {
         return dtype == mlx::core::bfloat16
             ? mapped_bf16_kernel
@@ -901,16 +1031,19 @@ bool moe_dense_router_topk_supported(
     const bool activation16 =
         input.dtype() == mlx::core::float16 ||
         input.dtype() == mlx::core::bfloat16;
-    return input.ndim() > 0
-        && activation16
-        && input.size() == static_cast<std::size_t>(
-            input.shape(-1))
-        && input.shape(-1) > 0
-        && (input.shape(-1) % 4) == 0
-        && weight.ndim() == 2
+    if (input.ndim() == 0) {
+        return false;
+    }
+    const int width = input.ndim() > 0 ? input.shape(-1) : 0;
+    if (!activation16 || width <= 0 || (width % 4) != 0 ||
+        input.size() % static_cast<std::size_t>(width) != 0) {
+        return false;
+    }
+    const auto rows = input.size() / static_cast<std::size_t>(width);
+    return rows >= 1 && rows <= 16 && weight.ndim() == 2
         && weight.dtype() == input.dtype()
         && (weight.shape(0) == 256 || weight.shape(0) == 384)
-        && weight.shape(1) == input.shape(-1);
+        && weight.shape(1) == width;
 }
 
 MlxMoeTopKResult dense_router_topk_impl(
@@ -923,7 +1056,7 @@ MlxMoeTopKResult dense_router_topk_impl(
     float scale) {
     if (!moe_dense_router_topk_supported(input, weight)) {
         throw std::invalid_argument(
-            "fused dense router requires one FP16/BF16 row and a "
+            "fused dense router requires 1..16 FP16/BF16 rows and a "
             "matching contiguous [256|384,K] weight with K divisible by four");
     }
     if (!std::isfinite(norm_floor) || norm_floor < 0.0f ||
@@ -931,12 +1064,18 @@ MlxMoeTopKResult dense_router_topk_impl(
         throw std::invalid_argument(
             "fused dense router parameters are invalid");
     }
+    const int width = input.shape(-1);
+    const int rows = checked_int(
+        input.size() / static_cast<std::size_t>(width),
+        "fused router row count");
     auto source = mlx::core::contiguous(
-        mlx::core::reshape(
-            input,
-            Shape{1, input.shape(-1)}));
+        mlx::core::reshape(input, Shape{rows, width}));
     auto weights = mlx::core::contiguous(weight);
     const int experts = weight.shape(0);
+    if (expert_map != nullptr && experts > 256) {
+        throw std::invalid_argument(
+            "packed fused router supports at most 256 global experts");
+    }
     array bias_values =
         mlx::core::zeros(Shape{experts}, mlx::core::float32);
     if (bias.has_value()) {
@@ -985,8 +1124,8 @@ MlxMoeTopKResult dense_router_topk_impl(
         params,
     };
     std::vector<Shape> output_shapes{
-        Shape{1, 6},
-        Shape{1, 6},
+        Shape{rows, 6},
+        Shape{rows, 6},
     };
     std::vector<mlx::core::Dtype> output_dtypes{
         mlx::core::int32,
@@ -1001,10 +1140,10 @@ MlxMoeTopKResult dense_router_topk_impl(
         std::move(kernel_inputs),
         std::move(output_shapes),
         std::move(output_dtypes),
-        {1024, 1, 1},
+        {rows * 1024, 1, 1},
         {1024, 1, 1},
         {
-            {"K", input.shape(-1)},
+            {"K", width},
             {"N_EXPERTS", experts},
             {"HAS_BIAS", static_cast<int>(bias.has_value())},
             {
@@ -1052,6 +1191,143 @@ MlxMoeTopKResult moe_dense_router_topk_packed(
         &expert_map,
         bias,
         available,
+        norm_floor,
+        scale);
+}
+
+bool moe_dense_hash_router_supported(
+    const array& input,
+    const array& weight,
+    const array& token_ids,
+    const array& token_experts) noexcept {
+    const bool activation16 =
+        input.dtype() == mlx::core::float16 ||
+        input.dtype() == mlx::core::bfloat16;
+    if (input.ndim() < 2 || !activation16 || input.shape(-1) <= 0 ||
+        (input.shape(-1) % 4) != 0 || weight.ndim() != 2 ||
+        weight.dtype() != input.dtype() ||
+        weight.shape(1) != input.shape(-1) ||
+        token_experts.ndim() != 2 || token_experts.shape(0) <= 0 ||
+        token_experts.shape(1) <= 0 ||
+        token_experts.shape(1) > kMaximumRoutes ||
+        token_experts.dtype() != mlx::core::int32 ||
+        token_ids.size() == 0 ||
+        (token_ids.dtype() != mlx::core::int32 &&
+         token_ids.dtype() != mlx::core::uint32)) {
+        return false;
+    }
+    const auto width = static_cast<std::size_t>(input.shape(-1));
+    const auto rows = input.size() / width;
+    return rows * width == input.size() && token_ids.size() == rows &&
+        weight.shape(0) > 0 && weight.shape(0) <= kMaximumExperts;
+}
+
+MlxMoeTopKResult dense_hash_router_impl(
+    const array& input,
+    const array& weight,
+    const array& token_ids,
+    const array& token_experts,
+    const array* expert_map,
+    float norm_floor,
+    float scale) {
+    if (!moe_dense_hash_router_supported(
+            input, weight, token_ids, token_experts)) {
+        throw std::invalid_argument(
+            "fused dense hash router shapes or dtypes are incompatible");
+    }
+    if (!std::isfinite(norm_floor) || norm_floor < 0.0f ||
+        !std::isfinite(scale)) {
+        throw std::invalid_argument(
+            "fused dense hash router parameters are invalid");
+    }
+    const int width = input.shape(-1);
+    const int rows = checked_int(
+        input.size() / static_cast<std::size_t>(width),
+        "fused hash router row count");
+    const int experts = weight.shape(0);
+    const int routes = token_experts.shape(1);
+    const int vocab = token_experts.shape(0);
+    if (expert_map != nullptr && experts > 256) {
+        throw std::invalid_argument(
+            "packed fused hash router supports at most 256 global experts");
+    }
+    auto source = mlx::core::contiguous(
+        mlx::core::reshape(input, Shape{rows, width}));
+    auto weights = mlx::core::contiguous(weight);
+    auto ids = int32_contiguous(token_ids);
+    ids = mlx::core::reshape(ids, Shape{rows});
+    auto table = int32_contiguous(token_experts);
+    const array params({norm_floor, scale}, mlx::core::float32);
+    std::vector<array> kernel_inputs{
+        source,
+        weights,
+        ids,
+        table,
+        params,
+    };
+    if (expert_map != nullptr) {
+        if (expert_map->dtype() != mlx::core::int32 ||
+            expert_map->shape() != Shape{experts} ||
+            !expert_map->flags().row_contiguous) {
+            throw std::invalid_argument(
+                "fused dense hash router expert map shape/dtype mismatch");
+        }
+        kernel_inputs.push_back(*expert_map);
+    }
+    auto outputs = dense_hash_router_kernel(
+        source.dtype(), expert_map != nullptr)(
+        std::move(kernel_inputs),
+        {Shape{rows, routes}, Shape{rows, routes}},
+        {mlx::core::int32, mlx::core::float32},
+        {rows * kThreads, 1, 1},
+        {kThreads, 1, 1},
+        {
+            {"K", width},
+            {"N_EXPERTS", experts},
+            {"VOCAB", vocab},
+            {"TOP_K", routes},
+            {"NORMALIZE", 1},
+        },
+        std::nullopt,
+        false,
+        {});
+    return {
+        std::move(outputs.at(0)),
+        std::move(outputs.at(1)),
+    };
+}
+
+MlxMoeTopKResult moe_dense_hash_router(
+    const array& input,
+    const array& weight,
+    const array& token_ids,
+    const array& token_experts,
+    float norm_floor,
+    float scale) {
+    return dense_hash_router_impl(
+        input,
+        weight,
+        token_ids,
+        token_experts,
+        nullptr,
+        norm_floor,
+        scale);
+}
+
+MlxMoeTopKResult moe_dense_hash_router_packed(
+    const array& input,
+    const array& weight,
+    const array& token_ids,
+    const array& token_experts,
+    const array& expert_map,
+    float norm_floor,
+    float scale) {
+    return dense_hash_router_impl(
+        input,
+        weight,
+        token_ids,
+        token_experts,
+        &expert_map,
         norm_floor,
         scale);
 }

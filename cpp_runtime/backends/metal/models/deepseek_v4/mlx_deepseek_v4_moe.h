@@ -114,8 +114,10 @@ public:
     }
 
     bool uses_grouped_shared_projection() const noexcept {
-        return grouped_projections_.has_value()
-            || grouped_shared_gate_up_.has_value();
+        return (projection_batch_.has_value() &&
+                projection_batch_->grouped_projection_count() > 0) ||
+            (shared_gate_up_batch_.has_value() &&
+             shared_gate_up_batch_->grouped_projection_count() > 0);
     }
     bool uses_streamed_experts() const noexcept {
         return static_cast<bool>(expert_offload_)
@@ -172,9 +174,8 @@ private:
     std::string streamed_up_name_;
     std::string streamed_down_name_;
     bool legacy_tpq_stream_ = false;
-    std::optional<MlxGroupedLinear> grouped_projections_;
-    std::optional<MlxGroupedLinear>
-        grouped_shared_gate_up_;
+    std::optional<MlxProjectionBatch> projection_batch_;
+    std::optional<MlxProjectionBatch> shared_gate_up_batch_;
     bool fused_shared_swiglu_ = true;
     bool fused_dense_router_ = true;
     std::optional<mlx::core::array> router_bias_;

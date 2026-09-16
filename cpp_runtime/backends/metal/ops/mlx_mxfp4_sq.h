@@ -86,6 +86,14 @@ public:
     mlx::core::array backward_input(
         const mlx::core::array& output_gradient) const;
 
+    // Projection-fused Q/K/V and gate/up execution.  Every member retains its
+    // own self-describing q=1..4 stream; the common Metal dispatch only shares
+    // the activation read and launch, so no profile-specific tensor format is
+    // introduced by grouping.
+    static std::vector<mlx::core::array> projection_group_matmul(
+        std::span<const MlxMxfp4SqWeight> weights,
+        const mlx::core::array& input);
+
     int bits() const noexcept {
         return layout_.bits;
     }

@@ -247,17 +247,33 @@ MlxQwen35LinearAttentionBlock::MlxQwen35LinearAttentionBlock(
 
     const auto* alpha_weight = alpha_->dense_weight_ref();
     const auto* beta_weight = beta_->dense_weight_ref();
-    if (alpha_weight != nullptr &&
-        beta_weight != nullptr &&
+    if (alpha_weight != nullptr && beta_weight != nullptr &&
         alpha_weight->dtype() == beta_weight->dtype()) {
-        alpha_beta_.emplace(
-            mlx::core::contiguous(
-                mlx::core::concatenate(
-                    {*alpha_weight, *beta_weight},
-                    0)));
+        alpha_beta_.emplace(mlx::core::contiguous(
+            mlx::core::concatenate(
+                {*alpha_weight, *beta_weight}, 0)));
         alpha_.reset();
         beta_.reset();
     }
+
+    std::vector<const MlxLinear*> projections;
+    if (split_input_) {
+        projections.push_back(&*split_qk_);
+        projections.push_back(&*split_value_);
+    } else {
+        projections.push_back(&*combined_qkv_);
+    }
+    projections.push_back(&z_);
+    const std::size_t alpha_offset = projections.size();
+    if (alpha_beta_) {
+        projections.push_back(&*alpha_beta_);
+    } else {
+        projections.push_back(&*alpha_);
+        projections.push_back(&*beta_);
+    }
+    input_projections_.emplace(std::move(projections));
+    alpha_beta_grouped_ = alpha_beta_.has_value() ||
+        input_projections_->projections_share_group(alpha_offset, 2);
 }
 
 void MlxQwen35LinearAttentionBlock::
@@ -552,54 +568,50 @@ array MlxQwen35LinearAttentionBlock::forward(
     const auto activation_dtype = input.dtype();
 
     const auto normalized = attention_norm_(input);
+    auto input_projections = (*input_projections_)(normalized);
+    std::size_t projection_offset = 0;
     array qk = normalized;
     array value_input = normalized;
-    array z = normalized;
     if (split_input_) {
-        qk = (*split_qk_)(normalized);
-        value_input = (*split_value_)(normalized);
-        z = z_(normalized);
+        qk = std::move(input_projections.at(projection_offset++));
+        value_input = std::move(
+            input_projections.at(projection_offset++));
     } else {
-        const auto projected = (*combined_qkv_)(normalized);
+        auto projected = std::move(
+            input_projections.at(projection_offset++));
         auto pieces = mlx::core::split(
             projected,
             Shape{2 * key_size},
             -1);
         qk = std::move(pieces.at(0));
         value_input = std::move(pieces.at(1));
-        z = z_(normalized);
     }
-
+    auto z = std::move(input_projections.at(projection_offset++));
     array alpha = normalized;
     array beta = normalized;
     if (alpha_beta_) {
-        auto projected = (*alpha_beta_)(normalized);
         auto pieces = mlx::core::split(
-            projected,
+            std::move(input_projections.at(projection_offset++)),
             Shape{value_heads},
             -1);
         alpha = mlx::core::reshape(
             mlx::core::astype(
-                pieces.at(0),
-                mlx::core::float32),
+                std::move(pieces.at(0)), mlx::core::float32),
             Shape{batch, tokens, value_heads});
         beta = mlx::core::reshape(
-            mlx::core::sigmoid(
-                mlx::core::astype(
-                    pieces.at(1),
-                    mlx::core::float32)),
+            mlx::core::sigmoid(mlx::core::astype(
+                std::move(pieces.at(1)), mlx::core::float32)),
             Shape{batch, tokens, value_heads});
     } else {
         alpha = mlx::core::reshape(
             mlx::core::astype(
-                (*alpha_)(normalized),
+                std::move(input_projections.at(projection_offset++)),
                 mlx::core::float32),
             Shape{batch, tokens, value_heads});
         beta = mlx::core::reshape(
-            mlx::core::sigmoid(
-                mlx::core::astype(
-                    (*beta_)(normalized),
-                    mlx::core::float32)),
+            mlx::core::sigmoid(mlx::core::astype(
+                std::move(input_projections.at(projection_offset++)),
+                mlx::core::float32)),
             Shape{batch, tokens, value_heads});
     }
     if (detail::component_profile_active()) {

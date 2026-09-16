@@ -9,6 +9,7 @@ import numpy as np
 import pytest
 from gguf import GGUFReader
 
+from mfq.architectures.hf_config import load_hf_model_config
 from mfq.formats.assets import (
     HF_GENERATION_CONFIG_ASSET,
     HF_SOURCE_MAP_ASSET,
@@ -120,6 +121,42 @@ def test_catalog_discovers_native_hf_checkpoint(tmp_path: Path) -> None:
     assert artifacts.data[0].dtypes == ["BF16"]
     assert artifacts.data[0].complete
     assert artifacts.data[0].loadable
+
+
+def test_hf_inference_config_only_fills_missing_text_fields(
+    tmp_path: Path,
+) -> None:
+    model = tmp_path / "DeepSeek-Vision"
+    _hf_fixture(model, model_type="deepseek_v4", tensor_name="embed.weight")
+    (model / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "deepseek_v4",
+                "hidden_size": 4096,
+                "num_nextn_predict_layers": 3,
+            }
+        ),
+        encoding="utf-8",
+    )
+    (model / "inference").mkdir()
+    (model / "inference" / "config.json").write_text(
+        json.dumps(
+            {
+                "hidden_size": 1,
+                "n_mtp_layers": 3,
+                "dspark_block_size": 5,
+                "dspark_target_layer_ids": [40, 41, 42],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    config = load_hf_model_config(model)
+
+    assert config["hidden_size"] == 4096
+    assert config["n_mtp_layers"] == 3
+    assert config["dspark_block_size"] == 5
+    assert config["dspark_target_layer_ids"] == [40, 41, 42]
 
 
 def test_catalog_tracks_native_hf_routed_expert_bytes(tmp_path: Path) -> None:

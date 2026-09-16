@@ -35,38 +35,6 @@ MlxMoeWeight moe_weight(
     return MlxMoeWeight::from_blob(mapped.view());
 }
 
-std::optional<MlxGroupedLinear> make_grouped(
-    const MlxLinear& router,
-    const MlxLinear& gate,
-    const MlxLinear& up) {
-    const auto router_ref = router.grouped_weight_ref();
-    const auto gate_ref = gate.grouped_weight_ref();
-    const auto up_ref = up.grouped_weight_ref();
-    if (!router_ref || !gate_ref || !up_ref) {
-        return std::nullopt;
-    }
-    try {
-        return MlxGroupedLinear({*router_ref, *gate_ref, *up_ref});
-    } catch (const MlxGroupedLinearUnsupported&) {
-        return std::nullopt;
-    }
-}
-
-std::optional<MlxGroupedLinear> make_grouped_gate_up(
-    const MlxLinear& gate,
-    const MlxLinear& up) {
-    const auto gate_ref = gate.grouped_weight_ref();
-    const auto up_ref = up.grouped_weight_ref();
-    if (!gate_ref || !up_ref) {
-        return std::nullopt;
-    }
-    try {
-        return MlxGroupedLinear({*gate_ref, *up_ref});
-    } catch (const MlxGroupedLinearUnsupported&) {
-        return std::nullopt;
-    }
-}
-
 array limited_swiglu(
     const array& gate,
     const array& up,
@@ -99,8 +67,15 @@ MlxDeepseekV41Moe MlxDeepseekV41Moe::load(
         predictor ? config.dspark_top_k : config.top_k,
         "route count");
     const auto expert_prefix = prefix + ".experts.";
-    const bool split_gate_up = model.contains(
+    const bool has_gate = model.contains(
         expert_prefix + "gate.weight");
+    const bool has_up = model.contains(
+        expert_prefix + "up.weight");
+    if (has_gate != has_up) {
+        throw std::runtime_error(
+            "DeepSeek-V4.1 split Gate/Up residency is incomplete");
+    }
+    const bool split_gate_up = has_gate;
     const auto gate_up_name = split_gate_up
         ? expert_prefix + "gate.weight"
         : expert_prefix + "gate_up.weight";
@@ -114,10 +89,17 @@ MlxDeepseekV41Moe MlxDeepseekV41Moe::load(
          || !mfe_offload_cache->can_group_mfe(down_name))) {
         mfe_offload_cache.reset();
     }
-    std::optional<MlxRoutedLinear> gate_up;
+    std::optional<MlxMoeWeight> gate_up;
+    std::optional<MlxRoutedLinear> gate;
+    std::optional<MlxRoutedLinear> up;
     std::optional<MlxRoutedLinear> down;
     if (!ssd_expert_cache && !mfe_offload_cache) {
-        gate_up.emplace(load_routed_gate_up_weight(model, prefix));
+        if (split_gate_up) {
+            gate.emplace(moe_weight(model, gate_up_name));
+            up.emplace(moe_weight(model, *up_name));
+        } else {
+            gate_up.emplace(moe_weight(model, gate_up_name));
+        }
         down.emplace(moe_weight(model, down_name));
     }
     return MlxDeepseekV41Moe(
@@ -141,6 +123,8 @@ MlxDeepseekV41Moe MlxDeepseekV41Moe::load(
         MlxLinear::load(model, prefix + ".shared_expert.up.weight"),
         MlxLinear::load(model, prefix + ".shared_expert.down.weight"),
         std::move(gate_up),
+        std::move(gate),
+        std::move(up),
         std::move(down),
         std::move(ssd_expert_cache),
         std::move(mfe_offload_cache),
@@ -164,7 +148,9 @@ MlxDeepseekV41Moe::MlxDeepseekV41Moe(
     MlxLinear shared_gate,
     MlxLinear shared_up,
     MlxLinear shared_down,
-    std::optional<MlxRoutedLinear> routed_gate_up,
+    std::optional<MlxMoeWeight> routed_gate_up,
+    std::optional<MlxRoutedLinear> routed_gate,
+    std::optional<MlxRoutedLinear> routed_up,
     std::optional<MlxRoutedLinear> routed_down,
     std::shared_ptr<MlxMoeSsdExpertCache> ssd_expert_cache,
     std::shared_ptr<MlxMfeOffloadCache> mfe_offload_cache,
@@ -187,6 +173,8 @@ MlxDeepseekV41Moe::MlxDeepseekV41Moe(
       shared_up_(std::move(shared_up)),
       shared_down_(std::move(shared_down)),
       routed_gate_up_(std::move(routed_gate_up)),
+      routed_gate_(std::move(routed_gate)),
+      routed_up_(std::move(routed_up)),
       routed_down_(std::move(routed_down)),
       ssd_expert_cache_(std::move(ssd_expert_cache)),
       mfe_offload_cache_(std::move(mfe_offload_cache)),
@@ -196,6 +184,25 @@ MlxDeepseekV41Moe::MlxDeepseekV41Moe(
       expert_cache_layer_(expert_cache_layer) {
     const bool cached = static_cast<bool>(ssd_expert_cache_)
         || static_cast<bool>(mfe_offload_cache_);
+    const bool split_resident = routed_gate_.has_value()
+        && routed_up_.has_value();
+    const bool combined_resident = routed_gate_up_.has_value();
+    const bool routed_geometry = combined_resident
+        ? routed_gate_up_->experts() == experts_
+            && routed_gate_up_->neuron_len() == hidden_
+            && ((routed_gate_up_->projections() == 2
+                 && routed_gate_up_->out_per_expert() == intermediate_)
+                || (routed_gate_up_->projections() == 1
+                    && routed_gate_up_->out_per_expert()
+                        == 2 * intermediate_))
+        : split_resident
+            ? routed_gate_->weight().experts() == experts_
+                && routed_gate_->weight().neuron_len() == hidden_
+                && routed_gate_->weight().out_per_expert() == intermediate_
+                && routed_up_->weight().experts() == experts_
+                && routed_up_->weight().neuron_len() == hidden_
+                && routed_up_->weight().out_per_expert() == intermediate_
+            : true;
     if (top_k_ > experts_ || router_.input_size() != hidden_ ||
         router_.output_size() != experts_ ||
         shared_gate_.input_size() != hidden_ ||
@@ -204,18 +211,14 @@ MlxDeepseekV41Moe::MlxDeepseekV41Moe(
         shared_up_.output_size() != intermediate_ ||
         shared_down_.input_size() != intermediate_ ||
         shared_down_.output_size() != hidden_ ||
-        routed_gate_up_.has_value() != routed_down_.has_value() ||
-        routed_gate_up_.has_value() == cached ||
+        routed_gate_.has_value() != routed_up_.has_value() ||
+        (combined_resident && split_resident) ||
+        routed_down_.has_value() !=
+            (combined_resident || split_resident) ||
+        (combined_resident || split_resident) == cached ||
         (ssd_expert_cache_ && mfe_offload_cache_) ||
-        (routed_gate_up_ && (
-        routed_gate_up_->weight().experts() != experts_ ||
-        routed_gate_up_->weight().neuron_len() != hidden_ ||
-        !(
-            (routed_gate_up_->weight().projections() == 2 &&
-             routed_gate_up_->weight().out_per_expert() == intermediate_) ||
-            (routed_gate_up_->weight().projections() == 1 &&
-             routed_gate_up_->weight().out_per_expert() == 2 * intermediate_)
-        ) ||
+        !routed_geometry ||
+        (routed_down_ && (
         routed_down_->weight().experts() != experts_ ||
         routed_down_->weight().neuron_len() != intermediate_ ||
         routed_down_->weight().out_per_expert() != hidden_))) {
@@ -252,19 +255,26 @@ MlxDeepseekV41Moe::MlxDeepseekV41Moe(
         *vision_bias_ = mlx::core::reshape(
             mlx::core::astype(*vision_bias_, mlx::core::float32), Shape{experts_});
     }
-    grouped_projections_ = make_grouped(
-        router_, shared_gate_, shared_up_);
-    grouped_shared_gate_up_ = make_grouped_gate_up(
-        shared_gate_, shared_up_);
+    projection_batch_.emplace(
+        std::vector<const MlxLinear*>{
+            &router_, &shared_gate_, &shared_up_,
+        });
+    shared_gate_up_batch_.emplace(
+        std::vector<const MlxLinear*>{
+            &shared_gate_, &shared_up_,
+        });
 }
 
 int MlxDeepseekV41Moe::recommended_prefill_chunk_size() const noexcept {
     if (ssd_expert_cache_ || mfe_offload_cache_ ||
-        !routed_gate_up_ || !routed_down_) {
+        (!routed_gate_up_ && !routed_gate_) || !routed_down_) {
         return 0;
     }
-    const int gate_up =
-        routed_gate_up_->recommended_mxfp4_nax_prefill_tokens(top_k_);
+    const int gate_up = routed_gate_up_
+        ? routed_gate_up_->recommended_mxfp4_nax_prefill_tokens(top_k_)
+        : std::min(
+              routed_gate_->recommended_mxfp4_nax_prefill_tokens(top_k_),
+              routed_up_->recommended_mxfp4_nax_prefill_tokens(top_k_));
     const int down =
         routed_down_->recommended_mxfp4_nax_prefill_tokens(top_k_);
     return gate_up > 0 && down > 0 ? std::min(gate_up, down) : 0;
@@ -286,27 +296,20 @@ MlxDeepseekV41MoeResult MlxDeepseekV41Moe::forward(
 
     std::optional<array> logits;
     array shared_hidden(0.0f);
-    if (grouped_shared_gate_up_ &&
-        (grouped_shared_gate_up_->supports_single_row_swiglu(source) ||
-         grouped_shared_gate_up_->supports_small_m_swiglu(source))) {
-        shared_hidden =
-            grouped_shared_gate_up_->supports_single_row_swiglu(source)
-            ? grouped_shared_gate_up_->single_row_swiglu(
-                  source, swiglu_limit_)
-            : grouped_shared_gate_up_->small_m_swiglu(
-                  source, swiglu_limit_);
+    if (shared_gate_up_batch_ &&
+        shared_gate_up_batch_->supports_fused_swiglu(source)) {
+        shared_hidden = shared_gate_up_batch_->swiglu(
+            source, swiglu_limit_);
         if (!fused_router) {
             logits = router_(source);
         }
-    } else if (!fused_router && grouped_projections_ &&
-               grouped_projections_->supports(source)) {
-        auto projections = grouped_projections_->matmul(source);
+    } else if (!fused_router && projection_batch_) {
+        auto projections = (*projection_batch_)(source);
         logits = std::move(projections.at(0));
         shared_hidden = limited_swiglu(
             projections.at(1), projections.at(2), swiglu_limit_);
-    } else if (grouped_shared_gate_up_ &&
-               grouped_shared_gate_up_->supports(source)) {
-        auto projections = grouped_shared_gate_up_->matmul(source);
+    } else if (shared_gate_up_batch_) {
+        auto projections = (*shared_gate_up_batch_)(source);
         shared_hidden = limited_swiglu(
             projections.at(0), projections.at(1), swiglu_limit_);
         if (!fused_router) {
@@ -364,14 +367,16 @@ MlxDeepseekV41MoeResult MlxDeepseekV41Moe::forward(
         routes.weights = mlx::core::where(mask, visual.weights, routes.weights);
     }
 
-    array routed_pairs(0.0f);
+    array routed(0.0f);
     if (ssd_expert_cache_) {
         auto prepared = ssd_expert_cache_->prepare_routes(
             expert_cache_layer_, routes.ids);
         auto routed_hidden = prepared.weights().gate_up.swiglu(
             source, prepared.expert_ids(), swiglu_limit_);
-        routed_pairs = prepared.weights().down(
-            routed_hidden, prepared.expert_ids());
+        routed = prepared.weights().down.combine(
+            routed_hidden,
+            prepared.expert_ids(),
+            routes.weights);
     } else if (mfe_offload_cache_) {
         auto global_ids = mlx::core::contiguous(
             mlx::core::astype(routes.ids, mlx::core::int32));
@@ -410,26 +415,38 @@ MlxDeepseekV41MoeResult MlxDeepseekV41Moe::forward(
                 global_to_local.begin(),
                 Shape{static_cast<int>(global_to_local.size())}),
             global_ids + array(1, mlx::core::int32));
-        auto gate_up = mfe_offload_cache_->grouped_mfe(
+        auto gate = mfe_offload_cache_->grouped_mfe(
             streamed_gate_up_name_, active);
-        if (streamed_up_name_) {
-            gate_up = MlxMfeWeight::concatenate_projections({
-                std::move(gate_up),
-                mfe_offload_cache_->grouped_mfe(
-                    *streamed_up_name_, active),
-            });
-        }
-        auto routed_hidden = gate_up.routed_swiglu(
-            source, local_ids, swiglu_limit_);
+        array routed_hidden = [&]() {
+            if (streamed_up_name_) {
+                auto up = mfe_offload_cache_->grouped_mfe(
+                    *streamed_up_name_, active);
+                return gate.routed_swiglu_pair(
+                    up, source, local_ids, swiglu_limit_);
+            }
+            return gate.routed_swiglu(
+                source, local_ids, swiglu_limit_);
+        }();
         auto down = mfe_offload_cache_->grouped_mfe(
             streamed_down_name_, active);
-        routed_pairs = down.routed_matmul(routed_hidden, local_ids);
+        routed = down.routed_matmul_reduce(
+            routed_hidden,
+            local_ids,
+            routes.weights);
     } else {
-        auto routed_hidden = routed_gate_up_->swiglu(
-            source, routes.ids, swiglu_limit_);
-        routed_pairs = (*routed_down_)(routed_hidden, routes.ids);
+        auto routed_hidden = routed_gate_up_
+            ? routed_gate_up_->routed_swiglu(
+                  source, routes.ids, swiglu_limit_)
+            : routed_gate_->swiglu_pair(
+                  *routed_up_,
+                  source,
+                  routes.ids,
+                  swiglu_limit_);
+        routed = routed_down_->combine(
+            routed_hidden,
+            routes.ids,
+            routes.weights);
     }
-    auto routed = moe_weighted_reduce(routed_pairs, routes.weights);
     auto shared = shared_down_(shared_hidden);
     return {
         mlx::core::reshape(std::move(routed), input.shape()),

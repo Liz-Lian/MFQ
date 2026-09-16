@@ -549,6 +549,57 @@ MoeFixture make_mixed_moe(
     };
 }
 
+MoeFixture make_streamable_nint_moe(
+    int output,
+    int input,
+    int salt) {
+    const std::array<int, kExperts> bits{2, 3, 5, 6};
+    std::vector<TensorFixture> tensors;
+    tensors.reserve(kExperts);
+    for (int expert = 0; expert < kExperts; ++expert) {
+        tensors.push_back(make_nint(
+            bits[static_cast<std::size_t>(expert)],
+            output,
+            input,
+            salt + expert * 7));
+    }
+
+    std::vector<std::uint8_t> blob{'N', 'I', 'M', '2'};
+    append<std::uint32_t>(blob, kExperts);
+    append<std::uint32_t>(blob, output);
+    append<std::uint32_t>(blob, input);
+    append<std::uint32_t>(blob, kExperts);
+    std::vector<float> dense(
+        static_cast<std::size_t>(kExperts) * output * input);
+    std::vector<RotationFixture> rotations(kExperts);
+    for (int expert = kExperts - 1; expert >= 0; --expert) {
+        const auto& tensor = tensors[static_cast<std::size_t>(expert)];
+        append<std::uint32_t>(blob, 1);
+        append<std::uint32_t>(
+            blob,
+            static_cast<std::uint32_t>(tensor.dtype.size()));
+        append<std::uint64_t>(blob, tensor.blob.size());
+        append<std::uint64_t>(blob, tensor.runtime.size());
+        append<std::int32_t>(blob, expert);
+        blob.insert(blob.end(), tensor.dtype.begin(), tensor.dtype.end());
+        append_bytes(blob, tensor.runtime);
+        append_bytes(blob, tensor.blob);
+        std::copy(
+            tensor.dense.begin(),
+            tensor.dense.end(),
+            dense.begin() + static_cast<std::ptrdiff_t>(
+                static_cast<std::size_t>(expert) * output * input));
+        rotations[static_cast<std::size_t>(expert)] = tensor.rotation;
+    }
+    return {
+        std::move(blob),
+        std::move(dense),
+        std::move(rotations),
+        output,
+        input,
+    };
+}
+
 MoeFixture make_tpq_moe(
     int output,
     int input,
@@ -1949,6 +2000,70 @@ void test_split_gate_up_eager_load_and_forward() {
     run(34, 29);
 }
 
+void test_split_gate_up_mfe_offload_load_and_forward() {
+    auto model_reference = make_model_fixture();
+    auto gate = make_streamable_nint_moe(
+        kIntermediate, kHidden, 47);
+    auto up = make_streamable_nint_moe(
+        kIntermediate, kHidden, 53);
+    model_reference.routed_gate_up = concatenate_gate_up_reference(gate, up);
+    model_reference.routed_down = make_streamable_nint_moe(
+        kHidden, kIntermediate, 59);
+    const SplitModelFixture fixture{
+        std::move(model_reference),
+        std::move(gate),
+        std::move(up),
+    };
+    const TemporaryDeepseekMfq file(
+        split_model_records(
+            fixture,
+            kTokenExperts,
+            true),
+        "deepseek_v4-ew-mfq");
+    const mfq::metal::MfqContainer model(file.path());
+    auto residency = std::make_shared<
+        mfq::metal::MlxMfeOffloadCache>(
+            model,
+            0,
+            kExperts);
+    const auto config = test_config(true);
+    auto moe = MlxDeepseekV4Moe::load(
+        model,
+        config,
+        0,
+        availability_array(kAvailable),
+        residency);
+    require(
+        moe.uses_streamed_experts(),
+        "split MFE Gate/Up did not select streamed residency");
+
+    const auto run = [&](int rows, int salt) {
+        const auto input = input_values(rows, salt);
+        std::vector<std::int32_t> tokens(
+            static_cast<std::size_t>(rows));
+        for (int row = 0; row < rows; ++row) {
+            tokens[static_cast<std::size_t>(row)] = row % kVocab;
+        }
+        const auto expected = reference(
+            fixture.reference,
+            config,
+            input,
+            rows,
+            tokens,
+            std::nullopt,
+            kTokenExperts,
+            kAvailable);
+        compare(
+            moe.forward_with_routing(
+                array(input.begin(), Shape{rows, kHidden}),
+                array(tokens.begin(), Shape{rows})),
+            expected,
+            3e-2f);
+    };
+    run(1, 30);
+    run(5, 32);
+}
+
 void test_split_gate_up_streamed_load_and_forward() {
     const auto fixture = make_split_model_fixture(true);
     const TemporaryDeepseekMfq file(
@@ -2426,6 +2541,7 @@ int main() {
         test_hash_repair_and_mixed_formats(fixture);
         test_visual_tokens_use_visual_router_bias(fixture);
         test_split_gate_up_eager_load_and_forward();
+        test_split_gate_up_mfe_offload_load_and_forward();
         test_split_gate_up_streamed_load_and_forward();
         test_split_gate_up_requires_pair();
         test_streamed_tpq_load_and_forward();

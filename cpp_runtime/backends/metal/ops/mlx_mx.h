@@ -47,6 +47,13 @@ public:
         int output_size);
 
     mlx::core::array matmul(const mlx::core::array& input) const;
+    // Zero-copy projection group for native row/block-32 MXFP8 weights.
+    // This is the storage used by QAT Attention projections: all members keep
+    // their own packed payload and expanded E8M0 sidecar, but share one Metal
+    // submission over the common activation.
+    static std::vector<mlx::core::array> projection_group_matmul(
+        std::span<const MlxMxWeight> weights,
+        const mlx::core::array& input);
     mlx::core::array dequantize(
         mlx::core::Dtype dtype = mlx::core::float16) const;
     mlx::core::array embedding(

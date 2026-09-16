@@ -171,8 +171,213 @@ def test_qwen4_uses_the_shared_ssd_expert_cache() -> None:
     qwen4_server = DECODE_APP[DECODE_APP.index('backbone == "qwen4_exp"') :]
     assert "requested_cache_bytes(" in qwen4_server
     assert "container, context, expert_cache_bytes" in qwen4_server
-    assert "runtime.prewarm_ssd_expert_arena();" in qwen4_server
     assert "Qwen4ExpertCache" not in model_sources()
+
+
+def test_qwen4_small_m_down_reduce_is_format_neutral() -> None:
+    moe = QWEN4[QWEN4.index("class Qwen4Moe") :]
+    assert moe.count("const bool combine_routes = tokens <= 6;") == 2
+    assert moe.count("routed_matmul_reduce(") >= 2
+    assert "supports_mxfp4_blocks" not in moe
+
+
+def test_qwen4_qsa_caches_completed_index_blocks_incrementally() -> None:
+    assert "MlxSequenceCache pooled_index_cache_;" in QWEN4
+    assert "const int cached = pooled_index_cache_.position();" in QWEN4
+    assert "pooled_index_cache_.append(pool_index_keys(" in QWEN4
+    assert "return pooled_index_cache_.view();" in QWEN4
+    assert "trim_pooled_index_cache();" in QWEN4
+
+
+def test_native_server_prewarms_shared_ssd_arenas_on_load_and_reload() -> None:
+    serving = DECODE_APP[
+        DECODE_APP.index("int serve_loaded_runtime(") :
+        DECODE_APP.index("int run_native_server(")
+    ]
+    assert "runtime.prewarm_ssd_expert_arena();" in serving
+    # Three capability checks and their matching calls cover initial load,
+    # successful context reload, and restoration after a failed reload.
+    assert serving.count(".prewarm_ssd_expert_arena();") == 6
+
+
+def test_dspark_moe_is_explicitly_text_only() -> None:
+    dspark = (
+        ROOT
+        / "cpp_runtime/backends/metal/models/deepseek_v4/"
+        "mlx_deepseek_v4_dspark.cpp"
+    ).read_text()
+    block = dspark[dspark.index("auto branches = stage.components.moe.forward_branches(") :]
+    block = block[: block.index("return deepseek_v4_hc_post_sum(")]
+    assert "token_ids,\n            nullptr,\n            false);" in block
+
+
+def test_deepseek_v41_moe_uses_fused_down_reduce_for_every_backing() -> None:
+    source = (
+        ROOT
+        / "cpp_runtime/backends/metal/models/deepseek_v41/"
+        "mlx_deepseek_v41_moe.cpp"
+    ).read_text()
+    forward = source[source.index("MlxDeepseekV41Moe::forward(") :]
+    assert "prepared.weights().down.combine(" in forward
+    assert "down.routed_matmul_reduce(" in forward
+    assert "routed_down_->combine(" in forward
+    assert "moe_weighted_reduce(routed_pairs" not in forward
+
+
+def test_deepseek_v41_resident_split_gate_up_keeps_two_projection_weight() -> None:
+    header = (
+        ROOT
+        / "cpp_runtime/backends/metal/models/deepseek_v41/"
+        "mlx_deepseek_v41_moe.h"
+    ).read_text()
+    source = DSV41_MOE
+    assert "std::optional<MlxMoeWeight> routed_gate_up" in header
+    assert "std::optional<MlxMoeWeight> gate_up;" in source
+    assert "routed_gate_up_->routed_swiglu(" in source
+    assert "std::optional<MlxRoutedLinear> routed_gate_up" not in header
+
+
+def test_dspark_reuses_model_neutral_inverse_rope_output_projection() -> None:
+    tensor_header = (
+        METAL / "runtime" / "mlx_tensor.h"
+    ).read_text(encoding="utf-8")
+    tensor_source = (
+        METAL / "runtime" / "mlx_tensor.cpp"
+    ).read_text(encoding="utf-8")
+    assert "MlxLinear::grouped_row_matmul_inverse_rope(" in tensor_source
+    assert "grouped_row_matmul_inverse_rope(" in tensor_header
+    for source in (DSV_DSPARK, DSV41_DSPARK):
+        assert ".grouped_row_matmul_inverse_rope(" in source
+
+
+def test_dspark_reads_circular_context_in_chronological_order() -> None:
+    transformer_header = (
+        METAL / "runtime" / "mlx_transformer.h"
+    ).read_text(encoding="utf-8")
+    transformer_source = (
+        METAL / "runtime" / "mlx_transformer.cpp"
+    ).read_text(encoding="utf-8")
+    assert "mlx_circular_cache_history(" in transformer_header
+    assert "array mlx_circular_cache_history(" in transformer_source
+    for source in (DSV_DSPARK, DSV41_DSPARK):
+        assert "mlx_circular_cache_history(ring, position)" in source
+        assert "slice_axis(ring, 1, 0, active)" not in source
+
+
+def test_deepseek_attention_input_projection_grouping_is_runtime_owned() -> None:
+    tensor_header = (
+        METAL / "runtime" / "mlx_tensor.h"
+    ).read_text(encoding="utf-8")
+    tensor_source = (
+        METAL / "runtime" / "mlx_tensor.cpp"
+    ).read_text(encoding="utf-8")
+    assert "mlx_group_linears(" in tensor_header
+    assert "std::optional<MlxGroupedLinear> mlx_group_linears(" in tensor_source
+    assert "class MlxProjectionBatch" in tensor_header
+    assert "MlxProjectionBatch::MlxProjectionBatch(" in tensor_source
+
+    v4_attention = (
+        ROOT
+        / "cpp_runtime/backends/metal/models/deepseek_v4/"
+        "mlx_deepseek_v4_attention.cpp"
+    ).read_text(encoding="utf-8")
+    assert "std::optional<MlxProjectionBatch> projections;" in v4_attention
+    assert "class ProjectionGroup" not in v4_attention
+
+    v41_header = (
+        ROOT
+        / "cpp_runtime/backends/metal/models/deepseek_v41/"
+        "mlx_deepseek_v41_attention.h"
+    ).read_text(encoding="utf-8")
+    v41_attention = (
+        ROOT
+        / "cpp_runtime/backends/metal/models/deepseek_v41/"
+        "mlx_deepseek_v41_attention.cpp"
+    ).read_text(encoding="utf-8")
+    assert "std::optional<MlxProjectionBatch> input_projections_;" in v41_header
+    assert "input_projections_.emplace(std::move(input_projections));" in v41_attention
+    assert "(*input_projections_)(input)" in v41_attention
+
+    for source in (DSV_DSPARK, DSV41_DSPARK):
+        assert "MlxProjectionBatch input_projections;" in source
+        assert "input_projections(std::vector<const MlxLinear*>" in source
+        assert "stage.input_projections(input)" in source
+
+
+def test_deepseek_v4_mfe_streaming_uses_fused_down_reduce() -> None:
+    source = (
+        ROOT
+        / "cpp_runtime/backends/metal/models/deepseek_v4/"
+        "mlx_deepseek_v4_moe.cpp"
+    ).read_text()
+    streamed = source[source.index("} else if (!expert_offload_) {") :]
+    streamed = streamed[: streamed.index("if (!shared.has_value())")]
+    assert "down_weight.routed_matmul_reduce(" in streamed
+    # Legacy TPQ has no matching fused primitive and retains its fallback.
+    assert "return moe_weighted_reduce(" in streamed
+
+
+def test_deepseek_v4_only_tracks_token_counts_for_active_penalties() -> None:
+    source = (
+        ROOT
+        / "cpp_runtime/backends/metal/models/deepseek_v4/"
+        "mlx_deepseek_v4_causal_lm.cpp"
+    ).read_text()
+    generation = source[source.index("MlxDeepseekV4CausalLm::generate_impl(") :]
+    assert "std::optional<array> counts;" in generation
+    assert "if (sampling.has_penalties())" in generation
+    assert "? sampler.sample(logits, *counts)" in generation
+    assert "if (counts) {\n            *counts = sample_token_counts_add(" in generation
+
+
+def test_deepseek_v4_small_m_reuses_ssd_route_transactions() -> None:
+    source = (
+        ROOT
+        / "cpp_runtime/backends/metal/models/deepseek_v4/"
+        "mlx_deepseek_v4_causal_lm.cpp"
+    ).read_text()
+    forward = source[source.index("MlxDeepseekV4CausalLm::forward_chunk(") :]
+    transaction_begin = forward.index("const bool grouped_route_transaction")
+    transaction = forward[
+        transaction_begin :
+        forward.index("std::size_t eval_group_begin", transaction_begin)
+    ]
+    assert "routed_rows >= 1 && routed_rows <= 6" in forward
+    assert "has_full_residency_capacity" not in transaction
+    assert "capture_target(group_begin);" in transaction
+    assert "capture_target_into(" in transaction
+    assert "target_hiddens = std::move(trial_targets);" in transaction
+
+
+def test_dspark_small_m_reuses_the_shared_ssd_route_transaction() -> None:
+    draft = DSV_DSPARK[DSV_DSPARK.index("MlxDeepseekV4DSpark::draft_impl(") :]
+    assert "routed_rows <= 6" in draft
+    assert "mlx_ssd_route_transactions_enabled()" in draft
+    assert "begin_route_transaction();" in draft
+    assert "resolve_route_transaction();" in draft
+    assert "route_layer_likely_hit(" in draft
+
+
+def test_deepseek_v41_multitoken_attention_orders_circular_cache_write() -> None:
+    source = (
+        ROOT
+        / "cpp_runtime/backends/metal/models/deepseek_v41/"
+        "mlx_deepseek_v41_attention.cpp"
+    ).read_text()
+    forward = source[source.index("MlxDeepseekV41Attention::forward(") :]
+    assert "std::optional<array> pending_local_values;" in forward
+    assert "std::optional<array> pending_local_rows;" in forward
+    assert "mlx::core::depends(\n            std::vector<array>{state.local_kv},\n            std::vector<array>{attended})" in forward
+    assert "ordered_local.front(),\n            *pending_local_values" in forward
+
+
+def test_direct_native_hf_server_uses_size_aware_expert_residency() -> None:
+    assert "native_hf_source_bytes(" in DECODE_APP
+    assert "*source_bytes <= automatic_limit" in DECODE_APP
+    assert (
+        "requested_cache_bytes(\n"
+        "                arguments.expert_cache_gb, native_hf, container"
+    ) in DECODE_APP
 
 
 def test_mixed_mfe_offload_uses_the_shared_pager() -> None:

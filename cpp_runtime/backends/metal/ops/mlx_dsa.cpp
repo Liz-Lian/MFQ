@@ -192,16 +192,16 @@ Kernel make_kernel(
     const char* name,
     std::vector<std::string> inputs,
     std::vector<std::string> outputs,
-    const char* source,
-    const char* header = "") {
+    std::string source,
+    std::string header = {}) {
     CompileOptions options;
     options.math_mode = MathMode::Fast;
     return mlx::core::fast::metal_kernel(
         name,
         std::move(inputs),
         std::move(outputs),
-        source,
-        header,
+        std::move(source),
+        std::move(header),
         true,
         false,
         options);
@@ -277,13 +277,22 @@ const Kernel& indexer_scores_kernel() {
     return kernel;
 }
 
-const Kernel& indexer_decode_scores_kernel() {
-    static const auto kernel = make_kernel(
-        "mfq_cpp_dsa_indexer_decode_scores",
+const Kernel& indexer_decode_scores_kernel(Dtype dtype) {
+    static const auto fp16_kernel = make_kernel(
+        "mfq_cpp_dsa_indexer_decode_scores_f16",
         {"q", "k", "weights", "params", "decode_params"},
         {"out"},
-        kIndexerDecodeScoresSource);
-    return kernel;
+        std::string("#define MFQ_INDEXER_INPUT_BF16 0\n") +
+            kIndexerDecodeScoresSource);
+    static const auto bf16_kernel = make_kernel(
+        "mfq_cpp_dsa_indexer_decode_scores_bf16",
+        {"q", "k", "weights", "params", "decode_params"},
+        {"out"},
+        std::string("#define MFQ_INDEXER_INPUT_BF16 1\n") +
+            kIndexerDecodeScoresSource);
+    return dtype == mlx::core::bfloat16
+        ? bf16_kernel
+        : fp16_kernel;
 }
 
 const Kernel& topk_kernel() {
@@ -845,9 +854,10 @@ MlxDsaPoolUpdate mlx_dsa_decode_pool_update(
     bool overlap,
     int quant_mode,
     float eps) {
-    auto pool_values = typed_contiguous(
-        pool,
-        mlx::core::float16);
+    const Dtype pool_dtype = pool.dtype() == mlx::core::bfloat16
+        ? mlx::core::bfloat16
+        : mlx::core::float16;
+    auto pool_values = typed_contiguous(pool, pool_dtype);
     auto step = mlx_dsa_decode_pool_step(
         kv_token,
         gate_token,
@@ -895,15 +905,12 @@ array mlx_dsa_indexer_scores_decode(
     int query_offset,
     int ratio,
     int score_count) {
-    auto query = typed_contiguous(
-        q,
-        mlx::core::float16);
-    auto key = typed_contiguous(
-        k,
-        mlx::core::float16);
-    auto head_weights = typed_contiguous(
-        weights,
-        mlx::core::float16);
+    const Dtype index_dtype = k.dtype() == mlx::core::bfloat16
+        ? mlx::core::bfloat16
+        : mlx::core::float16;
+    auto query = typed_contiguous(q, index_dtype);
+    auto key = typed_contiguous(k, index_dtype);
+    auto head_weights = typed_contiguous(weights, index_dtype);
     if (query.ndim() != 4 ||
         key.ndim() != 3 ||
         head_weights.ndim() != 3 ||
@@ -956,7 +963,7 @@ array mlx_dsa_indexer_scores_decode(
             key_tiles,
         },
         mlx::core::int32);
-    auto outputs = indexer_decode_scores_kernel()(
+    auto outputs = indexer_decode_scores_kernel(index_dtype)(
         {
             query,
             key,
@@ -987,15 +994,12 @@ array mlx_dsa_indexer_scores(
     const array& weights,
     int query_offset,
     int ratio) {
-    auto query = typed_contiguous(
-        q,
-        mlx::core::float16);
-    auto key = typed_contiguous(
-        k,
-        mlx::core::float16);
-    auto head_weights = typed_contiguous(
-        weights,
-        mlx::core::float16);
+    const Dtype index_dtype = k.dtype() == mlx::core::bfloat16
+        ? mlx::core::bfloat16
+        : mlx::core::float16;
+    auto query = typed_contiguous(q, index_dtype);
+    auto key = typed_contiguous(k, index_dtype);
+    auto head_weights = typed_contiguous(weights, index_dtype);
     if (query.ndim() != 4 ||
         key.ndim() != 3 ||
         head_weights.ndim() != 3 ||
@@ -1349,7 +1353,7 @@ array mlx_dsa_sparse_attention(
 array mlx_dsa_sparse_multi_attention(
     const array& q,
     const array& local_kv,
-    const array& pooled_kv,
+    const std::optional<array>& pooled_kv,
     int pool_len,
     const array& topk,
     const array& sinks,

@@ -10,20 +10,6 @@
 
 namespace mfq::metal {
 
-namespace detail {
-
-// Decode keeps ordinary packed GEMVs because the heterogeneous grouped
-// projection kernel is slower for a single flattened row. The caller still
-// checks the grouped kernel's supported row range for multi-row inputs.
-inline bool qwen35_use_grouped_projection_rows(
-    std::size_t input_elements,
-    int input_width) noexcept {
-    return input_width > 0 &&
-        input_elements / static_cast<std::size_t>(input_width) != 1;
-}
-
-} // namespace detail
-
 // Dense or packed Qwen-style SwiGLU feed-forward network:
 // down(silu(gate(x)) * up(x)).
 class MlxQwen35DenseSwiGlu {
@@ -52,7 +38,7 @@ public:
         return output_size_;
     }
     bool uses_grouped_gate_up() const noexcept {
-        return gate_up_.has_value();
+        return gate_up_.grouped_projection_count() == 2;
     }
 
 private:
@@ -62,7 +48,7 @@ private:
     MlxLinear gate_;
     MlxLinear up_;
     MlxLinear down_;
-    std::optional<MlxGroupedLinear> gate_up_;
+    MlxProjectionBatch gate_up_;
     std::shared_ptr<MlxQwen35DenseSwiGlu> important_neurons_;
     int input_size_ = 0;
     int intermediate_size_ = 0;
@@ -148,7 +134,8 @@ public:
         return config_;
     }
     bool uses_grouped_qkv() const noexcept {
-        return qkv_.has_value();
+        return qkv_.has_value() &&
+            qkv_->grouped_projection_count() >= 2;
     }
     bool uses_grouped_ffn() const noexcept {
         return ffn_.uses_grouped_gate_up();
@@ -168,7 +155,7 @@ private:
     MlxLinear key_;
     MlxLinear value_;
     MlxLinear output_;
-    std::optional<MlxGroupedLinear> qkv_;
+    std::optional<MlxProjectionBatch> qkv_;
     std::optional<MlxRmsNorm> query_norm_;
     std::optional<MlxRmsNorm> key_norm_;
     MlxRmsNorm ffn_norm_;

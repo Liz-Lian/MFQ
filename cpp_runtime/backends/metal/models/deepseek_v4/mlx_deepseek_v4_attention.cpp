@@ -697,57 +697,6 @@ array generic_index_topk(
         mlx::core::int32);
 }
 
-class ProjectionGroup {
-public:
-    explicit ProjectionGroup(
-        std::vector<const MlxLinear*> projections)
-        : projections_(std::move(projections)) {
-        std::vector<MlxGroupedLinearWeightRef> refs;
-        refs.reserve(projections_.size());
-        for (const auto* projection : projections_) {
-            const auto reference =
-                projection->grouped_weight_ref();
-            if (!reference.has_value()) {
-                return;
-            }
-            refs.push_back(*reference);
-        }
-        if (refs.size() < 2) {
-            return;
-        }
-        try {
-            grouped_.emplace(std::move(refs));
-        } catch (const MlxGroupedLinearUnsupported&) {
-            grouped_.reset();
-        }
-    }
-
-    std::vector<array> operator()(
-        const array& input) const {
-        const std::size_t rows =
-            input.ndim() == 0 || input.shape(-1) <= 0
-            ? 0
-            : input.size() /
-                static_cast<std::size_t>(input.shape(-1));
-        if (grouped_.has_value() &&
-            grouped_->supports(input) &&
-            (rows > 1 ||
-             grouped_->supports_single_row_projection_fusion())) {
-            return (*grouped_)(input);
-        }
-        std::vector<array> result;
-        result.reserve(projections_.size());
-        for (const auto* projection : projections_) {
-            result.push_back((*projection)(input));
-        }
-        return result;
-    }
-
-private:
-    std::vector<const MlxLinear*> projections_;
-    std::optional<MlxGroupedLinear> grouped_;
-};
-
 void require_linear(
     const MlxLinear& linear,
     int input,
@@ -1517,7 +1466,8 @@ struct MlxDeepseekV4Attention::Impl {
     std::optional<std::pair<array, array>> pool_rope;
     array rms_params;
     MlxRmsNorm q_norm;
-    std::optional<ProjectionGroup> projections;
+    std::optional<MlxProjectionBatch> projections;
+    std::optional<MlxProjectionBatch> query_projections;
 
     Impl(
         DeepseekV4Config selected_config,
@@ -1563,6 +1513,13 @@ struct MlxDeepseekV4Attention::Impl {
                         strides)));
         }
         projections.emplace(projection_list());
+        if (ratio == 4) {
+            query_projections.emplace(
+                std::vector<const MlxLinear*>{
+                    &components.q_b,
+                    &*components.index_q_b,
+                });
+        }
     }
 
     std::vector<const MlxLinear*> projection_list() {
@@ -1775,10 +1732,10 @@ struct MlxDeepseekV4Attention::Impl {
     }
 
     array index_query(
-        const array& q_rank,
+        const array& projected,
         const array& positions) const {
-        const int batch = q_rank.shape(0);
-        const int tokens = q_rank.shape(1);
+        const int batch = projected.shape(0);
+        const int tokens = projected.shape(1);
         const int heads = checked_int(
             config.index_n_heads,
             "index heads");
@@ -1786,7 +1743,7 @@ struct MlxDeepseekV4Attention::Impl {
             config.index_head_dim,
             "index dimension");
         auto query = mlx::core::reshape(
-            (*components.index_q_b)(q_rank),
+            projected,
             Shape{batch, tokens, heads, dimension});
         const int rotary = checked_int(
             config.qk_rope_head_dim,
@@ -1823,13 +1780,13 @@ struct MlxDeepseekV4Attention::Impl {
     }
 
     array topk(
-        const array& q_rank,
+        const array* index_query_projection,
         const array& index_weights,
         const MlxDeepseekV4LayerState& state,
         const array& positions,
         int pos0) const {
-        const int batch = q_rank.shape(0);
-        const int tokens = q_rank.shape(1);
+        const int batch = index_weights.shape(0);
+        const int tokens = index_weights.shape(1);
         const int pool_len =
             state.main_.has_value()
             ? state.main_->pool_len()
@@ -1851,8 +1808,12 @@ struct MlxDeepseekV4Attention::Impl {
                     Shape{1, 1, pool_len}),
                 Shape{batch, tokens, pool_len});
         }
+        if (index_query_projection == nullptr) {
+            throw std::logic_error(
+                "DeepSeek-V4 Indexer query projection is unavailable");
+        }
         auto query = index_query(
-            q_rank,
+            *index_query_projection,
             positions);
         if (config.fast_indexer() &&
             requested == 512) {
@@ -1897,66 +1858,19 @@ struct MlxDeepseekV4Attention::Impl {
         const int rank = checked_int(
             config.o_lora_rank,
             "output rank");
-        const int input_width =
-            checked_product(
-                {
-                    checked_int(
-                        config.n_heads,
-                        "attention heads"),
-                    checked_int(
-                        config.head_dim,
-                        "head dimension"),
-                },
-                "attention width") /
-            groups;
         const int head_dim = checked_int(
             config.head_dim,
             "head dimension");
         const int rotary = checked_int(
             config.qk_rope_head_dim,
             "rotary dimension");
-        auto grouped = mlx::core::reshape(
+        array low_rank = components.wo_a.grouped_row_matmul_inverse_rope(
             value,
-            Shape{
-                batch,
-                tokens,
-                groups,
-                input_width,
-            });
-        array low_rank =
-            components.wo_a.nint8_zero_weight_ref()
-            ? components.wo_a.nint8_zero_weight_ref()
-                  ->grouped_row_matmul_inverse_rope(
-                      grouped,
-                      groups,
-                      cosine,
-                      sine,
-                      head_dim,
-                      rotary)
-            : components.wo_a.mx_weight_ref() && tokens <= 6
-            ? components.wo_a.mx_weight_ref()
-                  ->grouped_row_matmul_inverse_rope(
-                      grouped,
-                      groups,
-                      cosine,
-                      sine,
-                      head_dim,
-                      rotary)
-            : components.wo_a.grouped_row_matmul(
-                  mlx::core::reshape(
-                      mlx_rope_adjacent(
-                          value,
-                          rotary,
-                          cosine,
-                          sine,
-                          true),
-                      Shape{
-                          batch,
-                          tokens,
-                          groups,
-                          input_width,
-                      }),
-                  groups);
+            groups,
+            cosine,
+            sine,
+            head_dim,
+            rotary);
         low_rank = mlx::core::reshape(
             std::move(low_rank),
             Shape{
@@ -2239,14 +2153,6 @@ array MlxDeepseekV4Attention::operator()(
             profile_component("q_rank_norm"),
             q_rank);
     }
-    auto q_projected = mlx::core::reshape(
-        impl_->components.q_b(q_rank),
-        Shape{batch, tokens, heads, head_dim});
-    if (detail::component_profile_active()) {
-        detail::profile_eval(
-            profile_component("q_b_projection"),
-            q_projected);
-    }
     const int rotary = checked_int(
         config.qk_rope_head_dim,
         "rotary dimension");
@@ -2258,20 +2164,6 @@ array MlxDeepseekV4Attention::operator()(
         impl_->rope.second,
         positions,
         0);
-    auto q_cosine = mlx::core::expand_dims(
-        mlx::core::expand_dims(cosine, 0),
-        2);
-    auto q_sine = mlx::core::expand_dims(
-        mlx::core::expand_dims(sine, 0),
-        2);
-    auto q = rms_replace_last_rope(
-        q_projected,
-        rotary,
-        q_cosine,
-        q_sine,
-        impl_->rms_params,
-        false,
-        impl_->rms_params);
     kv = rms_replace_last_rope(
         kv,
         rotary,
@@ -2289,9 +2181,6 @@ array MlxDeepseekV4Attention::operator()(
         speculation->local_kv = kv;
     }
     if (detail::component_profile_active()) {
-        detail::profile_eval(
-            profile_component("q_rms_rope"),
-            q);
         detail::profile_eval(
             profile_component("kv_norm_rope"),
             kv);
@@ -2433,8 +2322,57 @@ array MlxDeepseekV4Attention::operator()(
             std::move(compressor_state));
     }
 
+    const bool needs_index_query =
+        impl_->ratio == 4 &&
+        state.main_->pool_len() >
+            checked_int(config.index_topk, "index top-k");
+    std::optional<array> index_query_projection;
+    array q_projected = [&]() {
+        if (!needs_index_query) {
+            return impl_->components.q_b(q_rank);
+        }
+        auto values = (*impl_->query_projections)(q_rank);
+        if (values.size() != 2) {
+            throw std::logic_error(
+                "DeepSeek-V4 query projection group output mismatch");
+        }
+        index_query_projection.emplace(std::move(values[1]));
+        return std::move(values[0]);
+    }();
+    q_projected = mlx::core::reshape(
+        std::move(q_projected),
+        Shape{batch, tokens, heads, head_dim});
+    if (detail::component_profile_active()) {
+        std::vector<array> query_values{q_projected};
+        if (index_query_projection) {
+            query_values.push_back(*index_query_projection);
+        }
+        detail::profile_eval(
+            profile_component("q_b_projection"),
+            std::move(query_values));
+    }
+    auto q = rms_replace_last_rope(
+        q_projected,
+        rotary,
+        mlx::core::expand_dims(
+            mlx::core::expand_dims(cosine, 0),
+            2),
+        mlx::core::expand_dims(
+            mlx::core::expand_dims(sine, 0),
+            2),
+        impl_->rms_params,
+        false,
+        impl_->rms_params);
+    if (detail::component_profile_active()) {
+        detail::profile_eval(
+            profile_component("q_rms_rope"),
+            q);
+    }
+
     auto topk = impl_->topk(
-        q_rank,
+        index_query_projection
+            ? &*index_query_projection
+            : nullptr,
         index_weights,
         state,
         positions,
@@ -2512,26 +2450,8 @@ array MlxDeepseekV4Attention::operator()(
         }
     } else {
         const int history = std::min(pos0, window);
-        array history_values = slice_axis(
-            state.local_,
-            1,
-            0,
-            0);
-        if (history != 0) {
-            auto history_positions = mlx::core::arange(
-                pos0 - history,
-                pos0,
-                1,
-                mlx::core::int32);
-            auto history_slots =
-                mlx::core::remainder(
-                    history_positions,
-                    array(window, mlx::core::int32));
-            history_values = mlx::core::take(
-                state.local_,
-                history_slots,
-                1);
-        }
+        auto history_values = mlx_circular_cache_history(
+            state.local_, pos0);
         array local_values = mlx::core::concatenate(
             std::vector<array>{
                 history_values,
@@ -2540,25 +2460,27 @@ array MlxDeepseekV4Attention::operator()(
                     state.local_.dtype()),
             },
             1);
-        const bool use_direct_pool =
+        const bool use_direct_attention =
             config.fast_attention() &&
-            speculation == nullptr &&
-            visibility == nullptr &&
-            state.main_.has_value() &&
-            pool_len > 0 &&
-            topk.shape(2) > 0;
-        if (use_direct_pool) {
+            visibility == nullptr;
+        if (use_direct_attention) {
+            std::optional<array> pooled;
+            if (state.main_.has_value()) {
+                pooled = state.main_->pool();
+            }
             direct_multi = mlx_dsa_sparse_multi_attention(
                 mlx::core::transpose(
                     q,
                     {0, 2, 1, 3}),
                 local_values,
-                state.main_->pool(),
+                pooled,
                 pool_len,
                 topk,
                 impl_->components.sinks,
                 pos0,
-                impl_->ratio,
+                impl_->ratio == 0
+                    ? 1
+                    : impl_->ratio,
                 window);
         } else {
             std::vector<array> parts{local_values};

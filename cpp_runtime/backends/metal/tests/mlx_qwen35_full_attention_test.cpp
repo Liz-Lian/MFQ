@@ -181,17 +181,6 @@ void test_important_neuron_swiglu() {
     require_close(values[1], 4.0f / (1.0f + std::exp(-2.0f)));
 }
 
-void test_decode_projection_routing() {
-    require(
-        !mfq::metal::detail::qwen35_use_grouped_projection_rows(
-            64, 64),
-        "single-row decode unexpectedly selected grouped projection");
-    require(
-        mfq::metal::detail::qwen35_use_grouped_projection_rows(
-            128, 64),
-        "multi-row prefill did not select grouped projection");
-}
-
 void test_prefill_decode_cache_equivalence() {
     const array full_input(
         {
@@ -279,7 +268,6 @@ int main() {
 #endif
         test_swiglu();
         test_important_neuron_swiglu();
-        test_decode_projection_routing();
         test_prefill_decode_cache_equivalence();
         std::cout
             << "MFQ C++ Qwen3.5 full-attention block tests passed\n";

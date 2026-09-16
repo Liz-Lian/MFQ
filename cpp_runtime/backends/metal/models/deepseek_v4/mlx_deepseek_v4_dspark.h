@@ -120,7 +120,9 @@ public:
         std::vector<MlxDeepseekV4DSparkStageComponents> stages,
         MlxDeepseekV4DSparkHeadComponents head,
         int max_context,
-        std::pair<mlx::core::array, mlx::core::array> rope);
+        std::pair<mlx::core::array, mlx::core::array> rope,
+        std::shared_ptr<MlxMoeSsdExpertCache> ssd_expert_cache = nullptr,
+        std::size_t expert_layer_base = 0);
 
     MlxDeepseekV4DSparkState make_state(
         int batch = 1,

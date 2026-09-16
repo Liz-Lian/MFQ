@@ -4,9 +4,11 @@
 #include <array>
 #include <cmath>
 #include <limits>
+#include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <utility>
 
 namespace mfq::metal {
@@ -19,8 +21,9 @@ using mlx::core::MathMode;
 using mlx::core::Shape;
 
 constexpr const char* kFp8SqHeader = R"METAL(
+template <typename Stream>
 inline uint mfq_fp8_sq_read_bits(
-    device const uchar* stream,
+    Stream stream,
     uint value_index,
     uint bits
 ) {
@@ -48,8 +51,9 @@ inline float mfq_fp8_sq_e4m3(uchar raw) {
     return (raw & 0x80u) == 0u ? value : -value;
 }
 
+template <typename Scales>
 inline float mfq_fp8_sq_scale(
-    device const uchar* scales,
+    Scales scales,
     uint index,
     uint scale_kind
 ) {
@@ -77,17 +81,18 @@ inline float mfq_fp8_sq_scale(
     return as_type<float>(word);
 }
 
+template <typename Blob, typename RowQ, typename RowOffsets>
 inline uchar mfq_fp8_sq_code(
-    device const uchar* blob,
-    device const uchar* row_q,
-    device const uint* row_symbol_byte_offsets,
+    Blob blob,
+    RowQ row_q,
+    RowOffsets row_symbol_byte_offsets,
     uint output,
     uint column,
     uint symbols_offset,
     uint palettes_offset
 ) {
     uint bits = uint(row_q[output]);
-    device const uchar* row_symbols = blob + symbols_offset
+    auto row_symbols = blob + symbols_offset
         + row_symbol_byte_offsets[output];
     if (bits == 8u) {
         return row_symbols[column];
@@ -97,10 +102,11 @@ inline uchar mfq_fp8_sq_code(
     return blob[palettes_offset + palette_offset + symbol];
 }
 
+template <typename Blob, typename RowQ, typename RowOffsets>
 inline float mfq_fp8_sq_weight(
-    device const uchar* blob,
-    device const uchar* row_q,
-    device const uint* row_symbol_byte_offsets,
+    Blob blob,
+    RowQ row_q,
+    RowOffsets row_symbol_byte_offsets,
     uint output,
     uint column,
     uint palettes_offset,
@@ -517,6 +523,128 @@ const mlx::core::fast::CustomKernelFunction& backward_kernel(
         : fp8_128_backward_kernel();
 }
 
+std::vector<std::string> projection_group_input_names(
+    std::size_t projections) {
+    std::vector<std::string> names;
+    names.reserve(projections * 3 + 1);
+    for (std::size_t projection = 0;
+         projection < projections;
+         ++projection) {
+        const auto suffix = std::to_string(projection);
+        names.push_back("blob_" + suffix);
+        names.push_back("row_q_" + suffix);
+        names.push_back("row_symbol_byte_offsets_" + suffix);
+    }
+    names.emplace_back("x");
+    return names;
+}
+
+std::string make_projection_group_source(std::size_t projections) {
+    std::string source = R"METAL(
+    uint lane = thread_index_in_simdgroup;
+    uint workgroup = thread_position_in_grid.x >> 5u;
+    uint logical_output = workgroup % uint(TOTAL_OUT);
+    uint row_tile = workgroup / uint(TOTAL_OUT);
+    uint first_row = row_tile * uint(TILE_M);
+    if (first_row >= uint(M)) {
+        return;
+    }
+
+    uint local_output = 0u;
+    uint projection = 0u;
+)METAL";
+    for (std::size_t projection = 0;
+         projection < projections;
+         ++projection) {
+        const auto suffix = std::to_string(projection);
+        source += projection == 0 ? "    if (" : "    else if (";
+        source += "logical_output < uint(P" + suffix + "_END)) {\n";
+        source += "        projection = " + suffix + "u;\n";
+        source += "        local_output = logical_output - uint(P" + suffix
+            + "_OFFSET);\n"
+              "    }\n";
+    }
+    source += R"METAL(
+    float accum[TILE_M];
+    for (uint local = 0u; local < uint(TILE_M); ++local) {
+        accum[local] = 0.0f;
+    }
+    for (uint column = lane; column < uint(K); column += 32u) {
+        float weight = 0.0f;
+)METAL";
+    for (std::size_t projection = 0;
+         projection < projections;
+         ++projection) {
+        const auto suffix = std::to_string(projection);
+        source += projection == 0
+            ? "        if ("
+            : "        else if (";
+        source += "projection == " + suffix + "u) {\n";
+        source +=
+            "            weight = mfq_fp8_sq_weight(\n"
+            "                blob_" + suffix + ", row_q_" + suffix
+            + ", row_symbol_byte_offsets_" + suffix + ",\n"
+            "                local_output, column,\n"
+            "                uint(P" + suffix + "_PALETTES_OFFSET),\n"
+            "                uint(P" + suffix + "_SYMBOLS_OFFSET),\n"
+            "                uint(P" + suffix + "_SCALES_OFFSET),\n"
+            "                uint(P" + suffix + "_SCALE_KIND),\n"
+            "                uint(P" + suffix + "_BLOCK_ROWS),\n"
+            "                uint(P" + suffix + "_BLOCK_COLUMNS),\n"
+            "                uint(P" + suffix + "_SCALE_COLUMNS));\n"
+            "        }\n";
+    }
+    source += R"METAL(
+        for (uint local = 0u; local < uint(TILE_M); ++local) {
+            uint row = first_row + local;
+            if (row < uint(M)) {
+                accum[local] +=
+                    float(x[row * uint(K) + column]) * weight;
+            }
+        }
+    }
+    for (uint local = 0u; local < uint(TILE_M); ++local) {
+        uint row = first_row + local;
+        float total = simd_sum(accum[local]);
+        if (lane == 0u && row < uint(M)) {
+            y[row * uint(TOTAL_OUT) + logical_output] = T(total);
+        }
+    }
+)METAL";
+    return source;
+}
+
+mlx::core::fast::CustomKernelFunction projection_group_kernel(
+    std::string_view dtype,
+    std::size_t projections) {
+    static std::mutex mutex;
+    static std::unordered_map<
+        std::string,
+        mlx::core::fast::CustomKernelFunction> kernels;
+    const std::string family = dtype == "MXFP8-SQ"
+        ? "mxfp8"
+        : "fp8_128";
+    const auto key = family + "_p" + std::to_string(projections);
+    std::lock_guard<std::mutex> lock(mutex);
+    if (const auto found = kernels.find(key); found != kernels.end()) {
+        return found->second;
+    }
+    CompileOptions options;
+    options.math_mode = MathMode::Fast;
+    auto kernel = mlx::core::fast::metal_kernel(
+        "mfq_cpp_" + family + "_sq_projection_group_p"
+            + std::to_string(projections),
+        projection_group_input_names(projections),
+        {"y"},
+        make_projection_group_source(projections),
+        kFp8SqHeader,
+        true,
+        false,
+        options);
+    kernels.emplace(key, kernel);
+    return kernel;
+}
+
 } // namespace
 
 bool is_fp8_sq_dtype(std::string_view dtype) noexcept {
@@ -650,6 +778,124 @@ array MlxFp8SqWeight::matmul(const array& input) const {
         false,
         {});
     return mlx::core::reshape(std::move(outputs.front()), std::move(output_shape));
+}
+
+std::vector<array> MlxFp8SqWeight::projection_group_matmul(
+    std::span<const MlxFp8SqWeight> weights,
+    const array& input) {
+    if (weights.size() < 2 || weights.size() > 10) {
+        throw std::invalid_argument(
+            "FP8-SQ projection group requires two through ten weights");
+    }
+    const int input_size = weights.front().input_size();
+    const auto& dtype = weights.front().dtype();
+    if (input.ndim() == 0 || input.shape(-1) != input_size) {
+        throw std::invalid_argument(
+            "FP8-SQ projection group input width mismatch");
+    }
+    if (input.dtype() != mlx::core::float16 &&
+        input.dtype() != mlx::core::float32) {
+        throw std::invalid_argument(
+            "FP8-SQ projection group requires FP16 or FP32 input");
+    }
+
+    std::vector<int> output_sizes;
+    output_sizes.reserve(weights.size());
+    int total_output = 0;
+    for (const auto& weight : weights) {
+        if (weight.input_size() != input_size || weight.dtype() != dtype) {
+            throw std::invalid_argument(
+                "FP8-SQ projection group requires one width and scale family");
+        }
+        total_output = checked_int(
+            static_cast<std::size_t>(total_output) +
+                static_cast<std::size_t>(weight.output_size()),
+            "projection-group output width");
+        output_sizes.push_back(weight.output_size());
+    }
+
+    const auto rows = input.size() / static_cast<std::size_t>(input_size);
+    if (rows < 1 || rows > 16) {
+        throw std::invalid_argument(
+            "FP8-SQ projection group supports one through sixteen rows");
+    }
+    Shape prefix(input.shape().begin(), input.shape().end() - 1);
+    auto source = mlx::core::contiguous(mlx::core::reshape(
+        input,
+        Shape{checked_int(rows, "projection-group row count"), input_size}));
+    const int tile_rows = rows <= 6 ? static_cast<int>(rows) : 8;
+    const auto row_tiles = (rows + static_cast<std::size_t>(tile_rows) - 1) /
+        static_cast<std::size_t>(tile_rows);
+
+    std::vector<array> inputs;
+    inputs.reserve(weights.size() * 3 + 1);
+    std::vector<std::pair<std::string, mlx::core::fast::TemplateArg>> arguments{
+        {"T", source.dtype()},
+        {"M", checked_int(rows, "projection-group row count")},
+        {"TILE_M", tile_rows},
+        {"K", input_size},
+        {"TOTAL_OUT", total_output},
+    };
+    int output_offset = 0;
+    for (std::size_t projection = 0;
+         projection < weights.size();
+         ++projection) {
+        const auto& weight = weights[projection];
+        const auto& layout = weight.layout_;
+        const auto prefix_name = "P" + std::to_string(projection) + "_";
+        inputs.push_back(weight.blob_);
+        inputs.push_back(weight.row_q_);
+        inputs.push_back(weight.row_symbol_byte_offsets_);
+        arguments.emplace_back(prefix_name + "OFFSET", output_offset);
+        output_offset += weight.output_size();
+        arguments.emplace_back(prefix_name + "END", output_offset);
+        arguments.emplace_back(
+            prefix_name + "PALETTES_OFFSET",
+            checked_int(layout.palettes, "palette offset"));
+        arguments.emplace_back(
+            prefix_name + "SYMBOLS_OFFSET",
+            checked_int(layout.symbols, "symbol offset"));
+        arguments.emplace_back(
+            prefix_name + "SCALES_OFFSET",
+            checked_int(layout.scales, "scale offset"));
+        arguments.emplace_back(
+            prefix_name + "SCALE_KIND",
+            static_cast<int>(layout.scale_kind));
+        arguments.emplace_back(prefix_name + "BLOCK_ROWS", layout.block_rows);
+        arguments.emplace_back(
+            prefix_name + "BLOCK_COLUMNS", layout.block_columns);
+        arguments.emplace_back(
+            prefix_name + "SCALE_COLUMNS", layout.scale_columns);
+    }
+    inputs.push_back(source);
+    const auto workgroups = row_tiles * static_cast<std::size_t>(total_output);
+    auto combined = projection_group_kernel(dtype, weights.size())(
+        std::move(inputs),
+        {Shape{checked_int(rows, "projection-group row count"), total_output}},
+        {source.dtype()},
+        {checked_int(workgroups * 32, "projection-group Metal grid"), 1, 1},
+        {32, 1, 1},
+        std::move(arguments),
+        std::nullopt,
+        false,
+        {}).front();
+
+    std::vector<array> outputs;
+    outputs.reserve(output_sizes.size());
+    int offset = 0;
+    for (const int width : output_sizes) {
+        auto shape = prefix;
+        shape.push_back(width);
+        outputs.push_back(mlx::core::reshape(
+            mlx::core::slice(
+                combined,
+                Shape{0, offset},
+                Shape{checked_int(rows, "projection-group row count"),
+                      offset + width}),
+            std::move(shape)));
+        offset += width;
+    }
+    return outputs;
 }
 
 array MlxFp8SqWeight::routed_matmul(

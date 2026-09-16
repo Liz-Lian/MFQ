@@ -1495,13 +1495,8 @@ public:
         return residual + (*this)(input);
     }
 
-    const MlxNintWeight* unbiased_nint_weight() const noexcept {
-        return bias_ ? nullptr : weight_.nint_weight_ref();
-    }
-
-    std::optional<MlxGroupedLinearWeightRef>
-    unbiased_grouped_weight() const noexcept {
-        return bias_ ? std::nullopt : weight_.grouped_weight_ref();
+    const MlxLinear* unbiased_weight() const noexcept {
+        return bias_ ? nullptr : &weight_;
     }
 
 private:
@@ -1509,21 +1504,16 @@ private:
     std::optional<array> bias_;
 };
 
-std::optional<MlxGroupedLinear> make_mini_grouped_linear(
+std::optional<MlxProjectionBatch> make_mini_projection_batch(
     std::initializer_list<const MiniLinear*> projections) {
-    std::vector<MlxGroupedLinearWeightRef> weights;
+    std::vector<const MlxLinear*> weights;
     weights.reserve(projections.size());
     for (const auto* projection : projections) {
-        const auto weight = projection->unbiased_grouped_weight();
-        if (!weight) return std::nullopt;
-        weights.push_back(*weight);
+        const auto* weight = projection->unbiased_weight();
+        if (weight == nullptr) return std::nullopt;
+        weights.push_back(weight);
     }
-    return MlxGroupedLinear(std::move(weights));
-}
-
-bool minicpmo_grouped_qkv_enabled() noexcept {
-    const auto* value = std::getenv("MFQ_MINICPM_GROUPED_QKV");
-    return value == nullptr || std::strcmp(value, "0") != 0;
+    return MlxProjectionBatch(std::move(weights));
 }
 
 class MiniLayerNorm {
@@ -1712,7 +1702,9 @@ public:
     MiniQwen3Ffn(MiniLinear gate, MiniLinear up, MiniLinear down)
         : gate_(std::move(gate)),
           up_(std::move(up)),
-          down_(std::move(down)) {}
+          down_(std::move(down)) {
+        gate_up_ = make_mini_projection_batch({&gate_, &up_});
+    }
 
     array operator()(const array& input) const {
         return forward(input, nullptr);
@@ -1728,23 +1720,15 @@ private:
     array forward(
         const array& input,
         const array* residual) const {
-        const auto* gate_weight = gate_.unbiased_nint_weight();
-        const auto* up_weight = up_.unbiased_nint_weight();
-        if (input.size() == static_cast<std::size_t>(input.shape(-1)) &&
-            gate_weight != nullptr && up_weight != nullptr &&
-            gate_weight->can_fuse_swiglu(*up_weight)) {
-            auto activated = as_dtype(
-                gate_weight->swiglu(*up_weight, input), input.dtype());
-            detail::profile_eval("minicpmo.ffn_gate_up", activated);
-            auto output = residual != nullptr
-                ? down_.add_to(activated, *residual)
-                : down_(activated);
-            detail::profile_eval("minicpmo.ffn_down", output);
-            return output;
-        }
-        const auto gate = gate_(input);
-        const auto up = up_(input);
-        auto activated = gate * mlx::core::sigmoid(gate) * up;
+        auto activated = [&]() {
+            if (gate_up_) {
+                return as_dtype(
+                    gate_up_->swiglu(input), input.dtype());
+            }
+            auto gate = gate_(input);
+            auto up = up_(input);
+            return gate * mlx::core::sigmoid(gate) * up;
+        }();
         detail::profile_eval("minicpmo.ffn_gate_up", activated);
         auto output = residual != nullptr
             ? down_.add_to(activated, *residual)
@@ -1755,6 +1739,7 @@ private:
     MiniLinear gate_;
     MiniLinear up_;
     MiniLinear down_;
+    std::optional<MlxProjectionBatch> gate_up_;
 };
 
 class MiniQwen3Block {
@@ -1816,7 +1801,7 @@ public:
           key_norm_(std::move(key_norm)),
           ffn_norm_(std::move(ffn_norm)),
           ffn_(std::move(ffn)) {
-        qkv_ = make_mini_grouped_linear({&query_, &key_, &value_});
+        qkv_ = make_mini_projection_batch({&query_, &key_, &value_});
     }
 
     void reset_cache(int batch, int initial_capacity = 16) {
@@ -1873,8 +1858,7 @@ public:
         auto normalized = attention_norm_(input);
         detail::profile_eval("minicpmo.attention_norm", normalized);
         std::vector<array> projections;
-        if (tokens == 1 && minicpmo_grouped_qkv_enabled() &&
-            qkv_ && qkv_->supports(normalized)) {
+        if (qkv_) {
             projections = (*qkv_)(normalized);
         } else {
             projections = {
@@ -2083,7 +2067,7 @@ private:
     MiniLinear key_;
     MiniLinear value_;
     MiniLinear output_;
-    std::optional<MlxGroupedLinear> qkv_;
+    std::optional<MlxProjectionBatch> qkv_;
     std::optional<MlxRmsNorm> query_norm_;
     std::optional<MlxRmsNorm> key_norm_;
     MlxRmsNorm ffn_norm_;

@@ -65,7 +65,7 @@ std::vector<MlxGroupedLinearWeightRef> grouped_refs(
     refs.reserve(linears.size());
     for (const auto* linear : linears) {
         const auto ref = linear->grouped_weight_ref();
-        require(ref.has_value(), "profile group contains a dense weight");
+        require(ref.has_value(), "profile group contains an unsupported weight");
         refs.push_back(*ref);
     }
     return refs;
@@ -75,7 +75,11 @@ std::size_t packed_bytes(const MlxLinear& linear) {
     if (const auto ref = linear.grouped_weight_ref()) {
         return std::visit(
             [](const auto* weight) {
-                return weight->packed_nbytes();
+                if constexpr (requires { weight->packed_nbytes(); }) {
+                    return weight->packed_nbytes();
+                } else {
+                    return weight->nbytes();
+                }
             },
             *ref);
     }

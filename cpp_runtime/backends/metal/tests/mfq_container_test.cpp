@@ -409,6 +409,12 @@ void test_hf_virtual_full_precision_container(
         std::ofstream stream(hf / "config.json", std::ios::binary);
         stream << config;
     }
+    std::filesystem::create_directories(hf / "inference");
+    {
+        std::ofstream stream(
+            hf / "inference" / "config.json", std::ios::binary);
+        stream << R"({"hidden_size":999,"dspark_block_size":5})";
+    }
     {
         std::ofstream stream(
             hf / "generation_config.json", std::ios::binary);
@@ -460,9 +466,12 @@ void test_hf_virtual_full_precision_container(
             "\"top_k\":20") != std::string::npos,
         "HF virtual runtime profile mismatch");
     require(model.source_paths().size() == 1, "HF virtual shard count mismatch");
+    const auto merged_config = json::parse(
+        model.read_text("__mfq_asset__/model_config.json"));
     require(
-        model.read_text("__mfq_asset__/model_config.json") == config,
-        "HF virtual config asset mismatch");
+        merged_config.at("hidden_size") == 2 &&
+            merged_config.at("dspark_block_size") == 5,
+        "HF inference config did not supplement the authoritative root config");
 
     const auto dense = model.read("model.embed_tokens.weight");
     require(dense.size() == 28, "HF virtual dense record size mismatch");
@@ -846,8 +855,32 @@ void test_hf_virtual_mfe_experts(
                     prepared.weights().gate_up.weight().experts() == 8,
                 "shared SSD route preparation did not map the batch");
     }
+    require(
+        cache.route_layer_likely_hit(0),
+        "full-residency SSD cache did not enable exact device routing "
+        "after its first confirmed hit");
+    {
+        // MTP target verification carries several routed rows through one
+        // cache transaction. Keep the transaction bookkeeping independent
+        // of the old single-token assumption.
+        cache.begin_route_transaction();
+        auto snapshot = cache.snapshot_page_table(0);
+        const auto slot = snapshot.slot_for_expert()[1];
+        require(slot >= 0, "SSD route snapshot omitted a resident expert");
+        std::array<std::int32_t, 6> packed_ids{};
+        packed_ids.fill(1 | ((slot + 1) << 8));
+        mlx::core::array packed(
+            packed_ids.begin(), mlx::core::Shape{6, 1});
+        packed.eval();
+        snapshot.defer_transaction(packed);
+        const auto transaction = cache.resolve_route_transaction();
+        require(transaction.all_hit && transaction.routes.size() == 1 &&
+                    transaction.routes.front().experts ==
+                        std::vector<std::int32_t>{1},
+                "multi-row SSD route transaction did not validate");
+    }
     const auto cache_stats = cache.stats();
-    require(cache_stats.loads == 2 && cache_stats.hits == 1 &&
+    require(cache_stats.loads == 2 && cache_stats.hits == 2 &&
                 cache_stats.resident_experts == 2 &&
                 cache_stats.bytes_read == 2 * store.slot_bytes(),
             "canonical SSD expert cache accounting mismatch");

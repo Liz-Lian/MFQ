@@ -2493,12 +2493,25 @@ struct NativeMoeConfig {
 struct Mxfp4DecodeReduceConfig {
     Dtype dtype;
     Shape output_shape;
+    int tokens = 0;
     int routes = 0;
     int experts = 0;
     int output_width = 0;
     int input_width = 0;
     int descriptor_size = 0;
     int rows_per_lane_group = 2;
+    int workgroups = 0;
+};
+
+struct Mxfp4PairSwiGluConfig {
+    Dtype dtype;
+    Shape output_shape;
+    int tokens = 0;
+    int routes = 0;
+    int experts = 0;
+    int output_width = 0;
+    int input_width = 0;
+    int descriptor_size = 0;
     int workgroups = 0;
 };
 
@@ -3071,6 +3084,7 @@ std::string mxfp4_decode_reduce_kernel_name(
     name
         << "mfq_mxfp4_decode_down_reduce_"
         << (config.dtype == mlx::core::float16 ? "f16" : "f32")
+        << "_t" << config.tokens
         << "_r" << config.routes
         << "_e" << config.experts
         << "_o" << config.output_width
@@ -3107,6 +3121,7 @@ std::string make_mxfp4_decode_reduce_source(
            "[[simdgroup_index_in_threadgroup]],\n"
         << "uint3 threadgroup_position_in_grid "
            "[[threadgroup_position_in_grid]]) {\n"
+        << "constexpr uint TOKENS = " << config.tokens << "u;\n"
         << "constexpr uint ROUTES = " << config.routes << "u;\n"
         << "constexpr uint EXPERTS = " << config.experts << "u;\n"
         << "constexpr uint OUT = " << config.output_width << "u;\n"
@@ -3125,7 +3140,13 @@ std::string make_mxfp4_decode_reduce_source(
     const uint k_lane = lane & (K_LANES - 1u);
     const uint lane_group = lane / K_LANES;
     const uint route = simdgroup_index_in_threadgroup;
-    const uint output_base = threadgroup_position_in_grid.x * OUTPUTS_PER_TG
+    const uint output_tiles = (OUT + OUTPUTS_PER_TG - 1u)
+        / OUTPUTS_PER_TG;
+    const uint token = threadgroup_position_in_grid.x / output_tiles;
+    const uint output_tile = threadgroup_position_in_grid.x
+        - token * output_tiles;
+    if (token >= TOKENS) return;
+    const uint output_base = output_tile * OUTPUTS_PER_TG
         + lane_group * ROWS_PER_LANE_GROUP;
     uint bounded_outputs[ROWS_PER_LANE_GROUP];
     float accumulators[ROWS_PER_LANE_GROUP] = {0.0f};
@@ -3133,7 +3154,7 @@ std::string make_mxfp4_decode_reduce_source(
         bounded_outputs[row] = min(output_base + row, OUT - 1u);
     }
 
-    const int expert = expert_ids[route];
+    const int expert = expert_ids[token * ROUTES + route];
     if (expert >= 0 && expert < int(EXPERTS)) {
         const uint descriptor_base = uint(expert) * DESCRIPTOR_SIZE;
         // This primitive is selected only for a pure MXFP4 projection.
@@ -3164,13 +3185,17 @@ std::string make_mxfp4_decode_reduce_source(
             for (uint component = 0u; component < 32u; component += 16u) {
                 const uint column = column_base + component;
                 const vec<T, 4> source0 = *reinterpret_cast<
-                    device const vec<T, 4>*>(x + route * K + column);
+                    device const vec<T, 4>*>(
+                        x + (token * ROUTES + route) * K + column);
                 const vec<T, 4> source1 = *reinterpret_cast<
-                    device const vec<T, 4>*>(x + route * K + column + 4u);
+                    device const vec<T, 4>*>(
+                        x + (token * ROUTES + route) * K + column + 4u);
                 const vec<T, 4> source2 = *reinterpret_cast<
-                    device const vec<T, 4>*>(x + route * K + column + 8u);
+                    device const vec<T, 4>*>(
+                        x + (token * ROUTES + route) * K + column + 8u);
                 const vec<T, 4> source3 = *reinterpret_cast<
-                    device const vec<T, 4>*>(x + route * K + column + 12u);
+                    device const vec<T, 4>*>(
+                        x + (token * ROUTES + route) * K + column + 12u);
                 const float activations[16] = {
                     float(source0.x), float(source0.y),
                     float(source0.z), float(source0.w),
@@ -3220,7 +3245,7 @@ std::string make_mxfp4_decode_reduce_source(
             route_outputs[
                 route * OUTPUTS_PER_TG
                     + lane_group * ROWS_PER_LANE_GROUP + row
-            ] = down * route_weights[route];
+            ] = down * route_weights[token * ROUTES + route];
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -3228,14 +3253,13 @@ std::string make_mxfp4_decode_reduce_source(
     // One SIMD group performs the tiny deterministic Top-6 reduction while
     // the other route groups finish together at the same barrier.
     if (simdgroup_index_in_threadgroup == 0u && lane < OUTPUTS_PER_TG) {
-        const uint output = threadgroup_position_in_grid.x * OUTPUTS_PER_TG
-            + lane;
+        const uint output = output_tile * OUTPUTS_PER_TG + lane;
         float total = 0.0f;
         for (uint selected = 0u; selected < ROUTES; ++selected) {
             total += route_outputs[selected * OUTPUTS_PER_TG + lane];
         }
         if (output < OUT) {
-            y[output] = T(total);
+            y[token * OUT + output] = T(total);
         }
     }
 }
@@ -3332,6 +3356,262 @@ array mxfp4_decode_reduce_dispatch(
         std::move(shape),
         dtype,
         std::make_shared<Mxfp4DecodeReducePrimitive>(
+            stream,
+            std::move(config)),
+        std::move(inputs));
+}
+
+std::string mxfp4_pair_swiglu_kernel_name(
+    const Mxfp4PairSwiGluConfig& config) {
+    std::ostringstream name;
+    name
+        << "mfq_mxfp4_pair_swiglu_"
+        << (config.dtype == mlx::core::float16 ? "f16" : "f32")
+        << "_t" << config.tokens
+        << "_r" << config.routes
+        << "_e" << config.experts
+        << "_o" << config.output_width
+        << "_k" << config.input_width;
+    return name.str();
+}
+
+std::string make_mxfp4_pair_swiglu_source(
+    const Mxfp4PairSwiGluConfig& config,
+    const std::string& kernel_name) {
+    std::ostringstream source;
+    source
+        << "#include <metal_stdlib>\n"
+        << "using namespace metal;\n"
+        << "using T = "
+        << (config.dtype == mlx::core::float16 ? "half" : "float")
+        << ";\n"
+        << "constant constexpr float MXFP4_LUT[16] = {\n"
+           "    0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,\n"
+           "    -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f,\n"
+           "};\n"
+        << "inline float decode_e8m0(uchar raw) {\n"
+           "    if (raw == 255u) return NAN;\n"
+           "    uint bits = raw == 0u ? 0x00400000u : uint(raw) << 23u;\n"
+           "    return as_type<float>(bits);\n"
+           "}\n"
+        << "kernel void " << kernel_name << "(\n"
+        << "device const int* gate_descriptors [[buffer(0)]],\n"
+        << "device const uchar* gate_values [[buffer(1)]],\n"
+        << "device const uchar* gate_scales [[buffer(2)]],\n"
+        << "device const int* up_descriptors [[buffer(3)]],\n"
+        << "device const uchar* up_values [[buffer(4)]],\n"
+        << "device const uchar* up_scales [[buffer(5)]],\n"
+        << "device const T* x [[buffer(6)]],\n"
+        << "device const int* expert_ids [[buffer(7)]],\n"
+        << "device const float* params [[buffer(8)]],\n"
+        << "device T* y [[buffer(9)]],\n"
+        << "uint thread_index_in_simdgroup "
+           "[[thread_index_in_simdgroup]],\n"
+        << "uint simdgroup_index_in_threadgroup "
+           "[[simdgroup_index_in_threadgroup]],\n"
+        << "uint3 threadgroup_position_in_grid "
+           "[[threadgroup_position_in_grid]]) {\n"
+        << "constexpr uint TOKENS = " << config.tokens << "u;\n"
+        << "constexpr uint ROUTES = " << config.routes << "u;\n"
+        << "constexpr uint EXPERTS = " << config.experts << "u;\n"
+        << "constexpr uint OUT = " << config.output_width << "u;\n"
+        << "constexpr uint K = " << config.input_width << "u;\n"
+        << "constexpr uint DESCRIPTOR_SIZE = "
+        << config.descriptor_size << "u;\n"
+        << R"METAL(
+    constexpr uint K_LANES = 8u;
+    constexpr uint LANE_GROUPS = 32u / K_LANES;
+    constexpr uint SIMD_GROUPS = 2u;
+    constexpr uint OUTPUTS_PER_TG = LANE_GROUPS * SIMD_GROUPS;
+    constexpr uint OUTPUT_TILES = (OUT + OUTPUTS_PER_TG - 1u)
+        / OUTPUTS_PER_TG;
+
+    const uint lane = thread_index_in_simdgroup;
+    const uint k_lane = lane & (K_LANES - 1u);
+    const uint lane_group = lane / K_LANES;
+    const uint workgroup = threadgroup_position_in_grid.x;
+    const uint output_tile = workgroup % OUTPUT_TILES;
+    const uint routed_row = workgroup / OUTPUT_TILES;
+    const uint route = routed_row % ROUTES;
+    const uint token = routed_row / ROUTES;
+    if (token >= TOKENS) return;
+
+    const uint output = output_tile * OUTPUTS_PER_TG
+        + simdgroup_index_in_threadgroup * LANE_GROUPS
+        + lane_group;
+    const uint bounded_output = min(output, OUT - 1u);
+    const int expert = expert_ids[token * ROUTES + route];
+    float gate_accumulator = 0.0f;
+    float up_accumulator = 0.0f;
+    if (expert >= 0 && expert < int(EXPERTS)) {
+        const uint descriptor_base = uint(expert) * DESCRIPTOR_SIZE;
+        const uint gate_local = uint(gate_descriptors[descriptor_base + 1u]);
+        const uint up_local = uint(up_descriptors[descriptor_base + 1u]);
+        const uint groups = uint(gate_descriptors[descriptor_base + 4u]);
+        const uint gate_value_offset = uint(
+            gate_descriptors[descriptor_base + 5u]);
+        const uint gate_scale_offset = uint(
+            gate_descriptors[descriptor_base + 6u]);
+        const uint up_value_offset = uint(
+            up_descriptors[descriptor_base + 5u]);
+        const uint up_scale_offset = uint(
+            up_descriptors[descriptor_base + 6u]);
+        const ulong gate_pool_output = ulong(gate_local) * ulong(OUT)
+            + ulong(bounded_output);
+        const ulong up_pool_output = ulong(up_local) * ulong(OUT)
+            + ulong(bounded_output);
+
+        for (uint group = 0u; group < groups; ++group) {
+            const uint column = group * 32u + k_lane * 4u;
+            const vec<T, 4> raw_activations = *reinterpret_cast<
+                device const vec<T, 4>*>(x + token * K + column);
+            const float4 activations = float4(raw_activations);
+            const ulong gate_packed_offset = ulong(gate_value_offset)
+                + gate_pool_output * (ulong(K) >> 1u)
+                + (ulong(column) >> 1u);
+            const ulong up_packed_offset = ulong(up_value_offset)
+                + up_pool_output * (ulong(K) >> 1u)
+                + (ulong(column) >> 1u);
+            const uchar2 gate_codes = *reinterpret_cast<
+                device const uchar2*>(gate_values + gate_packed_offset);
+            const uchar2 up_codes = *reinterpret_cast<
+                device const uchar2*>(up_values + up_packed_offset);
+            const float gate_scale = decode_e8m0(gate_scales[
+                ulong(gate_scale_offset)
+                    + gate_pool_output * ulong(groups) + ulong(group)]);
+            const float up_scale = decode_e8m0(up_scales[
+                ulong(up_scale_offset)
+                    + up_pool_output * ulong(groups) + ulong(group)]);
+            const float4 gate_weights = gate_scale * float4(
+                MXFP4_LUT[uint(gate_codes.x & 15u)],
+                MXFP4_LUT[uint(gate_codes.x >> 4u)],
+                MXFP4_LUT[uint(gate_codes.y & 15u)],
+                MXFP4_LUT[uint(gate_codes.y >> 4u)]);
+            const float4 up_weights = up_scale * float4(
+                MXFP4_LUT[uint(up_codes.x & 15u)],
+                MXFP4_LUT[uint(up_codes.x >> 4u)],
+                MXFP4_LUT[uint(up_codes.y & 15u)],
+                MXFP4_LUT[uint(up_codes.y >> 4u)]);
+            gate_accumulator += dot(activations, gate_weights);
+            up_accumulator += dot(activations, up_weights);
+        }
+        for (uint offset = K_LANES >> 1u; offset > 0u; offset >>= 1u) {
+            gate_accumulator += simd_shuffle_down(
+                gate_accumulator, offset);
+            up_accumulator += simd_shuffle_down(
+                up_accumulator, offset);
+        }
+    }
+
+    if (k_lane == 0u && output < OUT) {
+        if (expert < 0 || expert >= int(EXPERTS)) {
+            y[routed_row * OUT + output] = T(0.0f);
+            return;
+        }
+        // Preserve the unfused graph's projection-boundary rounding.
+        float gate = float(T(gate_accumulator));
+        float up = float(T(up_accumulator));
+        if (params[0] > 0.0f) {
+            gate = min(gate, params[0]);
+            up = clamp(up, -params[0], params[0]);
+        }
+        const float activated = gate / (1.0f + exp(-gate));
+        y[routed_row * OUT + output] = T(activated * up);
+    }
+}
+)METAL";
+    return source.str();
+}
+
+class Mxfp4PairSwiGluPrimitive final
+    : public mlx::core::UnaryPrimitive {
+public:
+    Mxfp4PairSwiGluPrimitive(
+        mlx::core::Stream stream,
+        Mxfp4PairSwiGluConfig config)
+        : UnaryPrimitive(stream),
+          config_(std::move(config)),
+          kernel_name_(mxfp4_pair_swiglu_kernel_name(config_)) {}
+
+    void eval_cpu(
+        const std::vector<array>&,
+        array&) override {
+        throw std::runtime_error(
+            "MXFP4 pair SwiGLU has no CPU path");
+    }
+
+    void eval_gpu(
+        const std::vector<array>& inputs,
+        array& output) override {
+        if (inputs.size() != 9) {
+            throw std::logic_error(
+                "MXFP4 pair SwiGLU input count mismatch");
+        }
+        output.set_data(
+            mlx::core::allocator::malloc(output.nbytes()));
+        auto& selected_stream = stream();
+        auto& device = mlx::core::metal::device(
+            selected_stream.device);
+        CompileOptions compile_options;
+        compile_options.math_mode = MathMode::Fast;
+        auto* library = device.get_library(
+            kernel_name_,
+            compile_options,
+            [config = config_, name = kernel_name_] {
+                return make_mxfp4_pair_swiglu_source(config, name);
+            });
+        auto* kernel = device.get_kernel(kernel_name_, library);
+        auto& encoder = mlx::core::metal::get_command_encoder(
+            selected_stream);
+        encoder.set_compute_pipeline_state(kernel);
+        for (int index = 0; index < 9; ++index) {
+            encoder.set_input_array(
+                inputs[static_cast<std::size_t>(index)],
+                index);
+        }
+        encoder.set_output_array(output, 9);
+        encoder.dispatch_threadgroups(
+            MTL::Size(config_.workgroups, 1, 1),
+            MTL::Size(64, 1, 1));
+    }
+
+    const char* name() const override {
+        return "Mxfp4PairSwiGluPrimitive";
+    }
+
+    bool is_equivalent(
+        const mlx::core::Primitive& other) const override {
+        const auto* primitive =
+            dynamic_cast<const Mxfp4PairSwiGluPrimitive*>(&other);
+        return primitive != nullptr
+            && primitive->kernel_name_ == kernel_name_;
+    }
+
+    std::vector<Shape> output_shapes(
+        const std::vector<array>&) override {
+        return {config_.output_shape};
+    }
+
+private:
+    Mxfp4PairSwiGluConfig config_;
+    std::string kernel_name_;
+};
+
+array mxfp4_pair_swiglu_dispatch(
+    std::vector<array> inputs,
+    Mxfp4PairSwiGluConfig config) {
+    auto stream = mlx::core::default_stream(
+        mlx::core::default_device());
+    if (stream.device != mlx::core::Device::gpu) {
+        throw std::invalid_argument(
+            "MXFP4 pair SwiGLU requires the Metal device");
+    }
+    auto shape = config.output_shape;
+    const auto dtype = config.dtype;
+    return array(
+        std::move(shape),
+        dtype,
+        std::make_shared<Mxfp4PairSwiGluPrimitive>(
             stream,
             std::move(config)),
         std::move(inputs));
@@ -9891,6 +10171,126 @@ array MlxMfeWeight::routed_swiglu_packed(
         true);
 }
 
+array MlxMfeWeight::routed_swiglu_pair(
+    const MlxMfeWeight& up,
+    const array& input,
+    const array& expert_ids,
+    float limit) const {
+    if (!std::isfinite(limit) || limit < 0.0f) {
+        throw std::invalid_argument(
+            "paired MFE SwiGLU limit must be finite and non-negative");
+    }
+    if (impl_->experts != up.impl_->experts
+        || impl_->out_per_expert != up.impl_->out_per_expert
+        || impl_->neuron_len != up.impl_->neuron_len
+        || impl_->projections != 1
+        || up.impl_->projections != 1) {
+        throw std::invalid_argument(
+            "paired MFE Gate and Up weights are incompatible");
+    }
+    const auto fallback = [&]() {
+        auto gate_output = routed_matmul(input, expert_ids);
+        auto up_output = up.routed_matmul(input, expert_ids);
+        if (limit > 0.0f) {
+            return moe_limited_swiglu_pair(
+                std::move(gate_output),
+                std::move(up_output),
+                limit);
+        }
+        return moe_swiglu_split(mlx::core::concatenate(
+            {std::move(gate_output), std::move(up_output)},
+            -1));
+    };
+    const bool native_pair =
+        impl_->native_primitive
+        && up.impl_->native_primitive
+        && impl_->family_mask
+            == (std::uint32_t{1} << kFamilyMxfp4)
+        && up.impl_->family_mask
+            == (std::uint32_t{1} << kFamilyMxfp4)
+        && impl_->rotations.empty()
+        && up.impl_->rotations.empty()
+        && (impl_->k_lanes_override == 0
+            || impl_->k_lanes_override == 8)
+        && (up.impl_->k_lanes_override == 0
+            || up.impl_->k_lanes_override == 8)
+        && input.ndim() == 2
+        && expert_ids.ndim() == 2
+        && input.shape(0) >= 1
+        && input.shape(0) <= 6
+        && expert_ids.shape(0) == input.shape(0)
+        && expert_ids.shape(1) >= 1
+        && expert_ids.shape(1) <= 16
+        && input.shape(1) == impl_->neuron_len
+        && impl_->out_per_expert > 0
+        && impl_->neuron_len > 0
+        && impl_->neuron_len % 32 == 0
+        && impl_->descriptor_values.size()
+            == static_cast<std::size_t>(impl_->experts)
+                * kDescriptorSize
+        && up.impl_->descriptor_values.size()
+            == static_cast<std::size_t>(up.impl_->experts)
+                * kDescriptorSize;
+    if (!native_pair || mlx_reference_enabled()) {
+        return fallback();
+    }
+
+    auto source = input;
+    if (source.dtype() != mlx::core::float16
+        && source.dtype() != mlx::core::float32) {
+        source = mlx::core::astype(source, mlx::core::float16);
+    }
+    source = mlx::core::contiguous(std::move(source));
+    auto ids = mlx::core::contiguous(
+        mlx::core::astype(expert_ids, mlx::core::int32));
+    const int tokens = ids.shape(0);
+    const int routes = ids.shape(1);
+    constexpr int kOutputsPerWorkgroup = 8;
+    const auto output_tiles =
+        (static_cast<std::size_t>(impl_->out_per_expert)
+             + kOutputsPerWorkgroup - 1u)
+        / kOutputsPerWorkgroup;
+    const auto routed_rows = checked_product(
+        static_cast<std::size_t>(tokens),
+        static_cast<std::size_t>(routes),
+        "MXFP4 pair routed rows");
+    const int workgroups = checked_int(
+        checked_product(
+            routed_rows,
+            output_tiles,
+            "MXFP4 pair workgroups"),
+        "MXFP4 pair workgroups");
+    return mxfp4_pair_swiglu_dispatch(
+        {
+            impl_->descriptors,
+            impl_->mx_values,
+            impl_->mx_scales,
+            up.impl_->descriptors,
+            up.impl_->mx_values,
+            up.impl_->mx_scales,
+            std::move(source),
+            std::move(ids),
+            array({limit}, mlx::core::float32),
+        },
+        Mxfp4PairSwiGluConfig{
+            .dtype = input.dtype() == mlx::core::float32
+                ? mlx::core::float32
+                : mlx::core::float16,
+            .output_shape = Shape{
+                tokens,
+                routes,
+                impl_->out_per_expert,
+            },
+            .tokens = tokens,
+            .routes = routes,
+            .experts = impl_->experts,
+            .output_width = impl_->out_per_expert,
+            .input_width = impl_->neuron_len,
+            .descriptor_size = kDescriptorSize,
+            .workgroups = workgroups,
+        });
+}
+
 array MlxMfeWeight::routed_matmul_reduce(
     const array& input,
     const array& expert_ids,
@@ -9912,9 +10312,10 @@ array MlxMfeWeight::routed_matmul_reduce(
         || input.ndim() != 3
         || expert_ids.ndim() != 2
         || route_weights.ndim() != 2
-        || input.shape(0) != 1
-        || expert_ids.shape(0) != 1
-        || route_weights.shape(0) != 1
+        || input.shape(0) < 1
+        || input.shape(0) > 6
+        || expert_ids.shape(0) != input.shape(0)
+        || route_weights.shape(0) != input.shape(0)
         || input.shape(1) != expert_ids.shape(1)
         || route_weights.shape(1) != expert_ids.shape(1)
         || input.shape(2) != impl_->neuron_len
@@ -9939,15 +10340,19 @@ array MlxMfeWeight::routed_matmul_reduce(
         mlx::core::astype(expert_ids, mlx::core::int32));
     auto weights = mlx::core::contiguous(
         mlx::core::astype(route_weights, mlx::core::float32));
+    const int tokens = ids.shape(0);
     const int routes = ids.shape(1);
     const int rows_per_lane_group =
         mxfp4_decode_down_reduce_rows();
     const int outputs_per_workgroup =
         4 * rows_per_lane_group;
     const int workgroups = checked_int(
-        (static_cast<std::size_t>(impl_->out_per_expert)
-             + static_cast<std::size_t>(outputs_per_workgroup) - 1u)
-            / static_cast<std::size_t>(outputs_per_workgroup),
+        checked_product(
+            static_cast<std::size_t>(tokens),
+            (static_cast<std::size_t>(impl_->out_per_expert)
+                 + static_cast<std::size_t>(outputs_per_workgroup) - 1u)
+                / static_cast<std::size_t>(outputs_per_workgroup),
+            "MXFP4 decode down-reduce workgroups"),
         "MXFP4 decode down-reduce workgroups");
     return mxfp4_decode_reduce_dispatch(
         {
@@ -9962,7 +10367,8 @@ array MlxMfeWeight::routed_matmul_reduce(
             .dtype = input.dtype() == mlx::core::float32
                 ? mlx::core::float32
                 : mlx::core::float16,
-            .output_shape = Shape{1, impl_->out_per_expert},
+            .output_shape = Shape{tokens, impl_->out_per_expert},
+            .tokens = tokens,
             .routes = routes,
             .experts = impl_->experts,
             .output_width = impl_->out_per_expert,
@@ -11488,6 +11894,18 @@ array MlxRoutedLinear::swiglu_packed(
     return weight_.routed_swiglu_packed(
         input,
         packed_expert_ids,
+        limit);
+}
+
+array MlxRoutedLinear::swiglu_pair(
+    const MlxRoutedLinear& up,
+    const array& input,
+    const array& expert_ids,
+    float limit) const {
+    return weight_.routed_swiglu_pair(
+        up.weight_,
+        input,
+        expert_ids,
         limit);
 }
 

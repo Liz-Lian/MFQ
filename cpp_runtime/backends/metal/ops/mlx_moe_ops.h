@@ -23,8 +23,8 @@ MlxMoeTopKResult moe_topk(
     float norm_floor = 1e-20f,
     float scale = 1.0f);
 
-// Decode-only normalized top-6 sqrt-softplus router hot path. Compute one
-// FP16 dense router row and selection weights in one Metal dispatch.
+// Small-M normalized top-6 sqrt-softplus router hot path. Compute up to 16
+// FP16/BF16 router rows and selection weights in one Metal dispatch.
 bool moe_dense_router_topk_supported(
     const mlx::core::array& input,
     const mlx::core::array& weight) noexcept;
@@ -43,6 +43,33 @@ MlxMoeTopKResult moe_dense_router_topk_packed(
     const mlx::core::array& expert_map,
     const std::optional<mlx::core::array>& bias = std::nullopt,
     const std::optional<mlx::core::array>& available = std::nullopt,
+    float norm_floor = 1e-20f,
+    float scale = 1.0f);
+
+// Hash-routed models already know the selected expert IDs from the token
+// table.  Compute only those dense router rows and their normalized
+// sqrt-softplus weights in one dispatch instead of materializing every
+// expert logit and running a redundant Top-K pass.
+bool moe_dense_hash_router_supported(
+    const mlx::core::array& input,
+    const mlx::core::array& weight,
+    const mlx::core::array& token_ids,
+    const mlx::core::array& token_experts) noexcept;
+
+MlxMoeTopKResult moe_dense_hash_router(
+    const mlx::core::array& input,
+    const mlx::core::array& weight,
+    const mlx::core::array& token_ids,
+    const mlx::core::array& token_experts,
+    float norm_floor = 1e-20f,
+    float scale = 1.0f);
+
+MlxMoeTopKResult moe_dense_hash_router_packed(
+    const mlx::core::array& input,
+    const mlx::core::array& weight,
+    const mlx::core::array& token_ids,
+    const mlx::core::array& token_experts,
+    const mlx::core::array& expert_map,
     float norm_floor = 1e-20f,
     float scale = 1.0f);
 

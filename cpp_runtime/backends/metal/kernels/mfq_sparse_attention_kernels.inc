@@ -599,7 +599,8 @@ constexpr const char* kIndexerScoresSource = R"MFQ_METAL(
         uint local_key = index - dimension * KEY_TILE;
         uint key_index = key_base + local_key;
         key_tile[index] = key_index < uint(K)
-            ? k[(batch * uint(K) + key_index) * DIM + dimension]
+            ? half(float(k[
+                  (batch * uint(K) + key_index) * DIM + dimension]))
             : half(0.0f);
     }
     if (local_thread < KEY_TILE) {
@@ -631,22 +632,22 @@ constexpr const char* kIndexerScoresSource = R"MFQ_METAL(
             metal::simdgroup_matrix<half, 8, 8> a1;
             metal::simdgroup_matrix<half, 8, 8> b0;
             metal::simdgroup_matrix<half, 8, 8> b1;
-            a0.thread_elements()[0] = q[
+            a0.thread_elements()[0] = half(float(q[
                 q_base + (head_base + fragment_row) * DIM
                     + dimension + fragment_col
-            ];
-            a0.thread_elements()[1] = q[
+            ]));
+            a0.thread_elements()[1] = half(float(q[
                 q_base + (head_base + fragment_row) * DIM
                     + dimension + fragment_col + 1u
-            ];
-            a1.thread_elements()[0] = q[
+            ]));
+            a1.thread_elements()[0] = half(float(q[
                 q_base + (head_base + 8u + fragment_row) * DIM
                     + dimension + fragment_col
-            ];
-            a1.thread_elements()[1] = q[
+            ]));
+            a1.thread_elements()[1] = half(float(q[
                 q_base + (head_base + 8u + fragment_row) * DIM
                     + dimension + fragment_col + 1u
-            ];
+            ]));
             b0.thread_elements()[0] = key_tile[
                 (dimension + fragment_row) * KEY_TILE
                     + local_key_base + fragment_col
@@ -762,11 +763,25 @@ constexpr const char* kIndexerDecodeScoresSource = R"MFQ_METAL(
         uint key_index = first_group_key + local_key;
         half4x4 value;
         if (key_index < uint(decode_params[2])) {
+#if MFQ_INDEXER_INPUT_BF16
+            uint value_base =
+                (batch * uint(decode_params[3]) + key_index) * DIM
+                + block * 16u;
+            for (uint column = 0u; column < 4u; ++column) {
+                uint offset = value_base + column * 4u;
+                value[column] = half4(
+                    half(float(k[offset])),
+                    half(float(k[offset + 1u])),
+                    half(float(k[offset + 2u])),
+                    half(float(k[offset + 3u])));
+            }
+#else
             const device half4x4* row =
                 reinterpret_cast<const device half4x4*>(
                     k + (batch * uint(decode_params[3]) + key_index) * DIM
                 );
             value = row[block];
+#endif
         } else {
             for (uint column = 0u; column < 4u; ++column) {
                 value[column] = half4(0.0h);
@@ -810,11 +825,22 @@ constexpr const char* kIndexerDecodeScoresSource = R"MFQ_METAL(
         ) {
             uint local_head = index / (DIM / 4u);
             uint vector_index = index - local_head * (DIM / 4u);
+#if MFQ_INDEXER_INPUT_BF16
+            uint value_base = query_base
+                + (head_base + local_head) * DIM
+                + vector_index * 4u;
+            query4[index] = half4(
+                half(float(q[value_base])),
+                half(float(q[value_base + 1u])),
+                half(float(q[value_base + 2u])),
+                half(float(q[value_base + 3u])));
+#else
             const device half4* row =
                 reinterpret_cast<const device half4*>(
                     q + query_base + (head_base + local_head) * DIM
                 );
             query4[index] = row[vector_index];
+#endif
         }
         if (local_thread < HEADS_PER_TILE) {
             head_weights[local_thread] = float(

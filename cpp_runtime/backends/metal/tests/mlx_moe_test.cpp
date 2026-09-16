@@ -3964,6 +3964,42 @@ void test_mxfp4_pair_blocks_matches_native_projections() {
         for (std::size_t index = 0; index < actual.size(); ++index) {
             require_close(actual[index], reference[index], tolerance);
         }
+
+        for (const int small_tokens : {1, 2, 4, 6}) {
+            auto small_source = mlx::core::slice(
+                source,
+                mlx::core::Shape{0, 0},
+                mlx::core::Shape{small_tokens, input});
+            const auto small_ids = mlx::core::array(
+                ids.begin(),
+                mlx::core::Shape{small_tokens, routes});
+            const auto small_reference = evaluated_floats(
+                mfq::metal::moe_limited_swiglu_pair(
+                    gate.routed_matmul(small_source, small_ids),
+                    up.routed_matmul(small_source, small_ids),
+                    swiglu_limit));
+            auto small_paired = gate.routed_swiglu_pair(
+                up,
+                small_source,
+                small_ids,
+                swiglu_limit);
+            require(
+                small_paired.dtype() == mlx::core::float16,
+                "MXFP4 pair small-M output dtype mismatch");
+            const auto small_actual = evaluated_floats(
+                std::move(small_paired));
+            require(
+                small_actual.size() == small_reference.size(),
+                "MXFP4 pair small-M output size mismatch");
+            for (std::size_t index = 0;
+                 index < small_actual.size();
+                 ++index) {
+                require_close(
+                    small_actual[index],
+                    small_reference[index],
+                    tolerance);
+            }
+        }
     };
     check_dtype(mlx::core::float16, 8e-3f);
     check_dtype(mlx::core::bfloat16, 3e-2f);
@@ -4447,6 +4483,67 @@ void test_mxfp4_decode_down_reduce() {
         "packed MXFP4 decode down-reduce output shape mismatch");
     for (std::size_t index = 0; index < reference.size(); ++index) {
         require_close(reference[index], packed_fused[index], 1e-4f);
+    }
+
+    for (const int tokens : {2, 6}) {
+        std::vector<float> multi_source_values(
+            static_cast<std::size_t>(tokens) * routes * input);
+        for (std::size_t index = 0;
+             index < multi_source_values.size();
+             ++index) {
+            multi_source_values[index] = static_cast<float>(
+                static_cast<int>((index * 11 + 5) % 41) - 20) / 128.0f;
+        }
+        std::vector<std::int32_t> multi_ids(
+            static_cast<std::size_t>(tokens) * routes);
+        std::vector<float> multi_weights(
+            static_cast<std::size_t>(tokens) * routes);
+        for (int token = 0; token < tokens; ++token) {
+            for (int route = 0; route < routes; ++route) {
+                const auto index = static_cast<std::size_t>(
+                    token * routes + route);
+                multi_ids[index] = ids[
+                    static_cast<std::size_t>((route + token) % routes)];
+                multi_weights[index] = route_weights[
+                    static_cast<std::size_t>(route)];
+            }
+        }
+        const auto multi_source = mlx::core::astype(
+            mlx::core::array(
+                multi_source_values.begin(),
+                mlx::core::Shape{tokens, routes, input}),
+            mlx::core::float16);
+        const auto multi_expert_ids = mlx::core::array(
+            multi_ids.begin(),
+            mlx::core::Shape{tokens, routes});
+        const auto multi_route_weights = mlx::core::array(
+            multi_weights.begin(),
+            mlx::core::Shape{tokens, routes});
+        setenv("MFQ_METAL_MFE_DECODE_DOWN_REDUCE", "0", 1);
+        const auto multi_reference = evaluated_floats(
+            weight.routed_matmul_reduce(
+                multi_source,
+                multi_expert_ids,
+                multi_route_weights));
+        setenv("MFQ_METAL_MFE_DECODE_DOWN_REDUCE", "1", 1);
+        const auto multi_fused = evaluated_floats(
+            weight.routed_matmul_reduce(
+                multi_source,
+                multi_expert_ids,
+                multi_route_weights));
+        require(
+            multi_reference.size()
+                    == static_cast<std::size_t>(tokens * output)
+                && multi_fused.size() == multi_reference.size(),
+            "MXFP4 small-M down-reduce output shape mismatch");
+        for (std::size_t index = 0;
+             index < multi_reference.size();
+             ++index) {
+            require_close(
+                multi_reference[index],
+                multi_fused[index],
+                1e-4f);
+        }
     }
 
     if (saved.has_value()) {

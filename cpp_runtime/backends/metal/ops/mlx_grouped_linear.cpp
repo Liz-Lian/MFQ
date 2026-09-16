@@ -71,6 +71,8 @@ using RetainedProjection = std::variant<
     MlxVqWeight,
     MlxTpqInt4Weight,
     MlxTpqPqWeight,
+    MlxFp8SqWeight,
+    MlxMxfp4SqWeight,
     MlxMxWeight>;
 
 RetainedProjection retain_projection(
@@ -83,9 +85,14 @@ RetainedProjection retain_projection(
             }
             using Weight = std::remove_cv_t<
                 std::remove_pointer_t<decltype(weight)>>;
-            return RetainedProjection(
-                std::in_place_type<Weight>,
-                *weight);
+            if constexpr (std::is_same_v<Weight, array>) {
+                throw MlxGroupedLinearUnsupported(
+                    "dense projections require the dense grouped kernel");
+            } else {
+                return RetainedProjection(
+                    std::in_place_type<Weight>,
+                    *weight);
+            }
         },
         value);
 }
@@ -914,6 +921,91 @@ mlx::core::fast::CustomKernelFunction nint_projection_group_kernel(
         {"y"},
         make_nint_projection_group_source(projections),
         kNintProjectionHeader,
+        true,
+        false,
+        options);
+    kernels.emplace(projections, kernel);
+    return kernel;
+}
+
+std::vector<std::string> dense_projection_group_input_names(
+    std::size_t projections) {
+    std::vector<std::string> names;
+    names.reserve(projections + 1);
+    for (std::size_t projection = 0;
+         projection < projections;
+         ++projection) {
+        names.push_back("w_" + std::to_string(projection));
+    }
+    names.push_back("x");
+    return names;
+}
+
+std::string make_dense_projection_group_source(
+    std::size_t projections) {
+    std::string source = R"METAL(
+    uint tile = threadgroup_position_in_grid.x;
+    uint lane = thread_index_in_simdgroup;
+    uint output_lane = simdgroup_index_in_threadgroup;
+)METAL";
+    for (std::size_t projection = 0;
+         projection < projections;
+         ++projection) {
+        const auto suffix = std::to_string(projection);
+        source +=
+            "    if (tile >= uint(P" + suffix + "_TILE_BEGIN) &&\n"
+            "        tile < uint(P" + suffix + "_TILE_END)) {\n"
+            "        uint output = (tile - uint(P" + suffix
+            + "_TILE_BEGIN)) * 4u + output_lane;\n"
+            "        if (output >= uint(P" + suffix + "_OUT)) return;\n"
+            "        float accumulators[M];\n"
+            "        for (uint row = 0u; row < uint(M); ++row) {\n"
+            "            accumulators[row] = 0.0f;\n"
+            "        }\n"
+            "        for (uint column = lane; column < uint(K); "
+            "column += 32u) {\n"
+            "            float weight = float(w_" + suffix
+            + "[output * uint(K) + column]);\n"
+            "            for (uint row = 0u; row < uint(M); ++row) {\n"
+            "                accumulators[row] = fma(\n"
+            "                    float(x[row * uint(K) + column]),\n"
+            "                    weight,\n"
+            "                    accumulators[row]);\n"
+            "            }\n"
+            "        }\n"
+            "        for (uint row = 0u; row < uint(M); ++row) {\n"
+            "            float total = simd_sum(accumulators[row]);\n"
+            "            if (lane == 0u) {\n"
+            "                y[row * uint(TOTAL_OUT) + uint(P" + suffix
+            + "_OFFSET) + output] = T(total);\n"
+            "            }\n"
+            "        }\n"
+            "        return;\n"
+            "    }\n";
+    }
+    return source;
+}
+
+mlx::core::fast::CustomKernelFunction dense_projection_group_kernel(
+    std::size_t projections) {
+    static std::mutex mutex;
+    static std::unordered_map<
+        std::size_t,
+        mlx::core::fast::CustomKernelFunction> kernels;
+    std::lock_guard<std::mutex> lock(mutex);
+    const auto found = kernels.find(projections);
+    if (found != kernels.end()) {
+        return found->second;
+    }
+    CompileOptions options;
+    options.math_mode = MathMode::Fast;
+    auto kernel = mlx::core::fast::metal_kernel(
+        "mfq_cpp_dense_projection_group_p" +
+            std::to_string(projections),
+        dense_projection_group_input_names(projections),
+        {"y"},
+        make_dense_projection_group_source(projections),
+        "",
         true,
         false,
         options);
@@ -2913,7 +3005,13 @@ int weight_input_size(const MlxGroupedLinearWeightRef& value) {
                 throw std::invalid_argument(
                     "grouped linear weight cannot be null");
             }
-            return weight->input_size();
+            using Weight = std::remove_cv_t<
+                std::remove_pointer_t<decltype(weight)>>;
+            if constexpr (std::is_same_v<Weight, array>) {
+                return weight->ndim() == 2 ? weight->shape(1) : 0;
+            } else {
+                return weight->input_size();
+            }
         },
         value);
 }
@@ -2925,7 +3023,13 @@ int weight_output_size(const MlxGroupedLinearWeightRef& value) {
                 throw std::invalid_argument(
                     "grouped linear weight cannot be null");
             }
-            return weight->output_size();
+            using Weight = std::remove_cv_t<
+                std::remove_pointer_t<decltype(weight)>>;
+            if constexpr (std::is_same_v<Weight, array>) {
+                return weight->ndim() == 2 ? weight->shape(0) : 0;
+            } else {
+                return weight->output_size();
+            }
         },
         value);
 }
@@ -2938,7 +3042,13 @@ std::size_t weight_packed_nbytes(
                 throw std::invalid_argument(
                     "grouped linear weight cannot be null");
             }
-            return weight->packed_nbytes();
+            using Weight = std::remove_cv_t<
+                std::remove_pointer_t<decltype(weight)>>;
+            if constexpr (std::is_same_v<Weight, array>) {
+                return weight->nbytes();
+            } else {
+                return weight->packed_nbytes();
+            }
         },
         value);
 }
@@ -2953,6 +3063,10 @@ struct MlxGroupedLinear::Impl {
     std::optional<array> q8_scales;
     std::vector<RetainedProjection> common_kernel_weights;
     std::vector<MlxNintWeight> nint_projection_weights;
+    std::vector<MlxMxWeight> mxfp8_block32_projection_weights;
+    std::vector<MlxMxfp4SqWeight> mxfp4_sq_projection_weights;
+    std::vector<MlxFp8SqWeight> fp8_sq_projection_weights;
+    std::vector<array> dense_projection_weights;
     std::vector<DirectProjectionLayout> direct_layouts;
     std::vector<array> direct_weight_inputs;
     std::vector<int> output_sizes;
@@ -2982,6 +3096,54 @@ struct MlxGroupedLinear::Impl {
         int total_output,
         std::size_t bytes)
         : nint_projection_weights(std::move(weights)),
+          output_sizes(std::move(widths)),
+          input_size(width),
+          total_output_size(total_output),
+          packed_bytes(bytes) {}
+
+    Impl(
+        std::vector<MlxMxWeight> weights,
+        std::vector<int> widths,
+        int width,
+        int total_output,
+        std::size_t bytes)
+        : mxfp8_block32_projection_weights(std::move(weights)),
+          output_sizes(std::move(widths)),
+          input_size(width),
+          total_output_size(total_output),
+          packed_bytes(bytes) {}
+
+    Impl(
+        std::vector<MlxMxfp4SqWeight> weights,
+        std::vector<int> widths,
+        int width,
+        int total_output,
+        std::size_t bytes)
+        : mxfp4_sq_projection_weights(std::move(weights)),
+          output_sizes(std::move(widths)),
+          input_size(width),
+          total_output_size(total_output),
+          packed_bytes(bytes) {}
+
+    Impl(
+        std::vector<MlxFp8SqWeight> weights,
+        std::vector<int> widths,
+        int width,
+        int total_output,
+        std::size_t bytes)
+        : fp8_sq_projection_weights(std::move(weights)),
+          output_sizes(std::move(widths)),
+          input_size(width),
+          total_output_size(total_output),
+          packed_bytes(bytes) {}
+
+    Impl(
+        std::vector<array> weights,
+        std::vector<int> widths,
+        int width,
+        int total_output,
+        std::size_t bytes)
+        : dense_projection_weights(std::move(weights)),
           output_sizes(std::move(widths)),
           input_size(width),
           total_output_size(total_output),
@@ -3040,11 +3202,36 @@ struct MlxGroupedLinear::Impl {
     bool uses_zero_copy_storage() const noexcept {
         return !common_kernel_weights.empty()
             || !nint_projection_weights.empty()
+            || !mxfp8_block32_projection_weights.empty()
+            || !mxfp4_sq_projection_weights.empty()
+            || !fp8_sq_projection_weights.empty()
+            || !dense_projection_weights.empty()
             || !direct_layouts.empty();
     }
 
     bool has_nint_projection_group() const noexcept {
         return !nint_projection_weights.empty();
+    }
+
+    bool has_mxfp4_sq_projection_group() const noexcept {
+        return !mxfp4_sq_projection_weights.empty();
+    }
+
+    bool has_mxfp8_block32_projection_group() const noexcept {
+        return !mxfp8_block32_projection_weights.empty();
+    }
+
+    bool has_fp8_sq_projection_group() const noexcept {
+        return !fp8_sq_projection_weights.empty();
+    }
+
+    bool has_sq_projection_group() const noexcept {
+        return has_mxfp4_sq_projection_group() ||
+            has_fp8_sq_projection_group();
+    }
+
+    bool has_dense_projection_group() const noexcept {
+        return !dense_projection_weights.empty();
     }
 
     bool has_nint_swiglu_pair() const noexcept {
@@ -3087,6 +3274,32 @@ struct MlxGroupedLinear::Impl {
             && direct_layouts[1].family == kFamilyMx
             && direct_layouts[1].bits == 8;
     }
+
+    bool supports_bf16_matmul() const noexcept {
+        // Individual MX/NINT8-0 linears preserve a BF16 model boundary by
+        // projecting through FP16 and casting their result back to BF16.
+        // The zero-copy group can do the same conversion once for the shared
+        // input and once for the combined output, while retaining the native
+        // FP16 MXFP8/small-M kernels. Keep the broader retained/NINT families
+        // on their established dtype contract until each is verified.
+        if (has_sq_projection_group()) {
+            return true;
+        }
+        if (has_dense_projection_group()) {
+            return dense_projection_weights.front().dtype()
+                == mlx::core::bfloat16;
+        }
+        if (has_mxfp8_block32_projection_group()) {
+            return true;
+        }
+        return !direct_layouts.empty() && std::all_of(
+            direct_layouts.begin(),
+            direct_layouts.end(),
+            [](const DirectProjectionLayout& layout) {
+                return layout.family == kFamilyMx ||
+                    layout.family == kFamilyNint8Zero;
+            });
+    }
 };
 
 MlxGroupedLinear::MlxGroupedLinear(
@@ -3099,6 +3312,250 @@ MlxGroupedLinear::MlxGroupedLinear(
     if (shared_input <= 0) {
         throw std::invalid_argument(
             "grouped linear input width must be positive");
+    }
+
+    // Dense control/compressor projections are common beside packed Q/K/V
+    // weights. They previously remained separate MLX matmul submissions even
+    // when every projection consumed the same activation. Retain the original
+    // arrays and bind a homogeneous FP16/BF16 cohort to one small-M dispatch;
+    // mixed dense/packed lists are partitioned by MlxProjectionBatch.
+    const bool contains_dense = std::any_of(
+        weights.begin(),
+        weights.end(),
+        [](const MlxGroupedLinearWeightRef& weight) {
+            return std::holds_alternative<const array*>(weight);
+        });
+    if (contains_dense) {
+        const bool all_dense = std::all_of(
+            weights.begin(),
+            weights.end(),
+            [](const MlxGroupedLinearWeightRef& weight) {
+                return std::holds_alternative<const array*>(weight);
+            });
+        if (!all_dense || weights.size() > 14) {
+            throw MlxGroupedLinearUnsupported(
+                "dense projection group requires one homogeneous family");
+        }
+        const auto* first = std::get<const array*>(weights.front());
+        if (first == nullptr || first->ndim() != 2 ||
+            (first->dtype() != mlx::core::float16 &&
+             first->dtype() != mlx::core::bfloat16)) {
+            throw MlxGroupedLinearUnsupported(
+                "dense projection group requires FP16/BF16 matrices");
+        }
+        std::vector<array> retained;
+        std::vector<int> output_sizes;
+        retained.reserve(weights.size());
+        output_sizes.reserve(weights.size());
+        int total_output = 0;
+        std::size_t packed_bytes = 0;
+        for (const auto& weight : weights) {
+            const auto* value = std::get<const array*>(weight);
+            if (value == nullptr || value->ndim() != 2 ||
+                value->shape(1) != shared_input ||
+                value->dtype() != first->dtype() ||
+                !value->flags().row_contiguous) {
+                throw MlxGroupedLinearUnsupported(
+                    "dense grouped projections must share width, dtype, and row layout");
+            }
+            const int output = value->shape(0);
+            if (output <= 0) {
+                throw std::invalid_argument(
+                    "dense grouped projection output must be positive");
+            }
+            total_output = checked_int(
+                static_cast<std::size_t>(total_output) +
+                    static_cast<std::size_t>(output),
+                "dense grouped total output width");
+            if (value->nbytes() >
+                std::numeric_limits<std::size_t>::max() - packed_bytes) {
+                throw MlxGroupedLinearUnsupported(
+                    "dense grouped projection size overflows");
+            }
+            packed_bytes += value->nbytes();
+            output_sizes.push_back(output);
+            retained.push_back(*value);
+        }
+        impl_ = std::make_shared<Impl>(
+            std::move(retained),
+            std::move(output_sizes),
+            shared_input,
+            total_output,
+            packed_bytes);
+        return;
+    }
+
+    // Native-QAT SQ projections share one metadata-driven dispatch per format
+    // family.  Keep their packed blobs separate and bind them zero-copy; this
+    // avoids both a concatenated model-sized pool and architecture-local QKV or
+    // gate/up fallbacks.  Mixed scale families are partitioned by the generic
+    // MlxProjectionBatch coordinator instead of being silently reinterpreted.
+    const bool contains_mxfp4_sq = std::any_of(
+        weights.begin(),
+        weights.end(),
+        [](const MlxGroupedLinearWeightRef& weight) {
+            return std::holds_alternative<
+                const MlxMxfp4SqWeight*>(weight);
+        });
+    const bool contains_fp8_sq = std::any_of(
+        weights.begin(),
+        weights.end(),
+        [](const MlxGroupedLinearWeightRef& weight) {
+            return std::holds_alternative<
+                const MlxFp8SqWeight*>(weight);
+        });
+    if (contains_mxfp4_sq || contains_fp8_sq) {
+        const bool all_mxfp4_sq = std::all_of(
+            weights.begin(),
+            weights.end(),
+            [](const MlxGroupedLinearWeightRef& weight) {
+                return std::holds_alternative<
+                    const MlxMxfp4SqWeight*>(weight);
+            });
+        const bool all_fp8_sq = std::all_of(
+            weights.begin(),
+            weights.end(),
+            [](const MlxGroupedLinearWeightRef& weight) {
+                return std::holds_alternative<
+                    const MlxFp8SqWeight*>(weight);
+            });
+        if ((!all_mxfp4_sq && !all_fp8_sq) ||
+            (all_mxfp4_sq && weights.size() > 5) ||
+            (all_fp8_sq && weights.size() > 10)) {
+            throw MlxGroupedLinearUnsupported(
+                "native-QAT SQ projection group requires one format family");
+        }
+
+        std::vector<int> output_sizes;
+        output_sizes.reserve(weights.size());
+        int total_output = 0;
+        std::size_t packed_bytes = 0;
+        if (all_mxfp4_sq) {
+            std::vector<MlxMxfp4SqWeight> retained;
+            retained.reserve(weights.size());
+            for (const auto& weight : weights) {
+                const auto* value =
+                    std::get<const MlxMxfp4SqWeight*>(weight);
+                if (value == nullptr || value->input_size() != shared_input) {
+                    throw std::invalid_argument(
+                        "MXFP4-SQ grouped projections must share one input width");
+                }
+                total_output = checked_int(
+                    static_cast<std::size_t>(total_output) +
+                        static_cast<std::size_t>(value->output_size()),
+                    "total output width");
+                if (value->packed_nbytes() >
+                    std::numeric_limits<std::size_t>::max() - packed_bytes) {
+                    throw MlxGroupedLinearUnsupported(
+                        "MXFP4-SQ grouped packed size overflows");
+                }
+                packed_bytes += value->packed_nbytes();
+                output_sizes.push_back(value->output_size());
+                retained.push_back(*value);
+            }
+            impl_ = std::make_shared<Impl>(
+                std::move(retained),
+                std::move(output_sizes),
+                shared_input,
+                total_output,
+                packed_bytes);
+            return;
+        }
+
+        std::vector<MlxFp8SqWeight> retained;
+        retained.reserve(weights.size());
+        const auto* first = std::get<const MlxFp8SqWeight*>(weights.front());
+        for (const auto& weight : weights) {
+            const auto* value = std::get<const MlxFp8SqWeight*>(weight);
+            if (value == nullptr || first == nullptr ||
+                value->input_size() != shared_input ||
+                value->dtype() != first->dtype()) {
+                throw MlxGroupedLinearUnsupported(
+                    "FP8-SQ grouped projections must share width and scale family");
+            }
+            total_output = checked_int(
+                static_cast<std::size_t>(total_output) +
+                    static_cast<std::size_t>(value->output_size()),
+                "total output width");
+            if (value->packed_nbytes() >
+                std::numeric_limits<std::size_t>::max() - packed_bytes) {
+                throw MlxGroupedLinearUnsupported(
+                    "FP8-SQ grouped packed size overflows");
+            }
+            packed_bytes += value->packed_nbytes();
+            output_sizes.push_back(value->output_size());
+            retained.push_back(*value);
+        }
+        impl_ = std::make_shared<Impl>(
+            std::move(retained),
+            std::move(output_sizes),
+            shared_input,
+            total_output,
+            packed_bytes);
+        return;
+    }
+
+    // QAT attention commonly stores MXFP8 with one scale per 32 columns
+    // (either every row or every 32 rows).  The older direct projection kernel
+    // only understood 128x128 scale blocks, so merely registering a projection
+    // batch silently excluded the real released-model geometry.  Retain each
+    // payload and its expanded row/32 sidecar separately and execute the whole
+    // compatible cohort in the format-level kernel.
+    const bool contains_block32_mxfp8 = std::any_of(
+        weights.begin(),
+        weights.end(),
+        [](const MlxGroupedLinearWeightRef& weight) {
+            const auto* mx = std::get_if<const MlxMxWeight*>(&weight);
+            return mx != nullptr && *mx != nullptr &&
+                (*mx)->bits() == 8 &&
+                (*mx)->scale_column_block_size() == 32;
+        });
+    if (contains_block32_mxfp8) {
+        const bool all_block32_mxfp8 = std::all_of(
+            weights.begin(),
+            weights.end(),
+            [](const MlxGroupedLinearWeightRef& weight) {
+                const auto* mx = std::get_if<const MlxMxWeight*>(&weight);
+                return mx != nullptr && *mx != nullptr &&
+                    (*mx)->bits() == 8 &&
+                    (*mx)->scale_column_block_size() == 32;
+            });
+        if (!all_block32_mxfp8 || weights.size() > 14) {
+            throw MlxGroupedLinearUnsupported(
+                "column-32 MXFP8 projection group requires one format family");
+        }
+        std::vector<MlxMxWeight> retained;
+        std::vector<int> output_sizes;
+        retained.reserve(weights.size());
+        output_sizes.reserve(weights.size());
+        int total_output = 0;
+        std::size_t packed_bytes = 0;
+        for (const auto& weight : weights) {
+            const auto* value = std::get<const MlxMxWeight*>(weight);
+            if (value == nullptr || value->input_size() != shared_input) {
+                throw std::invalid_argument(
+                    "column-32 MXFP8 projections must share one input width");
+            }
+            total_output = checked_int(
+                static_cast<std::size_t>(total_output) +
+                    static_cast<std::size_t>(value->output_size()),
+                "total output width");
+            if (value->packed_nbytes() >
+                std::numeric_limits<std::size_t>::max() - packed_bytes) {
+                throw MlxGroupedLinearUnsupported(
+                    "column-32 MXFP8 grouped packed size overflows");
+            }
+            packed_bytes += value->packed_nbytes();
+            output_sizes.push_back(value->output_size());
+            retained.push_back(*value);
+        }
+        impl_ = std::make_shared<Impl>(
+            std::move(retained),
+            std::move(output_sizes),
+            shared_input,
+            total_output,
+            packed_bytes);
+        return;
     }
 
     // Two- and three-projection NINT groups use one projection-fused operator
@@ -3304,6 +3761,12 @@ MlxGroupedLinear::MlxGroupedLinear(
                         throw MlxGroupedLinearUnsupported(
                             "NINT cannot enter the heterogeneous direct kernel");
                     } else if constexpr (
+                        std::is_same_v<Weight, MlxFp8SqWeight> ||
+                        std::is_same_v<Weight, MlxMxfp4SqWeight>
+                    ) {
+                        throw MlxGroupedLinearUnsupported(
+                            "native-QAT SQ uses its format-level projection group");
+                    } else if constexpr (
                         std::is_same_v<
                             Weight,
                             MlxNint8ZeroWeight>
@@ -3454,6 +3917,11 @@ MlxGroupedLinear::MlxGroupedLinear(
                             weight->packed_values());
                         direct_inputs.push_back(
                             weight->block_scales());
+                    } else if constexpr (
+                        std::is_same_v<Weight, array>
+                    ) {
+                        throw MlxGroupedLinearUnsupported(
+                            "dense projections require the dense grouped kernel");
                     } else {
                         layout.family =
                             kFamilyTpqPq;
@@ -3478,7 +3946,11 @@ MlxGroupedLinear::MlxGroupedLinear(
                         direct_inputs.push_back(
                             weight->codebook());
                     }
-                    weight_bytes = weight->packed_nbytes();
+                    if constexpr (std::is_same_v<Weight, array>) {
+                        weight_bytes = weight->nbytes();
+                    } else {
+                        weight_bytes = weight->packed_nbytes();
+                    }
                 },
                 source);
             if (weight_bytes >
@@ -3729,7 +4201,23 @@ bool MlxGroupedLinear::supports(
     if (input.ndim() == 0 ||
         input.shape(-1) != impl_->input_size ||
         (input.dtype() != mlx::core::float16 &&
-         input.dtype() != mlx::core::float32)) {
+         input.dtype() != mlx::core::float32 &&
+         (input.dtype() != mlx::core::bfloat16 ||
+          !impl_->supports_bf16_matmul()))) {
+        return false;
+    }
+    if (impl_->has_mxfp4_sq_projection_group() &&
+        input.dtype() == mlx::core::float32) {
+        // The native MXFP4-SQ packed projection kernel consumes FP16 vectors.
+        // Preserve the FP32 contract through each standalone weight instead of
+        // claiming that the grouped launch can fuse this uncommon debug path.
+        return false;
+    }
+    if (impl_->has_mxfp8_block32_projection_group() &&
+        input.dtype() == mlx::core::float32) {
+        // Native row/32 MXFP8 projection groups intentionally preserve the
+        // production FP16/BF16 boundary. Debug FP32 remains an exact sequence
+        // of the standalone projections.
         return false;
     }
     std::size_t rows = 1;
@@ -3748,7 +4236,8 @@ bool MlxGroupedLinear::supports(
         rows *= static_cast<std::size_t>(value);
     }
     return rows >= 1 &&
-        rows <= static_cast<std::size_t>(max_rows());
+        rows <= static_cast<std::size_t>(max_rows()) &&
+        (!impl_->has_mxfp8_block32_projection_group() || rows <= 6);
 }
 
 bool MlxGroupedLinear::supports_single_row_swiglu(
@@ -3934,9 +4423,11 @@ std::vector<array> MlxGroupedLinear::matmul(
             "grouped linear input must end in the shared weight width");
     }
     if (input.dtype() != mlx::core::float16 &&
-        input.dtype() != mlx::core::float32) {
+        input.dtype() != mlx::core::float32 &&
+        (input.dtype() != mlx::core::bfloat16 ||
+         !impl_->supports_bf16_matmul())) {
         throw MlxGroupedLinearUnsupported(
-            "grouped linear supports only float16 or float32 input");
+            "grouped linear input dtype is unsupported by this format group");
     }
 
     std::size_t rows = 1;
@@ -3956,6 +4447,119 @@ std::vector<array> MlxGroupedLinear::matmul(
         rows > static_cast<std::size_t>(max_rows())) {
         throw MlxGroupedLinearUnsupported(
             "grouped linear supports one through 16 input rows");
+    }
+
+    if (impl_->has_dense_projection_group()) {
+        const auto weight_dtype =
+            impl_->dense_projection_weights.front().dtype();
+        auto source = input.dtype() == weight_dtype
+            ? input
+            : mlx::core::astype(input, weight_dtype);
+        source = mlx::core::contiguous(mlx::core::reshape(
+            std::move(source),
+            Shape{
+                static_cast<std::int32_t>(rows),
+                impl_->input_size,
+            }));
+
+        std::vector<array> inputs = impl_->dense_projection_weights;
+        inputs.push_back(source);
+        std::vector<
+            std::pair<std::string, mlx::core::fast::TemplateArg>>
+            templates{
+                {"T", weight_dtype},
+                {"M", static_cast<int>(rows)},
+                {"K", impl_->input_size},
+                {"TOTAL_OUT", impl_->total_output_size},
+            };
+        int output_offset = 0;
+        int tile_offset = 0;
+        for (std::size_t projection = 0;
+             projection < impl_->output_sizes.size();
+             ++projection) {
+            const auto prefix_name =
+                "P" + std::to_string(projection) + "_";
+            const int output = impl_->output_sizes[projection];
+            const int tiles = (output + 3) / 4;
+            templates.emplace_back(prefix_name + "OUT", output);
+            templates.emplace_back(
+                prefix_name + "OFFSET", output_offset);
+            templates.emplace_back(
+                prefix_name + "TILE_BEGIN", tile_offset);
+            templates.emplace_back(
+                prefix_name + "TILE_END", tile_offset + tiles);
+            output_offset += output;
+            tile_offset += tiles;
+        }
+        const auto grid = static_cast<std::size_t>(tile_offset) * 128;
+        if (grid > static_cast<std::size_t>(
+                std::numeric_limits<int>::max())) {
+            throw MlxGroupedLinearUnsupported(
+                "dense grouped projection Metal grid exceeds MLX limits");
+        }
+        auto combined = dense_projection_group_kernel(
+            impl_->dense_projection_weights.size())(
+            std::move(inputs),
+            {Shape{
+                static_cast<std::int32_t>(rows),
+                impl_->total_output_size,
+            }},
+            {weight_dtype},
+            {static_cast<int>(grid), 1, 1},
+            {128, 1, 1},
+            std::move(templates),
+            std::nullopt,
+            false,
+            {}).front();
+
+        std::vector<array> outputs;
+        outputs.reserve(impl_->output_sizes.size());
+        int offset = 0;
+        for (const int width : impl_->output_sizes) {
+            auto shape = prefix;
+            shape.push_back(width);
+            outputs.push_back(mlx::core::reshape(
+                mlx::core::slice(
+                    combined,
+                    Shape{0, offset},
+                    Shape{
+                        static_cast<std::int32_t>(rows),
+                        offset + width,
+                    }),
+                std::move(shape)));
+            offset += width;
+        }
+        return outputs;
+    }
+
+    if (impl_->has_sq_projection_group()) {
+        const bool preserve_bf16 = input.dtype() == mlx::core::bfloat16;
+        const auto source = preserve_bf16
+            ? mlx::core::astype(input, mlx::core::float16)
+            : input;
+        auto outputs = impl_->has_mxfp4_sq_projection_group()
+            ? MlxMxfp4SqWeight::projection_group_matmul(
+                impl_->mxfp4_sq_projection_weights,
+                source)
+            : MlxFp8SqWeight::projection_group_matmul(
+                impl_->fp8_sq_projection_weights,
+                source);
+        if (preserve_bf16) {
+            for (auto& output : outputs) {
+                output = mlx::core::astype(output, mlx::core::bfloat16);
+            }
+        }
+        return outputs;
+    }
+
+    if (impl_->has_mxfp8_block32_projection_group()) {
+        if (input.dtype() == mlx::core::float32) {
+            throw MlxGroupedLinearUnsupported(
+                "column-32 MXFP8 projection group requires FP16/BF16 input");
+        }
+        return MlxMxWeight::projection_group_matmul(
+            impl_->mxfp8_block32_projection_weights,
+            input);
     }
 
     if (!impl_->common_kernel_weights.empty()) {
@@ -3979,9 +4583,14 @@ std::vector<array> MlxGroupedLinear::matmul(
         return outputs;
     }
 
-    auto source = mlx::core::contiguous(
+    const bool preserve_bf16 =
+        input.dtype() == mlx::core::bfloat16;
+    auto source = preserve_bf16
+        ? mlx::core::astype(input, mlx::core::float16)
+        : input;
+    source = mlx::core::contiguous(
         mlx::core::reshape(
-            input,
+            std::move(source),
             Shape{
                 static_cast<std::int32_t>(rows),
                 impl_->input_size,
@@ -4341,6 +4950,12 @@ std::vector<array> MlxGroupedLinear::matmul(
             {}).front();
     }();
 
+    if (preserve_bf16) {
+        combined = mlx::core::astype(
+            std::move(combined),
+            mlx::core::bfloat16);
+    }
+
     std::vector<array> outputs;
     outputs.reserve(impl_->output_sizes.size());
     int offset = 0;
@@ -4395,7 +5010,20 @@ MlxGroupedLinear::copied_packed_nbytes() const noexcept {
 bool MlxGroupedLinear::supports_single_row_projection_fusion()
     const noexcept {
     return impl_->has_nint_projection_group() ||
-        impl_->has_single_row_mxfp8_fast_path();
+        impl_->has_dense_projection_group() ||
+        impl_->has_mxfp8_block32_projection_group() ||
+        impl_->has_sq_projection_group() ||
+        impl_->has_single_row_mxfp8_fast_path() ||
+        impl_->supports_bf16_matmul();
+}
+
+bool MlxGroupedLinear::has_projection_fusion() const noexcept {
+    // RetainedProjection is an exact graph composition: matmul() visits every
+    // member independently. It remains useful to direct callers, but accepting
+    // it as one projection-batch segment would prevent a longer list (for
+    // example seven NINT projections) from being partitioned into real 3/2/2
+    // fused dispatches.
+    return impl_->common_kernel_weights.empty();
 }
 
 bool MlxGroupedLinear::has_single_row_mxfp8_fast_path()

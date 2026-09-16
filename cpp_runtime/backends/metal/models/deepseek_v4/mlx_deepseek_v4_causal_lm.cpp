@@ -37,16 +37,6 @@ constexpr int kConnections = 4;
 constexpr int kHcProjectionWidth =
     2 * kConnections + kConnections * kConnections;
 
-bool ssd_route_transactions_enabled(bool safe_default) noexcept {
-    const char* value = std::getenv(
-        "MFQ_SSD_DEVICE_ROUTE_TRANSACTION");
-    if (value == nullptr) return safe_default;
-    const auto setting = std::string_view(value);
-    return setting != "0"
-        && setting != "false"
-        && setting != "off";
-}
-
 int ssd_route_transaction_layers() noexcept {
     const char* value = std::getenv("MFQ_SSD_DEVICE_ROUTE_GROUP");
     if (value == nullptr) {
@@ -1325,22 +1315,38 @@ array MlxDeepseekV4CausalLm::forward_chunk(
         target_hiddens.resize(
             config_.dspark_target_layer_ids.size());
     }
-    const auto capture_target = [&](std::size_t layer) {
+    const auto capture_target_into = [
+        &config = config_,
+        dspark_hidden
+    ](
+        std::size_t layer,
+        const array& values,
+        std::vector<std::optional<array>>& targets) {
         if (dspark_hidden == nullptr) return;
         for (std::size_t target = 0;
-             target < config_.dspark_target_layer_ids.size();
+             target < config.dspark_target_layer_ids.size();
              ++target) {
-            if (config_.dspark_target_layer_ids[target] ==
+            if (config.dspark_target_layer_ids[target] ==
                 static_cast<std::int64_t>(layer)) {
-                target_hiddens[target] = mlx::core::mean(
-                    hidden_values, 2);
+                targets[target] = mlx::core::mean(values, 2);
             }
         }
+    };
+    const auto capture_target = [&](std::size_t layer) {
+        capture_target_into(layer, hidden_values, target_hiddens);
     };
     detail::profile_eval(
         "model.embedding_broadcast",
         hidden_values);
     const bool bounded_prefill = tokens > 1;
+    const int routed_rows = checked_product(
+        batch, tokens, "routed row count");
+    // This is safe for bounded caches too: each layer first establishes a
+    // stable-hit confidence window, and a generation mismatch replays the
+    // group after loading and pinning the exact selected experts.
+    const bool grouped_route_transaction =
+        routed_rows >= 1 && routed_rows <= 6 && ssd_expert_cache_ &&
+        mlx_ssd_route_transactions_enabled();
     const bool compact_resident_speculation =
         bounded_prefill && tokens <= 6 && dspark_hidden != nullptr &&
         visibility == nullptr && !expert_offload_ && !ssd_expert_cache_;
@@ -1359,7 +1365,7 @@ array MlxDeepseekV4CausalLm::forward_chunk(
     std::array<
         std::optional<MlxSsdPrefetchedExpertLayer>,
         2> routed_pipeline;
-    if (bounded_prefill && !layers_.empty()) {
+    if (bounded_prefill && !grouped_route_transaction && !layers_.empty()) {
         const auto rows = static_cast<std::size_t>(batch) *
             static_cast<std::size_t>(tokens);
         routed_pipeline[0] = layers_[0].prefetch_routed(rows);
@@ -1367,11 +1373,6 @@ array MlxDeepseekV4CausalLm::forward_chunk(
             routed_pipeline[1] = layers_[1].prefetch_routed(rows);
         }
     }
-    const bool grouped_route_transaction =
-        !bounded_prefill && ssd_expert_cache_ &&
-        ssd_route_transactions_enabled(
-            ssd_expert_cache_->has_full_residency_capacity()) &&
-        dspark_hidden == nullptr;
     if (grouped_route_transaction) {
         const bool force_transactions = force_ssd_route_transactions();
         const auto group_layers = static_cast<std::size_t>(
@@ -1386,6 +1387,7 @@ array MlxDeepseekV4CausalLm::forward_chunk(
                     states_[group_begin],
                     pos0,
                     nullptr);
+                capture_target(group_begin);
                 ++group_begin;
                 continue;
             }
@@ -1413,6 +1415,7 @@ array MlxDeepseekV4CausalLm::forward_chunk(
                      ++attempt) {
                     ssd_expert_cache_->begin_route_transaction();
                     auto trial_hidden = hidden_checkpoint;
+                    auto trial_targets = target_hiddens;
                     for (std::size_t index = group_begin;
                          index < group_end;
                          ++index) {
@@ -1422,6 +1425,10 @@ array MlxDeepseekV4CausalLm::forward_chunk(
                             states_[index],
                             pos0,
                             nullptr);
+                        capture_target_into(
+                            index,
+                            trial_hidden,
+                            trial_targets);
                     }
                     // The attention output depends on the in-place cache
                     // writes required by this group. Materialize only the
@@ -1432,6 +1439,7 @@ array MlxDeepseekV4CausalLm::forward_chunk(
                         ssd_expert_cache_->resolve_route_transaction();
                     if (transaction.all_hit) {
                         hidden_values = std::move(trial_hidden);
+                        target_hiddens = std::move(trial_targets);
                         pins.clear();
                         ssd_expert_cache_->release_deferred();
                         completed = true;
@@ -2073,16 +2081,19 @@ std::int32_t MlxDeepseekV4CausalLm::generate_impl(
         prompt_values.begin(),
         Shape{1, prompt_count},
         mlx::core::int32);
-    auto counts = mlx::core::zeros(
-        Shape{vocab},
-        mlx::core::int32);
-    if (!count_values.empty()) {
-        counts = sample_token_counts_add(
-            counts,
-            array(
-                count_values.begin(),
-                Shape{1, static_cast<int>(count_values.size())},
-                mlx::core::int32));
+    std::optional<array> counts;
+    if (sampling.has_penalties()) {
+        counts = mlx::core::zeros(
+            Shape{vocab},
+            mlx::core::int32);
+        if (!count_values.empty()) {
+            *counts = sample_token_counts_add(
+                *counts,
+                array(
+                    count_values.begin(),
+                    Shape{1, static_cast<int>(count_values.size())},
+                    mlx::core::int32));
+        }
     }
     const std::size_t requested_stable_count = stable_prefix_tokens
         ? std::min(*stable_prefix_tokens, prompt.size())
@@ -2542,9 +2553,7 @@ std::int32_t MlxDeepseekV4CausalLm::generate_impl(
                 dspark_->block_size(),
                 logits,
                 mtp_sampling,
-                mtp_sampling.has_penalties()
-                    ? std::optional<array>(counts)
-                    : std::nullopt,
+                counts,
                 std::span<const std::int64_t>(eos),
                 callback,
                 0u,
@@ -2610,9 +2619,9 @@ std::int32_t MlxDeepseekV4CausalLm::generate_impl(
                     << std::endl;
             }
         };
-        auto sampled = sampler.sample(
-            logits,
-            counts);
+        auto sampled = counts
+            ? sampler.sample(logits, *counts)
+            : sampler.sample(logits);
         if (profile_this_step) {
             detail::profile_eval(
                 "model.sampling",
@@ -2629,9 +2638,12 @@ std::int32_t MlxDeepseekV4CausalLm::generate_impl(
         }
         if (token_constraint && token_constraint->allows &&
             !token_constraint->allows(token)) {
-            auto adjusted = mlx::core::contiguous(
+            auto adjusted = counts
+                ? sampler.apply_penalties(logits, *counts)
+                : logits;
+            adjusted = mlx::core::contiguous(
                 mlx::core::astype(
-                    sampler.apply_penalties(logits, counts),
+                    adjusted,
                     mlx::core::float32));
             adjusted.eval();
             std::vector<float> masked(
@@ -2657,9 +2669,11 @@ std::int32_t MlxDeepseekV4CausalLm::generate_impl(
             {token},
             Shape{1, 1},
             mlx::core::int32);
-        counts = sample_token_counts_add(
-            counts,
-            token_ids);
+        if (counts) {
+            *counts = sample_token_counts_add(
+                *counts,
+                token_ids);
+        }
         ++generated;
         if (callback &&
             !callback(

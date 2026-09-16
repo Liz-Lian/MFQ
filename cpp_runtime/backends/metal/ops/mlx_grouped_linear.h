@@ -1,5 +1,7 @@
 #pragma once
 
+#include "mlx_fp8_sq.h"
+#include "mlx_mxfp4_sq.h"
 #include "mlx_tpq.h"
 #include "mlx_mx.h"
 #include "mlx_nint.h"
@@ -15,16 +17,19 @@
 
 namespace mfq::metal {
 
-// A valid packed projection which can participate in the ordinary grouped
-// Q/K/V or gate/up Metal kernel. MlxGroupedLinear retains MLX array handles,
-// so the underlying packed storage remains shared with the source weight.
+// A projection which can participate in the ordinary grouped Q/K/V or
+// gate/up Metal kernel. MlxGroupedLinear retains MLX array handles, so both
+// packed and dense storage remain shared with the source weight.
 using MlxGroupedLinearWeightRef = std::variant<
     const MlxNintWeight*,
     const MlxNint8ZeroWeight*,
     const MlxVqWeight*,
     const MlxTpqInt4Weight*,
     const MlxTpqPqWeight*,
-    const MlxMxWeight*>;
+    const MlxFp8SqWeight*,
+    const MlxMxfp4SqWeight*,
+    const MlxMxWeight*,
+    const mlx::core::array*>;
 
 class MlxGroupedLinearUnsupported : public std::runtime_error {
 public:
@@ -91,6 +96,11 @@ public:
     // True when a single-row projection group is executed by one fused
     // operator instead of replaying the member projections independently.
     bool supports_single_row_projection_fusion() const noexcept;
+
+    // True when this coordinator owns a real multi-projection Metal dispatch
+    // for at least one supported row count. Graph-only retained groups must not
+    // hide smaller compatible groups from MlxProjectionBatch's partitioner.
+    bool has_projection_fusion() const noexcept;
 
     // True when a float16, single-row invocation can use the MXFP8
     // projection-fused decode kernel.

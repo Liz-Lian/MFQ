@@ -285,6 +285,49 @@ def test_startup_models_use_the_managed_load_path(tmp_path: Path) -> None:
     asyncio.run(run())
 
 
+def test_automatic_expert_residency_is_recomputed_for_later_loads(
+    tmp_path: Path,
+) -> None:
+    async def run() -> None:
+        model = tmp_path / "automatic-residency.mfq"
+        executable = tmp_path / "fake-runtime"
+        _model(model, architecture="qwen35")
+        _fake_runtime(executable)
+        catalog = ModelCatalog([tmp_path], cache_seconds=0)
+        pool = ManagedRuntimePool(
+            catalog,
+            executable,
+            startup_timeout_seconds=5,
+        )
+
+        def automatic_residency(
+            _artifact: DiscoveredModel,
+            request: ModelLoadRequest,
+            *,
+            runtime_route: RuntimeRoute,
+            memory_ceiling: int | None = None,
+        ) -> ModelLoadRequest:
+            del runtime_route, memory_ceiling
+            return request.model_copy(update={"moe_gpu_cache_gb": 42.0})
+
+        pool._apply_automatic_expert_residency = (  # type: ignore[method-assign]
+            automatic_residency
+        )
+        context = _TestJobContext()
+        try:
+            await pool.load(
+                context,  # type: ignore[arg-type]
+                {"model": "automatic-residency"},
+            )
+            remembered = pool._load_requests["automatic-residency"]
+            assert remembered.moe_gpu_cache_gb is None
+        finally:
+            await context.cleanup()
+            await pool.aclose()
+
+    asyncio.run(run())
+
+
 def test_failed_startup_model_remains_retryable_without_spawning(
     tmp_path: Path,
 ) -> None:
@@ -715,6 +758,104 @@ def test_oversized_mfq_moe_gets_an_automatic_metal_expert_budget(
         pressure_limited,
         runtime_route=route,
     ) == 57 << 30
+
+
+def test_native_hf_moe_defaults_to_full_residency_when_it_fits(
+    tmp_path: Path,
+) -> None:
+    model = tmp_path / "native-hf"
+    model.mkdir()
+    artifact = DiscoveredModel(
+        resource=ModelArtifactResource(
+            id="3" * 32,
+            name="native-hf",
+            architecture="deepseek_v4",
+            format="hf",
+            shard_count=16,
+            total_bytes=160 << 30,
+            tensor_count=1,
+            record_count=1,
+            complete=True,
+            loadable=True,
+            modified_at=datetime.now(timezone.utc),
+        ),
+        path=model,
+        routed_expert_bytes=140 << 30,
+    )
+    route = RuntimeRoute(
+        architecture_family="deepseek_v4",
+        backbone="deepseek_v4",
+    )
+    pool = ManagedRuntimePool(
+        ModelCatalog([tmp_path]),
+        tmp_path / "runtime",
+        max_runtime_memory_bytes=506 << 30,
+    )
+
+    automatic = pool._apply_automatic_expert_residency(
+        artifact,
+        ModelLoadRequest(model="native-hf"),
+        runtime_route=route,
+    )
+    explicit_streaming = pool._apply_automatic_expert_residency(
+        artifact,
+        ModelLoadRequest(model="native-hf", moe_gpu_cache_gb=96),
+        runtime_route=route,
+    )
+
+    assert automatic.moe_gpu_cache_gb == 0
+    assert pool._estimated_load_bytes(
+        artifact,
+        automatic,
+        runtime_route=route,
+    ) == 160 << 30
+    assert explicit_streaming.moe_gpu_cache_gb == 96
+
+
+def test_oversized_native_hf_moe_gets_a_bounded_expert_cache(
+    tmp_path: Path,
+) -> None:
+    model = tmp_path / "oversized-native-hf"
+    model.mkdir()
+    artifact = DiscoveredModel(
+        resource=ModelArtifactResource(
+            id="4" * 32,
+            name="oversized-native-hf",
+            architecture="deepseek_v4",
+            format="hf",
+            shard_count=16,
+            total_bytes=160 << 30,
+            tensor_count=1,
+            record_count=1,
+            complete=True,
+            loadable=True,
+            modified_at=datetime.now(timezone.utc),
+        ),
+        path=model,
+        routed_expert_bytes=140 << 30,
+    )
+    route = RuntimeRoute(
+        architecture_family="deepseek_v4",
+        backbone="deepseek_v4",
+    )
+    pool = ManagedRuntimePool(
+        ModelCatalog([tmp_path]),
+        tmp_path / "runtime",
+        max_runtime_memory_bytes=120 << 30,
+    )
+
+    automatic = pool._apply_automatic_expert_residency(
+        artifact,
+        ModelLoadRequest(model="oversized-native-hf"),
+        runtime_route=route,
+    )
+
+    assert automatic.moe_gpu_cache_gb == 96
+    assert pool._estimated_load_bytes(
+        artifact,
+        automatic,
+        runtime_route=route,
+    ) == 116 << 30
 
 
 def test_catalog_loads_registered_external_mfq_files(tmp_path: Path) -> None:
@@ -1290,6 +1431,43 @@ def test_managed_cuda_runtime_connects_explicit_request_concurrency(
         )
 
         assert command[command.index("--continuous-batching") + 1] == "6"
+
+    asyncio.run(run())
+
+
+def test_managed_native_runtime_leaves_default_prefill_chunk_to_model_autotune(
+    tmp_path: Path,
+) -> None:
+    async def run() -> None:
+        model = tmp_path / "tiny.mfq"
+        _model(model, architecture="qwen35")
+        catalog = ModelCatalog([tmp_path], cache_seconds=0)
+        artifact = await catalog.resolve_path(model)
+        pool = ManagedRuntimePool(
+            catalog,
+            tmp_path / "mfq-decode-metal",
+            backend="metal",
+        )
+        route = RuntimeRoute(
+            architecture_family="qwen3_5",
+            backbone="qwen3_5",
+        )
+
+        automatic, _environment = pool._launch_configuration(
+            artifact,
+            ModelLoadRequest(model="tiny"),
+            runtime_route=route,
+            port=43123,
+        )
+        explicit, _environment = pool._launch_configuration(
+            artifact,
+            ModelLoadRequest(model="tiny", prefill_chunk_size=4096),
+            runtime_route=route,
+            port=43124,
+        )
+
+        assert "--prefill-chunk-size" not in automatic
+        assert explicit[explicit.index("--prefill-chunk-size") + 1] == "4096"
 
     asyncio.run(run())
 

@@ -530,36 +530,21 @@ MlxDeepseekV41HcMetadataResult deepseek_v41_hc_metadata_exact(
         mlx::core::reshape(
             slice_last(base_values, 2 * kConnections, kMixWidth),
             Shape{kConnections, kConnections}));
-    array combination = logits;
-    if (rows == 1) {
-        const array params({eps}, mlx::core::float32);
-        auto outputs = metadata_exact_kernel()(
-            {logits, params},
-            {matrix_shape},
-            {mlx::core::float32},
-            {32, 1, 1},
-            {32, 1, 1},
-            {
-                {"ROWS", 1},
-                {"SINKHORN_ITERATIONS", sinkhorn_iterations},
-            },
-            std::nullopt,
-            false,
-            {});
-        combination = std::move(outputs.front());
-    } else {
-        combination = softmax_last(logits) + eps;
-        combination = combination /
-            (mlx::core::sum(combination, -2, true) + eps);
-        for (int iteration = 1;
-             iteration < sinkhorn_iterations;
-             ++iteration) {
-            combination = combination /
-                (mlx::core::sum(combination, -1, true) + eps);
-            combination = combination /
-                (mlx::core::sum(combination, -2, true) + eps);
-        }
-    }
+    const array params({eps}, mlx::core::float32);
+    auto outputs = metadata_exact_kernel()(
+        {logits, params},
+        {matrix_shape},
+        {mlx::core::float32},
+        {rows * 32, 1, 1},
+        {32, 1, 1},
+        {
+            {"ROWS", rows},
+            {"SINKHORN_ITERATIONS", sinkhorn_iterations},
+        },
+        std::nullopt,
+        false,
+        {});
+    array combination = std::move(outputs.front());
     return {
         std::move(post),
         std::move(combination),

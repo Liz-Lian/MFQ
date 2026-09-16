@@ -618,13 +618,44 @@ void MfqContainer::load_hf_directory(
             "cannot open HF model directory: " + requested_path.string());
     }
     const auto config_path = root / "config.json";
-    const auto config_text = read_file_text(config_path);
+    auto config_text = read_file_text(config_path);
     json config;
     try {
         config = json::parse(config_text);
     } catch (const json::exception& exception) {
         throw std::runtime_error(
             "invalid HF config.json: " + std::string(exception.what()));
+    }
+    const auto inference_config_path = root / "inference" / "config.json";
+    if (std::filesystem::is_regular_file(inference_config_path)) {
+        json supplemental;
+        try {
+            supplemental = json::parse(read_file_text(inference_config_path));
+        } catch (const json::exception& exception) {
+            throw std::runtime_error(
+                "invalid HF inference/config.json: " +
+                std::string(exception.what()));
+        }
+        if (!config.is_object() || !supplemental.is_object()) {
+            throw std::runtime_error(
+                "HF model configuration files must contain JSON objects");
+        }
+        json* target = &config;
+        if (const auto text = config.find("text_config");
+            text != config.end() && text->is_object()) {
+            target = &*text;
+        }
+        const json* source = &supplemental;
+        if (const auto text = supplemental.find("text_config");
+            text != supplemental.end() && text->is_object()) {
+            source = &*text;
+        }
+        for (const auto& [key, value] : source->items()) {
+            if (!target->contains(key)) {
+                (*target)[key] = value;
+            }
+        }
+        config_text = config.dump();
     }
     const auto model_type = config.find("model_type");
     if (model_type == config.end() || !model_type->is_string() ||

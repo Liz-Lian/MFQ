@@ -124,6 +124,8 @@ private:
     int ratio_;
     int max_context_;
     MlxDeepseekV41AttentionComponents components_;
+    std::optional<MlxProjectionBatch> input_projections_;
+    std::optional<MlxProjectionBatch> query_projections_;
     std::pair<mlx::core::array, mlx::core::array> rope_;
 };
 

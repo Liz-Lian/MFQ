@@ -36,6 +36,19 @@ class NativeRuntimeError(RuntimeError):
     """Raised when the private native worker cannot be started."""
 
 
+_NATIVE_DEFAULT_PREFILL_CHUNK_SIZE = 2048
+
+
+def append_native_prefill_chunk_override(
+    command: list[str],
+    prefill_chunk_size: int,
+) -> None:
+    """Pass only real overrides so the native model may autotune its default."""
+
+    if prefill_chunk_size != _NATIVE_DEFAULT_PREFILL_CHUNK_SIZE:
+        command.extend(["--prefill-chunk-size", str(prefill_chunk_size)])
+
+
 @dataclass(frozen=True)
 class RuntimeRoute:
     """Resolved runtime ownership for one model artifact."""
@@ -359,7 +372,7 @@ class NativeRuntime:
             "--model-name",
             self.model_name,
         ]
-        command.extend(["--prefill-chunk-size", str(self.prefill_chunk_size)])
+        append_native_prefill_chunk_override(command, self.prefill_chunk_size)
         if self.context_size > 0:
             command.extend(["--ctx-size", str(self.context_size)])
         request_capacity = native_request_capacity(

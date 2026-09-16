@@ -1,4 +1,5 @@
 #include "mlx_fp8_sq.h"
+#include "mlx_grouped_linear.h"
 #include "mlx_moe.h"
 
 #include <array>
@@ -210,6 +211,57 @@ void test_format(
     }
 }
 
+void test_projection_group(const std::string& dtype) {
+    using namespace mlx::core;
+    const auto first_fixture = make_fixture(
+        dtype, 32, 32, dtype == "MXFP8-SQ" ? 1 : 4, 8, 128);
+    const auto second_fixture = make_fixture(
+        dtype, 32, 32, dtype == "MXFP8-SQ" ? 1 : 4, 6, 128);
+    const auto first = mfq::metal::MlxFp8SqWeight::from_blob(
+        dtype, first_fixture.blob);
+    const auto second = mfq::metal::MlxFp8SqWeight::from_blob(
+        dtype, second_fixture.blob);
+    const mfq::metal::MlxGroupedLinear grouped({&first, &second});
+    require(grouped.uses_zero_copy_storage(),
+            dtype + " projection group copied packed storage");
+    require(grouped.copied_packed_nbytes() == 0,
+            dtype + " projection group reported a packed copy");
+    require(grouped.supports_single_row_projection_fusion(),
+            dtype + " projection group missed decode fusion");
+
+    for (int rows = 1; rows <= 6; ++rows) {
+        std::vector<float> values(static_cast<std::size_t>(rows) * 128);
+        for (std::size_t index = 0; index < values.size(); ++index) {
+            values[index] = static_cast<float>(
+                static_cast<int>((index * 13 + 9) % 37) - 18) / 256.0f;
+        }
+        auto input = astype(array(values.begin(), Shape{rows, 128}), float16);
+        auto actual = grouped(input);
+        std::array<array, 2> expected{
+            first.matmul(input),
+            second.matmul(input),
+        };
+        require(actual.size() == expected.size(),
+                dtype + " projection group output count mismatch");
+        for (std::size_t projection = 0;
+             projection < actual.size();
+             ++projection) {
+            auto difference = contiguous(astype(
+                abs(astype(actual[projection], float32) -
+                    astype(expected[projection], float32)),
+                float32));
+            eval(difference);
+            float maximum = 0.0f;
+            for (std::size_t index = 0; index < difference.size(); ++index) {
+                maximum = std::max(maximum, difference.data<float>()[index]);
+            }
+            require(maximum < 2.0e-3f,
+                    dtype + " projection group M=" + std::to_string(rows) +
+                        " mismatch: max_abs=" + std::to_string(maximum));
+        }
+    }
+}
+
 void test_packed_backward(
     const std::string& dtype,
     int block_rows,
@@ -332,6 +384,8 @@ int main() {
         test_format("FP8-128SQ", 128, 128, 2);
         test_format("FP8-128SQ", 128, 128, 3);
         test_format("FP8-128SQ", 128, 128, 4);
+        test_projection_group("MXFP8-SQ");
+        test_projection_group("FP8-128SQ");
         test_packed_backward("MXFP8-SQ", 1, 32, 1);
         test_packed_backward("MXFP8-SQ", 32, 32, 1);
         test_packed_backward("MXFP8-SQ", 128, 128, 1);

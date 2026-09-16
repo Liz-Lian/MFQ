@@ -292,6 +292,10 @@ template [[host_name("mfq_dsa_sparse_prefill_f16_bk256_dc32")]]
 [[kernel]] decltype(mfq_dsa_sparse_prefill<half, 256, 32, 64, 512, 8>)
     mfq_dsa_sparse_prefill<half, 256, 32, 64, 512, 8>;
 
+template [[host_name("mfq_dsa_sparse_prefill_bf16_bk256_dc32")]]
+[[kernel]] decltype(mfq_dsa_sparse_prefill<bfloat, 256, 32, 64, 512, 8>)
+    mfq_dsa_sparse_prefill<bfloat, 256, 32, 64, 512, 8>;
+
 template <typename T, int BK, int DC, int H, int D, int WM>
 [[kernel, max_total_threads_per_threadgroup(WM * 32)]]
 void mfq_dsa_sparse_circular(
@@ -549,3 +553,8 @@ template [[host_name("mfq_dsa_sparse_circular_f16_bk256_dc32")]]
 [[kernel]] decltype(
     mfq_dsa_sparse_circular<half, 256, 32, 64, 512, 8>)
     mfq_dsa_sparse_circular<half, 256, 32, 64, 512, 8>;
+
+template [[host_name("mfq_dsa_sparse_circular_bf16_bk256_dc32")]]
+[[kernel]] decltype(
+    mfq_dsa_sparse_circular<bfloat, 256, 32, 64, 512, 8>)
+    mfq_dsa_sparse_circular<bfloat, 256, 32, 64, 512, 8>;

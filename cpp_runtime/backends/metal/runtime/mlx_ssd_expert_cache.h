@@ -13,6 +13,10 @@
 
 namespace mfq::metal {
 
+// Shared policy switch for exact device-side expert route transactions.
+// Callers still apply shape and route-confidence eligibility themselves.
+bool mlx_ssd_route_transactions_enabled() noexcept;
+
 struct MlxSsdExpertCacheStats {
     std::uint64_t requests = 0;
     std::uint64_t hits = 0;

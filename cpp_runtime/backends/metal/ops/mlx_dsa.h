@@ -172,7 +172,7 @@ mlx::core::array mlx_dsa_sparse_attention(
 mlx::core::array mlx_dsa_sparse_multi_attention(
     const mlx::core::array& q,
     const mlx::core::array& local_kv,
-    const mlx::core::array& pooled_kv,
+    const std::optional<mlx::core::array>& pooled_kv,
     int pool_len,
     const mlx::core::array& topk,
     const mlx::core::array& sinks,

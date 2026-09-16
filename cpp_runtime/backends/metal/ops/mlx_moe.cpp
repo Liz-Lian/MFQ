@@ -2366,6 +2366,41 @@ std::int32_t checked_int(
     return static_cast<std::int32_t>(value);
 }
 
+constexpr std::int32_t descriptor_u32_bits(
+    std::uint32_t value) noexcept {
+    return std::bit_cast<std::int32_t>(value);
+}
+
+constexpr std::uint32_t descriptor_u32_value(
+    std::int32_t value) noexcept {
+    return std::bit_cast<std::uint32_t>(value);
+}
+
+static_assert(
+    descriptor_u32_value(
+        descriptor_u32_bits(std::uint32_t{0x80000000u}))
+    == std::uint32_t{0x80000000u});
+static_assert(
+    descriptor_u32_value(
+        descriptor_u32_bits(std::uint32_t{0xffffffffu}))
+    == std::uint32_t{0xffffffffu});
+
+std::int32_t checked_descriptor_u32(
+    std::size_t value,
+    const char* name) {
+    if (
+        value
+        > static_cast<std::size_t>(
+            std::numeric_limits<std::uint32_t>::max())
+    ) {
+        throw std::runtime_error(
+            std::string("MFE ") + name
+            + " exceeds uint32 descriptor range");
+    }
+    return descriptor_u32_bits(
+        static_cast<std::uint32_t>(value));
+}
+
 int checked_positive(
     std::uint32_t value,
     const char* name) {
@@ -4647,10 +4682,10 @@ std::optional<MlxMxWeight> add_mx_pool(
         return MlxMxWeight::from_blob(label, payload);
     }
 
-    const int value_offset = checked_int(
+    const std::int32_t value_offset = checked_descriptor_u32(
         streams.mx_values.size(),
         "MX value offset");
-    const int scale_offset = checked_int(
+    const std::int32_t scale_offset = checked_descriptor_u32(
         streams.mx_scales.size(),
         "MX scale offset");
     const int groups = neuron_len / static_cast<int>(block);
@@ -5378,6 +5413,19 @@ int descriptor_with_offset(
     return checked_int(
         checked_add(
             static_cast<std::size_t>(value),
+            offset,
+            name),
+        name);
+}
+
+std::int32_t descriptor_u32_with_offset(
+    std::int32_t value,
+    std::size_t offset,
+    const char* name) {
+    return checked_descriptor_u32(
+        checked_add(
+            static_cast<std::size_t>(
+                descriptor_u32_value(value)),
             offset,
             name),
         name);
@@ -8429,7 +8477,30 @@ struct MlxMfeWeight::Impl {
                         * kDescriptorSize;
                     const auto right_base = static_cast<std::size_t>(right)
                         * kDescriptorSize;
+                    const int left_family =
+                        descriptor_values[left_base + kFamily];
+                    const int right_family =
+                        descriptor_values[right_base + kFamily];
                     const auto compare_field = [&](int field) {
+                        if (
+                            left_family == right_family
+                            && (
+                                left_family == kFamilyMxfp4
+                                || left_family == kFamilyMxfp8
+                            )
+                            && (
+                                field == kMxValueOffset
+                                || field == kMxScaleOffset
+                            )
+                        ) {
+                            const auto left_value = descriptor_u32_value(
+                                descriptor_values[left_base + field]);
+                            const auto right_value = descriptor_u32_value(
+                                descriptor_values[right_base + field]);
+                            return left_value < right_value
+                                ? -1
+                                : left_value > right_value ? 1 : 0;
+                        }
                         return descriptor_values[left_base + field]
                             < descriptor_values[right_base + field]
                             ? -1
@@ -8480,12 +8551,11 @@ struct MlxMfeWeight::Impl {
                 const auto base = static_cast<std::size_t>(expert)
                     * kDescriptorSize;
                 const int local = descriptor_values[base + kLocalExpert];
-                const int value_offset =
-                    descriptor_values[base + kMxValueOffset];
-                const int scale_offset =
-                    descriptor_values[base + kMxScaleOffset];
-                if (!valid_slots || local < 0 || value_offset < 0
-                    || scale_offset < 0
+                const auto value_offset = descriptor_u32_value(
+                    descriptor_values[base + kMxValueOffset]);
+                const auto scale_offset = descriptor_u32_value(
+                    descriptor_values[base + kMxScaleOffset]);
+                if (!valid_slots || local < 0
                     || static_cast<std::size_t>(value_offset) % value_stride
                         != 0
                     || static_cast<std::size_t>(scale_offset) % scale_stride
@@ -9419,12 +9489,12 @@ MlxMfeWeight MlxMfeWeight::concatenate_projections(
                 || descriptor[kFamily] == kFamilyMxfp8
             ) {
                 descriptor[kMxValueOffset] =
-                    descriptor_with_offset(
+                    descriptor_u32_with_offset(
                         descriptor[kMxValueOffset],
                         mx_value_offset,
                         "MX value offset");
                 descriptor[kMxScaleOffset] =
-                    descriptor_with_offset(
+                    descriptor_u32_with_offset(
                         descriptor[kMxScaleOffset],
                         mx_scale_offset,
                         "MX scale offset");
@@ -9812,10 +9882,10 @@ MlxMfeWeight MlxMfeWeight::concatenate_experts(
             descriptor[kFamily] == kFamilyMxfp4
             || descriptor[kFamily] == kFamilyMxfp8
         ) {
-            descriptor[kMxValueOffset] = descriptor_with_offset(
+            descriptor[kMxValueOffset] = descriptor_u32_with_offset(
                 descriptor[kMxValueOffset], mx_value_offset,
                 "MX value offset");
-            descriptor[kMxScaleOffset] = descriptor_with_offset(
+            descriptor[kMxScaleOffset] = descriptor_u32_with_offset(
                 descriptor[kMxScaleOffset], mx_scale_offset,
                 "MX scale offset");
         } else {

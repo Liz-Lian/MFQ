@@ -310,6 +310,11 @@ public:
     }
 
 private:
+    enum class ExpertBackend {
+        resident,
+        streaming,
+    };
+
     void validate_components() const;
     mlx::core::array normalize_ids(
         const mlx::core::array& token_ids,
@@ -335,6 +340,28 @@ private:
     void append_state_arrays(
         const MlxDeepseekV4LayerState& state,
         std::vector<mlx::core::array>& arrays) const;
+    void materialize_layer_range(
+        const mlx::core::array& hidden,
+        std::size_t begin,
+        std::size_t end) const;
+    void capture_dspark_target(
+        std::size_t layer,
+        const mlx::core::array& hidden,
+        std::vector<std::optional<mlx::core::array>>* targets) const;
+    mlx::core::array forward_resident_layers(
+        mlx::core::array hidden,
+        const mlx::core::array& token_ids,
+        int pos0,
+        const MlxDeepseekV4ImageVisibility* visibility,
+        std::vector<std::optional<mlx::core::array>>* targets,
+        bool eager_layer_materialization);
+    mlx::core::array forward_streaming_layers(
+        mlx::core::array hidden,
+        const mlx::core::array& token_ids,
+        int pos0,
+        const MlxDeepseekV4ImageVisibility* visibility,
+        std::vector<std::optional<mlx::core::array>>* targets,
+        bool eager_layer_materialization);
     void begin_speculative_target(
         int confirmed_tokens,
         int total_tokens);
@@ -366,6 +393,7 @@ private:
         expert_offload_;
     std::shared_ptr<MlxMoeSsdExpertCache>
         ssd_expert_cache_;
+    ExpertBackend expert_backend_;
     std::optional<MlxDeepseekV4Vision> vision_;
     std::optional<MlxDeepseekV4DSpark> dspark_;
     MlxMtpGenerationStats last_mtp_stats_;

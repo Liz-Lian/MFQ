@@ -589,11 +589,22 @@ void test_speculative_cache_transaction() {
             input_tokens({0.7f, 0.8f, 0.9f}), actual, start);
         auto reference_output = reference_operation(
             input_tokens({0.7f, 0.8f, 0.9f}), reference, start);
+        const auto speculative_values = evaluated_float(speculative_output);
         require_close(
-            evaluated_float(speculative_output),
+            speculative_values,
             evaluated_float(reference_output),
             3e-4f,
             "speculative direct sparse-attention output");
+        materialize_state(actual);
+        actual.restart_speculative_attempt();
+        materialize_state(actual);
+        auto retried_output = actual_operation(
+            input_tokens({0.7f, 0.8f, 0.9f}), actual, start);
+        require_close(
+            evaluated_float(retried_output),
+            speculative_values,
+            3e-4f,
+            "restarted speculative attention output");
         materialize_state(actual);
         actual_operation.rollback_speculative(actual, 1);
         materialize_state(actual);

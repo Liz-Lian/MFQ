@@ -19,31 +19,11 @@ namespace mfq::metal {
 // Each predictor adapter supplies its own maximum depth in the request.
 inline constexpr int kMlxMtpEngineMaximumDraftDepth = 5;
 
-// The state machine remains common. Predictors select only the scheduling
-// objective: generic heads optimize measured throughput, while block-trained
-// predictors can keep their width driven solely by accepted-prefix length.
-enum class MlxMtpDepthPolicy {
-    AdaptiveThroughput,
-    AcceptanceOnly,
-};
-
-// Generic one-layer predictors can benefit from a sharper proposal. A block
-// predictor trained with the target sampler must preserve that distribution.
-enum class MlxMtpDraftSamplingPolicy {
-    Sharpened,
-    MatchTarget,
-};
-
-// Predictor behavior belongs to the predictor contract, not to a model-family
-// branch in the common generation engine. Recurrent heads use measured
-// throughput scheduling; block predictors retain their trained block sampling
-// semantics and follow the accepted prefix.
+// Predictor adapters describe only the maximum supported draft depth. The
+// common engine owns one reversible, throughput-adaptive scheduling and
+// proposal policy for every architecture.
 struct MlxMtpPredictorDescriptor {
     int maximum_depth = 0;
-    MlxMtpDepthPolicy depth_policy =
-        MlxMtpDepthPolicy::AdaptiveThroughput;
-    MlxMtpDraftSamplingPolicy draft_sampling_policy =
-        MlxMtpDraftSamplingPolicy::Sharpened;
 
     static constexpr MlxMtpPredictorDescriptor recurrent(
         int maximum_depth) noexcept {
@@ -52,11 +32,7 @@ struct MlxMtpPredictorDescriptor {
 
     static constexpr MlxMtpPredictorDescriptor block(
         int maximum_depth) noexcept {
-        return {
-            maximum_depth,
-            MlxMtpDepthPolicy::AcceptanceOnly,
-            MlxMtpDraftSamplingPolicy::MatchTarget,
-        };
+        return {maximum_depth};
     }
 };
 
@@ -207,9 +183,7 @@ class MlxMtpDepthController {
 public:
     explicit MlxMtpDepthController(
         int maximum_depth = 3,
-        int initial_depth = 2,
-        MlxMtpDepthPolicy policy =
-            MlxMtpDepthPolicy::AdaptiveThroughput);
+        int initial_depth = 2);
 
     int depth() const noexcept {
         return current_depth_;
@@ -236,8 +210,6 @@ private:
 
     int maximum_depth_ = 1;
     int current_depth_ = 1;
-    MlxMtpDepthPolicy policy_ =
-        MlxMtpDepthPolicy::AdaptiveThroughput;
     int cycles_ = 0;
     int probe_left_ = 0;
     double milliseconds_since_probe_ = 0.0;

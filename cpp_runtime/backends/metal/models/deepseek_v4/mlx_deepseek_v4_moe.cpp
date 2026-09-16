@@ -1542,15 +1542,16 @@ MlxDeepseekV4Moe::forward_branches(
             rows >= 32
             && gate_up_grouped
             && down->supports_grouped_mmq();
-        const bool gate_up_smallm_gather_qmm = split_resident
-            ? gate->prefers_mxfp4_smallm_nax(route_ids)
-                && up->prefers_mxfp4_smallm_nax(route_ids)
-            : gate_up->prefers_mxfp4_smallm_nax(route_ids);
+        // Split Gate/Up already has a fused routed_swiglu_pair primitive.
+        // Sorting it into two independent gather-QMM launches duplicates the
+        // route work and regresses the validated M3 Ultra DSpark path.  The
+        // sorted small-M path is only beneficial for a precombined container.
         const bool smallm_gather_qmm =
-            precomputed_hidden == nullptr
+            !split_resident
+            && precomputed_hidden == nullptr
             && expert_map == nullptr
             && !packed_expert_ids
-            && gate_up_smallm_gather_qmm
+            && gate_up->prefers_mxfp4_smallm_nax(route_ids)
             && down->prefers_mxfp4_smallm_nax(route_ids);
         if (smallm_gather_qmm) {
             detail::profile_marker(
@@ -1563,32 +1564,12 @@ MlxDeepseekV4Moe::forward_branches(
                             route_ids,
                             Shape{rows * routes})),
                     mlx::core::int32));
-            auto routed_hidden = [&]() {
-                if (split_resident) {
-                    return limited_swiglu_pair(
-                        gate->forward_sorted(
-                            source,
-                            route_ids,
-                            route_order,
-                            false,
-                            nullptr,
-                            true),
-                        up->forward_sorted(
-                            source,
-                            route_ids,
-                            route_order,
-                            false,
-                            nullptr,
-                            true),
-                        static_cast<float>(config_.swiglu_limit));
-                }
-                return gate_up->swiglu_sorted(
-                    source,
-                    route_ids,
-                    route_order,
-                    static_cast<float>(config_.swiglu_limit),
-                    true);
-            }();
+            auto routed_hidden = gate_up->swiglu_sorted(
+                source,
+                route_ids,
+                route_order,
+                static_cast<float>(config_.swiglu_limit),
+                true);
             if (detail::component_profile_active()) {
                 detail::profile_eval(
                     "moe.routed_gate_up_swiglu",

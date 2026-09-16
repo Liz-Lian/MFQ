@@ -1575,8 +1575,11 @@ void test_dspark_generation_uses_common_mtp_engine() {
         std::vector<std::int64_t>{});
     const auto& capped_stats = capped_model.last_mtp_stats();
     require(
-        capped_stats.depth_cycles[5] > 0,
-        "DeepSeek-V4 MTP did not use the checkpoint draft depth");
+        capped_stats.depth_cycles[2] > 0 &&
+            capped_stats.depth_cycles[3] == 0 &&
+            capped_stats.depth_cycles[4] == 0 &&
+            capped_stats.depth_cycles[5] == 0,
+        "DeepSeek-V4 MTP bypassed common adaptive warmup depth");
 
     mfq::metal::MlxSamplingParams penalized = sampling;
     penalized.presence_penalty = 0.2;

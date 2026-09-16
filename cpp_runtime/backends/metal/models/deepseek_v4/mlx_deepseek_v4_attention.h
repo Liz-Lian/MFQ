@@ -188,6 +188,7 @@ public:
     void begin_speculative(int confirmed_tokens, int total_tokens);
     const MlxDeepseekV4LayerState& speculative_checkpoint() const;
     bool has_speculative() const noexcept;
+    void restart_speculative_attempt();
 
 private:
     friend class MlxDeepseekV4Attention;

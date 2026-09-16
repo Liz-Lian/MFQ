@@ -4,6 +4,7 @@
 #include "mlx_deepseek_v4_attention.h"
 #include "mlx_deepseek_v4_hc.h"
 #include "mlx_dsa.h"
+#include "mlx_eval_timing.h"
 #include "mlx_sampling.h"
 #include "mlx_sparse_attention.h"
 #include "mlx_transformer.h"
@@ -358,6 +359,8 @@ struct MlxDeepseekV4DSpark::Impl {
     MlxRmsNorm output_norm;
     int maximum_context;
     std::pair<array, array> rope;
+    std::shared_ptr<MlxMoeSsdExpertCache> ssd_expert_cache;
+    std::size_t expert_layer_base;
     Impl(
         DeepseekV4Config selected_config,
         MlxEmbedding selected_embedding,
@@ -367,7 +370,9 @@ struct MlxDeepseekV4DSpark::Impl {
         std::vector<MlxDeepseekV4DSparkStageComponents> selected_stages,
         MlxDeepseekV4DSparkHeadComponents selected_head,
         int max_context,
-        std::pair<array, array> selected_rope)
+        std::pair<array, array> selected_rope,
+        std::shared_ptr<MlxMoeSsdExpertCache> selected_ssd_expert_cache,
+        std::size_t selected_expert_layer_base)
         : config(std::move(selected_config)),
           embedding(std::move(selected_embedding)),
           output(std::move(selected_output)),
@@ -383,7 +388,9 @@ struct MlxDeepseekV4DSpark::Impl {
           rope{
               float32_contiguous(selected_rope.first),
               float32_contiguous(selected_rope.second),
-          } {
+          },
+          ssd_expert_cache(std::move(selected_ssd_expert_cache)),
+          expert_layer_base(selected_expert_layer_base) {
         stages.reserve(selected_stages.size());
         for (auto& stage : selected_stages) {
             stages.emplace_back(
@@ -738,7 +745,9 @@ MlxDeepseekV4DSpark::load_if_present(
         mlx_yarn_tables(
             checked_int(config.qk_rope_head_dim, "rotary width"),
             max_context,
-            static_cast<float>(config.rope_theta)));
+            static_cast<float>(config.rope_theta)),
+        std::move(ssd_expert_cache),
+        expert_layer_base);
 }
 
 MlxDeepseekV4DSpark::MlxDeepseekV4DSpark(
@@ -750,7 +759,9 @@ MlxDeepseekV4DSpark::MlxDeepseekV4DSpark(
     std::vector<MlxDeepseekV4DSparkStageComponents> stages,
     MlxDeepseekV4DSparkHeadComponents head,
     int max_context,
-    std::pair<array, array> rope)
+    std::pair<array, array> rope,
+    std::shared_ptr<MlxMoeSsdExpertCache> ssd_expert_cache,
+    std::size_t expert_layer_base)
     : impl_(std::make_shared<Impl>(
           std::move(config),
           std::move(embedding),
@@ -760,7 +771,9 @@ MlxDeepseekV4DSpark::MlxDeepseekV4DSpark(
           std::move(stages),
           std::move(head),
           max_context,
-          std::move(rope))) {}
+          std::move(rope),
+          std::move(ssd_expert_cache),
+          expert_layer_base)) {}
 
 MlxDeepseekV4DSparkState MlxDeepseekV4DSpark::make_state(
     int batch,
@@ -860,13 +873,81 @@ MlxDeepseekV4DSpark::draft_impl(
             mlx::core::expand_dims(embedded, 2),
             Shape{
                 state.batch(), physical_width, kConnections, hidden_size}));
-    for (std::size_t stage = 0; stage < impl_->stages.size(); ++stage) {
-        hidden = impl_->block(
-            hidden,
-            draft_ids,
-            impl_->stages[stage],
-            state.rings_[stage],
-            state.position_);
+    const auto run_stages = [&](array value) {
+        for (std::size_t stage = 0; stage < impl_->stages.size(); ++stage) {
+            value = impl_->block(
+                value,
+                draft_ids,
+                impl_->stages[stage],
+                state.rings_[stage],
+                state.position_);
+        }
+        return value;
+    };
+    const int routed_rows = checked_product(
+        state.batch(), physical_width, "routed row count");
+    bool use_route_transaction =
+        impl_->ssd_expert_cache && routed_rows <= 6 &&
+        mlx_ssd_route_transactions_enabled();
+    if (use_route_transaction) {
+        for (std::size_t stage = 0; stage < impl_->stages.size(); ++stage) {
+            if (!impl_->ssd_expert_cache->route_layer_likely_hit(
+                    impl_->expert_layer_base + stage)) {
+                use_route_transaction = false;
+                break;
+            }
+        }
+    }
+    if (!use_route_transaction) {
+        hidden = run_stages(std::move(hidden));
+    } else {
+        const auto hidden_checkpoint = hidden;
+        std::vector<std::optional<MlxSsdPreparedExperts>> pins(
+            impl_->stages.size());
+        bool completed = false;
+        try {
+            for (std::size_t attempt = 0;
+                 attempt <= impl_->stages.size();
+                 ++attempt) {
+                impl_->ssd_expert_cache->begin_route_transaction();
+                auto trial = run_stages(hidden_checkpoint);
+                detail::eval_with_timing(trial);
+                auto transaction =
+                    impl_->ssd_expert_cache->resolve_route_transaction();
+                if (transaction.all_hit) {
+                    hidden = std::move(trial);
+                    pins.clear();
+                    impl_->ssd_expert_cache->release_deferred();
+                    completed = true;
+                    break;
+                }
+                for (const auto& route : transaction.routes) {
+                    if (route.layer < impl_->expert_layer_base ||
+                        route.layer >= impl_->expert_layer_base +
+                            impl_->stages.size()) {
+                        throw std::runtime_error(
+                            "DSpark SSD route layer is out of range");
+                    }
+                    auto prepared = impl_->ssd_expert_cache->prepare(
+                        route.layer, route.experts);
+                    pins.at(route.layer - impl_->expert_layer_base).emplace(
+                        std::move(prepared));
+                }
+                impl_->ssd_expert_cache->release_deferred();
+            }
+        } catch (...) {
+            impl_->ssd_expert_cache->cancel_route_transaction();
+            pins.clear();
+            impl_->ssd_expert_cache->release_deferred();
+            throw;
+        }
+        if (!completed) {
+            impl_->ssd_expert_cache->cancel_route_transaction();
+            pins.clear();
+            impl_->ssd_expert_cache->release_deferred();
+            throw std::runtime_error(
+                "DSpark SSD route transaction did not converge");
+        }
     }
     auto head_hidden = impl_->head_hidden(hidden);
     auto base_logits = mlx::core::astype(

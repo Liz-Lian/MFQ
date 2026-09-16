@@ -58,6 +58,20 @@ bool mlx_ssd_route_transactions_enabled() noexcept {
     return setting != "0" && setting != "false" && setting != "off";
 }
 
+int mlx_ssd_route_transaction_group_layers(int maximum_layers) noexcept {
+    const auto upper = std::max(1, maximum_layers);
+    const char* value = std::getenv("MFQ_SSD_DEVICE_ROUTE_GROUP");
+    return value == nullptr
+        ? std::min(4, upper)
+        : std::clamp(std::atoi(value), 1, upper);
+}
+
+bool mlx_ssd_force_route_transactions() noexcept {
+    const char* value = std::getenv(
+        "MFQ_SSD_DEVICE_ROUTE_FORCE_TRANSACTION");
+    return value != nullptr && std::string_view(value) != "0";
+}
+
 struct MlxMoeSsdExpertCache::Impl {
     enum class State {
         empty,
@@ -131,7 +145,8 @@ struct MlxMoeSsdExpertCache::Impl {
 
     struct TransactionRoute {
         std::size_t layer = 0;
-        mlx::core::array packed_expert_ids;
+        mlx::core::array expert_ids;
+        bool packed = true;
         std::shared_ptr<const std::vector<std::int32_t>> slot_map;
         std::shared_ptr<const std::vector<std::uint64_t>> generation_map;
     };
@@ -446,7 +461,8 @@ struct MlxMoeSsdExpertCache::Impl {
 
     void defer_transaction_route(
         std::size_t layer,
-        const mlx::core::array& packed_expert_ids,
+        const mlx::core::array& expert_ids,
+        bool packed,
         std::shared_ptr<const std::vector<std::int32_t>> slot_map,
         std::shared_ptr<const std::vector<std::uint64_t>> generation_map) {
         std::scoped_lock lock(mutex);
@@ -456,7 +472,8 @@ struct MlxMoeSsdExpertCache::Impl {
         }
         transaction_routes.push_back({
             .layer = layer,
-            .packed_expert_ids = packed_expert_ids,
+            .expert_ids = expert_ids,
+            .packed = packed,
             .slot_map = std::move(slot_map),
             .generation_map = std::move(generation_map),
         });
@@ -479,20 +496,25 @@ struct MlxMoeSsdExpertCache::Impl {
         result.routes.reserve(routes.size());
         for (const auto& route : routes) {
             std::vector<std::int32_t> experts;
-            experts.reserve(route.packed_expert_ids.size());
+            experts.reserve(route.expert_ids.size());
             bool encoded_all_hit = true;
             const auto* encoded =
-                route.packed_expert_ids.data<std::int32_t>();
+                route.expert_ids.data<std::int32_t>();
             for (std::size_t index = 0;
-                 index < route.packed_expert_ids.size();
+                 index < route.expert_ids.size();
                  ++index) {
-                const auto expert = encoded[index] & 0xff;
+                const auto expert = route.packed
+                    ? encoded[index] & 0xff
+                    : encoded[index];
                 experts.push_back(expert);
                 if (expert < 0 ||
                     static_cast<std::size_t>(expert) >=
                         route.slot_map->size() ||
-                    (encoded[index] >> 8) - 1 != (*route.slot_map)[
-                        static_cast<std::size_t>(expert)]) {
+                    (route.packed &&
+                     (encoded[index] >> 8) - 1 != (*route.slot_map)[
+                         static_cast<std::size_t>(expert)]) ||
+                    (!route.packed && (*route.slot_map)[
+                         static_cast<std::size_t>(expert)] < 0)) {
                     encoded_all_hit = false;
                 }
             }
@@ -967,6 +989,22 @@ struct MlxSsdExpertPageTableSnapshot::Impl {
         cache->defer_transaction_route(
             layer,
             packed_expert_ids,
+            true,
+            slot_map,
+            generation_map);
+        released = true;
+    }
+
+    void defer_transaction_global(
+        const mlx::core::array& global_expert_ids) {
+        if (released || !cache) {
+            throw std::logic_error(
+                "SSD expert page-table snapshot is already released");
+        }
+        cache->defer_transaction_route(
+            layer,
+            global_expert_ids,
+            false,
             slot_map,
             generation_map);
         released = true;
@@ -1191,6 +1229,15 @@ void MlxSsdExpertPageTableSnapshot::defer_transaction(
             "SSD expert page-table snapshot is empty");
     }
     impl_->defer_transaction(packed_expert_ids);
+}
+
+void MlxSsdExpertPageTableSnapshot::defer_transaction_global(
+    const mlx::core::array& global_expert_ids) {
+    if (!impl_) {
+        throw std::logic_error(
+            "SSD expert page-table snapshot is empty");
+    }
+    impl_->defer_transaction_global(global_expert_ids);
 }
 
 MlxSsdPrefetchedExpertLayer::MlxSsdPrefetchedExpertLayer(

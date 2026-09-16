@@ -1374,6 +1374,23 @@ bool MlxDeepseekV4LayerState::has_speculative() const noexcept {
     return static_cast<bool>(speculative_);
 }
 
+void MlxDeepseekV4LayerState::restart_speculative_attempt() {
+    if (!speculative_ || !speculative_->local_kv) {
+        throw std::runtime_error(
+            "DeepSeek-V4 speculative attempt is not restartable");
+    }
+    const int start_position = speculative_->start_position;
+    const int total_tokens = speculative_->total_tokens;
+    auto checkpoint = speculative_->checkpoint;
+    restore_speculative_snapshot(
+        std::move(checkpoint), start_position, total_tokens);
+    speculative_->local_kv.reset();
+    speculative_->main_kv.reset();
+    speculative_->main_gate.reset();
+    speculative_->index_kv.reset();
+    speculative_->index_gate.reset();
+}
+
 array MlxDeepseekV4LayerState::local_positions() const {
     const int window = local_.shape(1);
     auto slots = mlx::core::arange(

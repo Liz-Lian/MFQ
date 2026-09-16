@@ -183,14 +183,9 @@ constexpr double kDepthHysteresis = 1.03;
 
 MlxMtpDepthController::MlxMtpDepthController(
     int maximum_depth,
-    int initial_depth,
-    MlxMtpDepthPolicy policy)
+    int initial_depth)
     : maximum_depth_(std::clamp(maximum_depth, 1, 5)),
-      current_depth_(
-          policy == MlxMtpDepthPolicy::AcceptanceOnly
-              ? maximum_depth_
-              : std::clamp(initial_depth, 1, maximum_depth_)),
-      policy_(policy),
+      current_depth_(std::clamp(initial_depth, 1, maximum_depth_)),
       acceptance_(
           static_cast<std::size_t>(maximum_depth_),
           0.6),
@@ -215,9 +210,6 @@ MlxMtpDepthController::MlxMtpDepthController(
     // compile independently, so two samples can still leave the controller
     // with a cold timing and incorrectly pin an otherwise profitable request
     // to plain decoding.
-    if (policy_ == MlxMtpDepthPolicy::AcceptanceOnly) {
-        return;
-    }
     warmup_.insert(
         warmup_.end(),
         {current_depth_, current_depth_, current_depth_});
@@ -271,15 +263,6 @@ void MlxMtpDepthController::observe(
     }
     milliseconds_since_probe_ += cycle_ms;
     milliseconds_since_explore_ += cycle_ms;
-
-    if (policy_ == MlxMtpDepthPolicy::AcceptanceOnly) {
-        // DeepSeek DSpark follows the block predictor's accepted prefix: an
-        // early rejection retains one lookahead and a full accept grows by
-        // one. It never burns short responses benchmarking plain decode.
-        current_depth_ = std::min(
-            maximum_depth_, accepted_drafts + 1);
-        return;
-    }
 
     if (!warmup_.empty()) {
         warmup_.erase(warmup_.begin());
@@ -828,9 +811,7 @@ std::int32_t run_mlx_mtp_generation(
         !request.sampling.greedy() && request.sampling.top_k > 0 &&
         request.sampling.top_k <= 128;
     MlxSamplingParams draft_sampling = request.sampling;
-    if (compact_stochastic &&
-        callbacks.predictor.draft_sampling_policy ==
-            MlxMtpDraftSamplingPolicy::Sharpened) {
+    if (compact_stochastic) {
         // The proposal may be sharper than the target distribution because
         // exact p/q verification preserves the target sampler.
         draft_sampling.temperature = 0.6;
@@ -842,8 +823,7 @@ std::int32_t run_mlx_mtp_generation(
         : std::min(
               callbacks.predictor.maximum_depth,
               std::clamp(request.sampling.mtp_max_draft_tokens, 1, 5));
-    MlxMtpDepthController depth_controller(
-        maximum_depth, 2, callbacks.predictor.depth_policy);
+    MlxMtpDepthController depth_controller(maximum_depth, 2);
 
     auto pending = sample_token(
         request.initial_logits, counts, request.token_constraint);

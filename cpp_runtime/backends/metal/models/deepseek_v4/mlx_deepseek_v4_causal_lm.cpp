@@ -37,20 +37,6 @@ constexpr int kConnections = 4;
 constexpr int kHcProjectionWidth =
     2 * kConnections + kConnections * kConnections;
 
-int ssd_route_transaction_layers() noexcept {
-    const char* value = std::getenv("MFQ_SSD_DEVICE_ROUTE_GROUP");
-    if (value == nullptr) {
-        return 4;
-    }
-    return std::clamp(std::atoi(value), 1, 43);
-}
-
-bool force_ssd_route_transactions() noexcept {
-    const char* value = std::getenv(
-        "MFQ_SSD_DEVICE_ROUTE_FORCE_TRANSACTION");
-    return value != nullptr && std::string_view(value) != "0";
-}
-
 int resident_prefill_eval_group_layers() noexcept {
     const char* value = std::getenv(
         "MFQ_DSV4_PREFILL_EVAL_GROUP");
@@ -1266,7 +1252,6 @@ array MlxDeepseekV4CausalLm::forward_streaming_layers(
         batch, tokens, "routed row count");
     const bool route_transaction =
         ssd_expert_cache_
-        && targets == nullptr
         && routed_rows >= 1
         && routed_rows <= 6
         && mlx_ssd_route_transactions_enabled();
@@ -1311,9 +1296,10 @@ array MlxDeepseekV4CausalLm::forward_streaming_layers(
         return hidden;
     }
 
-    const bool force_transactions = force_ssd_route_transactions();
+    const bool force_transactions = mlx_ssd_force_route_transactions();
     const auto group_layers = static_cast<std::size_t>(
-        ssd_route_transaction_layers());
+        mlx_ssd_route_transaction_group_layers(
+            static_cast<int>(layers_.size())));
     std::size_t group_begin = 0;
     while (group_begin < layers_.size()) {
         if (!force_transactions &&
@@ -1325,6 +1311,7 @@ array MlxDeepseekV4CausalLm::forward_streaming_layers(
                 pos0,
                 nullptr,
                 visibility);
+            capture_dspark_target(group_begin, hidden, targets);
             if (eager_layer_materialization) {
                 materialize_layer_range(
                     hidden,
@@ -1357,6 +1344,9 @@ array MlxDeepseekV4CausalLm::forward_streaming_layers(
                  ++attempt) {
                 ssd_expert_cache_->begin_route_transaction();
                 auto trial = hidden_checkpoint;
+                auto trial_targets = targets != nullptr
+                    ? *targets
+                    : std::vector<std::optional<array>>{};
                 for (std::size_t index = group_begin;
                      index < group_end;
                      ++index) {
@@ -1367,18 +1357,38 @@ array MlxDeepseekV4CausalLm::forward_streaming_layers(
                         pos0,
                         nullptr,
                         visibility);
+                    capture_dspark_target(
+                        index,
+                        trial,
+                        targets != nullptr ? &trial_targets : nullptr);
                 }
                 detail::eval_with_timing(trial);
                 auto transaction =
                     ssd_expert_cache_->resolve_route_transaction();
                 if (transaction.all_hit) {
                     hidden = std::move(trial);
+                    if (targets != nullptr) {
+                        *targets = std::move(trial_targets);
+                    }
                     pins.clear();
                     ssd_expert_cache_->release_deferred();
                     completed = true;
                     break;
                 }
                 states_ = state_checkpoint;
+                bool restarted_speculation = false;
+                for (std::size_t index = group_begin;
+                     index < group_end;
+                     ++index) {
+                    if (states_[index].has_speculative()) {
+                        states_[index].restart_speculative_attempt();
+                        restarted_speculation = true;
+                    }
+                }
+                if (restarted_speculation) {
+                    materialize_layer_range(
+                        hidden_checkpoint, group_begin, group_end);
+                }
                 for (const auto& route : transaction.routes) {
                     auto prepared = ssd_expert_cache_->prepare(
                         route.layer,

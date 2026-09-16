@@ -280,9 +280,20 @@ int MlxDeepseekV41Moe::recommended_prefill_chunk_size() const noexcept {
     return gate_up > 0 && down > 0 ? std::min(gate_up, down) : 0;
 }
 
+std::optional<MlxSsdPrefetchedExpertLayer>
+MlxDeepseekV41Moe::prefetch_routed(std::size_t rows) const {
+    constexpr std::size_t kFullLayerPrefetchRows = 512;
+    if (ssd_expert_cache_ && rows >= kFullLayerPrefetchRows &&
+        ssd_expert_cache_->prefill_overlap_enabled()) {
+        return ssd_expert_cache_->prefetch_layer(expert_cache_layer_);
+    }
+    return std::nullopt;
+}
+
 MlxDeepseekV41MoeResult MlxDeepseekV41Moe::forward(
     const array& input,
-    const std::optional<array>& image_mask) const {
+    const std::optional<array>& image_mask,
+    MlxSsdPrefetchedExpertLayer* prefetched) const {
     if (input.ndim() < 2 || input.shape(-1) != hidden_) {
         throw std::invalid_argument("DeepSeek-V4.1 MoE input shape mismatch");
     }
@@ -368,7 +379,36 @@ MlxDeepseekV41MoeResult MlxDeepseekV41Moe::forward(
     }
 
     array routed(0.0f);
-    if (ssd_expert_cache_) {
+    const bool route_transaction = ssd_expert_cache_ &&
+        ssd_expert_cache_->route_transaction_active();
+    if (prefetched != nullptr) {
+        if (!ssd_expert_cache_ ||
+            prefetched->layer() != expert_cache_layer_) {
+            throw std::invalid_argument(
+                "DeepSeek-V4.1 SSD prefetch layer mismatch");
+        }
+        const auto& weights = prefetched->wait();
+        auto routed_hidden = weights.gate_up.swiglu(
+            source, routes.ids, swiglu_limit_);
+        routed = weights.down.combine(
+            routed_hidden,
+            routes.ids,
+            routes.weights);
+        detail::eval_with_timing(routed);
+    } else if (route_transaction) {
+        auto snapshot = ssd_expert_cache_->snapshot_page_table(
+            expert_cache_layer_);
+        auto resident_ids = mlx::core::take(
+            snapshot.slot_ids(),
+            mlx::core::astype(routes.ids, mlx::core::int32));
+        auto routed_hidden = snapshot.weights().gate_up.swiglu(
+            source, resident_ids, swiglu_limit_);
+        routed = snapshot.weights().down.combine(
+            routed_hidden,
+            resident_ids,
+            routes.weights);
+        snapshot.defer_transaction_global(routes.ids);
+    } else if (ssd_expert_cache_) {
         auto prepared = ssd_expert_cache_->prepare_routes(
             expert_cache_layer_, routes.ids);
         auto routed_hidden = prepared.weights().gate_up.swiglu(

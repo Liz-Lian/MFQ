@@ -75,26 +75,6 @@ int main() {
             }
         }
         {
-            mfq::metal::MlxMtpDepthController controller(
-                5,
-                2,
-                mfq::metal::MlxMtpDepthPolicy::AcceptanceOnly);
-            if (controller.depth() != 5) {
-                throw std::runtime_error(
-                    "acceptance-driven MTP did not start at model depth");
-            }
-            controller.observe(5, 1, 1000.0);
-            if (controller.depth() != 2) {
-                throw std::runtime_error(
-                    "acceptance-driven MTP did not retain one lookahead");
-            }
-            controller.observe(2, 2, 1.0e6);
-            if (controller.depth() != 3) {
-                throw std::runtime_error(
-                    "acceptance-driven MTP incorrectly used wall time");
-            }
-        }
-        {
             mfq::metal::MlxMtpDepthController controller(1);
             controller.observe(1, 0, 80.0);
             controller.observe(1, 0, 75.0);

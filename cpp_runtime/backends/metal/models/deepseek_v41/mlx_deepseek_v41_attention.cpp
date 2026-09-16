@@ -714,7 +714,7 @@ std::vector<array> MlxDeepseekV41Attention::begin_speculative(
     int total_tokens) const {
     const int batch = state.local_kv.shape(0);
     const int window = state.local_kv.shape(1);
-    if (state.speculation || confirmed_tokens <= 0 ||
+    if (state.speculation || confirmed_tokens < 0 ||
         total_tokens <= confirmed_tokens || total_tokens > window ||
         state.position < 0 || state.position + total_tokens > max_context_) {
         throw std::invalid_argument(

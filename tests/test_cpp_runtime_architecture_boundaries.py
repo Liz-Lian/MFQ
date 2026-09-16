@@ -26,6 +26,9 @@ QWEN4_HEADER = (
 DSV = (MODELS / "deepseek_v4" / "mlx_deepseek_v4_causal_lm.cpp").read_text(
     encoding="utf-8"
 )
+DSV_MOE = (MODELS / "deepseek_v4" / "mlx_deepseek_v4_moe.cpp").read_text(
+    encoding="utf-8"
+)
 DSV41 = (
     MODELS / "deepseek_v41" / "mlx_deepseek_v41_causal_lm.cpp"
 ).read_text(encoding="utf-8")
@@ -160,6 +163,17 @@ def test_m3_ultra_small_m_mxfp4_dispatch_is_geometry_based() -> None:
     assert "input_width == 4096" in MOE_OPERATOR
     assert "output_width == 2048 || output_width == 4096" in MOE_OPERATOR
     assert "input_width == 2048 && output_width == 4096" in MOE_OPERATOR
+
+
+def test_deepseek_v4_split_resident_moe_keeps_fused_pair_path() -> None:
+    small_m = DSV_MOE[DSV_MOE.index("const bool smallm_gather_qmm =") :]
+    small_m = small_m[: small_m.index("} else if (grouped_prefill)")]
+    assert "!split_resident" in small_m
+    assert "gate->forward_sorted(" not in small_m
+
+    direct = DSV_MOE[DSV_MOE.index('"moe.dispatch.resident_direct"') :]
+    direct = direct[: direct.index("if (detail::component_profile_active())")]
+    assert "gate->swiglu_pair(" in direct
 
 
 def test_qwen4_uses_the_shared_ssd_expert_cache() -> None:
@@ -336,17 +350,19 @@ def test_deepseek_v4_small_m_reuses_ssd_route_transactions() -> None:
         / "cpp_runtime/backends/metal/models/deepseek_v4/"
         "mlx_deepseek_v4_causal_lm.cpp"
     ).read_text()
-    forward = source[source.index("MlxDeepseekV4CausalLm::forward_chunk(") :]
-    transaction_begin = forward.index("const bool grouped_route_transaction")
-    transaction = forward[
-        transaction_begin :
-        forward.index("std::size_t eval_group_begin", transaction_begin)
+    forward = source[
+        source.index("MlxDeepseekV4CausalLm::forward_streaming_layers(") :
+        source.index("MlxDeepseekV4CausalLm::begin_speculative_target(")
     ]
-    assert "routed_rows >= 1 && routed_rows <= 6" in forward
+    transaction_begin = forward.index("const bool route_transaction")
+    transaction = forward[transaction_begin:]
+    assert "&& routed_rows >= 1" in forward
+    assert "&& routed_rows <= 6" in forward
     assert "has_full_residency_capacity" not in transaction
-    assert "capture_target(group_begin);" in transaction
-    assert "capture_target_into(" in transaction
-    assert "target_hiddens = std::move(trial_targets);" in transaction
+    assert "targets == nullptr" not in transaction
+    assert "capture_dspark_target(group_begin, hidden, targets);" in transaction
+    assert "auto trial_targets = targets != nullptr" in transaction
+    assert "*targets = std::move(trial_targets);" in transaction
 
 
 def test_dspark_small_m_reuses_the_shared_ssd_route_transaction() -> None:
@@ -369,6 +385,11 @@ def test_deepseek_v41_multitoken_attention_orders_circular_cache_write() -> None
     assert "std::optional<array> pending_local_rows;" in forward
     assert "mlx::core::depends(\n            std::vector<array>{state.local_kv},\n            std::vector<array>{attended})" in forward
     assert "ordered_local.front(),\n            *pending_local_values" in forward
+
+
+def test_deepseek_v41_route_transactions_keep_wide_global_expert_ids() -> None:
+    assert "snapshot.defer_transaction_global(routes.ids);" in DSV41_MOE
+    assert "snapshot.defer_transaction(routes.ids);" not in DSV41_MOE
 
 
 def test_direct_native_hf_server_uses_size_aware_expert_residency() -> None:

@@ -21,8 +21,6 @@ from mfq.formats.assets import (
     HF_GENERATION_CONFIG_ASSET,
     HF_TOKENIZER_CONFIG_ASSET,
     HF_TOKENIZER_JSON_ASSET,
-    MODEL_CONFIG_ASSET,
-    MODEL_GRAPH_ASSET,
 )
 from mfq.formats.header import FileHeader
 from mfq.runtime.flash_next_worker import (
@@ -39,11 +37,6 @@ from mfq.runtime.flash_next_worker import (
 )
 from mfq.server.backend import OpenAIChatBackend
 from mfq.server.models import SamplingParams
-from mfq.server.native import (
-    NativeRuntime,
-    python_mlx_runtime_command,
-    resolve_runtime_route,
-)
 
 
 def _tiny_tokenizer() -> bytes:
@@ -821,160 +814,6 @@ def test_flash_next_worker_closes_text_model_when_vision_initialization_fails(
         )
 
     assert loaded.closed
-
-
-def test_python_mlx_runtime_command_reenters_mfq_cli(tmp_path: Path) -> None:
-    command = python_mlx_runtime_command(
-        ("python", "-m", "mfq.cli"),
-        model="model.mfq",
-        model_name="Flash",
-        host="127.0.0.1",
-        port=1234,
-        context_size=8192,
-    )
-    assert command == [
-        "python",
-        "-m",
-        "mfq.cli",
-        "_flash-next-worker",
-        "--model",
-        "model.mfq",
-        "--host",
-        "127.0.0.1",
-        "--port",
-        "1234",
-        "--model-name",
-        "Flash",
-        "--ctx-size",
-        "8192",
-        "--prefill-chunk-size",
-        "2048",
-    ]
-    model = tmp_path / "glm5.mfq"
-    io.save(
-        model,
-        FileHeader(version=2, model_arch="legacy-name-is-ignored"),
-        {
-            MODEL_GRAPH_ASSET: json.dumps(
-                {
-                    "schema_version": 1,
-                    "architecture": "glm5_next",
-                    "graph": {"kind": "causal_lm", "backbone": "glm5_next"},
-                    "components": [
-                        {
-                            "kind": "text",
-                            "tensor_root": "model",
-                            "implementation": "glm5_next",
-                        }
-                    ],
-                    "canonical_naming": {
-                        "namespace": "mfq.tensor",
-                        "version": 1,
-                        "component_roots": ["model"],
-                    },
-                }
-            ).encode(),
-        },
-    )
-    runtime = NativeRuntime(
-        executable=Path("/runtime/mfq-decode-metal"),
-        model=model,
-        model_name="Flash",
-        backend="metal",
-        context_size=4096,
-        architecture="glm5_next-hf-mfq-nint-recipe",
-        controller_command=("mfq-cli",),
-    )
-    assert runtime.command(9001)[0:2] == ["mfq-cli", "_flash-next-worker"]
-    assert "--server" not in runtime.command(9001)
-
-
-def test_runtime_route_uses_graph_backbone_and_native_qwen_components(
-    tmp_path: Path,
-) -> None:
-    model = tmp_path / "qwen35-vl.mfq"
-    io.save(
-        model,
-        FileHeader(version=2, model_arch="qwen3_5-hf-full-mfq"),
-        {
-            MODEL_CONFIG_ASSET: json.dumps(
-                {
-                    "model_type": "qwen3_5",
-                    "language_model_only": False,
-                    "vision_config": {"model_type": "qwen3_5"},
-                }
-            ).encode(),
-            "model.visual.patch_embed.proj.weight": np.ones((1,), dtype=np.float16),
-        },
-    )
-
-    route = resolve_runtime_route("qwen3_5-hf-full-mfq", model)
-    assert route.architecture_family == "qwen3_5"
-    assert route.backbone == "qwen3_5"
-    assert route.vision_available
-    assert not route.python_mlx_worker
-    runtime = NativeRuntime(
-        executable=Path("/runtime/mfq-decode-metal"),
-        model=model,
-        model_name="Qwen3.5-VL",
-        backend="metal",
-        context_size=4096,
-        architecture="qwen3_5-hf-full-mfq",
-        controller_command=("mfq-cli",),
-    )
-    assert runtime.command(9002)[0] == "/runtime/mfq-decode-metal"
-    assert "--server" in runtime.command(9002)
-
-    text_only = tmp_path / "qwen35-text.mfq"
-    io.save(
-        text_only,
-        FileHeader(version=2, model_arch="qwen3_5-hf-full-mfq"),
-        {
-            MODEL_CONFIG_ASSET: b'{"model_type":"qwen3_5","language_model_only":true}',
-            "weight": np.ones((1,), dtype=np.float16),
-        },
-    )
-    route = resolve_runtime_route("qwen3_5-hf-full-mfq", text_only)
-    assert not route.vision_available
-    assert not route.python_mlx_worker
-
-    flash_next = resolve_runtime_route("glm5_next-hf-mfq-nint-recipe", text_only)
-    assert flash_next.architecture_family == "qwen3_5"
-    assert not flash_next.python_mlx_worker
-
-
-def test_runtime_route_selects_native_cpp_for_qwen4_exp(tmp_path: Path) -> None:
-    model = tmp_path / "qwen4.mfq"
-    io.save(
-        model,
-        FileHeader(version=2, model_arch="legacy-name-is-ignored"),
-        {
-            MODEL_GRAPH_ASSET: json.dumps(
-                {
-                    "schema_version": 1,
-                    "architecture": "qwen4_exp",
-                    "graph": {"kind": "causal_lm", "backbone": "qwen4_exp"},
-                    "components": [
-                        {
-                            "kind": "text",
-                            "tensor_root": "model",
-                            "implementation": "qwen4_exp",
-                        }
-                    ],
-                    "canonical_naming": {
-                        "namespace": "mfq.tensor",
-                        "version": 1,
-                        "component_roots": ["model"],
-                    },
-                }
-            ).encode(),
-        },
-    )
-
-    route = resolve_runtime_route("qwen4_exp-hf-mfq-nint-recipe", model)
-    assert route.architecture_family == "qwen4_exp"
-    assert route.backbone == "qwen4_exp"
-    assert not route.python_mlx_worker
 
 
 class _FakeWorker:

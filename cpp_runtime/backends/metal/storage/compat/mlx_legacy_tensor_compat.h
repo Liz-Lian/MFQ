@@ -6,10 +6,6 @@ namespace mfq::metal {
 
 class MfqContainer;
 
-// Normalize a registered source checkpoint once at the container boundary.
-// Runtime implementations consume only the resulting canonical records.
-void install_hf_source_compatibility(MfqContainer& model);
-
 // Temporary Metal record-alias boundary. The backend-neutral legacy graph is
 // synthesized separately by mfq_legacy_model_graph; backend loaders see only
 // these canonical aliases. Delete both adapters after the schema-v1 migration

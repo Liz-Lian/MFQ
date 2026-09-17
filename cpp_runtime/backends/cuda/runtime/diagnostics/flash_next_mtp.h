@@ -3,7 +3,7 @@
 // Architecture-specific CLI diagnostics. Production generation uses the
 // common CudaMtpModule path and does not depend on these concrete types.
 
-static int run_flash_next_mtp_check(Model& model,CudaFlashNextMtp& mtp) {
+static int run_flash_next_mtp_check(CudaModel& model,CudaFlashNextMtp& mtp) {
     namespace tb=mfq_tensor_backend;
     MFQ_RUNTIME_CHECK(model.c.is_flash_next() && model.c.vocab_size>=8 && model.c.max_position_embeddings>=24,
         "Flash-Next MTP diagnostic requires vocab>=8 and context>=24");
@@ -54,7 +54,7 @@ static int run_flash_next_mtp_check(Model& model,CudaFlashNextMtp& mtp) {
     for (int i=0;i<sampling.max_tokens;++i) {
         auto next=model.next_token(current);expected.push_back(next.item<int64_t>());current=next.reshape({1,1});
     }
-    const auto count=generate_mtp_tokens(model,mtp,prompt,sampling,
+    const auto count=run_cuda_mtp_generation(model,mtp,prompt,sampling,
         [&](int64_t token) {generated.push_back(token);return true;},{});
     MFQ_RUNTIME_CHECK(count==sampling.max_tokens && generated==expected && mtp.last_cycles>0,
         "Flash-Next MTP greedy tokens disagree with incremental target");
@@ -64,13 +64,13 @@ static int run_flash_next_mtp_check(Model& model,CudaFlashNextMtp& mtp) {
     result["selected_depth"]=mtp.last_stats.selected_depth;
     result["depth_cycles"]=mtp.last_stats.depth_cycles;
     generated.clear();
-    const auto stopped=generate_mtp_tokens(model,mtp,prompt,sampling,
+    const auto stopped=run_cuda_mtp_generation(model,mtp,prompt,sampling,
         [&](int64_t token) {generated.push_back(token);return generated.size()<3;},{});
     MFQ_RUNTIME_CHECK(stopped==3 && generated==std::vector<int64_t>(expected.begin(),expected.begin()+3),
         "Flash-Next MTP callback emitted extra or incorrect tokens");
     sampling.max_tokens=8;sampling.temperature=.8;sampling.top_k=16;sampling.top_p=.95;
     sampling.presence_penalty=.2;sampling.frequency_penalty=.1;sampling.repetition_penalty=1.05;sampling.seed=20260907;
-    MFQ_RUNTIME_CHECK(generate_mtp_tokens(model,mtp,prompt,sampling,[](int64_t){return true;},{})==8,
+    MFQ_RUNTIME_CHECK(run_cuda_mtp_generation(model,mtp,prompt,sampling,[](int64_t){return true;},{})==8,
         "Flash-Next stochastic MTP failed to generate requested tokens");
     std::cout<<"flash_next_mtp_check "<<result.dump()<<'\n';return 0;
 }

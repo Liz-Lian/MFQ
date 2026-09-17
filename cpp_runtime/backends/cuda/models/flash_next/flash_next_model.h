@@ -2,12 +2,17 @@
 
 // Native configuration parsers for the Flash-Next model family.
 #include <nlohmann/json.hpp>
+#include "cuda_model_plan.h"
+#include "mfq/model_graph.h"
 #include <algorithm>
 #include <cmath>
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
+
+namespace mfq { class ModelSource; }
 
 namespace mfq::flash_next {
 struct QwenConfig {
@@ -18,6 +23,8 @@ struct QwenConfig {
     bool interleaved,normalize_routes,silu_gate,tied_embeddings,dedicated_predictor_embeddings;
     std::vector<int64_t> sections,ple_layers;
     std::vector<std::string> layer_types;
+    static QwenConfig from_json(std::string_view payload);
+    static QwenConfig from_source(const mfq::ModelSource& source);
     static QwenConfig parse(const nlohmann::json& outer) {
         const auto& text=outer.contains("text_config")?outer.at("text_config"):outer;
         const auto outer_type=outer.value("model_type",std::string{});
@@ -96,6 +103,8 @@ struct GlmConfig {
     bool tail, normalize_routes, tied_embeddings;
     std::vector<std::string> layer_types, mlp_types;
 
+    static GlmConfig from_json(std::string_view payload);
+    static GlmConfig from_source(const mfq::ModelSource& source);
     static GlmConfig parse(const nlohmann::json& outer) {
         const auto& text = outer.contains("text_config") ? outer.at("text_config") : outer;
         const auto outer_type = outer.value("model_type", std::string{});
@@ -169,3 +178,19 @@ struct GlmConfig {
     }
 };
 } // namespace mfq::flash_next
+
+
+// Architecture-owned CUDA config loading.
+
+struct CudaRuntimeParameters;
+
+namespace mfq::cuda::flash_next {
+
+CudaRuntimeParameters load_runtime_parameters(
+    const mfq::ModelSource& source,
+    std::string_view payload,
+    bool embedded_config,
+    const mfq::ModelGraph& model_graph,
+    const mfq::cuda::CudaModelPlan& runtime_plan);
+
+} // namespace mfq::cuda::flash_next

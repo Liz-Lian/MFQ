@@ -1,6 +1,8 @@
 # Backend-neutral graph, policies, interfaces, and generated tables.
 
 add_library(mfq-model-graph STATIC
+    grid_vision.cpp
+    grid_vision.h
     mfq_model_graph.cpp
     mfq_model_graph.h
     models/deepseek_v41.cpp
@@ -22,6 +24,30 @@ set_target_properties(mfq-model-graph PROPERTIES
     POSITION_INDEPENDENT_CODE ON
 )
 
+add_library(mfq-model-source STATIC
+    hf_model_source.cpp
+    hf_safetensors_source.cpp
+    include/mfq/hf_model_source.h
+    include/mfq/hf_safetensors_source.h
+    include/mfq/model_graph.h
+    include/mfq/model_source.h
+    include/mfq/mfq_model_source.h
+    mfq_model_source.cpp
+    model_source.cpp
+)
+add_library(mfq::model-source ALIAS mfq-model-source)
+target_include_directories(mfq-model-source PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/compat
+)
+target_link_libraries(mfq-model-source PUBLIC mfq-model-graph)
+target_link_libraries(mfq-model-source PRIVATE mfq-json)
+target_compile_features(mfq-model-source PUBLIC cxx_std_17)
+set_target_properties(mfq-model-source PROPERTIES
+    POSITION_INDEPENDENT_CODE ON
+)
+
 add_library(mfq-core INTERFACE)
 add_library(mfq::core ALIAS mfq-core)
 target_include_directories(mfq-core INTERFACE
@@ -32,6 +58,7 @@ target_include_directories(mfq-core INTERFACE
 )
 target_link_libraries(mfq-core INTERFACE
     mfq-model-graph
+    mfq-model-source
     mfq-json
 )
 

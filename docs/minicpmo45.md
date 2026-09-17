@@ -131,7 +131,7 @@ audio, and video requests do not use this diagnostic interface.
 
 ```bash
 mfq-decode \
-  --mfq /models/MiniCPM-o-4_5-Q4KM-table.mfq \
+  --model /models/MiniCPM-o-4_5-Q4KM-table.mfq \
   --minicpmo-input-prefix /data/request \
   --minicpmo-output-prefix /data/result \
   --minicpmo-tts-steps 2
@@ -170,7 +170,7 @@ sampling, and turn state before processing that unit.
 
 ```bash
 mfq-decode \
-  --mfq models/MiniCPM-o-4_5-Q4KM-table.mfq \
+  --model models/MiniCPM-o-4_5-Q4KM-table.mfq \
   --minicpmo-duplex-input-prefix fixtures/session \
   --minicpmo-duplex-output-prefix outputs/result \
   --minicpmo-duplex-steps 4
@@ -195,7 +195,7 @@ duplex capability automatically; it is not a server launch option:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 mfq-decode \
-  --mfq /models/MiniCPM-o-4_5.mfq \
+  --model /models/MiniCPM-o-4_5.mfq \
   --server \
   --host 127.0.0.1 \
   --port 8081
@@ -205,7 +205,7 @@ On Apple Silicon, use the Metal executable with the same server options:
 
 ```bash
 mfq-decode-metal \
-  --mfq /models/MiniCPM-o-4_5.mfq \
+  --model /models/MiniCPM-o-4_5.mfq \
   --server \
   --host 127.0.0.1 \
   --port 8081

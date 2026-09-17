@@ -285,8 +285,9 @@ def test_hf_tokenizer_cache_is_reusable_and_runtime_selected(
 
     monkeypatch.setenv("MFQ_SERVER_TOKENIZER_CACHE_DIR", str(cache))
     arguments = native_tokenizer_arguments(model, "metal")
-    assert arguments[0] == "--tokenizer-gguf"
+    assert arguments[0] == "--tokenizer"
     assert Path(arguments[1]).is_file()
+    assert native_tokenizer_arguments(model, "cuda") == arguments
 
 
 @pytest.mark.parametrize(
@@ -441,7 +442,7 @@ def test_mfq_embedded_hf_tokenizer_cache_is_reusable_and_runtime_selected(
 
     monkeypatch.setenv("MFQ_SERVER_TOKENIZER_CACHE_DIR", str(cache))
     arguments = native_tokenizer_arguments(model, "metal")
-    assert arguments == ["--tokenizer-gguf", str(tokenizer)]
+    assert arguments == ["--tokenizer", str(tokenizer)]
     assert native_tokenizer_arguments(model, "cuda") == []
 
 

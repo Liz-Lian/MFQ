@@ -1,9 +1,12 @@
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-DECODE = (
-    ROOT / "cpp_runtime" / "backends" / "cuda" / "apps" / "mfq_decode.cpp"
-).read_text(encoding="utf-8")
+CUDA_ROOT = ROOT / "cpp_runtime" / "backends" / "cuda"
+DECODE = "\n".join(
+    path.read_text(encoding="utf-8")
+    for path in sorted(CUDA_ROOT.rglob("*"))
+    if path.suffix in {".h", ".cpp"}
+)
 BATCHING = (
     ROOT
     / "cpp_runtime"

@@ -1,10 +1,16 @@
 from pathlib import Path
 
 ROOT = Path(__file__).parents[1]
-DECODE = (ROOT / "cpp_runtime" / "backends" / "cuda" / "apps" / "mfq_decode.cpp").read_text(encoding="utf-8")
-CUDA_COMPONENTS = (
-    ROOT / "cpp_runtime" / "backends" / "cuda" / "runtime" / "server_components.h"
-).read_text(encoding="utf-8")
+CUDA_ROOT = ROOT / "cpp_runtime" / "backends" / "cuda"
+DECODE = "\n".join(
+    path.read_text(encoding="utf-8")
+    for path in sorted(CUDA_ROOT.rglob("*"))
+    if path.suffix in {".h", ".cpp"}
+)
+CUDA_COMPONENTS = "\n".join(
+    (CUDA_ROOT / "runtime" / name).read_text(encoding="utf-8")
+    for name in ("server_components.h", "server_components.cpp")
+)
 ROPE = (ROOT / "mfq" / "kernels" / "cuda" / "rope.cu").read_text(
     encoding="utf-8"
 )
@@ -14,8 +20,9 @@ ATTENTION = (ROOT / "mfq" / "kernels" / "cuda" / "attention.cu").read_text(
 NORM = (ROOT / "mfq" / "kernels" / "cuda" / "norm.cu").read_text(
     encoding="utf-8"
 )
-GRAPH = (ROOT / "cpp_runtime" / "backends" / "cuda" / "models" / "minicpmo45_runtime.inc").read_text(
-    encoding="utf-8"
+GRAPH = "\n".join(
+    (CUDA_ROOT / "models" / "minicpmo45" / name).read_text(encoding="utf-8")
+    for name in ("minicpmo45_runtime.h", "minicpmo45_runtime.cpp")
 )
 METAL_GRAPH = (ROOT / "cpp_runtime" / "backends" / "metal" / "models/minicpmo45" / "mlx_minicpmo45.cpp").read_text(
     encoding="utf-8"
@@ -50,11 +57,11 @@ STUDIO_REALTIME = (
 
 
 def test_minicpmo45_uses_native_composite_graph_and_canonical_names():
-    assert '#include "minicpmo45_runtime.inc"' in DECODE
+    assert "minicpmo45_runtime.h" in DECODE
     assert 'const std::string embed_name = "model.token_embedding.weight"' in DECODE
     assert 'const std::string norm_name = "model.output_norm.weight"' in DECODE
     assert 'const std::string output_name = "model.output.weight"' in DECODE
-    assert "MfqCudaBackbone::minicpmo45" in DECODE
+    assert "CudaBackbone::minicpmo45" in DECODE
     assert "llm.model." not in DECODE
     assert "llm.lm_head.weight" not in DECODE
 
@@ -86,7 +93,7 @@ def test_minicpmo45_audio_and_tts_follow_official_attention_contracts():
     assert "mfq_linear(" in GRAPH
     assert 'result.model_type = "minicpmtts"' in GRAPH
     assert "uses_minicpmo45_bf16_graph()" in DECODE
-    assert "MfqCudaBackbone::minicpmo_tts" in DECODE
+    assert "CudaBackbone::minicpmo_tts" in DECODE
     assert "result.norm_weight_offset = 0.0" in GRAPH
     assert "cache_position += tokens" in GRAPH
     assert "generate_official(" in GRAPH

@@ -121,7 +121,7 @@ def test_cpp_nvq3j512_linear_paths_match_materialized_weight(tmp_path, m):
     completed = subprocess.run(
         [
             str(executable),
-            "--mfq",
+            "--model",
             str(model_path),
             "--check-linear",
             "linear.weight",
@@ -170,7 +170,7 @@ def test_cpp_extended_nvq_linear_paths_match_materialized_weight(
     completed = subprocess.run(
         [
             str(executable),
-            "--mfq",
+            "--model",
             str(model_path),
             "--check-linear",
             "linear.weight",

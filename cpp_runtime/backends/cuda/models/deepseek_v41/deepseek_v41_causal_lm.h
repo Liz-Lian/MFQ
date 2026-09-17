@@ -1,15 +1,31 @@
-// Included by mfq_decode.cpp after the common linear/MoE loaders.  Keeping the
-// architecture adapter here prevents the legacy decode driver from becoming
-// the implementation of DeepSeek-V4.1's CED/CSA2 state machine.
+#pragma once
+
+#include "../../runtime/cuda_transformer.h"
+#include "../deepseek_v4/deepseek_v4_causal_lm.h"
+#include "deepseek_v41_engram.h"
+#include "deepseek_v41_dspark.h"
+#include "deepseek_v41_model.h"
+#include "mfq/kernels/cuda/deepseek_v4_attention.h"
+#include "mfq/kernels/cuda/deepseek_v4_hc.h"
+#include "mfq/kernels/cuda/deepseek_v41.h"
+
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <cstdint>
+#include <memory>
+#include <optional>
+#include <string>
+#include <utility>
+#include <vector>
 
 namespace mfq::cuda::deepseek_v41_runtime {
 
 using Tensor = mfq_tensor_backend::Tensor;
 using CommonConfig = mfq::models::deepseek_v41::Config;
 
-static void run_dspark_self_check();
-
 struct SharedState {
+    CommonConfig config;
     Tensor compressed_kv;
     Tensor index_k;
     Tensor topk;
@@ -183,7 +199,7 @@ struct AttentionState {
     std::int64_t partial_length = 0;
 };
 
-static Tensor weighted_rms(
+inline Tensor weighted_rms(
     const Tensor& input,
     const Tensor& weight,
     double epsilon) {
@@ -201,7 +217,7 @@ static Tensor weighted_rms(
         .contiguous();
 }
 
-static Tensor rotate_token_major_tail(
+inline Tensor rotate_token_major_tail(
     Tensor input,
     const Tensor& positions,
     const Dsv4RopeTable& rope,
@@ -218,7 +234,7 @@ static Tensor rotate_token_major_tail(
         .contiguous();
 }
 
-static Tensor empty_topk(
+inline Tensor empty_topk(
     std::int64_t batch,
     std::int64_t tokens,
     const mfq_tensor_backend::Device& device) {
@@ -229,7 +245,7 @@ static Tensor empty_topk(
             .dtype(mfq_tensor_backend::kInt32));
 }
 
-static Tensor normalize_topk(
+inline Tensor normalize_topk(
     Tensor selected,
     const Tensor& values,
     std::int64_t pool_length) {
@@ -246,7 +262,7 @@ static Tensor normalize_topk(
         .contiguous();
 }
 
-static Tensor select_topk(
+inline Tensor select_topk(
     const Tensor& scores,
     std::int64_t requested,
     std::int64_t pool_length,
@@ -285,7 +301,7 @@ static Tensor select_topk(
     return normalize_topk(selected, values, pool_length);
 }
 
-static Tensor candidate_blocks_from_scores(
+inline Tensor candidate_blocks_from_scores(
     const Tensor& scores,
     std::int64_t ratio,
     std::int64_t position,
@@ -339,7 +355,7 @@ static Tensor candidate_blocks_from_scores(
         .contiguous();
 }
 
-static Tensor candidate_positions(
+inline Tensor candidate_positions(
     const Tensor& blocks,
     std::int64_t block_size,
     std::int64_t pool_length) {
@@ -942,7 +958,7 @@ struct Block final : ::Block {
         Tensor positions,
         std::int64_t cache_position,
         const MfqOptional<Tensor>& sequence_lengths,
-        const ::Config&,
+        const ::CudaRuntimeParameters&,
         const RopeCache&,
         const MfqOptional<Tensor>& cache_positions = mfq_nullopt,
         const MfqOptional<Tensor>& attention_mask = mfq_nullopt) override {
@@ -1020,17 +1036,17 @@ struct Block final : ::Block {
     }
 };
 
-static FFN load_moe_at(
-    const MfqFile& model,
-    const ::Config& runtime,
+inline FFN load_moe_at(
+    const mfq::ModelSource& model,
+    const ::CudaRuntimeParameters& runtime,
     const std::string& prefix,
     std::int64_t layer,
     std::int64_t top_k,
     bool cacheable) {
     FFN result;
     result.is_moe = true;
-    const bool split_gate = model.has_record(prefix + "experts.gate.weight");
-    const bool split_up = model.has_record(prefix + "experts.up.weight");
+    const bool split_gate = has_tensor(model, prefix + "experts.gate.weight");
+    const bool split_up = has_tensor(model, prefix + "experts.up.weight");
     if (split_gate != split_up) {
         throw std::runtime_error(
             "DeepSeek-V4.1 split routed Gate/Up records are incomplete at layer " +
@@ -1080,9 +1096,9 @@ static FFN load_moe_at(
     return result;
 }
 
-static FFN load_moe(
-    const MfqFile& model,
-    const ::Config& runtime,
+inline FFN load_moe(
+    const mfq::ModelSource& model,
+    const ::CudaRuntimeParameters& runtime,
     std::int64_t layer) {
     return load_moe_at(
         model,
@@ -1093,159 +1109,19 @@ static FFN load_moe(
         true);
 }
 
-static std::unique_ptr<::Block> load_block(
-    const MfqFile& model,
-    const ::Config& runtime,
+std::unique_ptr<::Block> load_block(
+    const mfq::ModelSource& model,
+    const ::CudaRuntimeParameters& runtime,
     std::int64_t layer,
-    const std::shared_ptr<SharedState>& shared) {
-    MFQ_RUNTIME_CHECK(
-        runtime.deepseek_v41.has_value() && shared,
-        "missing DeepSeek-V4.1 CUDA configuration/state");
-    const auto& config = *runtime.deepseek_v41;
-    const auto prefix = "model.block." + std::to_string(layer) + ".";
-    auto result = std::make_unique<Block>();
-    result->config = config;
-    result->layer = layer;
-    result->ratio = config.compress_ratios.at(
-        static_cast<std::size_t>(layer));
-    result->max_context = runtime.max_position_embeddings;
-    result->shared = shared;
-    if (config.has_engram(layer)) {
-        result->engram = Engram::load(
-            model, config, static_cast<int>(layer));
-    }
-    result->attention_norm = load_dense_gpu(
-        model, prefix + "attention.norm.weight");
-    result->mlp_norm = load_dense_gpu(
-        model, prefix + "mlp.norm.weight");
-    result->query_a_norm = load_dense_gpu(
-        model, prefix + "attention.query_a_norm.weight");
-    result->key_value_norm = load_dense_gpu(
-        model, prefix + "attention.key_value_norm.weight");
-    result->sinks = load_dense_gpu(
-        model, prefix + "attention.sink")
-                            .to(mfq_tensor_backend::kFloat32)
-                            .contiguous();
-    result->attention_mhc_function = load_dense_gpu(
-        model, prefix + "attention.mhc.pre.function")
-                                         .to(mfq_tensor_backend::kFloat32)
-                                         .contiguous();
-    result->attention_mhc_scale = load_dense_gpu(
-        model, prefix + "attention.mhc.pre.scale")
-                                      .to(mfq_tensor_backend::kFloat32)
-                                      .contiguous();
-    result->attention_mhc_base = load_dense_gpu(
-        model, prefix + "attention.mhc.pre.base")
-                                     .to(mfq_tensor_backend::kFloat32)
-                                     .contiguous();
-    result->mlp_mhc_function = load_dense_gpu(
-        model, prefix + "mlp.mhc.pre.function")
-                                   .to(mfq_tensor_backend::kFloat32)
-                                   .contiguous();
-    result->mlp_mhc_scale = load_dense_gpu(
-        model, prefix + "mlp.mhc.pre.scale")
-                                .to(mfq_tensor_backend::kFloat32)
-                                .contiguous();
-    result->mlp_mhc_base = load_dense_gpu(
-        model, prefix + "mlp.mhc.pre.base")
-                               .to(mfq_tensor_backend::kFloat32)
-                               .contiguous();
-    result->query_a = load_quant_linear(
-        model, prefix + "attention.query_a.weight");
-    result->query_b = load_quant_linear(
-        model, prefix + "attention.query_b.weight");
-    result->key_value = load_quant_linear(
-        model, prefix + "attention.key_value.weight");
-    result->output_a = load_quant_linear(
-        model, prefix + "attention.output_a.weight");
-    result->output_b = load_quant_linear(
-        model, prefix + "attention.output_b.weight");
-    if (result->kv_source()) {
-        result->compressor_key_value = load_quant_linear(
-            model, prefix + "attention.compressor.key_value.weight");
-        result->compressor_norm = load_dense_gpu(
-            model, prefix + "attention.compressor.norm.weight");
-        result->index_key = load_quant_linear(
-            model, prefix + "attention.indexer.key.weight");
-        result->index_key_norm = load_dense_gpu(
-            model, prefix + "attention.indexer.key_norm.weight");
-        if (result->ratio > 1) {
-            result->compressor_gate = load_quant_linear(
-                model, prefix + "attention.compressor.gate.weight");
-        }
-    }
-    if (result->index_source()) {
-        result->index_query = load_quant_linear(
-            model, prefix + "attention.indexer.query.weight");
-        result->index_score = load_quant_linear(
-            model, prefix + "attention.indexer.score.weight");
-    }
-    result->mlp = load_moe(model, runtime, layer);
-    result->rope = Dsv4RopeTable(runtime, result->ratio);
+    const std::shared_ptr<SharedState>& shared);
+void validate_load_options(const ::CudaRuntimeParameters& config);
+std::shared_ptr<SharedState> load_shared_state(
+    const mfq::ModelSource& source,
+    const ::CudaRuntimeParameters& config);
 
-    const auto function_width = config.hc_mult * config.hidden;
-    const auto valid_mhc = [&](const Tensor& function,
-                               const Tensor& scale,
-                               const Tensor& base,
-                               const Tensor& norm) {
-        return function.dim() == 2 && function.size(0) == 24 &&
-            function.size(1) == function_width &&
-            scale.numel() == 3 && base.numel() == 24 &&
-            norm.numel() == config.hidden;
-    };
-    const bool base_shapes =
-        valid_mhc(
-            result->attention_mhc_function,
-            result->attention_mhc_scale,
-            result->attention_mhc_base,
-            result->attention_norm) &&
-        valid_mhc(
-            result->mlp_mhc_function,
-            result->mlp_mhc_scale,
-            result->mlp_mhc_base,
-            result->mlp_norm) &&
-        result->query_a_norm.numel() == config.q_lora_rank &&
-        result->key_value_norm.numel() == config.head_dim &&
-        result->sinks.numel() == config.n_heads &&
-        result->query_a.neuron_len() == config.hidden &&
-        result->query_a.out() == config.q_lora_rank &&
-        result->query_b.neuron_len() == config.q_lora_rank &&
-        result->query_b.out() == config.n_heads * config.head_dim &&
-        result->key_value.neuron_len() == config.hidden &&
-        result->key_value.out() == config.head_dim &&
-        result->output_a.neuron_len() ==
-            config.n_heads * config.head_dim / config.o_groups &&
-        result->output_a.out() == config.o_groups * config.o_lora_rank &&
-        result->output_b.neuron_len() ==
-            config.o_groups * config.o_lora_rank &&
-        result->output_b.out() == config.hidden;
-    const bool source_shapes = !result->kv_source() ||
-        (result->compressor_key_value.neuron_len() == config.hidden &&
-         result->compressor_key_value.out() == config.head_dim &&
-         result->compressor_norm.numel() == config.head_dim &&
-         result->index_key.neuron_len() == config.head_dim &&
-         result->index_key.out() == config.index_head_dim &&
-         result->index_key_norm.numel() == config.index_head_dim &&
-         (result->ratio == 1 ||
-          (result->compressor_gate.neuron_len() == config.hidden &&
-           result->compressor_gate.out() == config.head_dim)));
-    const bool index_shapes = !result->index_source() ||
-        (result->index_query.neuron_len() == config.q_lora_rank &&
-         result->index_query.out() ==
-             config.index_n_heads * config.index_head_dim &&
-         result->index_score.neuron_len() == config.hidden &&
-         result->index_score.out() == config.index_n_heads);
-    MFQ_RUNTIME_CHECK(
-        config.hc_mult == 4 && config.n_heads == 64 &&
-            config.head_dim == 512 && config.rope_head_dim == 64 &&
-            config.index_n_heads == 32 && config.index_head_dim == 128 &&
-            base_shapes && source_shapes && index_shapes,
-        "DeepSeek-V4.1 CUDA tensor geometry disagrees at layer ",
-        layer);
-    return result;
-}
 
-static int run_self_check() {
+
+inline int run_self_check() {
     EngramHashState::self_check();
     run_dspark_self_check();
     auto options = mfq_tensor_backend::TensorOptions()

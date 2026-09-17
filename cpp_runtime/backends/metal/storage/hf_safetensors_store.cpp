@@ -1,6 +1,6 @@
 #include "hf_safetensors_store.h"
 
-#include "nlohmann/json.hpp"
+#include "mfq/hf_safetensors_source.h"
 
 #include <algorithm>
 #include <cerrno>
@@ -18,72 +18,11 @@
 namespace mfq::metal {
 namespace {
 
-using json = nlohmann::json;
-
-std::string read_text_file(const std::filesystem::path& path) {
-    std::ifstream stream(path, std::ios::binary);
-    if (!stream) {
-        throw std::runtime_error("cannot open " + path.string());
-    }
-    stream.seekg(0, std::ios::end);
-    const auto end = stream.tellg();
-    if (end < 0) {
-        throw std::runtime_error("cannot size " + path.string());
-    }
-    std::string result(static_cast<std::size_t>(end), '\0');
-    stream.seekg(0, std::ios::beg);
-    stream.read(result.data(), static_cast<std::streamsize>(result.size()));
-    if (!stream && !result.empty()) {
-        throw std::runtime_error("cannot read " + path.string());
-    }
-    return result;
-}
-
-json parse_json(std::string_view payload, const std::filesystem::path& path) {
-    try {
-        return json::parse(payload.begin(), payload.end());
-    } catch (const json::exception& error) {
-        throw std::runtime_error(
-            "invalid JSON in " + path.string() + ": " + error.what());
-    }
-}
-
-std::uint64_t little_u64(const std::array<unsigned char, 8>& bytes) {
-    std::uint64_t result = 0;
-    for (std::size_t index = 0; index < bytes.size(); ++index) {
-        result |= static_cast<std::uint64_t>(bytes[index]) << (index * 8);
-    }
-    return result;
-}
-
 std::uint64_t checked_add(std::uint64_t left, std::uint64_t right) {
     if (right > std::numeric_limits<std::uint64_t>::max() - left) {
         throw std::overflow_error("Safetensors byte offset overflow");
     }
     return left + right;
-}
-
-std::vector<std::int64_t> parse_shape(
-    const json& value,
-    const std::string& name) {
-    if (!value.is_array()) {
-        throw std::runtime_error("Safetensors shape is not an array: " + name);
-    }
-    std::vector<std::int64_t> result;
-    result.reserve(value.size());
-    for (const auto& dimension : value) {
-        if (!dimension.is_number_integer()) {
-            throw std::runtime_error(
-                "Safetensors shape has a non-integer dimension: " + name);
-        }
-        const auto size = dimension.get<std::int64_t>();
-        if (size < 0) {
-            throw std::runtime_error(
-                "Safetensors shape has a negative dimension: " + name);
-        }
-        result.push_back(size);
-    }
-    return result;
 }
 
 void pread_exact(
@@ -254,128 +193,25 @@ HfSafetensorStore::HfSafetensorStore(
     std::filesystem::path root,
     bool bypass_file_cache)
     : impl_(std::make_unique<Impl>()) {
-    impl_->root = std::filesystem::canonical(std::move(root));
-    const auto index_path = impl_->root / "model.safetensors.index.json";
-    std::unordered_map<std::string, std::vector<std::string>> names_by_shard;
-    std::vector<std::string> shard_names;
-    if (std::filesystem::is_regular_file(index_path)) {
-        const auto index = parse_json(read_text_file(index_path), index_path);
-        const auto weight_map = index.find("weight_map");
-        if (weight_map == index.end() || !weight_map->is_object() ||
-            weight_map->empty()) {
-            throw std::runtime_error(
-                "Safetensors index requires a non-empty object weight_map: " +
-                index_path.string());
-        }
-        for (const auto& [name, shard] : weight_map->items()) {
-            if (!shard.is_string()) {
-                throw std::runtime_error(
-                    "Safetensors weight_map value is not a string: " + name);
-            }
-            names_by_shard[shard.get<std::string>()].push_back(name);
-        }
-        shard_names.reserve(names_by_shard.size());
-        for (const auto& [name, unused] : names_by_shard) {
-            static_cast<void>(unused);
-            shard_names.push_back(name);
-        }
-    } else {
-        for (const auto& entry : std::filesystem::directory_iterator(impl_->root)) {
-            if (entry.is_regular_file() && entry.path().extension() == ".safetensors") {
-                shard_names.push_back(entry.path().filename().string());
-            }
-        }
-        if (shard_names.empty()) {
-            throw std::runtime_error(
-                "no Safetensors weights found under " + impl_->root.string());
-        }
-    }
-    std::sort(shard_names.begin(), shard_names.end());
-
-    for (const auto& shard_name : shard_names) {
-        const auto path = impl_->root / shard_name;
-        std::ifstream stream(path, std::ios::binary);
-        if (!stream) {
-            throw std::runtime_error("cannot open " + path.string());
-        }
-        std::array<unsigned char, 8> header_size_bytes{};
-        stream.read(
-            reinterpret_cast<char*>(header_size_bytes.data()),
-            static_cast<std::streamsize>(header_size_bytes.size()));
-        if (!stream) {
-            throw std::runtime_error(
-                "cannot read Safetensors header size: " + path.string());
-        }
-        const auto header_size = little_u64(header_size_bytes);
-        const auto file_size = std::filesystem::file_size(path);
-        if (header_size > file_size - header_size_bytes.size()) {
-            throw std::runtime_error(
-                "invalid Safetensors header size: " + path.string());
-        }
-        std::string header(static_cast<std::size_t>(header_size), '\0');
-        stream.read(header.data(), static_cast<std::streamsize>(header.size()));
-        if (!stream && !header.empty()) {
-            throw std::runtime_error(
-                "cannot read Safetensors header: " + path.string());
-        }
-        const auto metadata = parse_json(header, path);
-        const auto shard_index = impl_->shards.size();
+    const mfq::HfSafetensorsSource source(std::move(root));
+    impl_->root = source.root();
+    for (const auto& path : source.source_paths()) {
         auto shard = std::make_unique<Impl::Shard>();
         shard->path = path;
-        shard->size = file_size;
+        shard->size = std::filesystem::file_size(path);
         shard->bypass_file_cache = bypass_file_cache;
         impl_->shards.push_back(std::move(shard));
-        const auto payload_base = checked_add(8, header_size);
-
-        std::vector<std::string> tensor_names;
-        const auto indexed_names = names_by_shard.find(shard_name);
-        if (indexed_names != names_by_shard.end()) {
-            tensor_names = indexed_names->second;
-        } else {
-            tensor_names.reserve(metadata.size());
-            for (const auto& [name, value] : metadata.items()) {
-                static_cast<void>(value);
-                if (name != "__metadata__") {
-                    tensor_names.push_back(name);
-                }
-            }
-        }
-        for (const auto& name : tensor_names) {
-            const auto found = metadata.find(name);
-            if (found == metadata.end() || !found->is_object()) {
-                throw std::runtime_error(
-                    "Safetensors index references a missing tensor: " + name);
-            }
-            const auto dtype = found->find("dtype");
-            const auto shape = found->find("shape");
-            const auto offsets = found->find("data_offsets");
-            if (dtype == found->end() || !dtype->is_string() ||
-                shape == found->end() ||
-                offsets == found->end() || !offsets->is_array() ||
-                offsets->size() != 2 ||
-                !(*offsets)[0].is_number_unsigned() ||
-                !(*offsets)[1].is_number_unsigned()) {
-                throw std::runtime_error(
-                    "invalid Safetensors tensor metadata: " + name);
-            }
-            const auto begin = (*offsets)[0].get<std::uint64_t>();
-            const auto end = (*offsets)[1].get<std::uint64_t>();
-            if (end < begin || checked_add(payload_base, end) > file_size) {
-                throw std::runtime_error(
-                    "Safetensors tensor range is outside its shard: " + name);
-            }
-            HfSafetensorRecord record;
-            record.name = name;
-            record.dtype = dtype->get<std::string>();
-            record.shape = parse_shape(*shape, name);
-            record.shard = shard_index;
-            record.offset = checked_add(payload_base, begin);
-            record.nbytes = end - begin;
-            if (!impl_->tensors.emplace(name, std::move(record)).second) {
-                throw std::runtime_error(
-                    "duplicate Safetensors tensor: " + name);
-            }
-        }
+    }
+    for (const auto& tensor : source.tensors()) {
+        const auto& location = source.location(tensor.name);
+        HfSafetensorRecord record;
+        record.name = tensor.name;
+        record.dtype = tensor.dtype;
+        record.shape = tensor.shape.value_or(std::vector<std::int64_t>{});
+        record.shard = location.shard;
+        record.offset = location.offset;
+        record.nbytes = tensor.nbytes;
+        impl_->tensors.emplace(record.name, std::move(record));
     }
 }
 

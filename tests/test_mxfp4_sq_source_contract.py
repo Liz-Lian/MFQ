@@ -2,6 +2,11 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
+CUDA_OPS = ROOT / "cpp_runtime/backends/cuda/ops"
+CUDA_RUNTIME = "\n".join(
+    (CUDA_OPS / name).read_text()
+    for name in ("cuda_quantized_ops.h", "cuda_quantized_ops.cpp")
+)
 
 
 def test_metal_mxfp4_sq_uses_one_profile_independent_compute_kernel() -> None:
@@ -52,9 +57,7 @@ def test_cpp_runtimes_route_mfe_sq_through_the_shared_linear_kernel() -> None:
     metal = (
         ROOT / "cpp_runtime/backends/metal/ops/mlx_moe.cpp"
     ).read_text()
-    cuda = (
-        ROOT / "cpp_runtime/backends/cuda/apps/mfq_decode.cpp"
-    ).read_text()
+    cuda = CUDA_RUNTIME
     assert "cohort.weight.routed_matmul(" in metal
     assert "impl->grouped_mmq = false;" in metal
     assert "mxfp4_sq_moe_matmul_cuda(" in cuda
@@ -74,9 +77,7 @@ def test_cpp_loader_uses_shared_variable_width_row_selection() -> None:
     shared = (
         ROOT / "cpp_runtime/core/include/mfq/mxfp4_sq_blob.h"
     ).read_text()
-    cuda = (
-        ROOT / "cpp_runtime/backends/cuda/apps/mfq_decode.cpp"
-    ).read_text()
+    cuda = CUDA_RUNTIME
     assert "inline std::vector<std::uint8_t> select_rows(" in shared
     assert "mfq::sq::select_rows(source.payload, rows)" in cuda
     assert "select_mxfp4_sq_payload_rows" not in cuda

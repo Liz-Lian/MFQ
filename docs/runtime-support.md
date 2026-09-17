@@ -8,8 +8,8 @@ the exact artifact on its deployment backend before release.
 
 - **Native C++** means the backend worker loads the model and performs prefill,
   decode, sampling, and serving without a Python model runtime.
-- **Reference** means an MFQ runtime exists for correctness and integration
-  work, but the managed production path still uses Python/MLX.
+- **Reference** means an explicit MFQ runtime exists for correctness and
+  integration work, but the managed server does not select it automatically.
 - **Optional** means a component is enabled only when the model graph declares
   it, its weights are present, the backend has an adapter, and the user has not
   disabled it.
@@ -36,15 +36,17 @@ the backbone from loading.
 - The quantizer accepts recognized Hugging Face Safetensors, GGUF, and
   full-precision MFQ sources and writes canonical tensor names into a
   self-contained `.mfq` container.
+- A backend-neutral model-source contract exposes direct MFQ and native HF
+  Safetensors loading to CUDA and Metal. CUDA directly consumes native MXFP8
+  and lossless `FP8-128SQ/SQ8` views of block-scaled HF `F8_E4M3` weights.
+  The native Metal path is production-validated for DeepSeek V4/V4.1; other
+  architecture/backend combinations still require exact-artifact validation.
 - Model configuration, model graph, tokenizer data, chat templates,
   special-token metadata, and sampling profiles can be embedded as runtime
   assets. Numbered MFQ shards are loaded directly by both Python tooling and
   C++ workers.
-- The native Metal storage layer can expose a supported Hugging Face
-  Safetensors directory through the same model-container interface. This path
-  is production-validated for DeepSeek V4/V4.1; other architecture/backend
-  combinations still require exact-artifact validation.
-- Legacy tensor names are normalized at the compatibility boundary. Current
+- Canonical MFE supports mixed-family HF/GGUF streaming conversion. Legacy
+  tensor names are normalized at the compatibility boundary; current
   quantization and runtime code use canonical semantic names internally.
 
 ## Shared runtime capabilities

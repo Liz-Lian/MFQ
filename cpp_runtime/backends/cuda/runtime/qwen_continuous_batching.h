@@ -1,6 +1,7 @@
 #pragma once
 
 #include "qwen_paged_kv.h"
+#include "../models/qwen35/qwen35_linear_attention.h"
 
 // Included by mfq_decode.cpp after the CUDA Qwen model and sampler are defined.
 // The scheduler owns request concurrency; the adapter below owns the hybrid
@@ -9,6 +10,7 @@
 namespace mfq::cuda::continuous {
 
 using Tensor = mfq_tensor_backend::Tensor;
+using LinearBlock = mfq::cuda::qwen35::LinearAttentionBlock;
 
 struct QwenBatchLayerState {
     enum class Kind { FullAttention, Recurrent };
@@ -34,9 +36,9 @@ static void clear_full_attention_decode_workspaces(FullBlock & block) {
 }
 
 static std::string qwen_continuous_batching_incompatibility(
-        const Model & model) {
+        const CudaModel & model) {
     if (model.c.runtime_plan.backbone !=
-            mfq::cuda::MfqCudaBackbone::generic_qwen ||
+            mfq::cuda::CudaBackbone::generic_qwen ||
             model.c.is_minicpmo45() || model.c.is_qwen4() ||
             model.c.is_flash_next()) {
         return "continuous batching currently requires the generic Qwen runtime";
@@ -83,7 +85,7 @@ static bool qwen_continuous_batch_packed_metadata_enabled() {
     return environment == nullptr || std::atoi(environment) != 0;
 }
 
-static bool qwen_continuous_batch_cuda_graph_enabled(const Model & model) {
+static bool qwen_continuous_batch_cuda_graph_enabled(const CudaModel & model) {
     const char * environment = std::getenv(
         "MFQ_CONTINUOUS_BATCH_CUDA_GRAPH");
     const char * server_environment = std::getenv("MFQ_SERVER_CUDA_GRAPH");
@@ -99,7 +101,7 @@ static bool qwen_continuous_paged_kv_enabled() {
 }
 
 static QwenBatchState take_qwen_batch_state(
-        Model & model, int64_t batch, QwenPagedKvArena * paged_kv) {
+        CudaModel & model, int64_t batch, QwenPagedKvArena * paged_kv) {
     MFQ_RUNTIME_CHECK(model.speculative_start < 0,
         "continuous batching cannot detach speculative state");
     QwenBatchState state;
@@ -168,7 +170,7 @@ static Tensor merge_batch_tensors(
 }
 
 static void restore_qwen_batch_states(
-        Model & model, const std::vector<QwenBatchState> & states,
+        CudaModel & model, const std::vector<QwenBatchState> & states,
         int64_t cache_position, QwenPagedKvArena * paged_kv) {
     MFQ_RUNTIME_CHECK(!states.empty(),
         "continuous batching cannot restore an empty state list");
@@ -246,7 +248,7 @@ static void restore_qwen_batch_states(
 }
 
 static void compact_qwen_batch_state(
-        Model & model, const std::vector<int64_t> & rows,
+        CudaModel & model, const std::vector<int64_t> & rows,
         int64_t cache_position, QwenPagedKvArena * paged_kv) {
     MFQ_RUNTIME_CHECK(!rows.empty(),
         "continuous batching cannot compact to an empty batch");
@@ -286,7 +288,7 @@ static void compact_qwen_batch_state(
     model.cache_pos = cache_position;
 }
 
-static Tensor qwen_logits_from_last_hidden(Model & model, Tensor hidden) {
+static Tensor qwen_logits_from_last_hidden(CudaModel & model, Tensor hidden) {
     auto last = hidden.index({Slice(), -1, Slice()})
         .to(mfq_tensor_backend::kFloat16).contiguous();
     auto logits = model.lm_head.forward(last);
@@ -298,7 +300,7 @@ static Tensor qwen_logits_from_last_hidden(Model & model, Tensor hidden) {
     return logits;
 }
 
-static std::vector<const void *> qwen_decode_state_addresses(Model & model) {
+static std::vector<const void *> qwen_decode_state_addresses(CudaModel & model) {
     std::vector<const void *> addresses;
     addresses.reserve(2 * model.blocks.size());
     for (auto & block : model.blocks) {
@@ -371,7 +373,7 @@ struct QwenContinuousDecodeGraph {
 class CudaContinuousBatcher {
 public:
     CudaContinuousBatcher(
-            Model & model, std::mutex & model_mutex,
+            CudaModel & model, std::mutex & model_mutex,
             int32_t max_sequences,
             int64_t prefill_chunk_size = 2048,
             std::chrono::microseconds initial_batch_wait =
@@ -1392,7 +1394,7 @@ private:
         }
     }
 
-    Model & model_;
+    CudaModel & model_;
     std::mutex & model_mutex_;
     int32_t max_sequences_ = 0;
     int64_t prefill_chunk_size_ = 2048;
@@ -1428,7 +1430,7 @@ private:
     std::unique_ptr<QwenContinuousDecodeGraph> decode_graph_;
 };
 
-static int run_qwen_continuous_batching_check(Model & model) {
+static int run_qwen_continuous_batching_check(CudaModel & model) {
     const auto incompatibility =
         qwen_continuous_batching_incompatibility(model);
     MFQ_RUNTIME_CHECK(incompatibility.empty(), incompatibility);

@@ -1,6 +1,6 @@
 #pragma once
 
-#include "mfq_model_graph.h"
+#include "mfq/model_graph.h"
 
 #include <string>
 #include <string_view>
@@ -10,7 +10,7 @@ namespace mfq::cuda {
 
 // CUDA resolves semantic implementation IDs from model_graph.json.  These are
 // execution implementations, not checkpoint/model aliases.
-enum class MfqCudaBackbone {
+enum class CudaBackbone {
     generic_qwen,
     minicpmo45,
     minicpmo_tts,
@@ -23,25 +23,26 @@ enum class MfqCudaBackbone {
     unsupported,
 };
 
-enum class MfqCudaVisionAdapter {
+enum class CudaVisionAdapter {
     none,
+    grid_vit,
     minicpmo45,
 };
 
-enum class MfqCudaPredictorAdapter {
+enum class CudaPredictorAdapter {
     none,
     qwen35,
     flash_next,
     deepseek_v41_dspark,
 };
 
-struct MfqCudaModelPlan {
-    MfqCudaBackbone backbone = MfqCudaBackbone::unsupported;
-    MfqCudaVisionAdapter vision = MfqCudaVisionAdapter::none;
-    MfqCudaPredictorAdapter predictor = MfqCudaPredictorAdapter::none;
+struct CudaModelPlan {
+    CudaBackbone backbone = CudaBackbone::unsupported;
+    CudaVisionAdapter vision = CudaVisionAdapter::none;
+    CudaPredictorAdapter predictor = CudaPredictorAdapter::none;
 };
 
-struct MfqCudaComponentState {
+struct CudaComponentState {
     bool vision_declared = false;
     bool vision_supported = false;
     bool vision_available = false;
@@ -52,36 +53,43 @@ struct MfqCudaComponentState {
     bool mtp_enabled = false;
 };
 
-inline constexpr MfqCudaBackbone mfq_cuda_backbone(
+inline constexpr CudaBackbone cuda_backbone(
         std::string_view implementation) noexcept {
     if (implementation == "qwen3_5" ||
         implementation == "generic_qwen") {
-        return MfqCudaBackbone::generic_qwen;
+        return CudaBackbone::generic_qwen;
     }
     if (implementation == "minicpmo45") {
-        return MfqCudaBackbone::minicpmo45;
+        return CudaBackbone::minicpmo45;
     }
     if (implementation == "minicpmo_tts") {
-        return MfqCudaBackbone::minicpmo_tts;
+        return CudaBackbone::minicpmo_tts;
     }
-    if (implementation == "gemma4") return MfqCudaBackbone::gemma4;
-    if (implementation == "glm_dsa") return MfqCudaBackbone::glm_dsa;
-    if (implementation == "glm5_next") return MfqCudaBackbone::glm5_next;
-    if (implementation == "qwen4_exp") return MfqCudaBackbone::qwen4_exp;
+    if (implementation == "gemma4") return CudaBackbone::gemma4;
+    if (implementation == "glm_dsa") return CudaBackbone::glm_dsa;
+    if (implementation == "glm5_next") return CudaBackbone::glm5_next;
+    if (implementation == "qwen4_exp") return CudaBackbone::qwen4_exp;
     if (implementation == "deepseek_v4") {
-        return MfqCudaBackbone::deepseek_v4;
+        return CudaBackbone::deepseek_v4;
     }
     if (implementation == "deepseek_v41") {
-        return MfqCudaBackbone::deepseek_v41;
+        return CudaBackbone::deepseek_v41;
     }
-    return MfqCudaBackbone::unsupported;
+    return CudaBackbone::unsupported;
 }
 
-inline MfqCudaModelPlan mfq_cuda_model_plan(
-        const MfqModelGraph& graph) noexcept {
-    MfqCudaModelPlan result;
-    result.backbone = mfq_cuda_backbone(graph.backbone);
+inline CudaModelPlan cuda_model_plan(
+        const ModelGraph& graph) noexcept {
+    CudaModelPlan result;
+    result.backbone = cuda_backbone(graph.backbone);
     const auto* vision = graph.component("vision");
+    if (graph.backbone == "qwen3_5" && vision != nullptr &&
+        vision->tensor_root == "vision" &&
+        vision->implementation == "grid_vit" &&
+        vision->input_contract == kMfqGridVisionInputContract &&
+        vision->position_policy == kMfqGridMropePositionPolicy) {
+        result.vision = CudaVisionAdapter::grid_vit;
+    }
     const auto* audio = graph.component("audio_input");
     const auto* tts = graph.component("audio_output");
     // The current CUDA MiniCPM adapter is one composite implementation.  Do
@@ -91,42 +99,42 @@ inline MfqCudaModelPlan mfq_cuda_model_plan(
         vision->implementation == "minicpmo45_vision" &&
         audio->implementation == "minicpmo45_audio" &&
         tts->implementation == "minicpmo45_tts") {
-        result.vision = MfqCudaVisionAdapter::minicpmo45;
+        result.vision = CudaVisionAdapter::minicpmo45;
     }
     const auto* predictor = graph.component("predictor");
     if (graph.backbone == "qwen3_5" && predictor != nullptr &&
         predictor->implementation == "next_token_prediction" &&
         predictor->tensor_root == "predictor") {
-        result.predictor = MfqCudaPredictorAdapter::qwen35;
+        result.predictor = CudaPredictorAdapter::qwen35;
     }
     if ((graph.backbone=="qwen4_exp" || graph.backbone=="glm5_next") && predictor!=nullptr &&
         predictor->implementation=="next_token_prediction" && predictor->tensor_root=="predictor") {
-        result.predictor=MfqCudaPredictorAdapter::flash_next;
+        result.predictor=CudaPredictorAdapter::flash_next;
     }
     if (graph.backbone == "deepseek_v41" && predictor != nullptr &&
         predictor->implementation == "deepseek_v41_dspark" &&
         predictor->tensor_root == "predictor") {
-        result.predictor = MfqCudaPredictorAdapter::deepseek_v41_dspark;
+        result.predictor = CudaPredictorAdapter::deepseek_v41_dspark;
     }
     return result;
 }
 
-inline MfqCudaComponentState mfq_cuda_component_state(
-        const MfqModelGraph& graph,
-        const MfqCudaModelPlan& plan,
+inline CudaComponentState cuda_component_state(
+        const ModelGraph& graph,
+        const CudaModelPlan& plan,
         bool vision_loaded,
         bool mtp_loaded,
         bool enable_vision = true,
         bool enable_mtp = true) noexcept {
-    MfqCudaComponentState result;
+    CudaComponentState result;
     result.vision_declared = graph.has_component("vision");
     result.vision_supported = result.vision_declared &&
-        plan.vision != MfqCudaVisionAdapter::none;
+        plan.vision != CudaVisionAdapter::none;
     result.vision_available = result.vision_supported && vision_loaded;
     result.vision_enabled = result.vision_available && enable_vision;
     result.mtp_declared = graph.has_component("predictor");
     result.mtp_supported = result.mtp_declared &&
-        plan.predictor != MfqCudaPredictorAdapter::none;
+        plan.predictor != CudaPredictorAdapter::none;
     result.mtp_available = result.mtp_supported && mtp_loaded;
     result.mtp_enabled = result.mtp_available && enable_mtp;
     return result;

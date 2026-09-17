@@ -25,7 +25,7 @@ public:
     static constexpr int64_t kPageSize = 16;
     static constexpr int64_t kPagesPerChunk = 64;
 
-    QwenPagedKvArena(Model & model, int32_t maximum_sequences)
+    QwenPagedKvArena(CudaModel & model, int32_t maximum_sequences)
         : maximum_sequences_(maximum_sequences),
           logical_pages_per_sequence_(
               (model.c.max_position_embeddings + kPageSize - 1) /

@@ -73,7 +73,7 @@ def test_cpp_nint8_zero_linear_paths_match_materialized_weight(tmp_path, m):
     completed = subprocess.run(
         [
             str(executable),
-            "--mfq",
+            "--model",
             str(model_path),
             "--check-linear",
             "linear.weight",
@@ -95,7 +95,7 @@ def test_cpp_nint8_zero_linear_paths_match_materialized_weight(tmp_path, m):
     assert float(fields["production_rel"]) < 0.02
 
 
-def test_cpp_tensor_overlay_replaces_base_record(tmp_path):
+def test_cpp_tensor_overlay_is_rejected(tmp_path):
     executable = _executable()
     tensor = _tensor(37, 96, 20260727)
     rng = np.random.default_rng(20260728)
@@ -121,20 +121,21 @@ def test_cpp_tensor_overlay_replaces_base_record(tmp_path):
     completed = subprocess.run(
         [
             str(executable),
-            "--mfq",
+            "--model",
             str(base_path),
             "--check-linear",
             "linear.weight",
             "--check-linear-m",
             "1",
         ],
-        check=True,
+        check=False,
         capture_output=True,
         env=env,
         text=True,
         timeout=60,
     )
-    assert "dtype=NINT8-0" in completed.stdout
+    assert completed.returncode != 0
+    assert "unsupported by the canonical ModelSource path" in completed.stderr
 
 
 @pytest.mark.parametrize("tokens", (1, 13, 80, 512))
@@ -160,7 +161,7 @@ def test_cpp_nint8_zero_moe_paths_match_dense_reference(tmp_path, tokens):
     completed = subprocess.run(
         [
             str(executable),
-            "--mfq",
+            "--model",
             str(model_path),
             "--check-mfe-tensor",
             "experts.weight",

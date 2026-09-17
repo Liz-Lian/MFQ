@@ -1,6 +1,28 @@
-// Included by mfq_decode.cpp after its storage and linear loaders.  Engram's
-// token hashing stays on the CPU and each table faults in only selected MXFP8
-// rows; the multi-hundred-billion-row tables are never materialized.
+#pragma once
+
+#include "../../runtime/cuda_transformer.h"
+#include "deepseek_v41_model.h"
+#include "mfe_expert_store.h"
+
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <limits>
+#include <list>
+#include <memory>
+#include <mutex>
+#include <optional>
+#include <stdexcept>
+#include <string>
+#include <string_view>
+#include <unordered_map>
+#include <utility>
+#include <vector>
 
 namespace mfq::cuda::deepseek_v41_runtime {
 
@@ -90,7 +112,7 @@ std::vector<T> read_vector(
     return result;
 }
 
-std::uint64_t checked_product(
+inline std::uint64_t checked_product(
     std::uint64_t left,
     std::uint64_t right,
     std::string_view description) {
@@ -103,7 +125,7 @@ std::uint64_t checked_product(
     return left * right;
 }
 
-std::uint64_t read_u64_at(
+inline std::uint64_t read_u64_at(
     const std::vector<std::uint8_t>& bytes,
     std::size_t offset) {
     if (offset > bytes.size() || 8 > bytes.size() - offset) {
@@ -118,7 +140,7 @@ std::uint64_t read_u64_at(
     return value;
 }
 
-float decode_e4m3(std::uint8_t raw) {
+inline float decode_e4m3(std::uint8_t raw) {
     if ((raw & 0x7fu) == 0x7fu) {
         return std::numeric_limits<float>::quiet_NaN();
     }
@@ -132,7 +154,7 @@ float decode_e4m3(std::uint8_t raw) {
               exponent - 7));
 }
 
-std::size_t cache_capacity_rows() {
+inline std::size_t cache_capacity_rows() {
     constexpr std::size_t fallback = 16'384;
     const char* raw = std::getenv("MFQ_DEEPSEEK_V41_ENGRAM_CACHE_ROWS");
     if (raw == nullptr || *raw == '\0') return fallback;
@@ -176,15 +198,15 @@ struct EngramHashBatch {
 class EngramHashState {
 public:
     static std::unique_ptr<EngramHashState> load(
-        const MfqFile& model,
+        const mfq::ModelSource& model,
         const EngramConfig& config) {
         constexpr const char* asset_name =
             "__mfq_asset__/deepseek-v41-engram-v1.bin";
-        if (!model.has_record(asset_name)) {
+        if (!model.has_asset(asset_name)) {
             throw std::runtime_error(
-                "DeepSeek-V4.1 MFQ has no embedded Engram hash asset");
+                "DeepSeek-V4.1 model source has no Engram hash asset");
         }
-        const auto asset = model.read_asset(asset_name);
+        const auto asset = read_asset(model, asset_name);
         engram_detail::ByteCursor cursor(asset);
         const auto* magic = cursor.take(
             engram_detail::kMagic.size(), "asset magic");
@@ -574,17 +596,18 @@ private:
 class EngramTable {
 public:
     static std::shared_ptr<EngramTable> load(
-        const MfqFile& model,
+        const mfq::ModelSource& model,
         const std::string& name,
         std::int64_t expected_rows,
         int expected_width) {
-        const auto record = model.record(name);
+        const auto record = require_tensor(model, name);
         if (record.dtype != "MXFP8") {
             throw std::runtime_error(
                 "DeepSeek-V4.1 Engram table must use native MXFP8: " + name);
         }
-        auto header = read_record_range(record, name, 0,
-                                        engram_detail::kMxHeaderBytes);
+        auto header = read_record_range(
+            model, name, record.nbytes, 0,
+            engram_detail::kMxHeaderBytes);
         if (header.size() < engram_detail::kMxHeaderBytes ||
             std::memcmp(header.data(), "MXT1", 4) != 0 ||
             header[4] != 1 || header[5] != 8 ||
@@ -620,8 +643,9 @@ public:
                 "DeepSeek-V4.1 Engram MXFP8 payload size disagrees: " + name);
         }
         return std::shared_ptr<EngramTable>(new EngramTable(
-            record,
+            model,
             name,
+            record.nbytes,
             static_cast<std::int64_t>(rows),
             static_cast<int>(columns),
             value_bytes,
@@ -695,57 +719,39 @@ private:
     };
 
     static std::vector<std::uint8_t> read_record_range(
-        const Record& record,
+        const mfq::ModelSource& source,
         const std::string& name,
+        std::uint64_t nbytes,
         std::uint64_t relative_offset,
         std::uint64_t count) {
-        if (relative_offset > record.nbytes ||
-            count > record.nbytes - relative_offset ||
+        if (relative_offset > nbytes || count > nbytes - relative_offset ||
             count > static_cast<std::uint64_t>(
-                std::numeric_limits<std::size_t>::max()) ||
-            count > static_cast<std::uint64_t>(
-                std::numeric_limits<std::streamsize>::max()) ||
-            record.offset > std::numeric_limits<std::uint64_t>::max() -
-                relative_offset) {
+                std::numeric_limits<std::size_t>::max())) {
             throw std::out_of_range(
-                "MFQ record byte range is out of bounds: " + name);
+                "model tensor byte range is out of bounds: " + name);
         }
         std::vector<std::uint8_t> result(static_cast<std::size_t>(count));
-        std::ifstream stream(record.source_path, std::ios::binary);
-        if (!stream) {
-            throw std::runtime_error(
-                "cannot open DeepSeek-V4.1 Engram table: " + name);
-        }
-        stream.seekg(static_cast<std::streamoff>(
-            record.offset + relative_offset));
-        stream.read(
-            reinterpret_cast<char*>(result.data()),
-            static_cast<std::streamsize>(result.size()));
-        if (!stream) {
-            throw std::runtime_error(
-                "failed reading DeepSeek-V4.1 Engram table: " + name);
-        }
+        source.read_range_into(
+            name, relative_offset,
+            reinterpret_cast<std::byte*>(result.data()), result.size());
         return result;
     }
 
     EngramTable(
-        Record record,
+        const mfq::ModelSource& source,
         std::string name,
+        std::uint64_t nbytes,
         std::int64_t rows,
         int width,
         std::uint64_t value_bytes,
         std::size_t capacity)
-        : record_(std::move(record)),
+        : source_(&source),
           name_(std::move(name)),
+          nbytes_(nbytes),
           rows_(rows),
           width_(width),
           value_bytes_(value_bytes),
-          capacity_(capacity),
-          stream_(record_.source_path, std::ios::binary) {
-        if (!stream_) {
-            throw std::runtime_error(
-                "cannot open DeepSeek-V4.1 Engram table: " + name_);
-        }
+          capacity_(capacity) {
         for (std::size_t raw = 0; raw < e4m3_.size(); ++raw) {
             e4m3_[raw] = engram_detail::decode_e4m3(
                 static_cast<std::uint8_t>(raw));
@@ -764,23 +770,13 @@ private:
         std::uint64_t relative_offset,
         std::uint8_t* destination,
         std::size_t count) const {
-        if (relative_offset > record_.nbytes ||
-            count > record_.nbytes - relative_offset ||
-            record_.offset > std::numeric_limits<std::uint64_t>::max() -
-                relative_offset) {
+        if (relative_offset > nbytes_ || count > nbytes_ - relative_offset) {
             throw std::out_of_range(
                 "DeepSeek-V4.1 Engram row range is invalid: " + name_);
         }
-        stream_.clear();
-        stream_.seekg(static_cast<std::streamoff>(
-            record_.offset + relative_offset));
-        stream_.read(
-            reinterpret_cast<char*>(destination),
-            static_cast<std::streamsize>(count));
-        if (!stream_) {
-            throw std::runtime_error(
-                "failed reading DeepSeek-V4.1 Engram row: " + name_);
-        }
+        source_->read_range_into(
+            name_, relative_offset,
+            reinterpret_cast<std::byte*>(destination), count);
     }
 
     void decode_row(
@@ -839,8 +835,9 @@ private:
         return cache_.emplace(row, std::move(entry)).first->second.values;
     }
 
-    Record record_;
+    const mfq::ModelSource* source_ = nullptr;
     std::string name_;
+    std::uint64_t nbytes_ = 0;
     std::int64_t rows_ = 0;
     int width_ = 0;
     std::uint64_t value_bytes_ = 0;
@@ -853,13 +850,12 @@ private:
     mutable std::vector<float> scratch_;
     mutable std::vector<std::uint8_t> row_values_;
     mutable std::vector<std::uint8_t> row_scales_;
-    mutable std::ifstream stream_;
 };
 
 class Engram {
 public:
     static std::unique_ptr<Engram> load(
-        const MfqFile& model,
+        const mfq::ModelSource& model,
         const EngramConfig& config,
         int layer) {
         const auto found = std::find(

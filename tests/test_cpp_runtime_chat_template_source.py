@@ -5,8 +5,10 @@ ROOT = Path(__file__).resolve().parents[1]
 SERVER = (ROOT / "cpp_runtime" / "server" / "src" / "server.cpp").read_text(
     encoding="utf-8"
 )
-DECODE = (ROOT / "cpp_runtime" / "backends" / "cuda" / "apps" / "mfq_decode.cpp").read_text(
-    encoding="utf-8"
+CUDA_RUNTIME = ROOT / "cpp_runtime" / "backends" / "cuda" / "runtime"
+DECODE = "\n".join(
+    (CUDA_RUNTIME / name).read_text(encoding="utf-8")
+    for name in ("cuda_decode_runtime.cpp", "mtp.cpp")
 )
 CMAKE = (ROOT / "cpp_runtime" / "CMakeLists.txt").read_text(
     encoding="utf-8"
@@ -139,13 +141,10 @@ def test_server_links_integrated_text_runtime() -> None:
     assert "BUILD_WITH_INSTALL_RPATH ON" in METAL_CMAKE
 
 
-def test_server_rejects_external_runtime_assets() -> None:
+def test_cuda_server_accepts_an_external_tokenizer_only() -> None:
     assert "MFQ server does not accept an external model config" in DECODE
-    assert (
-        "MFQ server requires embedded model config, tokenizer, "
-        in DECODE
-    )
-    assert "server_config.tokenizer_model" not in DECODE
+    assert "model server requires model config and tokenizer GGUF" in DECODE
+    assert "server_config.tokenizer_model = tokenizer_model" in DECODE
 
 
 def test_studio_keeps_reasoning_separate_and_template_controlled() -> None:

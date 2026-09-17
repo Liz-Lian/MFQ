@@ -82,14 +82,6 @@ def _console_script_dir(executable: str | Path) -> Path:
     return Path(executable).parent
 
 
-def _controller_command() -> tuple[str, ...]:
-    """Command prefix that re-enters this CLI in source and frozen builds."""
-
-    if bool(getattr(sys, "frozen", False)):
-        return (sys.executable,)
-    return (sys.executable, "-m", "mfq.cli")
-
-
 def _environment_paths(name: str) -> list[Path]:
     return [Path(value) for value in os.environ.get(name, "").split(os.pathsep) if value]
 
@@ -244,7 +236,7 @@ def _run(args: argparse.Namespace) -> int:
     from mfq.server.components import VoiceOutputComponent
     from mfq.server.jobs import JobManager
     from mfq.server.models import ModelLoadRequest
-    from mfq.server.runtime_pool import ManagedRuntimePool
+    from mfq.server.runtime_pool import RuntimePool
     from mfq.server.service import ServerService
     from mfq.server.storage import SessionStore
     from mfq.server.tool_jobs import ToolJobHandlers, ToolJobPaths
@@ -306,7 +298,7 @@ def _run(args: argparse.Namespace) -> int:
                 prefix_cache_block_tokens=args.prefix_cache_block_tokens,
             )
         )
-    runtime_manager = ManagedRuntimePool(
+    runtime_manager = RuntimePool(
         catalog,
         executable,
         startup_timeout_seconds=args.runtime_startup_timeout,
@@ -321,7 +313,6 @@ def _run(args: argparse.Namespace) -> int:
         backend=selected_backend,
         voice_component=voice_component,
         runtime_environment=runtime_environment,
-        controller_command=_controller_command(),
         startup_loads=startup_loads,
         shared_cache_reclaimer=clear_image_decode_cache,
     )

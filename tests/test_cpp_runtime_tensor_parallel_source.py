@@ -1,8 +1,11 @@
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-SOURCE = (ROOT / "cpp_runtime" / "backends" / "cuda" / "apps" / "mfq_decode.cpp").read_text(
-    encoding="utf-8"
+CUDA_ROOT = ROOT / "cpp_runtime" / "backends" / "cuda"
+SOURCE = "\n".join(
+    path.read_text(encoding="utf-8")
+    for path in sorted(CUDA_ROOT.rglob("*"))
+    if path.suffix in {".h", ".cpp"}
 )
 CORE = (ROOT / "cpp_runtime" / "core" / "tensor_parallel.h").read_text(
     encoding="utf-8"
@@ -10,14 +13,10 @@ CORE = (ROOT / "cpp_runtime" / "core" / "tensor_parallel.h").read_text(
 CMAKE = (ROOT / "cpp_runtime" / "tests" / "CMakeLists.txt").read_text(
     encoding="utf-8"
 )
-COMPONENTS = (
-    ROOT
-    / "cpp_runtime"
-    / "backends"
-    / "cuda"
-    / "runtime"
-    / "server_components.h"
-).read_text(encoding="utf-8")
+COMPONENTS = "\n".join(
+    (CUDA_ROOT / "runtime" / name).read_text(encoding="utf-8")
+    for name in ("server_components.h", "server_components.cpp")
+)
 
 
 def test_tensor_parallel_cli_and_weighted_split_are_wired():

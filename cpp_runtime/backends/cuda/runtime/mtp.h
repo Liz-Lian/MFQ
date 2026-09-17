@@ -1,8 +1,17 @@
 #pragma once
 
+#include "mfq_cuda_mtp.h"
+#include "mfq_tensor_backend.h"
+#include "mfq/server.h"
+
 #include <cstdint>
 #include <functional>
 #include <stdexcept>
+#include <utility>
+#include <vector>
+
+struct CudaPreparedPrompt;
+struct CudaModel;
 
 struct CudaMtpStep {
     mfq_tensor_backend::Tensor sample_hidden;
@@ -18,22 +27,30 @@ struct CudaMtpBlockDraft {
     mfq_tensor_backend::Tensor confidence;
 };
 
-// Generation sees one predictor contract. Model-specific modules own their
+// Generation sees one predictor contract. Architecture-specific modules own their
 // equations and cache layout; the server does not branch on architecture.
 struct CudaMtpModule {
     virtual ~CudaMtpModule() = default;
     virtual void reset(int64_t batch = 1) = 0;
     virtual mfq_tensor_backend::Tensor forward(
-        Model& target,
+        CudaModel& target,
         mfq_tensor_backend::Tensor previous_hidden,
         mfq_tensor_backend::Tensor next_ids) = 0;
     virtual CudaMtpStep step(
-        Model& target,
+        CudaModel& target,
         mfq_tensor_backend::Tensor previous_hidden,
         mfq_tensor_backend::Tensor next_ids) {
         auto hidden = forward(
             target, std::move(previous_hidden), std::move(next_ids));
         return {hidden, hidden};
+    }
+    virtual CudaMtpStep step_positioned(
+        CudaModel&,
+        mfq_tensor_backend::Tensor,
+        mfq_tensor_backend::Tensor,
+        mfq_tensor_backend::Tensor) {
+        throw std::runtime_error(
+            "this CUDA MTP predictor does not accept explicit positions");
     }
     virtual int64_t cache_position() const noexcept = 0;
     virtual void trim_cache_to(int64_t position) = 0;
@@ -45,6 +62,9 @@ struct CudaMtpModule {
     }
     virtual bool blockwise_drafting() const noexcept { return false; }
     virtual bool split_target_verification() const noexcept { return false; }
+    virtual bool retains_partial_target_prefix() const noexcept {
+        return false;
+    }
     virtual void append_target_context(
         mfq_tensor_backend::Tensor,
         std::int64_t) {
@@ -52,7 +72,7 @@ struct CudaMtpModule {
             "this CUDA MTP predictor has no target-context adapter");
     }
     virtual CudaMtpBlockDraft draft_block(
-        Model&,
+        CudaModel&,
         mfq_tensor_backend::Tensor,
         const CudaMtpTokenSelector&,
         int) {
@@ -65,3 +85,14 @@ struct CudaMtpModule {
     uint64_t last_accepted = 0;
     uint64_t last_rejected = 0;
 };
+
+int32_t run_cuda_mtp_generation(
+    CudaModel& model,
+    CudaMtpModule& mtp,
+    const std::vector<int64_t>& prompt,
+    const MfqSamplingParams& sampling,
+    const MfqTokenCallback& on_token,
+    const MfqPrefillCallback& on_prefill,
+    int64_t prefill_chunk_size = 2048,
+    const MfqTokenConstraintPtr& token_constraint = {},
+    const CudaPreparedPrompt* prepared = nullptr);

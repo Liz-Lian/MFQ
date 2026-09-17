@@ -216,6 +216,10 @@ function parseHubReference(
   return { provider, repoId, revision };
 }
 
+function isRuntimeReady(state: string | null | undefined): boolean {
+  return state === "ready" || state === "busy";
+}
+
 function runtimeModelNames(
   advertised: RuntimeModel[],
   instances: RuntimeInstance[],
@@ -223,7 +227,7 @@ function runtimeModelNames(
   return Array.from(new Set([
     ...advertised.map((item) => item.id),
     ...instances
-      .filter((item) => item.state === "ready" || item.state === "busy")
+      .filter((item) => isRuntimeReady(item.state))
       .map((item) => item.model),
   ].filter(Boolean)));
 }
@@ -1754,63 +1758,55 @@ export default function App() {
 
   const refreshRuntime = useCallback(async (quiet = true) => {
     try {
-      const selectedInstanceId = selectedRuntimeInstanceIdRef.current;
-      const [runtimeResults, management] = await Promise.all([
-        Promise.allSettled([
+      const management = await Promise.all([
+        api.runtimeMetrics(200),
+        api.modelArtifacts(),
+        api.runtimeInstances(),
+        api.runtimeProfiles(),
+        api.jobs(100),
+        api.runtimeLogs(100),
+        api.jobKinds(),
+        api.artifactLineage(),
+        api.datasets(),
+        api.evaluations(),
+        api.remoteNodes(),
+      ]);
+      const [metricHistory, nextArtifacts, nextInstances, nextProfiles, nextJobs, nextLogs, nextKinds, nextLineage, nextDatasets, nextEvaluations, nextNodes] = management;
+      const requestedInstanceId = selectedRuntimeInstanceIdRef.current;
+      const selectedInstanceId = nextInstances.some(
+        (instance) => instance.id === requestedInstanceId,
+      ) ? requestedInstanceId : null;
+      const [statusResult, voiceComponentResult] = await Promise.allSettled([
+        api.runtimeStatus(selectedInstanceId),
+        api.voiceOutputComponent(),
+      ]);
+      const status = statusResult.status === "fulfilled" ? statusResult.value : null;
+      let nextCapabilities: RuntimeCapabilities | null = null;
+      let nextModels: RuntimeModel[] = [];
+      let nextRealtime: RealtimeCapabilities | null = null;
+      if (isRuntimeReady(status?.runtime_state)) {
+        const [capabilityResult, modelResult, realtimeResult] = await Promise.allSettled([
           api.runtimeCapabilities(selectedInstanceId),
           api.runtimeModels(),
-          api.runtimeStatus(selectedInstanceId),
           api.realtimeCapabilities(),
-          api.voiceOutputComponent(),
-        ]),
-        Promise.all([
-          api.runtimeMetrics(200),
-          api.modelArtifacts(),
-          api.runtimeInstances(),
-          api.runtimeProfiles(),
-          api.jobs(100),
-          api.runtimeLogs(100),
-          api.jobKinds(),
-          api.artifactLineage(),
-          api.datasets(),
-          api.evaluations(),
-          api.remoteNodes(),
-        ]),
-      ]);
-      const [capabilityResult, modelResult, statusResult, realtimeResult, voiceComponentResult] = runtimeResults;
-      const [metricHistory, nextArtifacts, nextInstances, nextProfiles, nextJobs, nextLogs, nextKinds, nextLineage, nextDatasets, nextEvaluations, nextNodes] = management;
-      if (capabilityResult.status === "fulfilled") {
-        setCapabilities(capabilityResult.value);
-      } else {
-        setCapabilities(null);
+        ]);
+        if (capabilityResult.status === "fulfilled") nextCapabilities = capabilityResult.value;
+        if (modelResult.status === "fulfilled") nextModels = modelResult.value;
+        if (realtimeResult.status === "fulfilled") nextRealtime = realtimeResult.value;
       }
-      if (modelResult.status === "fulfilled") {
-        setModels(modelResult.value);
-      }
-      const status = statusResult.status === "fulfilled" ? statusResult.value : null;
+      setCapabilities(nextCapabilities);
+      setModels(nextModels);
       setRuntime(status);
-      const nextModelNames = runtimeModelNames(
-        modelResult.status === "fulfilled" ? modelResult.value : [],
-        nextInstances,
-      );
-      const nextSelectionNames = runtimeSelectionNames(
-        modelResult.status === "fulfilled" ? modelResult.value : [],
-        nextInstances,
-        nextJobs,
-      );
+      setRealtime(nextRealtime);
+      setRealtimeAvailable(nextRealtime?.available === true);
+      const nextModelNames = runtimeModelNames(nextModels, nextInstances);
+      const nextSelectionNames = runtimeSelectionNames(nextModels, nextInstances, nextJobs);
       const statusModel = typeof status?.model === "string" ? status.model : "";
       setModel((current) => {
         if (current && nextSelectionNames.includes(current)) return current;
         if (statusModel && nextModelNames.includes(statusModel)) return statusModel;
         return nextModelNames[0] ?? "";
       });
-      if (realtimeResult.status === "fulfilled") {
-        setRealtime(realtimeResult.value);
-        setRealtimeAvailable(realtimeResult.value.available === true);
-      } else {
-        setRealtime(null);
-        setRealtimeAvailable(false);
-      }
       if (voiceComponentResult.status === "fulfilled") {
         setVoiceComponent(voiceComponentResult.value);
       }
@@ -2038,11 +2034,16 @@ export default function App() {
             setStudioDraft({ ...status.config });
           }
         }
+        const initialStatusResult = await Promise.allSettled([api.runtimeStatus()]);
+        const initialRuntime = initialStatusResult[0].status === "fulfilled"
+          ? initialStatusResult[0].value
+          : null;
+        const runtimeReady = isRuntimeReady(initialRuntime?.runtime_state);
         const results = await Promise.allSettled([
-          api.runtimeCapabilities(),
-          api.runtimeModels(),
-          api.runtimeStatus(),
-          api.realtimeCapabilities(),
+          runtimeReady ? api.runtimeCapabilities() : Promise.resolve<RuntimeCapabilities | null>(null),
+          runtimeReady ? api.runtimeModels() : Promise.resolve<RuntimeModel[]>([]),
+          Promise.resolve(initialRuntime),
+          runtimeReady ? api.realtimeCapabilities() : Promise.resolve<RealtimeCapabilities | null>(null),
           api.listSessions(),
           api.modelArtifacts(),
           api.runtimeInstances(),
@@ -2075,9 +2076,8 @@ export default function App() {
         const initialModels = results[1].status === "fulfilled" ? results[1].value : [];
         const initialJobs = results[7].status === "fulfilled" ? results[7].value : [];
         const initialNames = runtimeSelectionNames(initialModels, initialInstances, initialJobs);
-        const initialStatusModel = results[2].status === "fulfilled"
-          && typeof results[2].value.model === "string"
-          ? results[2].value.model
+        const initialStatusModel = typeof initialRuntime?.model === "string"
+          ? initialRuntime.model
           : "";
         setModel(
           initialStatusModel && initialNames.includes(initialStatusModel)
@@ -2116,7 +2116,7 @@ export default function App() {
         if (results[19].status === "fulfilled") setVoiceComponent(results[19].value);
         if (results[3].status === "fulfilled") {
           setRealtime(results[3].value);
-          setRealtimeAvailable(results[3].value.available === true);
+          setRealtimeAvailable(results[3].value?.available === true);
         }
         if (results[4].status === "fulfilled") {
           setSessions(results[4].value);
@@ -2171,7 +2171,7 @@ export default function App() {
 
   useEffect(() => {
     const instanceId = selectedRuntimeInstance?.id;
-    if (!instanceId) return;
+    if (!instanceId || !isRuntimeReady(selectedRuntimeInstance?.state)) return;
     let current = true;
     void Promise.allSettled([
       api.runtimeCapabilities(instanceId),
@@ -4389,7 +4389,7 @@ export default function App() {
                 const ready = instance.state === "ready" || instance.state === "busy";
                 const selected = instance.model === model;
                 const stateLabel = instance.state === "loading" ? tr("加载中", "Loading") : instance.state === "unloading" ? tr("卸载中", "Unloading") : instance.state === "failed" ? tr("失败", "Failed") : instance.state === "busy" ? tr("使用中", "Busy") : tr("就绪", "Ready");
-                return <div className="model-row" key={instance.id}><span className={instance.state === "failed" ? "model-state failed" : ready ? "model-state active" : "model-state"} /><div><strong>{instance.model}</strong><small>{stateLabel} · {formatNumber(instance.context_size)} ctx{instance.pinned ? ` · ${tr("固定", "Pinned")}` : instance.idle_ttl_seconds != null ? ` · TTL ${instance.idle_ttl_seconds}s` : ""}</small></div><div className="model-row-actions">{ready && <button className={selected ? "selected" : ""} disabled={busy || sessionTransitioning || selected} onClick={() => selectModel(instance.model)} type="button">{selected ? tr("当前", "Current") : tr("用于对话", "Use in chat")}</button>}<button disabled={busy || !ready || instance.state === "busy"} onClick={() => void unloadInstance(instance.id)} type="button">{tr("卸载", "Unload")}</button></div></div>;
+                return <div className="model-row" key={instance.id}><span className={instance.state === "failed" ? "model-state failed" : ready ? "model-state active" : "model-state"} /><div><strong>{instance.model}</strong><small>{stateLabel} · {formatNumber(instance.context_size)} ctx{instance.pinned ? ` · ${tr("固定", "Pinned")}` : instance.idle_ttl_seconds != null ? ` · TTL ${instance.idle_ttl_seconds}s` : ""}</small></div><div className="model-row-actions">{ready && <button className={selected ? "selected" : ""} disabled={busy || sessionTransitioning || selected} onClick={() => selectModel(instance.model)} type="button">{selected ? tr("当前", "Current") : tr("用于对话", "Use in chat")}</button>}<button disabled={busy || instance.state !== "ready"} onClick={() => void unloadInstance(instance.id)} type="button">{tr("卸载", "Unload")}</button></div></div>;
               })}</div></TMPanel> : <div className="inline-empty model-runtime-empty">{tr("当前没有已加载模型。", "No models are currently loaded.")}</div>}
               <TMPanel className="model-catalog-panel">
                 <div className="panel-heading"><div><h2>{tr("加载策略", "Load policy")}</h2><p>{tr("控制模型的驻留与自动卸载。", "Control model residency and automatic unloading.")}</p></div></div>
@@ -4403,7 +4403,7 @@ export default function App() {
                   const instance = instances.find((candidate) => candidate.model === item.name && candidate.state !== "failed");
                   const loaded = Boolean(instance) || item.name === runtime?.model;
                   const policy = instance?.pinned ? tr("固定", "Pinned") : instance?.idle_ttl_seconds != null ? `TTL ${instance.idle_ttl_seconds}s` : null;
-                  return <div className="model-row" key={item.id}><span className={loaded ? "model-state active" : item.loadable ? "model-state" : "model-state failed"} /><div><strong>{item.name}</strong><small>{item.architecture} · {item.shard_count} shards · {formatNumber(item.total_bytes / 2 ** 30, 1)} GB{policy ? ` · ${policy}` : ""}</small></div>{instance ? <button disabled={busy || instance.state === "busy"} onClick={() => void unloadInstance(instance.id)} type="button">{tr("卸载", "Unload")}</button> : loaded ? <em>{tr("已加载", "Loaded")}</em> : !item.loadable ? <em className="failed" title={item.error || undefined}>{item.complete && item.format === "hf" ? tr("需先转换", "Convert first") : tr("不可用", "Invalid")}</em> : <button disabled={busy} onClick={() => void loadArtifact(item.name)} type="button">{tr("加载", "Load")}</button>}</div>;
+                  return <div className="model-row" key={item.id}><span className={loaded ? "model-state active" : item.loadable ? "model-state" : "model-state failed"} /><div><strong>{item.name}</strong><small>{item.architecture} · {item.shard_count} shards · {formatNumber(item.total_bytes / 2 ** 30, 1)} GB{policy ? ` · ${policy}` : ""}</small></div>{instance ? <button disabled={busy || instance.state !== "ready"} onClick={() => void unloadInstance(instance.id)} type="button">{tr("卸载", "Unload")}</button> : loaded ? <em>{tr("已加载", "Loaded")}</em> : !item.loadable ? <em className="failed" title={item.error || undefined}>{item.complete && item.format === "hf" ? tr("需先转换", "Convert first") : tr("不可用", "Invalid")}</em> : <button disabled={busy} onClick={() => void loadArtifact(item.name)} type="button">{tr("加载", "Load")}</button>}</div>;
                 })}</div></TMPanel> : <EmptyPanel icon="folder" title={tr("还没有本地模型", "No local models yet")} message={tr("添加一个模型文件夹即可开始。", "Add a model folder to get started.")} />}
             </>}
             {dashboardPage === "logs" && <>

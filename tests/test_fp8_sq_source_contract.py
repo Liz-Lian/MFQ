@@ -37,9 +37,11 @@ def test_cuda_dense_dispatch_keeps_packed_decode_and_transient_gemm() -> None:
 
 
 def test_cuda_runtime_routes_dense_and_mfe_without_model_branches() -> None:
-    source = (
-        ROOT / "cpp_runtime/backends/cuda/apps/mfq_decode.cpp"
-    ).read_text()
+    ops = ROOT / "cpp_runtime/backends/cuda/ops"
+    source = "\n".join(
+        (ops / name).read_text()
+        for name in ("cuda_quantized_ops.h", "cuda_quantized_ops.cpp")
+    )
     assert 'weight.dtype == "MXFP8-SQ"' in source
     assert 'weight.dtype == "FP8-128SQ"' in source
     assert "mxfp8_sq_moe_matmul_cuda(" in source

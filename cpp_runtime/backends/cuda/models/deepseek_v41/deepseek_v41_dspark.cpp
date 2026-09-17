@@ -1,6 +1,16 @@
-// Included by mfq_decode.cpp after the common MTP contract.  DSpark owns its
-// predictor math and ring state; sampling, verification, adaptive depth and
-// accounting remain in the backend-wide CUDA MTP engine.
+#include "deepseek_v41_dspark.h"
+
+#include "../../runtime/cuda_model.h"
+#include "../../runtime/mtp.h"
+#include "deepseek_v41_causal_lm.h"
+
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <memory>
+#include <optional>
+#include <utility>
+#include <vector>
 
 namespace mfq::cuda::deepseek_v41_runtime {
 
@@ -39,7 +49,7 @@ static std::pair<Tensor, Tensor> dspark_full_attention_plan(
 
 struct CudaDeepseekV41Dspark final : CudaMtpModule {
     CommonConfig config;
-    ::Config runtime;
+    ::CudaRuntimeParameters runtime;
     QuantLinear main_projection;
     Tensor main_norm;
     Tensor output_norm;
@@ -54,8 +64,8 @@ struct CudaDeepseekV41Dspark final : CudaMtpModule {
     std::int64_t position = 0;
 
     static std::unique_ptr<Block> load_stage(
-        const MfqFile& model,
-        const ::Config& runtime,
+        const mfq::ModelSource& model,
+        const ::CudaRuntimeParameters& runtime,
         const CommonConfig& config,
         std::int64_t stage) {
         const auto prefix = "predictor.stage." +
@@ -169,26 +179,26 @@ struct CudaDeepseekV41Dspark final : CudaMtpModule {
     }
 
     static std::optional<CudaDeepseekV41Dspark> load_if_present(
-        const MfqFile& model,
-        const ::Config& runtime) {
-        const bool root = model.has_record(
+        const mfq::ModelSource& model,
+        const ::CudaRuntimeParameters& runtime,
+        const CommonConfig& config) {
+        const bool root = has_tensor(model,
             "predictor.stage.0.main_projection.weight");
         const bool any = root ||
-            model.has_record("predictor.stage.0.attention.query_a.weight") ||
-            model.has_record("predictor.stage.0.mlp.router.weight") ||
-            model.has_record("predictor.stage.0.output_norm.weight");
+            has_tensor(model, "predictor.stage.0.attention.query_a.weight") ||
+            has_tensor(model, "predictor.stage.0.mlp.router.weight") ||
+            has_tensor(model, "predictor.stage.0.output_norm.weight");
         if (!root) {
             MFQ_RUNTIME_CHECK(
                 !any,
-                "DeepSeek-V4.1 MFQ contains an incomplete DSpark head");
+                "DeepSeek-V4.1 model source contains an incomplete DSpark head");
             return std::nullopt;
         }
         MFQ_RUNTIME_CHECK(
-            runtime.is_deepseek_v41() && runtime.deepseek_v41.has_value() &&
-                runtime.deepseek_v41->has_dspark(),
-            "DeepSeek-V4.1 MFQ has DSpark tensors without configuration");
+            runtime.is_deepseek_v41() && config.has_dspark(),
+            "DeepSeek-V4.1 model source has DSpark tensors without configuration");
         CudaDeepseekV41Dspark result;
-        result.config = *runtime.deepseek_v41;
+        result.config = config;
         result.runtime = runtime;
         result.maximum_context = runtime.max_position_embeddings;
         const auto first = std::string("predictor.stage.0.");
@@ -260,7 +270,7 @@ struct CudaDeepseekV41Dspark final : CudaMtpModule {
         position = 0;
     }
 
-    Tensor forward(Model&, Tensor, Tensor) override {
+    Tensor forward(CudaModel&, Tensor, Tensor) override {
         throw std::runtime_error(
             "DeepSeek-V4.1 DSpark uses blockwise drafting");
     }
@@ -404,7 +414,7 @@ struct CudaDeepseekV41Dspark final : CudaMtpModule {
     }
 
     CudaMtpBlockDraft draft_block(
-        Model& main,
+        CudaModel& main,
         Tensor anchor_ids,
         const CudaMtpTokenSelector& select_token,
         int requested) override {
@@ -526,7 +536,19 @@ struct CudaDeepseekV41Dspark final : CudaMtpModule {
     }
 };
 
-static void run_dspark_self_check() {
+std::unique_ptr<::CudaMtpModule> load_dspark_if_present(
+        const mfq::ModelSource& source,
+        const ::CudaRuntimeParameters& runtime,
+        const CommonConfig& config) {
+    auto predictor = CudaDeepseekV41Dspark::load_if_present(
+        source, runtime, config);
+    return predictor
+        ? std::make_unique<CudaDeepseekV41Dspark>(
+              std::move(*predictor))
+        : nullptr;
+}
+
+void run_dspark_self_check() {
     auto plan = dspark_full_attention_plan(
         1,
         2,

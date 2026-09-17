@@ -18,10 +18,27 @@ from mfq.commands.serve import (
 from mfq.server.native import (
     NativeRuntime,
     NativeRuntimeError,
-    RuntimeRoute,
     native_request_capacity,
     native_runtime_environment,
 )
+
+
+def test_server_runtime_control_plane_has_no_architecture_dispatch() -> None:
+    root = Path(__file__).resolve().parents[1]
+    source = "\n".join(
+        (root / path).read_text(encoding="utf-8")
+        for path in ("mfq/server/native.py", "mfq/server/runtime_pool.py")
+    )
+
+    for forbidden in (
+        "MODEL_GRAPH_ASSET",
+        "resolve_runtime_route",
+        "python_mlx_worker",
+        'backbone="glm5_next"',
+        'backbone="qwen3_5"',
+        'backbone="qwen4_exp"',
+    ):
+        assert forbidden not in source
 
 
 def test_server_imports_framework_without_loading_quantization_stack() -> None:
@@ -233,25 +250,16 @@ def test_native_cuda_worker_is_private_and_uses_a_loopback_port(tmp_path: Path) 
 
     command = runtime.command(43123)
 
-    assert command[:3] == [str(runtime.executable), "--mfq", str(runtime.model)]
+    assert command[:3] == [str(runtime.executable), "--model", str(runtime.model)]
     assert command[command.index("--host") + 1] == "127.0.0.1"
     assert command[command.index("--port") + 1] == "43123"
     assert command[command.index("--ctx-size") + 1] == "32768"
     assert command[command.index("--prefill-chunk-size") + 1] == "2048"
 
 
-def test_native_cuda_worker_enables_explicit_continuous_batching(
+def test_native_cuda_worker_forwards_explicit_continuous_batching(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(
-        "mfq.server.native.resolve_runtime_route",
-        lambda *_args: RuntimeRoute(
-            architecture_family="qwen3_5",
-            backbone="qwen3_5",
-            continuous_batching=True,
-        ),
-    )
     runtime = NativeRuntime(
         executable=tmp_path / "mfq-decode",
         model=tmp_path / "model.mfq",
@@ -265,35 +273,20 @@ def test_native_cuda_worker_enables_explicit_continuous_batching(
     assert command[command.index("--continuous-batching") + 1] == "8"
 
 
-def test_native_request_capacity_rejects_unsupported_and_moe_workers() -> None:
-    route = RuntimeRoute(
-        architecture_family="qwen3_5",
-        backbone="qwen3_5",
-        continuous_batching=True,
-    )
-
+def test_native_request_capacity_is_backend_and_storage_based() -> None:
     assert native_request_capacity(
         backend="cuda",
-        route=route,
         routed_expert_bytes=0,
         requested=8,
     ) == 8
     assert native_request_capacity(
         backend="metal",
-        route=route,
         routed_expert_bytes=0,
         requested=8,
     ) == 1
     assert native_request_capacity(
         backend="cuda",
-        route=route,
         routed_expert_bytes=1,
-        requested=8,
-    ) == 1
-    assert native_request_capacity(
-        backend="cuda",
-        route=RuntimeRoute(architecture_family="qwen4_exp"),
-        routed_expert_bytes=0,
         requested=8,
     ) == 1
 

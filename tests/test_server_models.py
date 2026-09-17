@@ -38,8 +38,7 @@ from mfq.server.models import (
     RuntimeInstanceState,
     SamplingParams,
 )
-from mfq.server.native import RuntimeRoute
-from mfq.server.runtime_pool import ManagedRuntimePool, RuntimeConflictError, _ManagedRuntime
+from mfq.server.runtime_pool import RuntimePool, RuntimeConflictError, _Runtime
 from mfq.server.service import ServerService
 from mfq.server.storage import SessionStore
 from mfq.tools.split_mfq import split_mfq
@@ -75,7 +74,7 @@ class _TestJobContext:
 
 def test_empty_runtime_pool_reports_an_idle_server() -> None:
     async def run() -> None:
-        pool = ManagedRuntimePool(ModelCatalog([]), "runtime", backend="metal")
+        pool = RuntimePool(ModelCatalog([]), "runtime", backend="metal")
 
         status = await pool.runtime_status()
         assert status["runtime_state"] == "idle"
@@ -95,20 +94,20 @@ def test_metal_runtime_pool_derives_a_safe_default_memory_budget(
         lambda: 128 << 30,
     )
 
-    automatic = ManagedRuntimePool(ModelCatalog([]), "runtime", backend="metal")
-    disabled = ManagedRuntimePool(
+    automatic = RuntimePool(ModelCatalog([]), "runtime", backend="metal")
+    disabled = RuntimePool(
         ModelCatalog([]),
         "runtime",
         backend="metal",
         automatic_memory_budget=False,
     )
-    explicit = ManagedRuntimePool(
+    explicit = RuntimePool(
         ModelCatalog([]),
         "runtime",
         backend="metal",
         max_runtime_memory_bytes=100 << 30,
     )
-    cuda = ManagedRuntimePool(ModelCatalog([]), "runtime", backend="cuda")
+    cuda = RuntimePool(ModelCatalog([]), "runtime", backend="cuda")
 
     assert automatic.max_runtime_memory_bytes == 122 << 30
     assert automatic.automatic_memory_budget is True
@@ -139,9 +138,9 @@ def test_automatic_memory_budget_tracks_current_reclaimable_memory(
         ),
     )
 
-    automatic = ManagedRuntimePool(ModelCatalog([]), "runtime", backend="metal")
+    automatic = RuntimePool(ModelCatalog([]), "runtime", backend="metal")
     automatic._load_bytes["resident"] = 30 * gib
-    explicit = ManagedRuntimePool(
+    explicit = RuntimePool(
         ModelCatalog([]),
         "runtime",
         backend="metal",
@@ -175,7 +174,7 @@ def test_automatic_memory_pressure_uses_soft_and_hard_watermarks(
             wired=80 * gib,
         ),
     )
-    pool = ManagedRuntimePool(ModelCatalog([]), "runtime", backend="metal")
+    pool = RuntimePool(ModelCatalog([]), "runtime", backend="metal")
     pool._load_bytes["resident"] = 40 * gib
 
     level, ratio, ceiling, committed = pool._runtime_memory_pressure_locked()
@@ -223,7 +222,7 @@ def test_load_pressure_reclaims_shared_host_cache_before_model_memory(
             "mfq.server.runtime_pool.host_memory_snapshot",
             snapshot,
         )
-        pool = ManagedRuntimePool(
+        pool = RuntimePool(
             ModelCatalog([]),
             "runtime",
             backend="metal",
@@ -260,7 +259,7 @@ def test_startup_models_use_the_managed_load_path(tmp_path: Path) -> None:
             prefill_chunk_size=333,
             prefix_cache_disk_bytes=1234,
         )
-        pool = ManagedRuntimePool(
+        pool = RuntimePool(
             catalog,
             executable,
             startup_timeout_seconds=5,
@@ -299,7 +298,7 @@ def test_failed_startup_model_remains_retryable_without_spawning(
             model=artifact.resource.name,
             artifact_uri=f"mfq://{artifact.resource.id}",
         )
-        pool = ManagedRuntimePool(
+        pool = RuntimePool(
             catalog,
             executable,
             max_runtime_memory_bytes=1,
@@ -339,7 +338,7 @@ def _fake_runtime(path: Path) -> None:
             from http.server import BaseHTTPRequestHandler, HTTPServer
 
             parser = argparse.ArgumentParser()
-            parser.add_argument('--mfq')
+            parser.add_argument('--model')
             parser.add_argument('--server', action='store_true')
             parser.add_argument('--host')
             parser.add_argument('--port', type=int)
@@ -549,12 +548,12 @@ def test_catalog_tracks_streamable_routed_expert_bytes(tmp_path: Path) -> None:
             model=artifact.resource.name,
             moe_gpu_cache_gb=1 / (1 << 30),
         )
-        pool = ManagedRuntimePool(ModelCatalog([tmp_path]), tmp_path / "runtime")
+        pool = RuntimePool(ModelCatalog([tmp_path]), tmp_path / "runtime")
         estimated = pool._estimated_load_bytes(artifact, request)
         assert estimated == (
             artifact.resource.total_bytes - artifact.routed_expert_bytes + 1
         )
-        runtime = _ManagedRuntime(
+        runtime = _Runtime(
             id=uuid4(),
             artifact=artifact,
             process=SimpleNamespace(returncode=None),
@@ -563,11 +562,11 @@ def test_catalog_tracks_streamable_routed_expert_bytes(tmp_path: Path) -> None:
             context_size=4096,
             reserved_bytes=estimated,
         )
-        assert ManagedRuntimePool._committed_runtime_bytes(runtime) == estimated
+        assert RuntimePool._committed_runtime_bytes(runtime) == estimated
         runtime.resident_bytes = max(1, estimated // 2)
-        assert ManagedRuntimePool._committed_runtime_bytes(runtime) == estimated
+        assert RuntimePool._committed_runtime_bytes(runtime) == estimated
         runtime.resident_bytes = estimated + 17
-        assert ManagedRuntimePool._committed_runtime_bytes(runtime) == estimated + 17
+        assert RuntimePool._committed_runtime_bytes(runtime) == estimated + 17
 
     asyncio.run(run())
 
@@ -600,54 +599,16 @@ def test_native_hf_metal_auto_streaming_reserves_its_expert_cache(
         lambda: 6 << 30,
     )
     request = ModelLoadRequest(model="native-hf")
-    route = RuntimeRoute(architecture_family="qwen4_exp", backbone="qwen4_exp")
 
-    metal = ManagedRuntimePool(ModelCatalog([tmp_path]), tmp_path / "runtime")
-    cuda = ManagedRuntimePool(
+    metal = RuntimePool(ModelCatalog([tmp_path]), tmp_path / "runtime")
+    cuda = RuntimePool(
         ModelCatalog([tmp_path]),
         tmp_path / "runtime",
         backend="cuda",
     )
 
-    assert metal._estimated_load_bytes(
-        artifact,
-        request,
-        runtime_route=route,
-    ) == 6 << 30
-    assert cuda._estimated_load_bytes(
-        artifact,
-        request,
-        runtime_route=route,
-    ) == 10 << 30
-
-
-def test_python_worker_estimate_never_claims_native_expert_streaming(
-    tmp_path: Path,
-) -> None:
-    model = tmp_path / "python-worker.mfq"
-    _model(model)
-
-    async def run() -> None:
-        artifact = await ModelCatalog([tmp_path], cache_seconds=0).resolve_path(model)
-        artifact = DiscoveredModel(
-            resource=artifact.resource,
-            path=artifact.path,
-            routed_expert_bytes=max(1, artifact.resource.total_bytes // 2),
-        )
-        pool = ManagedRuntimePool(ModelCatalog([tmp_path]), tmp_path / "runtime")
-        request = ModelLoadRequest(model="python-worker", moe_gpu_cache_gb=1)
-
-        assert pool._estimated_load_bytes(
-            artifact,
-            request,
-            runtime_route=RuntimeRoute(
-                architecture_family="glm5_next",
-                backbone="glm5_next",
-                python_mlx_worker=True,
-            ),
-        ) == artifact.resource.total_bytes
-
-    asyncio.run(run())
+    assert metal._estimated_load_bytes(artifact, request) == 6 << 30
+    assert cuda._estimated_load_bytes(artifact, request) == 10 << 30
 
 
 def test_oversized_mfq_moe_gets_an_automatic_metal_expert_budget(
@@ -672,8 +633,7 @@ def test_oversized_mfq_moe_gets_an_automatic_metal_expert_budget(
         path=model,
         routed_expert_bytes=110 << 30,
     )
-    route = RuntimeRoute(architecture_family="qwen4_exp", backbone="qwen4_exp")
-    pool = ManagedRuntimePool(
+    pool = RuntimePool(
         ModelCatalog([tmp_path]),
         tmp_path / "runtime",
         max_runtime_memory_bytes=96 << 30,
@@ -682,39 +642,24 @@ def test_oversized_mfq_moe_gets_an_automatic_metal_expert_budget(
     automatic = pool._apply_automatic_expert_residency(
         artifact,
         ModelLoadRequest(model="oversized"),
-        runtime_route=route,
     )
     full_resident = pool._apply_automatic_expert_residency(
         artifact,
         ModelLoadRequest(model="oversized", moe_gpu_cache_gb=0),
-        runtime_route=route,
     )
 
     assert automatic.moe_gpu_cache_gb == 77
-    assert pool._estimated_load_bytes(
-        artifact,
-        automatic,
-        runtime_route=route,
-    ) == 92 << 30
+    assert pool._estimated_load_bytes(artifact, automatic) == 92 << 30
     assert full_resident.moe_gpu_cache_gb == 0
-    assert pool._estimated_load_bytes(
-        artifact,
-        full_resident,
-        runtime_route=route,
-    ) == 125 << 30
+    assert pool._estimated_load_bytes(artifact, full_resident) == 125 << 30
 
     pressure_limited = pool._apply_automatic_expert_residency(
         artifact,
         ModelLoadRequest(model="oversized"),
-        runtime_route=route,
         memory_ceiling=60 << 30,
     )
     assert pressure_limited.moe_gpu_cache_gb == 42
-    assert pool._estimated_load_bytes(
-        artifact,
-        pressure_limited,
-        runtime_route=route,
-    ) == 57 << 30
+    assert pool._estimated_load_bytes(artifact, pressure_limited) == 57 << 30
 
 
 def test_catalog_loads_registered_external_mfq_files(tmp_path: Path) -> None:
@@ -891,7 +836,7 @@ def test_empty_runtime_pool_reports_idle_state(tmp_path: Path) -> None:
     async def run() -> None:
         model_dir = tmp_path / "models"
         model_dir.mkdir()
-        pool = ManagedRuntimePool(
+        pool = RuntimePool(
             ModelCatalog([model_dir]),
             tmp_path / "runtime",
             automatic_memory_budget=False,
@@ -927,7 +872,7 @@ def test_empty_runtime_pool_keeps_management_api_available(tmp_path: Path) -> No
         model_dir = tmp_path / "models"
         model_dir.mkdir()
         catalog = ModelCatalog([model_dir], cache_seconds=0)
-        pool = ManagedRuntimePool(catalog, tmp_path / "runtime")
+        pool = RuntimePool(catalog, tmp_path / "runtime")
         service = ServerService(
             SessionStore(tmp_path / "mfq.server.sqlite3"),
             pool,
@@ -980,7 +925,7 @@ def test_openai_models_advertises_complete_catalog_models_before_load(
         shards[1].unlink()
 
         catalog = ModelCatalog([model_dir], cache_seconds=0)
-        pool = ManagedRuntimePool(catalog, tmp_path / "runtime")
+        pool = RuntimePool(catalog, tmp_path / "runtime")
         service = ServerService(
             SessionStore(tmp_path / "mfq.server.sqlite3"),
             pool,
@@ -1137,7 +1082,7 @@ def test_managed_runtime_loads_and_unloads_through_persistent_jobs(tmp_path: Pat
         executable = tmp_path / "fake-runtime"
         _fake_runtime(executable)
         catalog = ModelCatalog([model_dir], cache_seconds=0)
-        pool = ManagedRuntimePool(
+        pool = RuntimePool(
             catalog,
             executable,
             startup_timeout_seconds=5,
@@ -1227,15 +1172,12 @@ def test_managed_runtime_dispatches_qwen4_mfq_to_native_cpp(tmp_path: Path) -> N
         _model(model, architecture="qwen4_exp-hf-mfq-nint-recipe")
         native_executable = tmp_path / "fake-native-runtime"
         _fake_runtime(native_executable)
-        controller = tmp_path / "python-worker-must-not-run"
-        controller.write_text("not executable", encoding="utf-8")
         catalog = ModelCatalog([model_dir], cache_seconds=0)
-        pool = ManagedRuntimePool(
+        pool = RuntimePool(
             catalog,
             native_executable,
             startup_timeout_seconds=5,
             max_instances=1,
-            controller_command=(str(controller),),
         )
         store = SessionStore(tmp_path / "mfq.server.sqlite3")
         service = ServerService(store, pool, catalog=catalog, runtime_manager=pool)
@@ -1271,7 +1213,7 @@ def test_managed_cuda_runtime_connects_explicit_request_concurrency(
         _model(model, architecture="qwen35")
         catalog = ModelCatalog([tmp_path], cache_seconds=0)
         artifact = await catalog.resolve_path(model)
-        pool = ManagedRuntimePool(
+        pool = RuntimePool(
             catalog,
             tmp_path / "mfq-decode",
             backend="cuda",
@@ -1281,11 +1223,6 @@ def test_managed_cuda_runtime_connects_explicit_request_concurrency(
         command, _environment = pool._launch_configuration(
             artifact,
             ModelLoadRequest(model="tiny"),
-            runtime_route=RuntimeRoute(
-                architecture_family="qwen3_5",
-                backbone="qwen3_5",
-                continuous_batching=True,
-            ),
             port=43123,
         )
 
@@ -1294,7 +1231,7 @@ def test_managed_cuda_runtime_connects_explicit_request_concurrency(
     asyncio.run(run())
 
 
-def test_managed_cuda_runtime_only_enables_supported_continuous_batching(
+def test_managed_cuda_runtime_leaves_continuous_batching_validation_to_worker(
     tmp_path: Path,
 ) -> None:
     async def run() -> None:
@@ -1302,7 +1239,7 @@ def test_managed_cuda_runtime_only_enables_supported_continuous_batching(
         _model(model, architecture="qwen4_exp")
         catalog = ModelCatalog([tmp_path], cache_seconds=0)
         artifact = await catalog.resolve_path(model)
-        pool = ManagedRuntimePool(
+        pool = RuntimePool(
             catalog,
             tmp_path / "mfq-decode",
             backend="cuda",
@@ -1310,13 +1247,9 @@ def test_managed_cuda_runtime_only_enables_supported_continuous_batching(
         )
         request = ModelLoadRequest(model="tiny")
 
-        unsupported, _environment = pool._launch_configuration(
+        dense, _environment = pool._launch_configuration(
             artifact,
             request,
-            runtime_route=RuntimeRoute(
-                architecture_family="qwen4_exp",
-                backbone="qwen4_exp",
-            ),
             port=43123,
         )
         moe, _environment = pool._launch_configuration(
@@ -1326,15 +1259,10 @@ def test_managed_cuda_runtime_only_enables_supported_continuous_batching(
                 routed_expert_bytes=1,
             ),
             request,
-            runtime_route=RuntimeRoute(
-                architecture_family="qwen3_5",
-                backbone="qwen3_5",
-                continuous_batching=True,
-            ),
             port=43124,
         )
 
-        assert "--continuous-batching" not in unsupported
+        assert dense[dense.index("--continuous-batching") + 1] == "6"
         assert "--continuous-batching" not in moe
 
     asyncio.run(run())
@@ -1349,7 +1277,7 @@ def test_runtime_instances_keep_model_bound_mtp_capabilities(tmp_path: Path) -> 
         executable = tmp_path / "fake-runtime"
         _fake_runtime(executable)
         catalog = ModelCatalog([model_dir], cache_seconds=0)
-        pool = ManagedRuntimePool(
+        pool = RuntimePool(
             catalog,
             executable,
             startup_timeout_seconds=5,
@@ -1387,7 +1315,7 @@ def test_concurrent_loads_reserve_the_catalog_name(tmp_path: Path) -> None:
         executable = tmp_path / "fake-runtime"
         _fake_runtime(executable)
         catalog = ModelCatalog([model_dir], cache_seconds=0)
-        pool = ManagedRuntimePool(
+        pool = RuntimePool(
             catalog,
             executable,
             startup_timeout_seconds=5,
@@ -1439,7 +1367,7 @@ def test_failed_runtime_start_does_not_leave_a_stuck_pool_slot(tmp_path: Path) -
         )
         executable.chmod(executable.stat().st_mode | stat.S_IXUSR)
         catalog = ModelCatalog([model_dir], cache_seconds=0)
-        pool = ManagedRuntimePool(
+        pool = RuntimePool(
             catalog,
             executable,
             startup_timeout_seconds=5,
@@ -1473,7 +1401,7 @@ def test_failed_runtime_start_does_not_leave_a_stuck_pool_slot(tmp_path: Path) -
 
 
 def test_stale_load_cleanup_cannot_release_a_new_load_reservation() -> None:
-    pool = ManagedRuntimePool(ModelCatalog([]), "runtime")
+    pool = RuntimePool(ModelCatalog([]), "runtime")
     stale_event = asyncio.Event()
     current_event = asyncio.Event()
     pool._load_events["tiny"] = current_event
@@ -1495,7 +1423,7 @@ def test_stale_load_cleanup_cannot_release_a_new_load_reservation() -> None:
 
 
 def test_runtime_memory_accounting_uses_backend_device_metrics() -> None:
-    observed = ManagedRuntimePool._observed_runtime_bytes(
+    observed = RuntimePool._observed_runtime_bytes(
         100,
         {
             "mlx_active_bytes": 80,
@@ -1505,8 +1433,8 @@ def test_runtime_memory_accounting_uses_backend_device_metrics() -> None:
         },
     )
     assert observed == 200
-    assert ManagedRuntimePool._observed_runtime_bytes(100, {}) == 100
-    assert ManagedRuntimePool._observed_runtime_bytes(None, {}) is None
+    assert RuntimePool._observed_runtime_bytes(100, {}) == 100
+    assert RuntimePool._observed_runtime_bytes(None, {}) is None
 
 
 def test_runtime_memory_enforcement_evicts_only_idle_unpinned_instances(
@@ -1518,7 +1446,7 @@ def test_runtime_memory_enforcement_evicts_only_idle_unpinned_instances(
         catalog = ModelCatalog([tmp_path], cache_seconds=0)
         older_artifact = await catalog.resolve("older")
         newer_artifact = await catalog.resolve("newer")
-        older = _ManagedRuntime(
+        older = _Runtime(
             id=uuid4(),
             artifact=older_artifact,
             process=SimpleNamespace(returncode=None),
@@ -1529,7 +1457,7 @@ def test_runtime_memory_enforcement_evicts_only_idle_unpinned_instances(
             resident_bytes=70,
             last_used_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
         )
-        newer = _ManagedRuntime(
+        newer = _Runtime(
             id=uuid4(),
             artifact=newer_artifact,
             process=SimpleNamespace(returncode=None),
@@ -1540,7 +1468,7 @@ def test_runtime_memory_enforcement_evicts_only_idle_unpinned_instances(
             resident_bytes=70,
             last_used_at=datetime(2026, 1, 2, tzinfo=timezone.utc),
         )
-        pool = ManagedRuntimePool(
+        pool = RuntimePool(
             catalog,
             tmp_path / "runtime",
             max_instances=2,
@@ -1583,7 +1511,7 @@ def test_runtime_memory_enforcement_rechecks_when_a_busy_runtime_drains(
         _model(tmp_path / "busy.mfq")
         catalog = ModelCatalog([tmp_path], cache_seconds=0)
         artifact = await catalog.resolve("busy")
-        instance = _ManagedRuntime(
+        instance = _Runtime(
             id=uuid4(),
             artifact=artifact,
             process=SimpleNamespace(returncode=None),
@@ -1594,7 +1522,7 @@ def test_runtime_memory_enforcement_rechecks_when_a_busy_runtime_drains(
             resident_bytes=101,
             request_slots=asyncio.Semaphore(1),
         )
-        pool = ManagedRuntimePool(
+        pool = RuntimePool(
             catalog,
             tmp_path / "runtime",
             max_runtime_memory_bytes=100,
@@ -1603,11 +1531,11 @@ def test_runtime_memory_enforcement_rechecks_when_a_busy_runtime_drains(
         pool._instances[instance.id] = instance
         stopped = asyncio.Event()
 
-        async def stop_process(victim: _ManagedRuntime) -> None:
+        async def stop_process(victim: _Runtime) -> None:
             assert victim is instance
             stopped.set()
 
-        async def refresh_usage(_instance: _ManagedRuntime) -> None:
+        async def refresh_usage(_instance: _Runtime) -> None:
             return None
 
         pool._stop_process = stop_process  # type: ignore[method-assign]
@@ -1653,7 +1581,7 @@ def test_runtime_control_lease_blocks_lru_eviction(tmp_path: Path) -> None:
         _model(tmp_path / "model.mfq")
         catalog = ModelCatalog([tmp_path], cache_seconds=0)
         artifact = await catalog.resolve("model")
-        instance = _ManagedRuntime(
+        instance = _Runtime(
             id=uuid4(),
             artifact=artifact,
             process=SimpleNamespace(returncode=None),
@@ -1663,7 +1591,7 @@ def test_runtime_control_lease_blocks_lru_eviction(tmp_path: Path) -> None:
             state=RuntimeInstanceState.READY,
             last_used_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
         )
-        pool = ManagedRuntimePool(catalog, tmp_path / "runtime", max_instances=1)
+        pool = RuntimePool(catalog, tmp_path / "runtime", max_instances=1)
         pool._instances[instance.id] = instance
         clearing = asyncio.create_task(pool.clear_runtime_cache(instance.id))
         await asyncio.wait_for(started.wait(), timeout=1)
@@ -1688,7 +1616,7 @@ def test_runtime_control_lease_release_survives_caller_cancellation(
         _model(tmp_path / "model.mfq")
         catalog = ModelCatalog([tmp_path], cache_seconds=0)
         artifact = await catalog.resolve("model")
-        instance = _ManagedRuntime(
+        instance = _Runtime(
             id=uuid4(),
             artifact=artifact,
             process=SimpleNamespace(returncode=None),
@@ -1698,7 +1626,7 @@ def test_runtime_control_lease_release_survives_caller_cancellation(
             state=RuntimeInstanceState.READY,
             control_leases=1,
         )
-        pool = ManagedRuntimePool(catalog, tmp_path / "runtime")
+        pool = RuntimePool(catalog, tmp_path / "runtime")
         pool._instances[instance.id] = instance
 
         await pool._lock.acquire()
@@ -1723,7 +1651,7 @@ def test_runtime_memory_enforcement_trims_idle_hot_tiers_before_models(
     async def run() -> None:
         class TrimBackend(IdleBackend):
             def __init__(self) -> None:
-                self.instance: _ManagedRuntime | None = None
+                self.instance: _Runtime | None = None
                 self.targets: list[int] = []
 
             async def trim_runtime_cache(self, target_bytes: int = 0) -> dict[str, object]:
@@ -1746,7 +1674,7 @@ def test_runtime_memory_enforcement_trims_idle_hot_tiers_before_models(
         catalog = ModelCatalog([tmp_path], cache_seconds=0)
         older_backend = TrimBackend()
         newer_backend = TrimBackend()
-        older = _ManagedRuntime(
+        older = _Runtime(
             id=uuid4(),
             artifact=await catalog.resolve("older"),
             process=SimpleNamespace(returncode=None),
@@ -1758,7 +1686,7 @@ def test_runtime_memory_enforcement_trims_idle_hot_tiers_before_models(
             kv_bytes=30,
             last_used_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
         )
-        newer = _ManagedRuntime(
+        newer = _Runtime(
             id=uuid4(),
             artifact=await catalog.resolve("newer"),
             process=SimpleNamespace(returncode=None),
@@ -1772,7 +1700,7 @@ def test_runtime_memory_enforcement_trims_idle_hot_tiers_before_models(
         )
         older_backend.instance = older
         newer_backend.instance = newer
-        pool = ManagedRuntimePool(
+        pool = RuntimePool(
             catalog,
             tmp_path / "runtime",
             max_instances=2,
@@ -1850,7 +1778,7 @@ def test_runtime_controls_target_the_requested_model_instance(tmp_path: Path) ->
         second_artifact = await catalog.resolve("second")
         first_backend = ControlBackend("first")
         second_backend = ControlBackend("second")
-        first = _ManagedRuntime(
+        first = _Runtime(
             id=uuid4(),
             artifact=first_artifact,
             process=SimpleNamespace(returncode=None),
@@ -1859,7 +1787,7 @@ def test_runtime_controls_target_the_requested_model_instance(tmp_path: Path) ->
             context_size=4096,
             state=RuntimeInstanceState.READY,
         )
-        second = _ManagedRuntime(
+        second = _Runtime(
             id=uuid4(),
             artifact=second_artifact,
             process=SimpleNamespace(returncode=None),
@@ -1868,7 +1796,7 @@ def test_runtime_controls_target_the_requested_model_instance(tmp_path: Path) ->
             context_size=4096,
             state=RuntimeInstanceState.READY,
         )
-        pool = ManagedRuntimePool(catalog, tmp_path / "runtime", max_instances=2)
+        pool = RuntimePool(catalog, tmp_path / "runtime", max_instances=2)
         pool._instances = {first.id: first, second.id: second}
         pool._last_instance_id = first.id
         service = ServerService(
@@ -1942,7 +1870,7 @@ def test_unexpected_runtime_exit_is_contained_until_explicit_retry(
         catalog = ModelCatalog([tmp_path], cache_seconds=0)
         artifact = await catalog.resolve("unstable")
         backend = ClosedBackend()
-        instance = _ManagedRuntime(
+        instance = _Runtime(
             id=uuid4(),
             artifact=artifact,
             process=ExitedProcess(),  # type: ignore[arg-type]
@@ -1951,7 +1879,7 @@ def test_unexpected_runtime_exit_is_contained_until_explicit_retry(
             context_size=4096,
             state=RuntimeInstanceState.READY,
         )
-        pool = ManagedRuntimePool(
+        pool = RuntimePool(
             catalog,
             tmp_path / "runtime",
             load_failure_cooldown_seconds=60,
@@ -1986,7 +1914,7 @@ def test_request_driven_load_waiters_receive_the_same_startup_error(
             encoding="utf-8",
         )
         executable.chmod(executable.stat().st_mode | stat.S_IXUSR)
-        pool = ManagedRuntimePool(
+        pool = RuntimePool(
             ModelCatalog([model_dir], cache_seconds=0),
             executable,
             startup_timeout_seconds=5,
@@ -2048,7 +1976,7 @@ def test_request_driven_model_loads_coalesce_and_restore_exact_settings(
         executable = tmp_path / "fake-runtime"
         _fake_runtime(executable)
         catalog = ModelCatalog([model_dir], cache_seconds=0)
-        pool = ManagedRuntimePool(
+        pool = RuntimePool(
             catalog,
             executable,
             startup_timeout_seconds=5,
@@ -2116,7 +2044,7 @@ def test_named_load_replaces_an_idle_stale_artifact_revision(
         _model(model, architecture="qwen35")
         executable = tmp_path / "fake-runtime"
         _fake_runtime(executable)
-        pool = ManagedRuntimePool(
+        pool = RuntimePool(
             ModelCatalog([model_dir], cache_seconds=0),
             executable,
             startup_timeout_seconds=5,
@@ -2174,7 +2102,7 @@ def test_runtime_pool_evicts_idle_lru_but_preserves_pinned_models(
         executable = tmp_path / "fake-runtime"
         _fake_runtime(executable)
         catalog = ModelCatalog([model_dir], cache_seconds=0)
-        pool = ManagedRuntimePool(
+        pool = RuntimePool(
             catalog,
             executable,
             startup_timeout_seconds=5,
@@ -2226,7 +2154,7 @@ def test_runtime_memory_budget_evicts_idle_models_and_respects_pins(
         catalog = ModelCatalog([root], cache_seconds=0)
         artifacts = (await catalog.list()).data
         budget = max(item.total_bytes for item in artifacts)
-        pool = ManagedRuntimePool(
+        pool = RuntimePool(
             catalog,
             executable,
             startup_timeout_seconds=5,
@@ -2278,7 +2206,7 @@ def test_failed_load_admission_does_not_partially_retire_lru_models(
         pinned_artifact = await catalog.resolve("pinned")
         incoming_artifact = await catalog.resolve("incoming")
         unit = incoming_artifact.resource.total_bytes
-        idle = _ManagedRuntime(
+        idle = _Runtime(
             id=uuid4(),
             artifact=idle_artifact,
             process=SimpleNamespace(returncode=None),
@@ -2289,7 +2217,7 @@ def test_failed_load_admission_does_not_partially_retire_lru_models(
             resident_bytes=unit,
             last_used_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
         )
-        pinned = _ManagedRuntime(
+        pinned = _Runtime(
             id=uuid4(),
             artifact=pinned_artifact,
             process=SimpleNamespace(returncode=None),
@@ -2301,7 +2229,7 @@ def test_failed_load_admission_does_not_partially_retire_lru_models(
             last_used_at=datetime(2026, 1, 2, tzinfo=timezone.utc),
             pinned=True,
         )
-        pool = ManagedRuntimePool(
+        pool = RuntimePool(
             catalog,
             tmp_path / "runtime",
             max_instances=3,
@@ -2333,7 +2261,7 @@ def test_runtime_pool_unloads_an_idle_ttl_model(tmp_path: Path) -> None:
         executable = tmp_path / "fake-runtime"
         _fake_runtime(executable)
         catalog = ModelCatalog([model_dir], cache_seconds=0)
-        pool = ManagedRuntimePool(
+        pool = RuntimePool(
             catalog,
             executable,
             startup_timeout_seconds=5,
@@ -2370,7 +2298,7 @@ def test_runtime_pool_close_waits_for_an_inflight_idle_unload(tmp_path: Path) ->
         executable = tmp_path / "fake-runtime"
         _fake_runtime(executable)
         catalog = ModelCatalog([model_dir], cache_seconds=0)
-        pool = ManagedRuntimePool(
+        pool = RuntimePool(
             catalog,
             executable,
             startup_timeout_seconds=5,
@@ -2439,7 +2367,7 @@ def test_runtime_stop_closes_backend_after_process_control_failure(
                 raise RuntimeError("terminate failed")
 
         backend = ClosingBackend()
-        instance = _ManagedRuntime(
+        instance = _Runtime(
             id=uuid4(),
             artifact=artifact,
             process=BrokenProcess(),  # type: ignore[arg-type]
@@ -2447,7 +2375,7 @@ def test_runtime_stop_closes_backend_after_process_control_failure(
             port=0,
             context_size=4096,
         )
-        pool = ManagedRuntimePool(catalog, tmp_path / "runtime")
+        pool = RuntimePool(catalog, tmp_path / "runtime")
         with pytest.raises(RuntimeError, match="terminate failed"):
             await pool._stop_process(instance)
         assert backend.closed
@@ -2485,7 +2413,7 @@ def test_runtime_stop_uses_kill_after_terminate_failure(tmp_path: Path) -> None:
 
         process = RecoverableProcess()
         backend = ClosingBackend()
-        instance = _ManagedRuntime(
+        instance = _Runtime(
             id=uuid4(),
             artifact=artifact,
             process=process,  # type: ignore[arg-type]
@@ -2493,7 +2421,7 @@ def test_runtime_stop_uses_kill_after_terminate_failure(tmp_path: Path) -> None:
             port=0,
             context_size=4096,
         )
-        pool = ManagedRuntimePool(
+        pool = RuntimePool(
             ModelCatalog([tmp_path], cache_seconds=0),
             tmp_path / "runtime",
         )
@@ -2514,7 +2442,7 @@ def test_runtime_retirement_retries_a_failed_process_automatically(
         _model(tmp_path / "model.mfq")
         catalog = ModelCatalog([tmp_path], cache_seconds=0)
         artifact = await catalog.resolve("model")
-        instance = _ManagedRuntime(
+        instance = _Runtime(
             id=uuid4(),
             artifact=artifact,
             process=SimpleNamespace(returncode=None),
@@ -2524,14 +2452,14 @@ def test_runtime_retirement_retries_a_failed_process_automatically(
             state=RuntimeInstanceState.READY,
             resident_bytes=123,
         )
-        pool = ManagedRuntimePool(catalog, tmp_path / "runtime")
+        pool = RuntimePool(catalog, tmp_path / "runtime")
         pool._instances[instance.id] = instance
         session_id = uuid4()
         pool._session_routes[session_id] = instance.id
         pool._last_instance_id = instance.id
         attempts = 0
 
-        async def stop_process(candidate: _ManagedRuntime) -> None:
+        async def stop_process(candidate: _Runtime) -> None:
             nonlocal attempts
             assert candidate is instance
             attempts += 1
@@ -2585,12 +2513,12 @@ def test_runtime_pool_close_attempts_every_instance_before_reporting_error(
                 self.closed = True
 
         fallback = ClosingBackend()
-        pool = ManagedRuntimePool(
+        pool = RuntimePool(
             catalog,
             tmp_path / "runtime",
             fallback=fallback,
         )
-        first = _ManagedRuntime(
+        first = _Runtime(
             id=uuid4(),
             artifact=first_artifact,
             process=SimpleNamespace(returncode=0),
@@ -2598,7 +2526,7 @@ def test_runtime_pool_close_attempts_every_instance_before_reporting_error(
             port=0,
             context_size=4096,
         )
-        second = _ManagedRuntime(
+        second = _Runtime(
             id=uuid4(),
             artifact=second_artifact,
             process=SimpleNamespace(returncode=0),
@@ -2609,7 +2537,7 @@ def test_runtime_pool_close_attempts_every_instance_before_reporting_error(
         pool._instances = {first.id: first, second.id: second}
         attempts = []
 
-        async def stop(instance: _ManagedRuntime) -> None:
+        async def stop(instance: _Runtime) -> None:
             attempts.append(instance.id)
             if instance is first:
                 raise RuntimeError("first stop failed")
@@ -2633,9 +2561,9 @@ def test_runtime_pool_close_retires_instances_concurrently(tmp_path: Path) -> No
             await catalog.resolve("first"),
             await catalog.resolve("second"),
         ]
-        pool = ManagedRuntimePool(catalog, tmp_path / "runtime")
+        pool = RuntimePool(catalog, tmp_path / "runtime")
         instances = [
-            _ManagedRuntime(
+            _Runtime(
                 id=uuid4(),
                 artifact=artifact,
                 process=SimpleNamespace(returncode=0),
@@ -2649,7 +2577,7 @@ def test_runtime_pool_close_retires_instances_concurrently(tmp_path: Path) -> No
         both_started = asyncio.Event()
         started: set[UUID] = set()
 
-        async def stop(instance: _ManagedRuntime) -> None:
+        async def stop(instance: _Runtime) -> None:
             started.add(instance.id)
             if len(started) == len(instances):
                 both_started.set()
@@ -2674,7 +2602,7 @@ def test_started_runtime_is_registered_in_the_instances_api(tmp_path: Path) -> N
             [sys.executable, "-c", "import time; time.sleep(60)"],
             stdin=subprocess.DEVNULL,
         )
-        pool = ManagedRuntimePool(catalog, tmp_path / "runtime", max_instances=1)
+        pool = RuntimePool(catalog, tmp_path / "runtime", max_instances=1)
         instance_id = pool.register_started(
             artifact=artifact,
             process=process,
@@ -2739,7 +2667,7 @@ def test_runtime_models_uses_catalog_name_when_no_alias_is_configured(tmp_path: 
             [sys.executable, "-c", "import time; time.sleep(60)"],
             stdin=subprocess.DEVNULL,
         )
-        pool = ManagedRuntimePool(catalog, tmp_path / "runtime", max_instances=1)
+        pool = RuntimePool(catalog, tmp_path / "runtime", max_instances=1)
         instance_id = pool.register_started(
             artifact=artifact,
             process=process,
@@ -2795,7 +2723,7 @@ def test_started_runtime_monitor_reports_abnormal_exit(tmp_path: Path) -> None:
             ],
             stdin=subprocess.DEVNULL,
         )
-        pool = ManagedRuntimePool(catalog, tmp_path / "runtime", max_instances=1)
+        pool = RuntimePool(catalog, tmp_path / "runtime", max_instances=1)
         instance_id = pool.register_started(
             artifact=artifact,
             process=process,
@@ -2849,9 +2777,9 @@ def test_runtime_selection_does_not_route_a_session_to_the_wrong_model(
         catalog = ModelCatalog([tmp_path], cache_seconds=0)
         first_artifact = await catalog.resolve_path(first_path)
         second_artifact = await catalog.resolve_path(second_path)
-        pool = ManagedRuntimePool(catalog, tmp_path / "runtime", max_instances=2)
+        pool = RuntimePool(catalog, tmp_path / "runtime", max_instances=2)
         first_backend = TrackingBackend()
-        first = _ManagedRuntime(
+        first = _Runtime(
             id=uuid4(),
             artifact=first_artifact,
             process=SimpleNamespace(returncode=None),
@@ -2861,7 +2789,7 @@ def test_runtime_selection_does_not_route_a_session_to_the_wrong_model(
             state=RuntimeInstanceState.READY,
             request_slots=asyncio.Semaphore(1),
         )
-        second = _ManagedRuntime(
+        second = _Runtime(
             id=uuid4(),
             artifact=second_artifact,
             process=SimpleNamespace(returncode=None),
@@ -2902,8 +2830,8 @@ def test_artifact_id_request_waits_on_the_canonical_model_load(
         _model(model_path)
         catalog = ModelCatalog([tmp_path], cache_seconds=0)
         artifact = await catalog.resolve_path(model_path)
-        pool = ManagedRuntimePool(catalog, tmp_path / "runtime")
-        instance = _ManagedRuntime(
+        pool = RuntimePool(catalog, tmp_path / "runtime")
+        instance = _Runtime(
             id=uuid4(),
             artifact=artifact,
             process=SimpleNamespace(returncode=None),
@@ -2945,7 +2873,7 @@ def test_runtime_preflight_rejects_an_exited_worker_before_streaming(
         _model(model_path)
         catalog = ModelCatalog([tmp_path], cache_seconds=0)
         artifact = await catalog.resolve_path(model_path)
-        instance = _ManagedRuntime(
+        instance = _Runtime(
             id=uuid4(),
             artifact=artifact,
             process=SimpleNamespace(returncode=9),
@@ -2955,7 +2883,7 @@ def test_runtime_preflight_rejects_an_exited_worker_before_streaming(
             state=RuntimeInstanceState.READY,
             request_slots=asyncio.Semaphore(1),
         )
-        pool = ManagedRuntimePool(catalog, tmp_path / "runtime")
+        pool = RuntimePool(catalog, tmp_path / "runtime")
         pool._instances[instance.id] = instance
 
         with pytest.raises(BackendError) as unavailable:
@@ -2988,7 +2916,7 @@ def test_runtime_sampling_defaults_apply_only_to_omitted_request_fields(
         catalog = ModelCatalog([tmp_path], cache_seconds=0)
         artifact = await catalog.resolve_path(model_path)
         backend = SamplingBackend()
-        instance = _ManagedRuntime(
+        instance = _Runtime(
             id=uuid4(),
             artifact=artifact,
             process=SimpleNamespace(returncode=None),
@@ -2999,7 +2927,7 @@ def test_runtime_sampling_defaults_apply_only_to_omitted_request_fields(
             state=RuntimeInstanceState.READY,
             request_slots=asyncio.Semaphore(1),
         )
-        pool = ManagedRuntimePool(catalog, tmp_path / "runtime")
+        pool = RuntimePool(catalog, tmp_path / "runtime")
         pool._instances[instance.id] = instance
 
         async def consume(sampling: SamplingParams) -> None:
@@ -3029,7 +2957,7 @@ def test_request_driven_load_rejects_a_changed_artifact_behind_a_loaded_name(
         _model(model, architecture="qwen35")
         catalog = ModelCatalog([tmp_path], cache_seconds=0)
         original = await catalog.resolve((await catalog.list()).data[0].id)
-        instance = _ManagedRuntime(
+        instance = _Runtime(
             id=uuid4(),
             artifact=original,
             process=SimpleNamespace(returncode=None),
@@ -3039,7 +2967,7 @@ def test_request_driven_load_rejects_a_changed_artifact_behind_a_loaded_name(
             state=RuntimeInstanceState.READY,
             request_slots=asyncio.Semaphore(1),
         )
-        pool = ManagedRuntimePool(catalog, tmp_path / "runtime", max_instances=2)
+        pool = RuntimePool(catalog, tmp_path / "runtime", max_instances=2)
         pool._instances[instance.id] = instance
 
         _model(model, architecture="minicpmo45")
@@ -3078,7 +3006,7 @@ def test_managed_runtime_reports_and_bounds_queued_requests(tmp_path: Path) -> N
         catalog = ModelCatalog([tmp_path], cache_seconds=0)
         artifact = await catalog.resolve((await catalog.list()).data[0].id)
         blocking_backend = BlockingBackend()
-        instance = _ManagedRuntime(
+        instance = _Runtime(
             id=uuid4(),
             artifact=artifact,
             process=SimpleNamespace(returncode=None),
@@ -3088,7 +3016,7 @@ def test_managed_runtime_reports_and_bounds_queued_requests(tmp_path: Path) -> N
             state=RuntimeInstanceState.READY,
             request_slots=asyncio.Semaphore(1),
         )
-        pool = ManagedRuntimePool(
+        pool = RuntimePool(
             catalog,
             tmp_path / "runtime",
             max_queued_requests_per_instance=1,
@@ -3152,7 +3080,7 @@ def test_managed_runtime_closes_backend_stream_when_consumer_stops(
         catalog = ModelCatalog([tmp_path], cache_seconds=0)
         artifact = await catalog.resolve((await catalog.list()).data[0].id)
         backend = InterruptibleBackend()
-        instance = _ManagedRuntime(
+        instance = _Runtime(
             id=uuid4(),
             artifact=artifact,
             process=SimpleNamespace(returncode=None),
@@ -3162,7 +3090,7 @@ def test_managed_runtime_closes_backend_stream_when_consumer_stops(
             state=RuntimeInstanceState.READY,
             request_slots=asyncio.Semaphore(1),
         )
-        pool = ManagedRuntimePool(catalog, tmp_path / "runtime")
+        pool = RuntimePool(catalog, tmp_path / "runtime")
         pool._instances[instance.id] = instance
 
         stream = pool.stream(
@@ -3189,7 +3117,7 @@ def test_runtime_instance_policy_updates_without_reload(tmp_path: Path) -> None:
         _model(model)
         catalog = ModelCatalog([tmp_path], cache_seconds=0)
         artifact = await catalog.resolve((await catalog.list()).data[0].id)
-        instance = _ManagedRuntime(
+        instance = _Runtime(
             id=uuid4(),
             artifact=artifact,
             process=SimpleNamespace(returncode=None),
@@ -3200,7 +3128,7 @@ def test_runtime_instance_policy_updates_without_reload(tmp_path: Path) -> None:
             state=RuntimeInstanceState.READY,
             request_slots=asyncio.Semaphore(1),
         )
-        pool = ManagedRuntimePool(catalog, tmp_path / "runtime")
+        pool = RuntimePool(catalog, tmp_path / "runtime")
         pool._instances[instance.id] = instance
         pool._load_requests[artifact.resource.name] = ModelLoadRequest(
             model=artifact.resource.name,
@@ -3287,7 +3215,7 @@ def test_minicpmo_voice_component_activates_in_the_managed_runtime(
         monkeypatch.setattr(realtime, "RealtimeGateway", Gateway)
         monkeypatch.setattr(realtime, "_backend_token2wav_steps", lambda *_args: 10)
         backend = SimpleNamespace(base_url="http://127.0.0.1:43123")
-        instance = _ManagedRuntime(
+        instance = _Runtime(
             id=uuid4(),
             artifact=artifact,
             process=SimpleNamespace(returncode=None),
@@ -3296,7 +3224,7 @@ def test_minicpmo_voice_component_activates_in_the_managed_runtime(
             context_size=4096,
             state=RuntimeInstanceState.READY,
         )
-        pool = ManagedRuntimePool(
+        pool = RuntimePool(
             catalog,
             tmp_path / "runtime",
             voice_component=Component(),
@@ -3326,7 +3254,7 @@ def test_runtime_pool_drains_startup_background_tasks_on_close(
             def ready() -> bool:
                 return True
 
-        pool = ManagedRuntimePool(
+        pool = RuntimePool(
             ModelCatalog([tmp_path], cache_seconds=0),
             tmp_path / "runtime",
             voice_component=Component(),

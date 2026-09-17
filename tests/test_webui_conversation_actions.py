@@ -66,3 +66,10 @@ def test_generation_tracks_the_exact_target_message() -> None:
     assert "setLive(null)" in APP
     assert "setMessages(persisted)" in APP
     assert "messages.pop()" not in APP
+
+
+def test_runtime_controls_wait_until_the_runtime_is_ready() -> None:
+    assert 'const runtimeReady = isRuntimeReady(initialRuntime?.runtime_state);' in APP
+    assert 'if (isRuntimeReady(status?.runtime_state)) {' in APP
+    assert 'if (!instanceId || !isRuntimeReady(selectedRuntimeInstance?.state)) return;' in APP
+    assert APP.count('disabled={busy || instance.state !== "ready"}') == 2

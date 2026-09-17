@@ -2,9 +2,22 @@ from pathlib import Path
 import re
 
 
-SOURCE = (Path(__file__).parents[1] / "cpp_runtime" / "backends" / "cuda" / "apps" / "mfq_decode.cpp").read_text(
+CUDA_ROOT = Path(__file__).parents[1] / "cpp_runtime" / "backends" / "cuda"
+CUDA_RUNTIME = (CUDA_ROOT / "runtime" / "cuda_decode_runtime.cpp").read_text(
     encoding="utf-8"
 )
+BACKEND_CHECKS = (
+    CUDA_ROOT / "runtime" / "diagnostics" / "backend_checks.cpp"
+).read_text(encoding="utf-8")
+SOURCE = "\n".join(
+    (CUDA_ROOT / "runtime" / name).read_text(encoding="utf-8")
+    for name in (
+        "cuda_model.h",
+        "cuda_transformer.h",
+        "cuda_execution.h",
+        "cuda_execution.cpp",
+    )
+) + "\n" + BACKEND_CHECKS + "\n" + CUDA_RUNTIME
 ATTENTION_SOURCE = (
     Path(__file__).parents[1] / "mfq" / "kernels" / "cuda" / "attention.cu"
 ).read_text(encoding="utf-8")
@@ -64,7 +77,7 @@ def test_minicpmo_persistent_decode_workspaces_are_warmed_before_capture() -> No
 
 
 def test_graph_stage_events_start_after_decode_workspace_warmup() -> None:
-    graph_path = SOURCE.rsplit(
+    graph_path = CUDA_RUNTIME.rsplit(
         "MfqCudaGraph graph;", 1
     )[1].split(
         "graph.capture_end();", 1
@@ -79,7 +92,7 @@ def test_graph_stage_events_start_after_decode_workspace_warmup() -> None:
 
 
 def test_graph_profile_covers_model_and_commit_boundaries() -> None:
-    graph_path = SOURCE.rsplit(
+    graph_path = CUDA_RUNTIME.rsplit(
         "MfqCudaGraph graph;", 1
     )[1].split(
         "graph.capture_end();", 1
@@ -101,8 +114,8 @@ def test_torch_reference_graph_can_emit_a_debug_dump() -> None:
 def test_backend_bf16_add_check_covers_eager_and_graph_paths() -> None:
     assert "run_backend_bf16_add_check" in SOURCE
     assert 'a == "--check-backend-bf16-add"' in SOURCE
-    check = SOURCE.split("static int run_backend_bf16_add_check", 1)[1].split(
-        "static int64_t g_decode_graph_attention_parts", 1
+    check = BACKEND_CHECKS.split("int run_backend_bf16_add_check", 1)[1].split(
+        "int run_backend_argmax_check", 1
     )[0]
     assert "eager = (left + right).contiguous();" in check
     assert "graph.capture_begin();" in check
@@ -227,7 +240,7 @@ def test_minicpmo_bf16_residual_uses_contiguous_specialized_add() -> None:
 def test_cuda_profiler_filter_supports_low_perturbation_eager_attribution() -> None:
     assert 'std::getenv("MFQ_PROFILE_CUDA_FILTER")' in SOURCE
     assert "if (!enabled || !selected(name)) return fn();" in SOURCE
-    eager_path = SOURCE.rsplit("} else {", 1)[1].split(
+    eager_path = CUDA_RUNTIME.rsplit("} else {", 1)[1].split(
         "mfq_cuda_synchronize();", 1
     )[0]
     assert 'g_profiler.measure("decode.eager_model"' in eager_path

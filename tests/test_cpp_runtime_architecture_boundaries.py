@@ -51,9 +51,40 @@ CONTRIBUTING = (ROOT / "CONTRIBUTING.md").read_text(encoding="utf-8")
 CUDA_MTP_HEADER = (
     ROOT / "cpp_runtime" / "backends" / "cuda" / "include" / "mfq_cuda_mtp.h"
 ).read_text(encoding="utf-8")
-CUDA_DECODE = (
+CUDA_APP = (
     ROOT / "cpp_runtime" / "backends" / "cuda" / "apps" / "mfq_decode.cpp"
 ).read_text(encoding="utf-8")
+CUDA_MODELS = ROOT / "cpp_runtime" / "backends" / "cuda" / "models"
+CUDA_RUNTIME = ROOT / "cpp_runtime" / "backends" / "cuda" / "runtime"
+CUDA_RUNTIME_SOURCE = (CUDA_RUNTIME / "cuda_decode_runtime.cpp").read_text(
+    encoding="utf-8"
+)
+CUDA_MTP_SOURCE = (CUDA_RUNTIME / "mtp.cpp").read_text(encoding="utf-8")
+CUDA_DECODE = CUDA_APP + "\n" + CUDA_RUNTIME_SOURCE
+CUDA_BACKEND_SOURCE = "\n".join(
+    path.read_text(encoding="utf-8")
+    for path in (ROOT / "cpp_runtime" / "backends" / "cuda").rglob("*")
+    if path.suffix in {".h", ".cpp"}
+)
+CUDA_REGISTRY = (CUDA_MODELS / "registry.cpp").read_text(encoding="utf-8")
+CUDA_TRANSFORMER_LOADER = (
+    CUDA_RUNTIME / "cuda_transformer_loader.cpp"
+).read_text(encoding="utf-8")
+CUDA_TRANSFORMER_HEADER = (
+    CUDA_RUNTIME / "cuda_transformer.h"
+).read_text(encoding="utf-8")
+CUDA_QWEN_LINEAR = (
+    CUDA_MODELS / "qwen35" / "qwen35_linear_attention.h"
+).read_text(encoding="utf-8") + (\
+    CUDA_MODELS / "qwen35" / "qwen35_causal_lm.cpp"
+).read_text(encoding="utf-8")
+CUDA_RUNTIME_PARAMETERS = (CUDA_MODELS / "cuda_model_config.h").read_text(
+    encoding="utf-8"
+)
+CUDA_RUNTIME_PARAMETERS_SOURCE = "\n".join(
+    (CUDA_MODELS / name).read_text(encoding="utf-8")
+    for name in ("cuda_model_config.h", "cuda_model_config.cpp")
+)
 SPARSE_OPERATOR = (METAL / "ops" / "mlx_sparse_attention.cpp").read_text(
     encoding="utf-8"
 )
@@ -69,6 +100,20 @@ DECODE_APP = (METAL / "apps" / "mfq_decode_mlx.cpp").read_text(
     encoding="utf-8"
 )
 PLATFORM = (METAL / "runtime" / "mlx_platform.h").read_text(encoding="utf-8")
+CORE = ROOT / "cpp_runtime" / "core"
+MODEL_SOURCE_HEADER = (
+    CORE / "include" / "mfq" / "model_source.h"
+).read_text(encoding="utf-8")
+MFQ_SOURCE = (CORE / "mfq_model_source.cpp").read_text(encoding="utf-8")
+HF_SOURCE = (CORE / "hf_safetensors_source.cpp").read_text(encoding="utf-8")
+HF_MODEL_SOURCE = (CORE / "hf_model_source.cpp").read_text(encoding="utf-8")
+MODEL_SOURCE_FACTORY = (CORE / "model_source.cpp").read_text(encoding="utf-8")
+METAL_CONTAINER = (
+    METAL / "storage" / "mfq_container.cpp"
+).read_text(encoding="utf-8")
+CUDA_MFE_STORE = (
+    ROOT / "cpp_runtime" / "backends" / "cuda" / "storage" / "mfe_expert_store.cpp"
+).read_text(encoding="utf-8")
 
 
 def model_sources() -> str:
@@ -77,6 +122,73 @@ def model_sources() -> str:
         for path in MODELS.rglob("*")
         if path.suffix in {".h", ".cpp"}
     )
+
+
+def test_model_sources_are_backend_neutral_and_shared() -> None:
+    assert "class ModelSource" in MODEL_SOURCE_HEADER
+    assert "class MfqModelSource final : public ModelSource" in (
+        CORE / "include" / "mfq" / "mfq_model_source.h"
+    ).read_text(encoding="utf-8")
+    assert "class HfSafetensorsSource final : public ModelSource" in (
+        CORE / "include" / "mfq" / "hf_safetensors_source.h"
+    ).read_text(encoding="utf-8")
+    assert "class HfModelSource final : public ModelSource" in (
+        CORE / "include" / "mfq" / "hf_model_source.h"
+    ).read_text(encoding="utf-8")
+    for source in (
+        MODEL_SOURCE_HEADER,
+        MFQ_SOURCE,
+        HF_SOURCE,
+        HF_MODEL_SOURCE,
+    ):
+        assert "backends/" not in source
+        assert "mlx::" not in source
+        assert "#include <cuda" not in source.lower()
+        assert "#include <metal" not in source.lower()
+    assert '#include "mfq/mfq_model_source.h"' not in CUDA_BACKEND_SOURCE
+    assert "HfModelSource" not in CUDA_BACKEND_SOURCE
+    assert '#include "mfq/mfq_model_source.h"' in MODEL_SOURCE_FACTORY
+    assert "HfModelSource" in MODEL_SOURCE_FACTORY
+    assert '#include "mfq/mfq_model_source.h"' in METAL_CONTAINER
+    assert "HfModelSource" in METAL_CONTAINER
+    assert "bad MFQ magic" not in CUDA_BACKEND_SOURCE
+    assert "MfqContainer::load_records" not in METAL_CONTAINER
+    assert "HfSafetensorStore" not in METAL_CONTAINER
+    assert "MXT1" not in METAL_CONTAINER
+    assert "struct MfqFile" not in CUDA_BACKEND_SOURCE
+    assert "open_model_source" in CUDA_BACKEND_SOURCE
+    assert "const mfq::ModelSource" in CUDA_BACKEND_SOURCE
+    assert "direct_source" not in CUDA_BACKEND_SOURCE
+    assert 'record.metadata.dtype = "FP8-128SQ"' in HF_MODEL_SOURCE
+    assert "record_.read_range(offset, destination)" in CUDA_MFE_STORE
+
+
+def test_native_cli_uses_backend_neutral_model_and_tokenizer_options() -> None:
+    sources = (
+        CUDA_DECODE,
+        DECODE_APP,
+        (METAL / "apps" / "mfq_perplexity_mlx.cpp").read_text(encoding="utf-8"),
+    )
+    for source in sources:
+        assert '"--model"' in source
+        assert '"--tokenizer"' in source
+        assert '"--mfq"' not in source
+        assert '"--tokenizer-model"' not in source
+        assert '"--tokenizer-gguf"' not in source
+
+
+def test_cuda_cli_is_a_thin_client_of_the_runtime_library() -> None:
+    assert "mfq::cuda::run_decode(argc, argv)" in CUDA_APP
+    assert len(CUDA_APP.splitlines()) <= 10
+    assert "struct Model" not in CUDA_APP
+    assert "run_linear_check" not in CUDA_APP
+
+    cmake = (ROOT / "cpp_runtime" / "cmake" / "CudaRuntime.cmake").read_text(
+        encoding="utf-8"
+    )
+    assert "add_library(mfq-cuda-runtime STATIC" in cmake
+    assert "runtime/cuda_decode_runtime.cpp" in cmake
+    assert "target_link_libraries(mfq-decode PRIVATE mfq-cuda-runtime)" in cmake
 
 
 def test_development_rules_forbid_architecture_bound_reuse() -> None:
@@ -254,10 +366,147 @@ def test_server_exposes_predictors_by_role_not_architecture_name() -> None:
     ) is None
 
 
+def test_cuda_config_loading_lives_with_each_model() -> None:
+    models = {
+        "minicpmo45": "minicpmo45_model",
+        "flash_next": "flash_next_model",
+        "deepseek_v41": "deepseek_v41_model",
+        "qwen35": "qwen35_model",
+        "glm_dsa": "glm_dsa_model",
+        "gemma4": "gemma4_model",
+        "deepseek_v4": "deepseek_v4_model",
+    }
+
+    assert (CUDA_MODELS / "config.h").is_file()
+    assert not (CUDA_MODELS / "config_json.h").exists()
+    assert not list(CUDA_MODELS.rglob("config_loader.h"))
+    assert not (CUDA_RUNTIME / "model_config.h").exists()
+    assert "struct CudaRuntimeParameters" in CUDA_RUNTIME_PARAMETERS
+    assert "struct ModelStructure" not in CUDA_RUNTIME_PARAMETERS_SOURCE
+    assert "architecture_config" not in CUDA_RUNTIME_PARAMETERS
+    assert "#include <any>" not in CUDA_RUNTIME_PARAMETERS
+    assert "resolved_config_json" in CUDA_RUNTIME_PARAMETERS
+    assert "resolved_config_json" in CUDA_REGISTRY
+    assert "flash_next::" not in CUDA_RUNTIME_PARAMETERS
+    assert "deepseek_v41::" not in CUDA_RUNTIME_PARAMETERS
+    qwen_config = (CUDA_MODELS / "qwen35" / "qwen35_model.h").read_text(
+        encoding="utf-8"
+    )
+    for field in (
+        "attention_output_gate",
+        "mtp_use_dedicated_embeddings",
+        "linear_conv_kernel_dim",
+        "linear_key_head_dim",
+        "linear_value_head_dim",
+        "linear_num_key_heads",
+        "linear_num_value_heads",
+        "mrope_sections",
+        "mrope_interleaved",
+        "grid_vision",
+        "image_token_id",
+        "video_token_id",
+    ):
+        assert field in qwen_config
+        assert field not in CUDA_RUNTIME_PARAMETERS
+    assert '"hidden_size"' not in CUDA_REGISTRY
+    assert "nlohmann::json::parse" not in CUDA_REGISTRY
+    assert "Config::from_json" not in CUDA_REGISTRY
+    for namespace, stem in models.items():
+        model_dir = CUDA_MODELS / namespace
+        header = model_dir / f"{stem}.h"
+        source = model_dir / f"{stem}.cpp"
+        assert header.is_file()
+        assert source.is_file()
+        assert f"{namespace}::load_runtime_parameters" in CUDA_REGISTRY
+        header_source = header.read_text(encoding="utf-8")
+        assert "CudaRuntimeParameters load_runtime_parameters(" in header_source
+        assert "const mfq::ModelSource& source" in header_source
+        assert "CudaRuntimeParameters load_runtime_parameters(" in source.read_text(encoding="utf-8")
+
+
+def test_cuda_model_runtime_uses_compiled_causal_lm_adapters() -> None:
+    cmake = (ROOT / "cpp_runtime" / "cmake" / "CudaRuntime.cmake").read_text(
+        encoding="utf-8"
+    )
+    adapters = {
+        "flash_next": "qwen4_causal_lm",
+        "deepseek_v41": "deepseek_v41_causal_lm",
+        "deepseek_v4": "deepseek_v4_causal_lm",
+        "glm_dsa": "glm_dsa_causal_lm",
+        "gemma4": "gemma4_causal_lm",
+        "qwen35": "qwen35_causal_lm",
+    }
+
+    assert not list(CUDA_MODELS.rglob("construction.h"))
+    assert not list(CUDA_MODELS.rglob("model_loader.h"))
+    assert not list((ROOT / "cpp_runtime" / "backends" / "cuda").rglob("*.inc"))
+    for namespace, stem in adapters.items():
+        model_dir = CUDA_MODELS / namespace
+        header = model_dir / f"{stem}.h"
+        source = model_dir / f"{stem}.cpp"
+        assert header.is_file()
+        assert source.is_file()
+        assert f'models/{namespace}/{stem}.cpp' in cmake
+        assert f'#include "{stem}.h"' in source.read_text(encoding="utf-8")
+        assert not stem.startswith("cuda_")
+
+    for concrete_definition in (
+        "struct Glm5NextBlock",
+        "struct Qwen4Block",
+        "struct Dsv4Block",
+        "struct GlmDsaBlock",
+        "struct QuantLinear",
+        "class MoeExpertCache",
+    ):
+        assert concrete_definition not in CUDA_RUNTIME_SOURCE
+    assert "std::make_unique<FullBlock>" in CUDA_TRANSFORMER_LOADER
+    assert "std::make_unique<LinearAttentionBlock>" in CUDA_QWEN_LINEAR
+    assert 'type == "linear_attention"' not in CUDA_TRANSFORMER_LOADER
+    assert len(CUDA_RUNTIME_SOURCE.splitlines()) < 12_000
+
+
+def test_cuda_ops_and_execution_are_real_compilation_units() -> None:
+    cuda = ROOT / "cpp_runtime" / "backends" / "cuda"
+    cmake = (ROOT / "cpp_runtime" / "cmake" / "CudaRuntime.cmake").read_text(
+        encoding="utf-8"
+    )
+    required = (
+        "ops/cuda_quantized_ops.cpp",
+        "runtime/cuda_execution.cpp",
+        "runtime/cuda_model.cpp",
+        "runtime/cuda_model_loader.cpp",
+        "runtime/cuda_transformer.cpp",
+        "runtime/cuda_transformer_loader.cpp",
+        "runtime/mtp.cpp",
+        "runtime/server_components.cpp",
+        "runtime/diagnostics/backend_checks.cpp",
+        "runtime/diagnostics/model_checks.cpp",
+    )
+    for relative in required:
+        assert (cuda / relative).is_file()
+        assert relative in cmake
+    assert "struct QuantLinear" in (
+        cuda / "ops" / "cuda_quantized_ops.h"
+    ).read_text(encoding="utf-8")
+    assert "struct QuantLinear" not in CUDA_RUNTIME_SOURCE
+    assert '#include "cuda_quantized_ops.cpp"' not in CUDA_BACKEND_SOURCE
+    assert not re.search(r'#include\s+["<][^">]+\.inc[">]', CUDA_BACKEND_SOURCE)
+
+
+def test_cuda_qwen_speculation_is_model_owned() -> None:
+    assert "struct LinearAttentionBlock final" in CUDA_QWEN_LINEAR
+    assert "LinearAttentionBlock::rollback_speculative" in CUDA_QWEN_LINEAR
+    assert "replay_recurrent_cuda(" in CUDA_QWEN_LINEAR
+    assert "forward_speculative(" not in CUDA_TRANSFORMER_HEADER
+    assert "struct LinearBlock" not in CUDA_TRANSFORMER_HEADER
+    assert "MFQ_QWEN_MTP_BATCH" not in CUDA_TRANSFORMER_HEADER
+    assert "for (int accepted_drafts : {0, 1, 2})" in CUDA_RUNTIME_SOURCE
+
+
 def test_cuda_mtp_generation_loop_is_architecture_independent_and_reversible() -> None:
-    begin = CUDA_DECODE.index("static int32_t generate_mtp_tokens(")
-    end = CUDA_DECODE.index("\nstatic int32_t generate_server_tokens(", begin)
-    generation = CUDA_DECODE[begin:end]
+    generation = CUDA_MTP_SOURCE
+    assert "run_cuda_mtp_generation(" in generation
+    assert "int32_t run_cuda_mtp_generation(" not in CUDA_RUNTIME_SOURCE
     for architecture_name in (
         "Qwen",
         "DeepSeek",
@@ -271,6 +520,9 @@ def test_cuda_mtp_generation_loop_is_architecture_independent_and_reversible() -
     assert "exit_streak" not in CUDA_MTP_HEADER
     assert "DepthController depth_controller" in generation
     assert "bounded_depth(depth_controller.depth())" in generation
+    assert "retains_partial_target_prefix()" in generation
+    assert "CompactDistribution" in generation
+    assert "mfq_tensor_backend::topk(" in generation
 
 
 def test_generic_generation_and_sequence_cache_helpers_are_not_redeclared() -> None:

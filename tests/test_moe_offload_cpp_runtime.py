@@ -354,7 +354,7 @@ def _run_check(
     executable = _executable()
     command = [
         str(executable),
-        "--mfq",
+        "--model",
         str(model),
         "--check-mfe-tensor",
         "experts.weight",
@@ -402,7 +402,7 @@ def _run_profile_check(
     completed = subprocess.run(
         [
             str(executable),
-            "--mfq",
+            "--model",
             str(model),
             "--check-mfe-tensor",
             "experts.weight",
@@ -449,7 +449,7 @@ def _run_gemma_overlap_check(
     completed = subprocess.run(
         [
             str(executable),
-            "--mfq",
+            "--model",
             str(model),
             "--config",
             str(config),
@@ -624,7 +624,7 @@ def test_generic_cache_rejects_legacy_layer_offload(
     completed = subprocess.run(
         [
             str(executable),
-            "--mfq",
+            "--model",
             str(model),
             "--check-mfe-tensor",
             "experts.weight",
@@ -699,7 +699,7 @@ def test_profile_requires_gpu_cache(tmp_path: Path) -> None:
     completed = subprocess.run(
         [
             str(executable),
-            "--mfq",
+            "--model",
             str(model),
             "--check-mfe-tensor",
             "experts.weight",

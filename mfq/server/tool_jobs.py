@@ -709,7 +709,7 @@ class ToolJobHandlers:
         runtime = self._required_executable(self.paths.runtime, "MFQ runtime")
         output = await self._run(
             context,
-            [str(runtime), "--mfq", str(artifact.path), "--check-mfq-container"],
+            [str(runtime), "--model", str(artifact.path), "--check-mfq-container"],
         )
         with suppress(ValueError, StorageError):
             await context.validate_artifact(self._artifact_uri(artifact.path))
@@ -726,7 +726,7 @@ class ToolJobHandlers:
         dataset = self._input(request.dataset_file)
         argv = [
             str(executable),
-            "--mfq",
+            "--model",
             str(artifact.path),
             "--file",
             str(dataset),
@@ -839,7 +839,7 @@ class ToolJobHandlers:
         runtime = self._required_executable(self.paths.runtime, "MFQ runtime")
         argv = [
             str(runtime),
-            "--mfq",
+            "--model",
             str(artifact.path),
             "--tensor",
             request.tensor,

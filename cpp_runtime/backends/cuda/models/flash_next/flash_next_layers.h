@@ -8,22 +8,22 @@ using Tensor = tb::Tensor;
 using Linear = mfq::flash_next::Linear;
 using Routed = std::function<Tensor(const Tensor&, const Tensor&)>;
 
-static Linear linear(const MfqFile& file, const std::string& name) {
+inline Linear linear(const mfq::ModelSource& file, const std::string& name) {
     auto weight=std::make_shared<QuantLinear>(load_quant_linear(file,name));
     return [weight](const Tensor& x) { return weight->forward(x); };
 }
 
-static Tensor dense(const MfqFile& file, const std::string& name) {
-    const auto& dtype=file.record(name).dtype;
+inline Tensor dense(const mfq::ModelSource& file, const std::string& name) {
+    const auto& dtype=require_tensor(file, name).dtype;
     MFQ_RUNTIME_CHECK(dtype=="F32" || dtype=="F16" || dtype=="BF16",
         "Flash-Next requires a dense parameter: ",name);
     auto value=load_dense_gpu(file,name);
     return value.to(dtype=="F16" ? tb::kFloat16 : dtype=="BF16" ? tb::kBFloat16 : tb::kFloat32);
 }
 
-static Routed routed(const MfqFile& file, const std::string& name, int layer,
+inline Routed routed(const mfq::ModelSource& file, const std::string& name, int layer,
     int64_t experts, int64_t output, int64_t input) {
-    const auto& dtype=file.record(name).dtype;
+    const auto& dtype=require_tensor(file, name).dtype;
     if (dtype=="F32" || dtype=="F16" || dtype=="BF16") {
         MFQ_RUNTIME_CHECK(!moe_parallel_config().enabled(),
             "expert parallelism requires packed routed tensors: ",name);
@@ -46,11 +46,11 @@ static Routed routed(const MfqFile& file, const std::string& name, int layer,
     };
 }
 
-static Routed routed_gate_up(const MfqFile& file, const std::string& mlp_prefix,
+inline Routed routed_gate_up(const mfq::ModelSource& file, const std::string& mlp_prefix,
     int layer, int64_t experts, int64_t width, int64_t input) {
     const auto base=mlp_prefix+".experts";
     const auto gate_name=base+".gate.weight",up_name=base+".up.weight";
-    const bool has_gate=file.has_record(gate_name),has_up=file.has_record(up_name);
+    const bool has_gate=has_tensor(file, gate_name),has_up=has_tensor(file, up_name);
     MFQ_RUNTIME_CHECK(has_gate==has_up,"incomplete routed Gate/Up pair under ",base);
     if (!has_gate) return routed(file,base+".gate_up.weight",layer,experts,2*width,input);
     auto gate=routed(file,gate_name,layer,experts,width,input);
@@ -60,7 +60,7 @@ static Routed routed_gate_up(const MfqFile& file, const std::string& mlp_prefix,
     };
 }
 
-static Linear headwise(Routed projection,int64_t heads,int64_t output) {
+inline Linear headwise(Routed projection,int64_t heads,int64_t output) {
     return [projection=std::move(projection),heads,output](const Tensor& x) {
         MFQ_RUNTIME_CHECK(x.dim()==4 && x.size(2)==heads,"Flash-Next head-wise projection shape mismatch");
         const auto b=x.size(0),t=x.size(1),rows=b*t*heads;
@@ -69,7 +69,7 @@ static Linear headwise(Routed projection,int64_t heads,int64_t output) {
     };
 }
 
-static Linear dense_ffn(const MfqFile& file,const std::string& p,double limit) {
+inline Linear dense_ffn(const mfq::ModelSource& file,const std::string& p,double limit) {
     auto gate=linear(file,p+".gate.weight"),up=linear(file,p+".up.weight"),down=linear(file,p+".down.weight");
     return [gate,up,down,limit](const Tensor& x) {
         auto g=tb::clamp_max(gate(x),limit),u=tb::clamp(up(x),-limit,limit);
@@ -77,7 +77,7 @@ static Linear dense_ffn(const MfqFile& file,const std::string& p,double limit) {
     };
 }
 
-static Linear glm_ffn(const MfqFile& file,const mfq::flash_next::GlmConfig& c,int i,const std::string& root="model") {
+inline Linear glm_ffn(const mfq::ModelSource& file,const mfq::flash_next::GlmConfig& c,int i,const std::string& root="model") {
     const auto p=root+".block."+std::to_string(i)+".mlp";
     if (root=="model" && c.mlp_types.at(i)=="dense") return dense_ffn(file,p,c.swiglu_limit);
     auto gate_up=routed_gate_up(file,p,i,c.experts,c.moe_intermediate,c.hidden);
@@ -104,7 +104,7 @@ struct Gr {
     Tensor norm,down,up,injection;
     int64_t hidden,streams;
     double eps;
-    Gr(const MfqFile& file,const mfq::flash_next::QwenConfig& c,const std::string& p,bool combine=true)
+    Gr(const mfq::ModelSource& file,const mfq::flash_next::QwenConfig& c,const std::string& p,bool combine=true)
         : norm(dense(file,p+".norm.weight").to(tb::kFloat32)),down(dense(file,p+".down.weight")),
           up(dense(file,p+".up.weight")),hidden(c.hidden),streams(c.streams),eps(c.eps) {
         if (combine) injection=dense(file,p.substr(0,p.size()-4)+".post.inject.weight");
@@ -118,7 +118,7 @@ struct Gr {
     }
 };
 
-static Linear qwen_ffn(const MfqFile& file,const mfq::flash_next::QwenConfig& c,int i,const std::string& root="model") {
+inline Linear qwen_ffn(const mfq::ModelSource& file,const mfq::flash_next::QwenConfig& c,int i,const std::string& root="model") {
     const auto p=root+".block."+std::to_string(i)+".mlp";
     auto gate_up=routed_gate_up(file,p,i,c.experts,c.moe_width,c.hidden);
     auto down=routed(file,p+".experts.down.weight",i,c.experts,c.hidden,c.moe_width);
@@ -140,15 +140,15 @@ static Linear qwen_ffn(const MfqFile& file,const mfq::flash_next::QwenConfig& c,
     };
 }
 
-static std::vector<int64_t> integers(const MfqFile& file,const std::string& name) {
-    const auto& type=file.record(name).dtype;
+inline std::vector<int64_t> integers(const mfq::ModelSource& file,const std::string& name) {
+    const auto& type=require_tensor(file, name).dtype;
     MFQ_RUNTIME_CHECK(type=="I64" || type=="I32","Qwen4 PLE metadata must be a dense integer array: ",name);
     auto host=load_dense_gpu(file,name).to(tb::kInt64).contiguous().cpu();
     MFQ_RUNTIME_CHECK(host.dim()==1,"Qwen4 PLE metadata must be a vector");
     return {host.data_ptr<int64_t>(),host.data_ptr<int64_t>()+host.numel()};
 }
 
-static std::unique_ptr<mfq::flash_next::Ple> qwen_ple(const MfqFile& file,const mfq::flash_next::QwenConfig& c,const std::string& p) {
+inline std::unique_ptr<mfq::flash_next::Ple> qwen_ple(const mfq::ModelSource& file,const mfq::flash_next::QwenConfig& c,const std::string& p) {
     std::vector<Linear> shards;
     int64_t rows=0,width=c.hidden/((c.ngram-1)*c.ngram_heads);
     for (int64_t i=0;i<c.shards;++i) {
@@ -170,7 +170,7 @@ static std::unique_ptr<mfq::flash_next::Ple> qwen_ple(const MfqFile& file,const 
 
 struct Mhc {
     Tensor function,base,scale;
-    explicit Mhc(const MfqFile& file,const std::string& p)
+    explicit Mhc(const mfq::ModelSource& file,const std::string& p)
         : function(dense(file,p+".function")),base(dense(file,p+".base")),scale(dense(file,p+".scale")) {}
     std::vector<Tensor> pre(const Tensor& x,const mfq::flash_next::GlmConfig& c) const {
         return mfq_flash_next::glm5_mhc_pre(x,function,base,scale,c.sinkhorn,c.hc_eps,c.eps);
@@ -187,7 +187,7 @@ struct Glm5NextBlock final : Block {
     std::unique_ptr<mfq::flash_next::Kda> kda;
     std::unique_ptr<mfq::flash_next::SparseMla> mla;
 
-    Glm5NextBlock(const MfqFile& file,const mfq::flash_next::GlmConfig& c,int i)
+    Glm5NextBlock(const mfq::ModelSource& file,const mfq::flash_next::GlmConfig& c,int i)
         : config(c),attention_hc(file,"model.block."+std::to_string(i)+".attention.mhc.pre"),
           ffn_hc(file,"model.block."+std::to_string(i)+".mlp.mhc.pre") {
         using namespace flash_runtime;
@@ -232,12 +232,12 @@ struct Glm5NextBlock final : Block {
         return mfq_flash_next::glm5_mhc_post(branch,hidden,second[0],second[1]);
     }
     Tensor forward(Tensor x,Tensor,int64_t position,const MfqOptional<Tensor>&,
-        const Config&,const RopeCache&,const MfqOptional<Tensor>& = mfq_nullopt,
+        const CudaRuntimeParameters&,const RopeCache&,const MfqOptional<Tensor>& = mfq_nullopt,
         const MfqOptional<Tensor>& mask = mfq_nullopt) override {
         MFQ_RUNTIME_CHECK(!mask.has_value(),"GLM Flash-Next requires its causal unpadded attention geometry");
         return execute(x,position);
     }
-    Tensor forward_context(Tensor x,const Context& context,const Config&,const RopeCache&) override {
+    Tensor forward_context(Tensor x,const Context& context,const CudaRuntimeParameters&,const RopeCache&) override {
         return execute(x,context.cache_position,context.confirmed_prefix);
     }
 };
@@ -250,7 +250,7 @@ struct Qwen4Block final : Block {
     std::unique_ptr<mfq::flash_next::Gdn> gdn;
     std::unique_ptr<mfq::flash_next::Qsa> qsa;
     std::unique_ptr<mfq::flash_next::Ple> ple;
-    Qwen4Block(const MfqFile& file,const mfq::flash_next::QwenConfig& c,int i,const std::string& root="model")
+    Qwen4Block(const mfq::ModelSource& file,const mfq::flash_next::QwenConfig& c,int i,const std::string& root="model")
         : config(c),attention_gr(file,c,root+".block."+std::to_string(i)+".attention.mhc.pre"),
           ffn_gr(file,c,root+".block."+std::to_string(i)+".mlp.mhc.pre"),ffn(flash_runtime::qwen_ffn(file,c,i,root)) {
         using namespace flash_runtime;
@@ -285,11 +285,11 @@ struct Qwen4Block final : Block {
         return ffn_gr.post(ffn(second[0]),second);
     }
     Tensor forward(Tensor,Tensor,int64_t,const MfqOptional<Tensor>&,
-        const Config&,const RopeCache&,const MfqOptional<Tensor>& = mfq_nullopt,
+        const CudaRuntimeParameters&,const RopeCache&,const MfqOptional<Tensor>& = mfq_nullopt,
         const MfqOptional<Tensor>& = mfq_nullopt) override {
         throw std::runtime_error("Qwen4 block requires the unified model position/PLE input lifecycle");
     }
-    Tensor forward_context(Tensor x,const Context& context,const Config&,const RopeCache&) override {
+    Tensor forward_context(Tensor x,const Context& context,const CudaRuntimeParameters&,const RopeCache&) override {
         return execute(std::move(x),context.token_ids,context.positions,
             context.full_positions,context.confirmed_prefix);
     }

@@ -3,6 +3,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <span>
 #include <stdexcept>
@@ -22,6 +23,7 @@ struct MfqRecordRange {
     std::string source_path;
     std::uint64_t offset = 0;
     std::uint64_t nbytes = 0;
+    std::function<void(std::uint64_t, std::span<std::uint8_t>)> read_range;
 };
 
 struct MfeMxfp4ExpertPart {

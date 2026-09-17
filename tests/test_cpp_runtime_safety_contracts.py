@@ -4,7 +4,16 @@ import ast
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-DECODE = (ROOT / "cpp_runtime" / "backends" / "cuda" / "apps" / "mfq_decode.cpp").read_text(
+CUDA_ROOT = ROOT / "cpp_runtime" / "backends" / "cuda"
+DECODE = "\n".join(
+    path.read_text(encoding="utf-8")
+    for path in sorted(CUDA_ROOT.rglob("*"))
+    if path.suffix in {".h", ".cpp"}
+)
+MODEL_LOADER = (CUDA_ROOT / "runtime" / "cuda_model_loader.cpp").read_text(
+    encoding="utf-8"
+)
+CUDA_RUNTIME = (CUDA_ROOT / "runtime" / "cuda_decode_runtime.cpp").read_text(
     encoding="utf-8"
 )
 SERVER = (ROOT / "cpp_runtime" / "server" / "src" / "server.cpp").read_text(
@@ -62,17 +71,11 @@ def test_moe_cache_capacity_failure_uses_full_projection_path() -> None:
 
 
 def test_optional_predictor_experts_join_the_shared_moe_cache() -> None:
-    load_model = DECODE[
-        DECODE.index("static Model load_model(") : DECODE.index(
-            '#include "deepseek_v41/deepseek_v41_dspark.inc"'
-        )
-    ]
-    main = DECODE[DECODE.index("int main(int argc, char ** argv)") :]
-    assert "bool defer_moe_cache_finalize = false" in load_model
-    assert "!defer_moe_cache_finalize" in load_model
-    assert "const bool load_optional_components" in main
-    assert main.index("load_cuda_runtime_components(") < main.index(
-        "g_moe_expert_cache->finalize();"
+    assert "bool defer_moe_cache_finalize = false" in DECODE
+    assert "!defer_moe_cache_finalize" in MODEL_LOADER
+    assert "const bool load_optional_components" in CUDA_RUNTIME
+    assert CUDA_RUNTIME.index("load_cuda_runtime_components(") < CUDA_RUNTIME.index(
+        "finalize_moe_expert_cache();"
     )
 
 

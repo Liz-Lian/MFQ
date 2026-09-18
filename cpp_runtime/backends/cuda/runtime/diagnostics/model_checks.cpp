@@ -1,6 +1,5 @@
 #include "model_checks.h"
 
-#include "../../models/deepseek_v4/deepseek_v4_model.h"
 #include "../../models/registry.h"
 #include "../../ops/cuda_quantized_ops.h"
 #include "../cuda_execution.h"
@@ -110,8 +109,9 @@ const char * kl_evaluator_name(KlEvaluator evaluator) {
     return evaluator == KlEvaluator::Legacy ? "legacy" : "optimized";
 }
 
+template <typename Model>
 static int run_kl_eval(
-        CudaModel & model,
+        Model& model,
         const std::string & path,
         int max_chunks,
         KlEvaluator evaluator,
@@ -153,7 +153,7 @@ static int run_kl_eval(
             // chunk's first corpus token with BOS before evaluating it, then
             // serializes the original corpus tokens in this legacy header.
             // Qwen legacy references use the serialized token directly.
-            if (model.c.is_gemma4() &&
+            if (Model::is_gemma4 &&
                     eval_chunks[(size_t)ci].tokens[0] != legacy_bos) {
                 eval_chunks[(size_t)ci].tokens[0] = legacy_bos;
                 ++legacy_bos_replacements;
@@ -162,9 +162,9 @@ static int run_kl_eval(
             eval_chunks[(size_t)ci].score_count = score_count;
         }
         std::cout << "cpp_kl_legacy_chunk_bos="
-                  << (model.c.is_gemma4() ? legacy_bos : -1)
+                  << (Model::is_gemma4 ? legacy_bos : -1)
                   << " replacements=" << legacy_bos_replacements
-                  << " model_type=" << model.c.model_type << "\n";
+                  << " model_type=" << model.model_type() << "\n";
     } else if (reference_format == "_logit2_" || reference_format == "_logit3_") {
         const bool has_exact_target_log_probs = reference_format == "_logit3_";
         uint32_t vocab = 0;
@@ -235,7 +235,7 @@ static int run_kl_eval(
     if (chunks <= 0) throw std::runtime_error("KL evaluation requires at least one chunk");
     for (int ci = 0; ci < chunks; ++ci) {
         if ((int64_t)eval_chunks[(size_t)ci].tokens.size() >
-                model.c.max_position_embeddings) {
+                model.max_position_embeddings()) {
             throw std::runtime_error(
                 "KL reference exceeds model context capacity");
         }
@@ -681,8 +681,9 @@ static void accumulate_streamed_kl_chunk(
     }
 }
 
+template <typename Model>
 int run_kl_eval_batched(
-    CudaModel & model,
+    Model& model,
     const std::string & reference_path,
     int max_chunks,
     int64_t requested_n_batch,
@@ -695,7 +696,7 @@ int run_kl_eval_batched(
         ? (reference_contract.n_batch == 0
               ? n_ctx : reference_contract.n_batch)
         : requested_n_batch;
-    if (n_ctx > model.c.max_position_embeddings) {
+    if (n_ctx > model.max_position_embeddings()) {
         throw std::runtime_error(
             "KL reference exceeds model context capacity");
     }
@@ -727,13 +728,13 @@ int run_kl_eval_batched(
                 "--kl-score-count exceeds the stored chunk score count");
         }
     }
-    if (input.n_vocab != model.c.vocab_size) {
+    if (input.n_vocab != model.vocab_size()) {
         throw std::runtime_error("KL vocab size mismatch");
     }
     int bos_replacements = 0;
     int32_t legacy_bos = -1;
     if (input.reference_format == "_logits_" &&
-        model.c.is_gemma4()) {
+        Model::is_gemma4) {
         legacy_bos = input.chunks[0].tokens[0];
         for (auto & chunk : input.chunks) {
             if (chunk.tokens[0] != legacy_bos) {
@@ -849,8 +850,9 @@ int run_kl_eval_batched(
     return 0;
 }
 
+template <typename Model>
 int run_selected_kl_eval(
-    CudaModel & model,
+    Model& model,
     const std::string & reference_path,
     int max_chunks,
     KlEvaluator evaluator,
@@ -948,29 +950,23 @@ int run_kl_eval_streamed(
     }
 
     auto started = std::chrono::steady_clock::now();
-    CudaModel model = load_model(model_path, config_path, n_ctx, false);
-    if (!model.c.is_dsv4()) {
-        throw std::runtime_error(
-            "streamed KL is currently implemented for DeepSeek V4");
-    }
+    auto model = mfq::cuda::load_causal_lm<
+        mfq::cuda::CudaBackbone::deepseek_v4>(
+            model_path, config_path, n_ctx, false);
     if (chunk_batch > 16) {
         throw std::runtime_error(
             "DeepSeek V4 streamed KL chunk batch must not exceed 16");
     }
-    if (model.c.vocab_size != input.n_vocab) {
+    if (model.vocab_size() != input.n_vocab) {
         throw std::runtime_error("KL vocab size mismatch");
     }
-    auto model_source = mfq::open_model_source(model_path);
-    const auto& mfq = *model_source;
-    (void)mfq::cuda::load_runtime_parameters(mfq, config_path);
-    const auto dsv4_config = mfq::cuda::deepseek_v4::Config::from_json(
-        model.c.resolved_config_json, model.c.num_hidden_layers);
+    const auto& mfq = *model.source;
 
     const int64_t hidden_bytes =
-        (int64_t)chunks * n_ctx * model.c.hc_mult *
-        model.c.hidden_size * (int64_t)sizeof(mfq_half);
+        (int64_t)chunks * n_ctx * model.hc_mult() *
+        model.hidden_size() * (int64_t)sizeof(mfq_half);
     auto hidden_cpu = mfq_tensor_backend::empty(
-        {chunks, n_ctx, model.c.hc_mult, model.c.hidden_size},
+        {chunks, n_ctx, model.hc_mult(), model.hidden_size()},
         mfq_tensor_backend::TensorOptions()
             .device(mfq_tensor_backend::kCPU)
             .dtype(mfq_tensor_backend::kFloat16)
@@ -994,7 +990,7 @@ int run_kl_eval_streamed(
         auto x = model.embed_forward(ids);
         x = x.unsqueeze(2)
             .expand({
-                count, n_ctx, model.c.hc_mult, model.c.hidden_size})
+                count, n_ctx, model.hc_mult(), model.hidden_size()})
             .contiguous();
         hidden_cpu.narrow(0, begin, count).copy_(x, true);
         mfq_cuda_synchronize();
@@ -1003,21 +999,21 @@ int run_kl_eval_streamed(
               << chunks << "\n";
 
     for (int layer_begin = 0;
-        layer_begin < model.c.num_hidden_layers;
+        layer_begin < model.num_hidden_layers();
          layer_begin += layer_group) {
         const int layer_end = std::min(
             layer_begin + layer_group,
-            (int)model.c.num_hidden_layers);
+            static_cast<int>(model.num_hidden_layers()));
         auto group_started = std::chrono::steady_clock::now();
         auto dsv4_state = std::make_shared<Dsv4SharedState>();
         std::vector<std::unique_ptr<Block>> blocks;
         blocks.reserve((size_t)(layer_end - layer_begin));
         for (int layer = layer_begin; layer < layer_end; ++layer) {
             std::cerr << "stream loading layer " << layer << " "
-                      << model.c.layer_types[(size_t)layer] << std::endl;
+                      << model.layer_type(layer) << std::endl;
             blocks.push_back(mfq::cuda::deepseek_v4::load_block(
-                mfq, model.c, dsv4_config, layer,
-                model.c.layer_types[(size_t)layer], dsv4_state));
+                mfq, model.config, layer,
+                std::string(model.layer_type(layer)), dsv4_state));
         }
         for (int begin = 0; begin < chunks; begin += chunk_batch) {
             const int count = std::min(chunk_batch, chunks - begin);
@@ -1031,7 +1027,7 @@ int run_kl_eval_streamed(
                 block->reset(count);
                 block->set_token_ids(ids);
                 x = block->forward(
-                    x, pos, 0, mfq_nullopt, model.c, model.rope);
+                    x, pos, 0, mfq_nullopt, model.rope);
             }
             hidden_cpu.narrow(0, begin, count).copy_(x, true);
             mfq_cuda_synchronize();
@@ -1060,12 +1056,8 @@ int run_kl_eval_streamed(
         auto y = model.finalize_hidden(x, count, n_ctx);
         auto selected =
             y.index({Slice(), Slice(first, first + score_count), Slice()});
-        auto logits = model.lm_head.forward(selected);
-        if (model.c.final_logit_softcapping > 0.0) {
-            logits = mfq_tensor_backend::tanh(
-                logits / model.c.final_logit_softcapping) *
-                model.c.final_logit_softcapping;
-        }
+        auto logits = model.apply_final_logit_softcap(
+            model.lm_head.forward(selected));
         if (logits_output.is_open()) {
             auto saved = logits.to(mfq_tensor_backend::kCPU, mfq_tensor_backend::kFloat16)
                              .contiguous();
@@ -2014,7 +2006,7 @@ int run_gemma_geglu_check(
     }
     auto model_source = mfq::open_model_source(model_path);
     const auto& mfq = *model_source;
-    (void)mfq::cuda::load_runtime_parameters(mfq, {});
+    mfq::cuda::validate_model_source(mfq);
     const std::string prefix =
         "model.block." + std::to_string(layer) + ".mlp.";
     auto gate_up = load_quant_group(
@@ -2609,7 +2601,7 @@ int run_mfe_tensor_check(
 
 static int run_gemma_moe_check(
         const mfq::ModelSource & mfq,
-        const CudaRuntimeParameters & config,
+        const mfq::models::gemma4::Config & config,
         int layer,
         const std::vector<int64_t> & token_sizes,
     int reps) {
@@ -2868,13 +2860,70 @@ int run_moe_check(
     }
     auto model_source = mfq::open_model_source(model_path);
     const auto& mfq = *model_source;
-    CudaRuntimeParameters config = mfq::cuda::load_runtime_parameters(mfq, config_path);
-    if (layer >= config.num_hidden_layers) throw std::runtime_error("MoE benchmark layer is out of range");
-    if (config.is_gemma4()) {
-        return run_gemma_moe_check(mfq, config, layer, token_sizes, reps);
+    mfq::cuda::validate_model_source(mfq);
+    const auto graph = mfq.resolved_model_graph();
+    const auto plan = mfq::cuda::cuda_model_plan(graph);
+    const auto payload = mfq::cuda::load_model_config_json(
+        mfq, config_path);
+    FFN ffn;
+    int64_t hidden_size = 0;
+    switch (plan.backbone) {
+        case mfq::cuda::CudaBackbone::gemma4: {
+            const auto config =
+                mfq::models::gemma4::Config::from_json(payload);
+            if (layer >= config.num_hidden_layers) {
+                throw std::runtime_error(
+                    "MoE benchmark layer is out of range");
+            }
+            return run_gemma_moe_check(
+                mfq, config, layer, token_sizes, reps);
+        }
+        case mfq::cuda::CudaBackbone::glm_dsa: {
+            const auto config =
+                mfq::models::glm_dsa::Config::from_json(payload);
+            if (layer >= config.num_hidden_layers) {
+                throw std::runtime_error(
+                    "MoE benchmark layer is out of range");
+            }
+            mfq::cuda::glm_dsa::load_ffn(
+                mfq, config, layer, ffn);
+            hidden_size = config.hidden_size;
+            break;
+        }
+        case mfq::cuda::CudaBackbone::deepseek_v4: {
+            const auto config =
+                mfq::models::deepseek_v4::Config::from_json(payload);
+            if (layer >= config.num_hidden_layers) {
+                throw std::runtime_error(
+                    "MoE benchmark layer is out of range");
+            }
+            auto block = mfq::cuda::deepseek_v4::load_block(
+                mfq, config, layer, "deepseek_v4",
+                std::make_shared<Dsv4SharedState>());
+            ffn = std::move(static_cast<Dsv4Block&>(*block).ffn);
+            hidden_size = config.hidden_size;
+            break;
+        }
+        case mfq::cuda::CudaBackbone::deepseek_v41: {
+            const auto config =
+                mfq::models::deepseek_v41::Config::from_json(payload);
+            if (layer >= config.n_layers) {
+                throw std::runtime_error(
+                    "MoE benchmark layer is out of range");
+            }
+            ffn = mfq::cuda::deepseek_v41_runtime::load_moe(
+                mfq, config, layer);
+            hidden_size = config.hidden;
+            break;
+        }
+        default:
+            throw std::runtime_error(
+                "selected CUDA backbone has no FFN MoE benchmark adapter");
     }
-    FFN ffn = load_ffn(mfq, config, layer);
-    if (!ffn.is_moe) throw std::runtime_error("selected layer does not contain MFE MoE weights");
+    if (!ffn.is_moe) {
+        throw std::runtime_error(
+            "selected layer does not contain MFE MoE weights");
+    }
     if (g_moe_expert_cache &&
             !moe_expert_cache_finalized()) {
         finalize_moe_expert_cache();
@@ -2896,7 +2945,7 @@ int run_moe_check(
     mfq_tensor_backend::Tensor output;
     for (int64_t tokens : token_sizes) {
         auto x = mfq_tensor_backend::randn(
-            {tokens, config.hidden_size},
+            {tokens, hidden_size},
             mfq_tensor_backend::TensorOptions().device(mfq_tensor_backend::kCUDA).dtype(mfq_tensor_backend::kFloat16));
         for (int warmup = 0; warmup < 10; ++warmup) output = ffn.forward(x);
         mfq_cuda_synchronize();
@@ -4190,7 +4239,7 @@ int run_text_session_state_check() {
         if (!condition) throw std::runtime_error(message);
     };
 
-    CudaModel dsv4_model;
+    mfq::cuda::DeepseekV4CausalLm dsv4_model;
     auto dsv4 = std::make_unique<Dsv4Block>();
     auto * dsv4_block = dsv4.get();
     dsv4_block->cuda_device = 0;
@@ -4276,7 +4325,7 @@ int run_text_session_state_check() {
         dsv4_model.cache_pos == 10 && dsv4_state.bytes > 0,
         "DeepSeek V4 session position restore failed");
 
-    CudaModel glm_model;
+    mfq::cuda::GlmDsaCausalLm glm_model;
     auto glm_shared = std::make_shared<GlmDsaSharedState>();
     std::vector<GlmDsaBlock *> glm_blocks;
     for (int index = 0; index < 2; ++index) {
@@ -4333,4 +4382,24 @@ int run_text_session_state_check() {
     std::cout << "text_session_state_check dsv4=1 glm_dsa=1\n";
     return 0;
 }
+
+#define MFQ_INSTANTIATE_KL(TYPE)                                           \
+    template int run_kl_eval_batched<TYPE>(                               \
+        TYPE&, const std::string&, int, std::int64_t, int,                 \
+        const KlReferenceContract&);                                       \
+    template int run_selected_kl_eval<TYPE>(                              \
+        TYPE&, const std::string&, int, KlEvaluator, std::int64_t, int,    \
+        const KlReferenceContract&)
+
+MFQ_INSTANTIATE_KL(mfq::cuda::Qwen35CausalLm);
+MFQ_INSTANTIATE_KL(mfq::cuda::MiniCPMO45CausalLm);
+MFQ_INSTANTIATE_KL(mfq::cuda::MiniCPMOTtsCausalLm);
+MFQ_INSTANTIATE_KL(mfq::cuda::Gemma4CausalLm);
+MFQ_INSTANTIATE_KL(mfq::cuda::GlmDsaCausalLm);
+MFQ_INSTANTIATE_KL(mfq::cuda::Glm5CausalLm);
+MFQ_INSTANTIATE_KL(mfq::cuda::Qwen4CausalLm);
+MFQ_INSTANTIATE_KL(mfq::cuda::DeepseekV4CausalLm);
+MFQ_INSTANTIATE_KL(mfq::cuda::DeepseekV41CausalLm);
+
+#undef MFQ_INSTANTIATE_KL
 

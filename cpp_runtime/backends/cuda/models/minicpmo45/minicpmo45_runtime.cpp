@@ -694,7 +694,7 @@ int run_minicpmo45_eval_batch(
             const auto decode_started = std::chrono::steady_clock::now();
             double first_token_seconds = 0.0;
             auto counts = mfq_tensor_backend::zeros(
-                {runtime.language.c.vocab_size},
+                {runtime.language.vocab_size()},
                 mfq_tensor_backend::TensorOptions().device(mfq_tensor_backend::kCUDA)
                     .dtype(mfq_tensor_backend::kInt32));
             std::vector<int64_t> generated;

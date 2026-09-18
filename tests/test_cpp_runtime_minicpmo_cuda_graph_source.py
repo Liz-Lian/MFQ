@@ -12,7 +12,7 @@ BACKEND_CHECKS = (
 SOURCE = "\n".join(
     (CUDA_ROOT / "runtime" / name).read_text(encoding="utf-8")
     for name in (
-        "cuda_model.h",
+        "causal_lm.h",
         "cuda_transformer.h",
         "cuda_execution.h",
         "cuda_execution.cpp",
@@ -69,7 +69,8 @@ def test_static_decode_uses_dynamic_position_for_kv_writes() -> None:
 
 def test_minicpmo_persistent_decode_workspaces_are_warmed_before_capture() -> None:
     warmup_gates = re.findall(
-        r"model\.c\.is_glm_dsa\(\) \|\|\s+model\.c\.is_minicpmo45\(\)\) \{",
+        r"Model::backbone == mfq::cuda::CudaBackbone::glm_dsa\) \|\|\s+"
+        r"Model::is_minicpmo45\) \{",
         SOURCE,
     )
     assert len(warmup_gates) == 1

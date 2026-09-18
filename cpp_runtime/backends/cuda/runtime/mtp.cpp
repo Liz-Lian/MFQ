@@ -1,7 +1,8 @@
 #include "mtp.h"
 
 #include "cuda_execution.h"
-#include "cuda_model.h"
+#include "causal_lm.h"
+#include "cuda_sampling.h"
 #include "prepared_prompt.h"
 #include "mfq_cuda_ops.h"
 
@@ -12,7 +13,6 @@
 #include <cmath>
 #include <cstdint>
 #include <iostream>
-#include <random>
 #include <span>
 #include <tuple>
 #include <utility>
@@ -20,68 +20,9 @@
 
 namespace {
 
-static bool sampling_has_penalties(const MfqSamplingParams & sampling) {
-    return sampling.presence_penalty != 0.0 ||
-           sampling.frequency_penalty != 0.0 ||
-           sampling.repetition_penalty != 1.0;
-}
-
-static mfq_tensor_backend::Tensor sample_server_logits(
-    mfq_tensor_backend::Tensor logits,
-    const MfqSamplingParams & sampling,
-    mfq_tensor_backend::Tensor counts,
-    mfq_tensor_backend::Tensor random_host,
-    mfq_tensor_backend::Tensor random_cuda,
-    std::mt19937_64 & rng,
-    const MfqTokenConstraintPtr & token_constraint)
-{
-    const bool greedy = sampling.temperature <= 0.0 || sampling.top_k == 1;
-    const bool has_penalties = sampling_has_penalties(sampling);
-    logits = logits.contiguous().view({1, -1});
-    if (has_penalties) {
-        logits = logits.clone();
-        sample_apply_penalties_cuda(
-            logits, counts, sampling.presence_penalty,
-            sampling.frequency_penalty, sampling.repetition_penalty);
-    }
-    std::uniform_real_distribution<float> uniform(0.0f, 1.0f);
-    const auto sample_logits = [&](mfq_tensor_backend::Tensor candidate_logits) {
-        if (greedy) return sample_greedy_cuda(candidate_logits);
-        *random_host.data_ptr<float>() = uniform(rng);
-        random_cuda.copy_(random_host, true);
-        if (sampling.top_k > 0) {
-            return sample_top_k_top_p_cuda(
-                candidate_logits, random_cuda, sampling.temperature,
-                sampling.top_k, sampling.top_p);
-        }
-        return sample_softmax_cuda(
-            candidate_logits, random_cuda, sampling.temperature);
-    };
-
-    auto next = sample_logits(logits);
-    if (token_constraint && token_constraint->allows &&
-        !token_constraint->allows(next.item<int64_t>())) {
-        auto masked = logits
-            .to(mfq_tensor_backend::kCPU, mfq_tensor_backend::kFloat32)
-            .contiguous();
-        token_constraint->apply(
-            masked.data_ptr<float>(),
-            static_cast<std::size_t>(masked.numel()));
-        next = sample_logits(masked.to(logits.device()));
-        const int64_t constrained_token = next.item<int64_t>();
-        if (!token_constraint->allows(constrained_token)) {
-            throw std::runtime_error(
-                "CUDA constrained sampler returned an invalid token");
-        }
-    }
-    if (token_constraint && token_constraint->accept) {
-        token_constraint->accept(next.item<int64_t>());
-    }
-    return next;
-}
-
+template <typename Model>
 static mfq_tensor_backend::Tensor server_hidden_forward_chunked(
-    CudaModel & model,
+    Model& model,
     const mfq_tensor_backend::Tensor & ids,
     int64_t chunk_size,
     mfq_tensor_backend::Tensor * raw_hidden = nullptr) {
@@ -119,8 +60,9 @@ static mfq_tensor_backend::Tensor server_hidden_forward_chunked(
     return hidden;
 }
 
+template <typename Model>
 static mfq_tensor_backend::Tensor server_hidden_forward_prepared_chunked(
-    CudaModel& model,
+    Model& model,
     const mfq_tensor_backend::Tensor& ids,
     const CudaPreparedPrompt& prepared,
     int64_t chunk_size,
@@ -132,7 +74,7 @@ static mfq_tensor_backend::Tensor server_hidden_forward_prepared_chunked(
             prepared.embeddings.dim() == 3 &&
             prepared.embeddings.size(0) == 1 &&
             prepared.embeddings.size(1) == ids.size(1) &&
-            prepared.embeddings.size(2) == model.c.hidden_size &&
+            prepared.embeddings.size(2) == model.hidden_size() &&
             (prepared.positions.dim() == 1 ||
              prepared.positions.dim() == 2) &&
             prepared.positions.size(-1) == ids.size(1),
@@ -377,8 +319,9 @@ static mfq::cuda::mtp::ChainVerification verify_compact_chain(
 
 } // namespace
 
-int32_t run_cuda_mtp_generation(
-        CudaModel& model, CudaMtpModule& mtp,
+template <mfq::cuda::CudaBackbone Backbone>
+int32_t run_mtp_generation(
+        mfq::cuda::CausalLmFor<Backbone>& model, MtpModule& mtp,
         const std::vector<int64_t>& prompt, const MfqSamplingParams& sampling,
         const MfqTokenCallback& on_token, const MfqPrefillCallback& on_prefill,
         int64_t prefill_chunk_size,
@@ -387,10 +330,24 @@ int32_t run_cuda_mtp_generation(
     using Tensor = mfq_tensor_backend::Tensor;
     using Clock = std::chrono::steady_clock;
     namespace policy = mfq::cuda::mtp;
-    MFQ_RUNTIME_CHECK(!prompt.empty() && prompt.size() <= static_cast<size_t>(model.c.max_position_embeddings),
+    const MtpTarget target{
+        [&model](Tensor ids) {
+            return model.embed_forward(std::move(ids));
+        },
+        [&model](Tensor hidden) {
+            return model.logits_from_hidden(std::move(hidden));
+        },
+        &model.rope,
+    };
+    MFQ_RUNTIME_CHECK(
+        !prompt.empty() && prompt.size() <=
+            static_cast<size_t>(model.max_position_embeddings()),
         "invalid MTP prompt length");
-    for (auto token : prompt) MFQ_RUNTIME_CHECK(token >= 0 && token < model.c.vocab_size,
-        "MTP prompt token outside vocabulary");
+    for (auto token : prompt) {
+        MFQ_RUNTIME_CHECK(
+            token >= 0 && token < model.vocab_size(),
+            "MTP prompt token outside vocabulary");
+    }
     const bool transformed_prompt = prepared != nullptr && prepared->transformed();
     MFQ_RUNTIME_CHECK(
         prepared == nullptr || prepared->token_ids == prompt,
@@ -411,13 +368,13 @@ int32_t run_cuda_mtp_generation(
         (transformed_prompt ? prepared->decode_position_delta : 0);
     MFQ_RUNTIME_CHECK(
         next_logical_position >= 0 &&
-            next_logical_position <= model.c.max_position_embeddings,
+            next_logical_position <= model.max_position_embeddings(),
         "prepared CUDA MTP decode position is outside context capacity");
     const int64_t occupied_context = std::max<int64_t>(
         static_cast<int64_t>(prompt.size()), next_logical_position);
     const int32_t limit = static_cast<int32_t>(std::min<int64_t>(
         sampling.max_tokens,
-        model.c.max_position_embeddings - occupied_context));
+        model.max_position_embeddings() - occupied_context));
     if (limit <= 0) return 0;
     const auto options = mfq_tensor_backend::TensorOptions().device(mfq_tensor_backend::kCUDA)
         .dtype(mfq_tensor_backend::kInt64);
@@ -436,7 +393,7 @@ int32_t run_cuda_mtp_generation(
             (transformed_prompt ? prepared->decode_position_delta : 0);
         MFQ_RUNTIME_CHECK(
             logical_start >= 0 &&
-                logical_start + tokens <= model.c.max_position_embeddings,
+                logical_start + tokens <= model.max_position_embeddings(),
             "CUDA MTP position span exceeds context capacity");
         auto result = mfq_tensor_backend::arange(
             logical_start, logical_start + tokens, options);
@@ -447,32 +404,39 @@ int32_t run_cuda_mtp_generation(
     auto predictor_step = [&](Tensor hidden, Tensor ids, Tensor positions) {
         return positions.defined()
             ? mtp.step_positioned(
-                  model, std::move(hidden), std::move(ids),
+                  target, std::move(hidden), std::move(ids),
                   std::move(positions))
-            : mtp.step(model, std::move(hidden), std::move(ids));
+            : mtp.step(target, std::move(hidden), std::move(ids));
     };
-    const bool penalties = sampling_has_penalties(sampling);
-    auto counts = penalties ? mfq_tensor_backend::zeros({model.c.vocab_size},
-        options.dtype(mfq_tensor_backend::kInt32)) : Tensor{};
-    if (penalties) sample_token_counts_add_cuda(counts, input_ids);
     auto random_host = mfq_tensor_backend::empty({1}, mfq_tensor_backend::TensorOptions()
         .device(mfq_tensor_backend::kCPU).dtype(mfq_tensor_backend::kFloat32).pinned_memory(true));
     auto random_gpu = mfq_tensor_backend::empty({1}, options.dtype(mfq_tensor_backend::kFloat32));
-    std::mt19937_64 rng(sampling.seed);
-    std::uniform_real_distribution<double> uniform(0., 1.);
-    const bool greedy = sampling.temperature <= 0. || sampling.top_k == 1;
+    mfq::cuda::Sampler sampler(
+        sampling,
+        mfq::cuda::SamplingOps(
+            std::move(random_host), std::move(random_gpu)));
+    const bool penalties = sampler.has_penalties();
+    auto counts = penalties
+        ? mfq_tensor_backend::zeros(
+            {model.vocab_size()},
+            options.dtype(mfq_tensor_backend::kInt32))
+        : Tensor{};
+    if (penalties) sample_token_counts_add_cuda(counts, input_ids);
+    const bool greedy = sampler.greedy();
     auto sample_normal = [&](Tensor logits, Tensor token_counts) {
-        return static_cast<int32_t>(sample_server_logits(logits, sampling, token_counts,
-            random_host, random_gpu, rng, {}).item<int64_t>());
+        if (penalties) logits = logits.clone();
+        return static_cast<int32_t>(mfq::cuda::sample_logits(
+            sampler, std::move(logits), token_counts).template item<int64_t>());
     };
     auto sample_constrained = [&](Tensor logits, Tensor token_counts,
                                   const MfqTokenConstraintPtr& constraint) {
+        if (penalties) logits = logits.clone();
         auto sampler_constraint = constraint
             ? constraint->clone()
             : MfqTokenConstraintPtr{};
-        return static_cast<int32_t>(sample_server_logits(
-            logits, sampling, token_counts, random_host, random_gpu, rng,
-            sampler_constraint).item<int64_t>());
+        return static_cast<int32_t>(mfq::cuda::sample_logits(
+            sampler, std::move(logits), token_counts,
+            sampler_constraint).template item<int64_t>());
     };
     auto probabilities = [&](Tensor logits, Tensor token_counts,
                              const MfqSamplingParams& parameters) {
@@ -484,7 +448,7 @@ int32_t run_cuda_mtp_generation(
                 parameters.repetition_penalty);
         }
         auto host = logits.to(mfq_tensor_backend::kFloat32).cpu().contiguous();
-        return policy::distribution(std::span<const float>(host.data_ptr<float>(), host.numel()),
+        return policy::distribution(std::span<const float>(host.template data_ptr<float>(), host.numel()),
             parameters.temperature, parameters.top_k, parameters.top_p);
     };
     auto compact_probabilities = [&](Tensor logits, Tensor token_counts,
@@ -509,7 +473,7 @@ int32_t run_cuda_mtp_generation(
             .to(mfq_tensor_backend::kCPU, mfq_tensor_backend::kInt64)
             .contiguous().reshape({-1});
         return compact_distribution_from_topk(
-            values.data_ptr<float>(), indices.data_ptr<int64_t>(),
+            values.template data_ptr<float>(), indices.template data_ptr<int64_t>(),
             static_cast<int>(values.numel()), parameters);
     };
     auto compact_probability_rows = [&](Tensor logits,
@@ -530,8 +494,8 @@ int32_t run_cuda_mtp_generation(
             .contiguous();
         const int64_t rows = values.size(0);
         const int64_t columns = values.size(1);
-        const float* value_data = values.data_ptr<float>();
-        const int64_t* index_data = indices.data_ptr<int64_t>();
+        const float* value_data = values.template data_ptr<float>();
+        const int64_t* index_data = indices.template data_ptr<int64_t>();
         std::vector<CompactDistribution> result;
         result.reserve(static_cast<size_t>(rows));
         for (int64_t row = 0; row < rows; ++row) {
@@ -548,7 +512,9 @@ int32_t run_cuda_mtp_generation(
     };
     int32_t generated = 0;
     auto emit = [&](int32_t token) {
-        MFQ_RUNTIME_CHECK(token >= 0 && token < model.c.vocab_size, "MTP sampled token outside vocabulary");
+        MFQ_RUNTIME_CHECK(
+            token >= 0 && token < model.vocab_size(),
+            "MTP sampled token outside vocabulary");
         if (token_constraint) token_constraint->accept(token);
         ++generated;
         if (penalties) sample_token_counts_add_cuda(counts, ids_for({token}));
@@ -654,7 +620,7 @@ int32_t run_cuda_mtp_generation(
         int64_t predictor_history_position = mtp.cache_position();
         auto bounded_depth = [&](int desired) {
             const auto context_depth = std::max<int64_t>(
-                0, model.c.max_position_embeddings - model.cache_pos - 1);
+                0, model.max_position_embeddings() - model.cache_pos - 1);
             const auto output_depth = std::max<int64_t>(
                 0, static_cast<int64_t>(limit - generated - 1));
             return static_cast<int>(std::min<int64_t>(
@@ -685,13 +651,13 @@ int32_t run_cuda_mtp_generation(
                 } else if (compact_stochastic) {
                     auto proposal = compact_probabilities(
                         draft_logits, prospective_counts, draft_sampling);
-                    token = sample_compact(proposal, uniform(rng));
+                    token = sample_compact(proposal, sampler.next_uniform());
                     result.compact_probabilities.push_back(
                         std::move(proposal));
                 } else {
                     auto proposal = probabilities(
                         draft_logits, prospective_counts, draft_sampling);
-                    token = policy::sample(proposal, uniform(rng));
+                    token = policy::sample(proposal, sampler.next_uniform());
                     result.probabilities.push_back(std::move(proposal));
                 }
                 result.tokens.push_back(token);
@@ -713,7 +679,7 @@ int32_t run_cuda_mtp_generation(
                     "CUDA block predictor cache did not advance");
                 if (requested_depth > 0) {
                     auto block = mtp.draft_block(
-                        model,
+                        target,
                         ids_for({next_ids.back()}),
                         select_draft,
                         requested_depth);
@@ -801,7 +767,7 @@ int32_t run_cuda_mtp_generation(
                     draft_count > 0 ? 1 : 0);
             }
             auto targets = logits_for(verified).reshape(
-                {draft_count + 1, model.c.vocab_size});
+                {draft_count + 1, model.vocab_size()});
 
             ++mtp.last_stats.cycles;
             mtp.last_stats.drafted_tokens += static_cast<uint64_t>(draft_count);
@@ -855,10 +821,11 @@ int32_t run_cuda_mtp_generation(
                     static_cast<size_t>(draft_count));
                 std::generate(
                     acceptance_uniforms.begin(), acceptance_uniforms.end(),
-                    [&] { return uniform(rng); });
+                    [&] { return sampler.next_uniform(); });
                 result = verify_compact_chain(
                     draft.tokens, draft.compact_probabilities,
-                    target_probabilities, acceptance_uniforms, uniform(rng));
+                    target_probabilities, acceptance_uniforms,
+                    sampler.next_uniform());
             } else {
                 std::vector<std::vector<float>> target_probabilities;
                 target_probabilities.reserve(static_cast<size_t>(draft_count + 1));
@@ -874,16 +841,17 @@ int32_t run_cuda_mtp_generation(
                     static_cast<size_t>(draft_count));
                 std::generate(
                     acceptance_uniforms.begin(), acceptance_uniforms.end(),
-                    [&] { return uniform(rng); });
+                    [&] { return sampler.next_uniform(); });
                 result = policy::verify_stochastic_chain(
                     draft.tokens, draft.probabilities, target_probabilities,
-                    acceptance_uniforms, uniform(rng));
+                    acceptance_uniforms, sampler.next_uniform());
             }
 
             int accepted = static_cast<int>(result.accepted_drafts);
             MFQ_RUNTIME_CHECK(
                 accepted >= 0 && accepted <= draft_count &&
-                    result.next_token >= 0 && result.next_token < model.c.vocab_size,
+                    result.next_token >= 0 &&
+                    result.next_token < model.vocab_size(),
                 "CUDA MTP verification returned invalid data");
             if (constraint_cursor) {
                 auto constraint_counts = penalties ? counts.clone() : Tensor{};
@@ -1001,3 +969,17 @@ int32_t run_cuda_mtp_generation(
         throw;
     }
 }
+
+#define MFQ_INSTANTIATE_MTP(BACKBONE)                                      \
+    template int32_t run_mtp_generation<BACKBONE>(                         \
+        mfq::cuda::CausalLmFor<BACKBONE>&, MtpModule&,                         \
+        const std::vector<int64_t>&, const MfqSamplingParams&,              \
+        const MfqTokenCallback&, const MfqPrefillCallback&, int64_t,         \
+        const MfqTokenConstraintPtr&, const CudaPreparedPrompt*)
+
+MFQ_INSTANTIATE_MTP(mfq::cuda::CudaBackbone::generic_qwen);
+MFQ_INSTANTIATE_MTP(mfq::cuda::CudaBackbone::glm5_next);
+MFQ_INSTANTIATE_MTP(mfq::cuda::CudaBackbone::qwen4_exp);
+MFQ_INSTANTIATE_MTP(mfq::cuda::CudaBackbone::deepseek_v41);
+
+#undef MFQ_INSTANTIATE_MTP

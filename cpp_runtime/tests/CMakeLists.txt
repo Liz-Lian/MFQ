@@ -34,6 +34,8 @@ mfq_add_core_test(mfq-model-graph-test mfq_model_graph_test.cpp)
 mfq_add_core_test(mfq-model-source-test model_source_test.cpp)
 mfq_add_core_test(mfq-grid-vision-test grid_vision_test.cpp)
 mfq_add_core_test(mfq-deepseek-v41-config-test deepseek_v41_config_test.cpp)
+mfq_add_core_test(mfq-model-config-test model_config_test.cpp)
+mfq_add_core_test(mfq-sampling-test mfq_sampling_test.cpp)
 mfq_add_core_test(mfq-moe-cache-policy-test moe_cache_policy_test.cpp)
 mfq_add_core_test(mfq-tensor-parallel-test tensor_parallel_test.cpp)
 
@@ -46,37 +48,6 @@ target_include_directories(mfq-cuda-model-plan-test PRIVATE
 target_link_libraries(mfq-cuda-model-plan-test PRIVATE mfq-core)
 target_compile_features(mfq-cuda-model-plan-test PRIVATE cxx_std_20)
 add_test(NAME mfq-cuda-model-plan-test COMMAND mfq-cuda-model-plan-test)
-
-add_executable(mfq-cuda-qwen35-config-test
-    ${PROJECT_SOURCE_DIR}/backends/cuda/models/qwen35/qwen35_model.cpp
-    ${PROJECT_SOURCE_DIR}/backends/cuda/tests/cuda_qwen35_config_test.cpp
-)
-target_include_directories(mfq-cuda-qwen35-config-test PRIVATE
-    ${PROJECT_SOURCE_DIR}/backends/cuda/include
-    ${PROJECT_SOURCE_DIR}/backends/cuda/models
-    ${PROJECT_SOURCE_DIR}/backends/cuda/models/qwen35
-)
-target_link_libraries(mfq-cuda-qwen35-config-test PRIVATE mfq-core)
-target_compile_features(mfq-cuda-qwen35-config-test PRIVATE cxx_std_20)
-add_test(NAME mfq-cuda-qwen35-config-test COMMAND mfq-cuda-qwen35-config-test)
-
-add_executable(mfq-cuda-typed-config-test
-    ${PROJECT_SOURCE_DIR}/backends/cuda/models/cuda_model_config.cpp
-    ${PROJECT_SOURCE_DIR}/backends/cuda/models/deepseek_v4/deepseek_v4_model.cpp
-    ${PROJECT_SOURCE_DIR}/backends/cuda/models/gemma4/gemma4_model.cpp
-    ${PROJECT_SOURCE_DIR}/backends/cuda/models/glm_dsa/glm_dsa_model.cpp
-    ${PROJECT_SOURCE_DIR}/backends/cuda/tests/cuda_typed_config_test.cpp
-)
-target_include_directories(mfq-cuda-typed-config-test PRIVATE
-    ${PROJECT_SOURCE_DIR}/backends/cuda/include
-    ${PROJECT_SOURCE_DIR}/backends/cuda/models
-    ${PROJECT_SOURCE_DIR}/backends/cuda/models/deepseek_v4
-    ${PROJECT_SOURCE_DIR}/backends/cuda/models/gemma4
-    ${PROJECT_SOURCE_DIR}/backends/cuda/models/glm_dsa
-)
-target_link_libraries(mfq-cuda-typed-config-test PRIVATE mfq-core)
-target_compile_features(mfq-cuda-typed-config-test PRIVATE cxx_std_20)
-add_test(NAME mfq-cuda-typed-config-test COMMAND mfq-cuda-typed-config-test)
 
 add_executable(mfq-cuda-mtp-test
     ${PROJECT_SOURCE_DIR}/backends/cuda/tests/mfq_cuda_mtp_test.cpp)

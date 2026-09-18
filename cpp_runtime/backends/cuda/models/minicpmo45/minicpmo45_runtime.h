@@ -1,8 +1,8 @@
 #pragma once
 
-#include "../../runtime/cuda_model.h"
+#include "../../runtime/causal_lm.h"
 #include "../../runtime/cuda_transformer_loader.h"
-#include "minicpmo45_model.h"
+#include "models/minicpmo45.h"
 #include "mfq_cuda_ops.h"
 
 #include <nlohmann/json.hpp>
@@ -924,7 +924,7 @@ struct MiniCPMO45AudioEncoder {
 };
 
 struct MiniCPMO45TtsDecoder {
-    CudaRuntimeParameters config;
+    mfq::models::ModelConfig config;
     RopeCache rope;
     QuantLinear text_embedding;
     QuantLinear code_embedding;
@@ -937,12 +937,9 @@ struct MiniCPMO45TtsDecoder {
     mfq_tensor_backend::Tensor code_head;
     int64_t cache_position = 0;
 
-    static CudaRuntimeParameters make_config() {
-        CudaRuntimeParameters result;
+    static mfq::models::ModelConfig make_config() {
+        mfq::models::ModelConfig result;
         result.model_type = "minicpmtts";
-        result.tensor_root = "tts";
-        result.runtime_plan.backbone =
-            mfq::cuda::CudaBackbone::minicpmo_tts;
         result.hidden_size = 768;
         result.intermediate_size = 3072;
         result.num_hidden_layers = 20;
@@ -953,7 +950,6 @@ struct MiniCPMO45TtsDecoder {
         result.max_position_embeddings = 4096;
         result.rope_base = 10000.0;
         result.rms_norm_eps = 1e-6;
-        result.norm_weight_offset = 0.0;
         result.layer_types.assign(20, "full_attention");
         return result;
     }
@@ -961,7 +957,10 @@ struct MiniCPMO45TtsDecoder {
     static MiniCPMO45TtsDecoder load(const mfq::ModelSource & mfq) {
         MiniCPMO45TtsDecoder result;
         result.config = make_config();
-        result.rope = RopeCache(result.config);
+        result.rope = RopeCache(
+            result.config.max_position_embeddings,
+            result.config.rotary_dim,
+            result.config.rope_base);
         result.text_embedding = load_quant_linear(
             mfq, "tts.text_embedding.weight");
         result.code_embedding = load_quant_linear(
@@ -999,7 +998,8 @@ struct MiniCPMO45TtsDecoder {
         result.blocks.reserve(20);
         for (int index = 0; index < 20; ++index) {
             auto block = load_transformer_block(
-                mfq, result.config, index, "full_attention");
+                mfq, result.config, index, "full_attention", false, "tts");
+            static_cast<FullBlock&>(*block).norm_weight_offset = 0.0;
             block->cuda_device = g_layer_placement.primary_device();
             result.blocks.push_back(std::move(block));
         }
@@ -1115,7 +1115,7 @@ struct MiniCPMO45TtsDecoder {
         for (auto & block : blocks) {
             hidden = block->forward(
                 hidden, positions, cache_position,
-                sequence_length, config, rope);
+                sequence_length, rope);
         }
         cache_position += tokens;
         auto flat = hidden.reshape(
@@ -1454,7 +1454,7 @@ struct MiniCPMO45ForwardResult {
 };
 
 struct MiniCPMO45Runtime {
-    CudaModel language;
+    mfq::cuda::MiniCPMO45CausalLm language;
     MiniCPMO45VisionEncoder vision;
     MiniCPMO45Resampler resampler;
     MiniCPMO45AudioEncoder audio;
@@ -1465,16 +1465,15 @@ struct MiniCPMO45Runtime {
             const std::string & config_path,
             int64_t context_size) {
         return load_with_language(
-            load_model(model_path, config_path, context_size));
+            mfq::cuda::load_causal_lm<
+                mfq::cuda::CudaBackbone::minicpmo45>(
+                    model_path, config_path, context_size));
     }
 
-    static MiniCPMO45Runtime load_with_language(CudaModel language) {
+    static MiniCPMO45Runtime load_with_language(
+            mfq::cuda::MiniCPMO45CausalLm language) {
         MiniCPMO45Runtime result;
         result.language = std::move(language);
-        if (!result.language.c.is_minicpmo45()) {
-            throw std::runtime_error(
-                "native composite graph requires MiniCPM-o 4.5");
-        }
         g_layer_placement.load_device =
             g_layer_placement.primary_device();
         MfqCudaGuard guard(
@@ -1730,7 +1729,7 @@ struct MiniCPMO45DuplexSession {
             mfq_tensor_backend::Tensor token_ids = mfq_tensor_backend::Tensor()) {
         if (embeddings.dim() == 2) embeddings = embeddings.unsqueeze(0);
         if (embeddings.dim() != 3 || embeddings.size(0) != 1 ||
-                embeddings.size(2) != runtime.language.c.hidden_size) {
+                embeddings.size(2) != runtime.language.hidden_size()) {
             throw std::runtime_error(
                 "MiniCPM-o duplex embeddings must have shape [1,tokens,4096]");
         }
@@ -2010,7 +2009,7 @@ struct MiniCPMO45DuplexSession {
                     {1, 0}, mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt64)
                         .device(mfq_tensor_backend::kCUDA));
                 hidden_tensor = mfq_tensor_backend::empty(
-                    {1, 0, runtime.language.c.hidden_size},
+                    {1, 0, runtime.language.hidden_size()},
                     mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kBFloat16)
                         .device(mfq_tensor_backend::kCUDA));
             } else {

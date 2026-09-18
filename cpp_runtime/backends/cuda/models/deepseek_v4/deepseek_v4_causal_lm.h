@@ -1,11 +1,16 @@
 #pragma once
 
 #include "../../runtime/cuda_transformer.h"
+#include "models/deepseek_v4.h"
 #include "mfq/kernels/cuda/deepseek_v4_attention.h"
 #include "mfq/kernels/cuda/deepseek_v4_hc.h"
 
 #include <memory>
 #include <vector>
+
+namespace mfq::cuda::deepseek_v4 {
+using Config = mfq::models::deepseek_v4::Config;
+}
 
 struct Dsv4RopeTable {
     mfq_tensor_backend::Tensor cos;
@@ -15,7 +20,8 @@ struct Dsv4RopeTable {
     Dsv4RopeTable() = default;
 
     Dsv4RopeTable(
-            const CudaRuntimeParameters& c,
+            int64_t max_position_embeddings,
+            double rope_base,
             int64_t compress_ratio,
             double compress_rope_base = 0.0,
             int64_t original_positions = 0,
@@ -25,9 +31,9 @@ struct Dsv4RopeTable {
         constexpr int64_t rotary_dim = 64;
         const int64_t half = rotary_dim / 2;
         const int64_t positions = std::max<int64_t>(
-            1, c.max_position_embeddings);
+            1, max_position_embeddings);
         const double base = compress_ratio > 0 && compress_rope_base > 0.0
-            ? compress_rope_base : c.rope_base;
+            ? compress_rope_base : rope_base;
         auto opts = mfq_tensor_backend::TensorOptions()
             .device(mfq_tensor_backend::kCUDA).dtype(mfq_tensor_backend::kFloat32);
         auto dims = mfq_tensor_backend::arange(0, rotary_dim, 2, opts);
@@ -782,7 +788,6 @@ struct Dsv4Block : Block {
         mfq_tensor_backend::Tensor pos,
         int64_t cache_pos,
         const MfqOptional<mfq_tensor_backend::Tensor> & seq_len,
-        const CudaRuntimeParameters &,
         const RopeCache &,
         const MfqOptional<mfq_tensor_backend::Tensor> & cache_positions = mfq_nullopt,
         const MfqOptional<mfq_tensor_backend::Tensor> & attention_mask = mfq_nullopt) override {
@@ -840,8 +845,6 @@ struct Dsv4Block : Block {
 };
 namespace mfq::cuda::deepseek_v4 {
 
-struct Config;
-
 struct OutputHeadWeights {
     mfq_tensor_backend::Tensor function;
     mfq_tensor_backend::Tensor scale;
@@ -850,14 +853,11 @@ struct OutputHeadWeights {
 
 std::unique_ptr<::Block> load_block(
     const mfq::ModelSource& source,
-    const ::CudaRuntimeParameters& runtime,
     const Config& config,
     int layer,
     const std::string& type,
     const std::shared_ptr<::Dsv4SharedState>& state);
-void validate_load_options(const ::CudaRuntimeParameters& config);
-OutputHeadWeights load_output_head(
-    const mfq::ModelSource& source,
-    const ::CudaRuntimeParameters& config);
+void validate_load_options(const Config& config);
+OutputHeadWeights load_output_head(const mfq::ModelSource& source);
 
 } // namespace mfq::cuda::deepseek_v4

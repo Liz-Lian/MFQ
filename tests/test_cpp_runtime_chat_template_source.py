@@ -8,7 +8,7 @@ SERVER = (ROOT / "cpp_runtime" / "server" / "src" / "server.cpp").read_text(
 CUDA_RUNTIME = ROOT / "cpp_runtime" / "backends" / "cuda" / "runtime"
 DECODE = "\n".join(
     (CUDA_RUNTIME / name).read_text(encoding="utf-8")
-    for name in ("cuda_decode_runtime.cpp", "mtp.cpp")
+    for name in ("cuda_decode_runtime.cpp", "cuda_sampling.h", "mtp.cpp")
 )
 CMAKE = (ROOT / "cpp_runtime" / "CMakeLists.txt").read_text(
     encoding="utf-8"
@@ -142,7 +142,7 @@ def test_server_links_integrated_text_runtime() -> None:
 
 
 def test_cuda_server_accepts_an_external_tokenizer_only() -> None:
-    assert "MFQ server does not accept an external model config" in DECODE
+    assert "model server does not accept an external model config" in DECODE
     assert "model server requires model config and tokenizer GGUF" in DECODE
     assert "server_config.tokenizer_model = tokenizer_model" in DECODE
 

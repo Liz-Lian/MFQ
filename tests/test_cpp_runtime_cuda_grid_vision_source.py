@@ -3,6 +3,12 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 CORE = (ROOT / "cpp_runtime/core/grid_vision.cpp").read_text()
+QWEN_CONFIG = (
+    ROOT / "cpp_runtime/core/models/qwen35.cpp"
+).read_text()
+COMMON_CONFIG = (
+    ROOT / "cpp_runtime/core/models/model_config.cpp"
+).read_text()
 CUDA_ROOT = ROOT / "cpp_runtime/backends/cuda"
 CUDA = (CUDA_ROOT / "runtime/grid_vision_runtime.h").read_text()
 CUDA_APP = "\n".join(
@@ -61,7 +67,7 @@ def test_prepared_prompt_separates_semantic_and_cache_positions() -> None:
 
 
 def test_prepared_prompt_supports_mtp_but_disables_remaining_fast_paths() -> None:
-    assert 'rope_parameters.value("mrope_interleaved", false)' in CUDA_APP
+    assert 'rope_parameters.value("mrope_interleaved", false)' in QWEN_CONFIG
     assert "interleaved_order" in CUDA_APP
     assert "server_hidden_forward_prepared_chunked" in CUDA_APP
     assert "model, full_ids, *prepared, prefill_chunk_size" in CUDA_APP
@@ -87,8 +93,8 @@ def test_batched_text_positions_do_not_select_grid_mrope_sections() -> None:
 
 
 def test_multimodal_model_type_prefers_outer_root() -> None:
-    assert "c.model_type = document.value(" in CUDA_APP
-    assert '"model_type", text.value("model_type"' in CUDA_APP
+    assert "config.model_type = root.value(" in COMMON_CONFIG
+    assert '"model_type", text.value("model_type"' in COMMON_CONFIG
 
 
 def test_cuda_registration_is_exact_and_video_is_not_advertised() -> None:

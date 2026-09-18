@@ -1,6 +1,6 @@
 #pragma once
 
-#include "cuda_model.h"
+#include "causal_lm.h"
 #include "grid_vision_runtime.h"
 #include "mtp.h"
 #include "../models/deepseek_v41/deepseek_v41_dspark.h"
@@ -10,20 +10,26 @@
 
 #include <memory>
 #include <optional>
+#include <type_traits>
 
-struct CudaRuntimeComponents {
+template <typename Model>
+struct RuntimeComponents {
     mfq::ModelGraph graph;
     mfq::cuda::CudaModelPlan plan;
     std::optional<MiniCPMO45Runtime> minicpmo;
     std::optional<
         mfq::cuda::grid_vision_runtime::CudaGridVisionPromptComponent>
         grid_vision;
-    std::unique_ptr<CudaMtpModule> mtp;
+    std::unique_ptr<MtpModule> mtp;
     bool vision_available = false;
     bool mtp_available = false;
 
-    CudaModel& language(CudaModel& fallback) {
-        return minicpmo ? minicpmo->language : fallback;
+    Model& language(Model& fallback) {
+        if constexpr (std::is_same_v<
+                          Model, mfq::cuda::MiniCPMO45CausalLm>) {
+            return minicpmo ? minicpmo->language : fallback;
+        }
+        return fallback;
     }
 
     mfq::cuda::CudaComponentState state() const noexcept {
@@ -32,6 +38,7 @@ struct CudaRuntimeComponents {
     }
 };
 
-CudaRuntimeComponents load_cuda_runtime_components(
-    CudaModel& model,
+template <typename Model>
+RuntimeComponents<Model> load_runtime_components(
+    Model& model,
     bool load_optional_components);

@@ -1,19 +1,19 @@
 #pragma once
 
+#include "models/gemma4.h"
+
 #include <memory>
 #include <string>
 
 namespace mfq { class ModelSource; }
 struct Block;
-struct CudaRuntimeParameters;
 
 namespace mfq::cuda::gemma4 {
 
-struct Config;
+using Config = mfq::models::gemma4::Config;
 
 std::unique_ptr<::Block> load_block(
     const mfq::ModelSource& source,
-    const ::CudaRuntimeParameters& runtime,
     const Config& config,
     int layer,
     const std::string& type);

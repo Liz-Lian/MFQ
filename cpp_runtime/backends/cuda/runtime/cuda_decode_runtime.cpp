@@ -1,8 +1,8 @@
 #include "cuda_decode_runtime.h"
 #include "cuda_execution.h"
+#include "cuda_sampling.h"
 #include "diagnostics/backend_checks.h"
 #include "../ops/cuda_quantized_ops.h"
-#include "../models/cuda_model_config.h"
 #include "../models/qwen35/qwen35_linear_attention.h"
 #include "../models/registry.h"
 #include "mfq_tensor_backend.h"
@@ -16,7 +16,6 @@
 #include "mfq_cuda_mtp.h"
 #include "mfq_cuda_paged_kv.h"
 #include "mfq_cuda_ops.h"
-#include "flash_next/flash_next_model.h"
 #include "flash_next/state.h"
 #include "flash_next/qwen4.h"
 #include "models/deepseek_v41.h"
@@ -63,7 +62,6 @@
 #include <mutex>
 #include <numeric>
 #include <optional>
-#include <random>
 #include <regex>
 #include <sstream>
 #include <stdexcept>
@@ -108,7 +106,7 @@
 } while (0)
 #endif
 
-#include "cuda_model.h"
+#include "causal_lm.h"
 #include "server_components.h"
 
 static std::vector<int64_t> parse_ids(const std::string & s) {
@@ -457,18 +455,20 @@ static std::unordered_set<int> parse_layer_ranges(
     return result;
 }
 
+template <typename Model>
 static int run_prefill_sweep(
-    CudaModel & model,
+    Model& model,
     const std::vector<int64_t> & sizes,
     int repeats) {
     if (repeats < 1) throw std::runtime_error("--prefill-sweep-reps must be positive");
     const int64_t max_m = *std::max_element(sizes.begin(), sizes.end());
-    if (max_m > model.c.max_position_embeddings) {
+    if (max_m > model.max_position_embeddings()) {
         throw std::runtime_error("--prefill-sweep exceeds the configured context size");
     }
 
     std::vector<int64_t> token_ids((size_t)max_m);
-    const int64_t token_span = std::max<int64_t>(1, std::min<int64_t>(1024, model.c.vocab_size - 2));
+    const int64_t token_span = std::max<int64_t>(
+        1, std::min<int64_t>(1024, model.vocab_size() - 2));
     for (int64_t i = 0; i < max_m; ++i) token_ids[(size_t)i] = 1 + i % token_span;
     auto all_ids = mfq_tensor_backend::tensor(
         token_ids, mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt64).device(mfq_tensor_backend::kCUDA)).unsqueeze(0);
@@ -491,7 +491,7 @@ static int run_prefill_sweep(
             mfq_cuda_synchronize();
             auto ended = std::chrono::steady_clock::now();
             elapsed_ms.push_back(std::chrono::duration<double, std::milli>(ended - started).count());
-            if (repeat == 0) top = logits.argmax(-1).item<int64_t>();
+            if (repeat == 0) top = logits.argmax(-1).template item<int64_t>();
         }
         std::sort(elapsed_ms.begin(), elapsed_ms.end());
         const double median_ms = elapsed_ms[elapsed_ms.size() / 2];
@@ -505,22 +505,25 @@ static int run_prefill_sweep(
     return 0;
 }
 
+template <typename Model>
 static int run_block_trace_compare(
-    CudaModel & test,
+    Model& test,
     const std::string & reference_model_path,
     const std::string & config_path,
     int64_t context_size,
     mfq_tensor_backend::Tensor ids)
 {
-    CudaModel reference = [&]() {
+    Model reference = [&]() {
         if (g_n_gpu_layers < 0) {
-            return load_model(reference_model_path, config_path, context_size);
+            return mfq::cuda::load_causal_lm<Model::backbone>(
+                reference_model_path, config_path, context_size);
         }
         const int saved_n_gpu_layers = g_n_gpu_layers;
         const int saved_cpu_layers = g_dense_cpu_layer_count;
         g_n_gpu_layers = -1;
         try {
-            auto loaded = load_model(reference_model_path, config_path, context_size);
+            auto loaded = mfq::cuda::load_causal_lm<Model::backbone>(
+                reference_model_path, config_path, context_size);
             g_n_gpu_layers = saved_n_gpu_layers;
             g_dense_cpu_layer_count = saved_cpu_layers;
             return loaded;
@@ -551,14 +554,14 @@ static int run_block_trace_compare(
         }
         auto ref_norm = ref.norm();
         auto got_norm = got.norm();
-        const double ref_norm_value = ref_norm.item<double>();
+        const double ref_norm_value = ref_norm.template item<double>();
         const double denominator = std::max(ref_norm_value, 1.0e-30);
-        const double relative_l2 = (got - ref).norm().item<double>() / denominator;
-        const double cosine = mfq_tensor_backend::dot(ref, got).item<double>() /
-            std::max(ref_norm_value * got_norm.item<double>(), 1.0e-30);
-        const double norm_ratio = got_norm.item<double>() / denominator;
-        const double reference_rms = ref.square().mean().sqrt().item<double>();
-        const double test_rms = got.square().mean().sqrt().item<double>();
+        const double relative_l2 = (got - ref).norm().template item<double>() / denominator;
+        const double cosine = mfq_tensor_backend::dot(ref, got).template item<double>() /
+            std::max(ref_norm_value * got_norm.template item<double>(), 1.0e-30);
+        const double norm_ratio = got_norm.template item<double>() / denominator;
+        const double reference_rms = ref.square().mean().sqrt().template item<double>();
+        const double test_rms = got.square().mean().sqrt().template item<double>();
         const std::string stage = i == 0
             ? "embedding"
             : "block_" + std::to_string(i - 1);
@@ -585,21 +588,22 @@ static int run_block_trace_compare(
         auto ref_logp = mfq_tensor_backend::log_softmax(ref_chunk, -1);
         auto got_logp = mfq_tensor_backend::log_softmax(got_chunk, -1);
         kl_sum += (ref_logp.exp() * (ref_logp - got_logp)).sum(-1)
-            .to(mfq_tensor_backend::kFloat64).sum().item<double>();
-        same_top += ref_chunk.argmax(-1).eq(got_chunk.argmax(-1)).sum().item<int64_t>();
+            .to(mfq_tensor_backend::kFloat64).sum().template item<double>();
+        same_top += ref_chunk.argmax(-1).eq(got_chunk.argmax(-1)).sum().template item<int64_t>();
         rows += end - start;
     }
     const double logits_relative_l2 =
-        (test_logits.to(mfq_tensor_backend::kFloat64) - reference_logits.to(mfq_tensor_backend::kFloat64)).norm().item<double>() /
-        std::max(reference_logits.to(mfq_tensor_backend::kFloat64).norm().item<double>(), 1.0e-30);
+        (test_logits.to(mfq_tensor_backend::kFloat64) - reference_logits.to(mfq_tensor_backend::kFloat64)).norm().template item<double>() /
+        std::max(reference_logits.to(mfq_tensor_backend::kFloat64).norm().template item<double>(), 1.0e-30);
     std::cout << "block_trace_logits kld=" << (kl_sum / std::max<int64_t>(rows, 1))
               << " same_top=" << ((double)same_top / std::max<int64_t>(rows, 1))
               << " relative_l2=" << logits_relative_l2 << "\n";
     return 0;
 }
 
+template <typename Model>
 static int run_block_trace_dump(
-    CudaModel & model,
+    Model& model,
     const std::string & output_dir,
     mfq_tensor_backend::Tensor ids,
     int64_t token_start,
@@ -631,7 +635,7 @@ static int run_block_trace_dump(
         std::ofstream output(root / "tokens.i32", std::ios::binary);
         if (!output) throw std::runtime_error("cannot create block trace token file");
         output.write(
-            reinterpret_cast<const char *>(ids_cpu.data_ptr<int32_t>()),
+            reinterpret_cast<const char *>(ids_cpu.template data_ptr<int32_t>()),
             static_cast<std::streamsize>(ids_cpu.nbytes()));
         if (!output) throw std::runtime_error("failed to write block trace tokens");
     }
@@ -656,7 +660,7 @@ static int run_block_trace_dump(
             throw std::runtime_error("cannot create block trace tensor: " + file.string());
         }
         output.write(
-            reinterpret_cast<const char *>(value.data_ptr<float>()),
+            reinterpret_cast<const char *>(value.template data_ptr<float>()),
             static_cast<std::streamsize>(value.nbytes()));
         if (!output) {
             throw std::runtime_error("failed to write block trace tensor: " + file.string());
@@ -679,7 +683,7 @@ static int run_block_trace_dump(
             throw std::runtime_error("cannot create block trace tensor: " + file.string());
         }
         output.write(
-            reinterpret_cast<const char *>(value.data_ptr<float>()),
+            reinterpret_cast<const char *>(value.template data_ptr<float>()),
             static_cast<std::streamsize>(value.nbytes()));
         if (!output) {
             throw std::runtime_error("failed to write block trace tensor: " + file.string());
@@ -697,19 +701,17 @@ static int run_block_trace_dump(
     };
     final_hidden = token_slice(final_hidden);
     dump_terminal("final_norm", final_hidden);
-    auto logits = model.lm_head.forward(final_hidden);
-    if (model.c.final_logit_softcapping > 0.0) {
-        logits = mfq_tensor_backend::tanh(logits / model.c.final_logit_softcapping) *
-            model.c.final_logit_softcapping;
-    }
+    auto logits = model.apply_final_logit_softcap(
+        model.lm_head.forward(final_hidden));
     dump_terminal("logits", logits);
     metadata.flush();
     if (!metadata) throw std::runtime_error("failed to write block trace metadata");
     return 0;
 }
 
+template <typename Model>
 static int run_dsv4_hc_model_compare(
-    CudaModel & model,
+    Model& model,
     mfq_tensor_backend::Tensor ids)
 {
     std::vector<mfq_tensor_backend::Tensor> reference_trace;
@@ -751,25 +753,25 @@ static int run_dsv4_hc_model_compare(
         auto reference_f64 = reference.to(mfq_tensor_backend::kFloat64);
         auto candidate_f64 = candidate.to(mfq_tensor_backend::kFloat64);
         const double denominator = std::max(
-            reference_f64.norm().item<double>(), 1.0e-30);
+            reference_f64.norm().template item<double>(), 1.0e-30);
         const std::string stage = index == 0
             ? "embedding"
             : "block_" + std::to_string(index - 1);
         std::cout << std::scientific << std::setprecision(9)
                   << "dsv4_hc_model_trace stage=" << stage
                   << " differing="
-                  << candidate.ne(reference).sum().item<int64_t>()
+                  << candidate.ne(reference).sum().template item<int64_t>()
                   << " rel_l2="
                   << (candidate_f64 - reference_f64)
-                         .norm().item<double>() / denominator
+                         .norm().template item<double>() / denominator
                   << " mean_abs="
                   << (candidate_f64 - reference_f64)
-                         .abs().mean().item<double>()
+                         .abs().mean().template item<double>()
                   << " max_abs="
                   << (candidate_f64 - reference_f64)
-                         .abs().max().item<double>()
+                         .abs().max().template item<double>()
                   << " repeat_differing="
-                  << repeat.ne(reference).sum().item<int64_t>()
+                  << repeat.ne(reference).sum().template item<int64_t>()
                   << "\n";
     }
 
@@ -778,11 +780,11 @@ static int run_dsv4_hc_model_compare(
     const double kld_candidate_reference = (
         candidate_logp.exp() *
         (candidate_logp - reference_logp))
-        .sum(-1).mean().item<double>();
+        .sum(-1).mean().template item<double>();
     const double kld_reference_candidate = (
         reference_logp.exp() *
         (reference_logp - candidate_logp))
-        .sum(-1).mean().item<double>();
+        .sum(-1).mean().template item<double>();
     auto logit_diff = (
         candidate_logits.to(mfq_tensor_backend::kFloat64) -
         reference_logits.to(mfq_tensor_backend::kFloat64));
@@ -793,29 +795,23 @@ static int run_dsv4_hc_model_compare(
               << " mean_kld_reference_candidate="
               << kld_reference_candidate
               << " relative_l2="
-              << logit_diff.norm().item<double>() /
+              << logit_diff.norm().template item<double>() /
                     std::max(
                         reference_logits.to(mfq_tensor_backend::kFloat64)
-                            .norm().item<double>(),
+                            .norm().template item<double>(),
                         1.0e-30)
               << " mean_abs="
-              << logit_diff.abs().mean().item<double>()
+              << logit_diff.abs().mean().template item<double>()
               << " max_abs="
-              << logit_diff.abs().max().item<double>()
+              << logit_diff.abs().max().template item<double>()
               << " same_top="
               << candidate_logits.argmax(-1)
                      .eq(reference_logits.argmax(-1))
-                     .to(mfq_tensor_backend::kFloat32).mean().item<double>()
+                     .to(mfq_tensor_backend::kFloat32).mean().template item<double>()
               << " repeat_logits_equal="
               << (repeat_logits.equal(reference_logits) ? 1 : 0)
               << "\n";
     return 0;
-}
-
-static bool sampling_has_penalties(const MfqSamplingParams & sampling) {
-    return sampling.presence_penalty != 0.0 ||
-           sampling.frequency_penalty != 0.0 ||
-           sampling.repetition_penalty != 1.0;
 }
 
 static std::vector<MfqCudaStream> make_cuda_graph_compute_streams(
@@ -945,7 +941,8 @@ struct ServerDecodeGraphCache {
     }
 };
 
-static void prepare_decode_graph_memory(CudaModel& model, MfqCudaGraph& graph,
+template <typename Model>
+static void prepare_decode_graph_memory(Model& model, MfqCudaGraph& graph,
         const std::function<void()>& warmup,
         const std::vector<MfqCudaStream>& participant_streams = {}) {
     using Tensor = mfq_tensor_backend::Tensor;
@@ -989,7 +986,7 @@ static void prepare_decode_graph_memory(CudaModel& model, MfqCudaGraph& graph,
         }
     };
     mfq_prepare_cuda_graph_memory(graph, participant_streams);
-    if (!saved.empty() || model.c.is_gemma4() || model.c.is_glm_dsa() || model.c.is_minicpmo45()) {
+    if (!saved.empty() || Model::is_gemma4 || (Model::backbone == mfq::cuda::CudaBackbone::glm_dsa) || Model::is_minicpmo45) {
         // The first pass may initialize persistent CUDA/NCCL workspace state.
         // A second pass then records the complete set of reusable temporaries
         // needed by capture after those persistent allocations exist.
@@ -1018,73 +1015,16 @@ static bool trace_server_cuda_graph() {
     return value != nullptr && std::atoi(value) != 0;
 }
 
-static mfq_tensor_backend::Tensor sample_server_logits(
-    mfq_tensor_backend::Tensor logits,
-    const MfqSamplingParams & sampling,
-    mfq_tensor_backend::Tensor counts,
-    mfq_tensor_backend::Tensor random_host,
-    mfq_tensor_backend::Tensor random_cuda,
-    std::mt19937_64 & rng,
-    const MfqTokenConstraintPtr & token_constraint)
-{
-    const bool greedy = sampling.temperature <= 0.0 || sampling.top_k == 1;
-    const bool has_penalties = sampling_has_penalties(sampling);
-    logits = logits.contiguous().view({1, -1});
-    if (has_penalties) {
-        sample_apply_penalties_cuda(
-            logits, counts, sampling.presence_penalty,
-            sampling.frequency_penalty, sampling.repetition_penalty);
-    }
-    std::uniform_real_distribution<float> uniform(0.0f, 1.0f);
-    const auto sample_logits = [&](mfq_tensor_backend::Tensor candidate_logits) {
-        if (greedy) return sample_greedy_cuda(candidate_logits);
-        *random_host.data_ptr<float>() = uniform(rng);
-        random_cuda.copy_(random_host, true);
-        if (sampling.top_k > 0) {
-            return sample_top_k_top_p_cuda(
-                candidate_logits, random_cuda, sampling.temperature,
-                sampling.top_k, sampling.top_p);
-        }
-        return sample_softmax_cuda(
-            candidate_logits, random_cuda, sampling.temperature);
-    };
-
-    auto next = sample_logits(logits);
-    if (token_constraint && token_constraint->allows &&
-        !token_constraint->allows(next.item<int64_t>())) {
-        auto masked = logits
-            .to(mfq_tensor_backend::kCPU, mfq_tensor_backend::kFloat32)
-            .contiguous();
-        token_constraint->apply(
-            masked.data_ptr<float>(),
-            static_cast<std::size_t>(masked.numel()));
-        next = sample_logits(masked.to(logits.device()));
-        const int64_t constrained_token = next.item<int64_t>();
-        if (!token_constraint->allows(constrained_token)) {
-            throw std::runtime_error(
-                "CUDA constrained sampler returned an invalid token");
-        }
-    }
-    if (token_constraint && token_constraint->accept) {
-        token_constraint->accept(next.item<int64_t>());
-    }
-    return next;
-}
-
+template <typename Model>
 static mfq_tensor_backend::Tensor sample_server_token(
-    CudaModel & model,
+    Model& model,
     mfq_tensor_backend::Tensor ids,
-    const MfqSamplingParams & sampling,
+    mfq::cuda::Sampler& sampler,
     mfq_tensor_backend::Tensor counts,
-    mfq_tensor_backend::Tensor random_host,
-    mfq_tensor_backend::Tensor random_cuda,
-    std::mt19937_64 & rng,
     const MfqTokenConstraintPtr & token_constraint,
     cudaEvent_t prefill_finished = nullptr)
 {
-    const bool greedy = sampling.temperature <= 0.0 || sampling.top_k == 1;
-    const bool has_penalties = sampling_has_penalties(sampling);
-    if (greedy && !has_penalties && !token_constraint) {
+    if (sampler.greedy() && !sampler.has_penalties() && !token_constraint) {
         auto next = model.next_token(ids);
         if (prefill_finished != nullptr) {
             MFQ_CUDA_CHECK(cudaEventRecord(
@@ -1098,13 +1038,13 @@ static mfq_tensor_backend::Tensor sample_server_token(
         MFQ_CUDA_CHECK(cudaEventRecord(
             prefill_finished, mfq_get_current_cuda_stream()));
     }
-    return sample_server_logits(
-        std::move(logits), sampling, counts, random_host,
-        random_cuda, rng, token_constraint);
+    return mfq::cuda::sample_logits(
+        sampler, std::move(logits), counts, token_constraint);
 }
 
+template <typename Model>
 static mfq_tensor_backend::Tensor server_prefill_tail(
-    CudaModel & model,
+    Model& model,
     mfq_tensor_backend::Tensor ids,
     int64_t chunk_size) {
     MFQ_RUNTIME_CHECK(
@@ -1124,8 +1064,9 @@ static mfq_tensor_backend::Tensor server_prefill_tail(
         : ids.narrow(1, offset, ids.size(1) - offset).contiguous();
 }
 
+template <typename Model>
 static mfq_tensor_backend::Tensor server_hidden_forward_chunked(
-    CudaModel & model,
+    Model& model,
     const mfq_tensor_backend::Tensor & ids,
     int64_t chunk_size,
     mfq_tensor_backend::Tensor * raw_hidden = nullptr) {
@@ -1163,8 +1104,9 @@ static mfq_tensor_backend::Tensor server_hidden_forward_chunked(
     return hidden;
 }
 
+template <typename Model>
 static mfq_tensor_backend::Tensor server_hidden_forward_prepared_chunked(
-    CudaModel& model,
+    Model& model,
     const mfq_tensor_backend::Tensor& ids,
     const CudaPreparedPrompt& prepared,
     int64_t chunk_size,
@@ -1176,7 +1118,7 @@ static mfq_tensor_backend::Tensor server_hidden_forward_prepared_chunked(
             prepared.embeddings.dim() == 3 &&
             prepared.embeddings.size(0) == 1 &&
             prepared.embeddings.size(1) == ids.size(1) &&
-            prepared.embeddings.size(2) == model.c.hidden_size &&
+            prepared.embeddings.size(2) == model.hidden_size() &&
             (prepared.positions.dim() == 1 ||
              prepared.positions.dim() == 2) &&
             prepared.positions.size(-1) == ids.size(1),
@@ -1288,12 +1230,13 @@ static std::filesystem::path default_cuda_prefix_cache_directory() {
         "tyloquant-mfq-prefix-cache";
 }
 
+template <typename Model>
 static std::string cuda_prefix_cache_compatibility_key(
-        const mfq::ModelSource& source, const CudaModel& model) {
+        const mfq::ModelSource& source, const Model& model) {
     std::ostringstream key;
     key << "mfq-cuda-prefix-v1\n"
         << "codec=cuda-full-attention-kv-v1\n"
-        << "context=" << model.c.max_position_embeddings << '\n'
+        << "context=" << model.max_position_embeddings() << '\n'
         << "architecture=" << source.architecture() << '\n';
     for (std::size_t index = 0; index < source.source_paths().size(); ++index) {
         const auto& path = source.source_paths()[index];
@@ -1322,9 +1265,10 @@ static std::string cuda_prefix_cache_compatibility_key(
     return key.str();
 }
 
+template <typename Model>
 static std::shared_ptr<mfq::cache::PagedPrefixCache>
 make_cuda_paged_prefix_cache(
-        const mfq::ModelSource& source, const CudaModel& model) {
+        const mfq::ModelSource& source, const Model& model) {
     const auto format = source.metadata().find("source.format");
     // ponytail: HF source fingerprints exclude config sidecars for now.
     if ((format != source.metadata().end() &&
@@ -1407,8 +1351,9 @@ public:
         return static_cast<bool>(paged_cache_);
     }
 
+    template <typename Model>
     size_t restore_best(
-            CudaModel & model,
+            Model& model,
             const std::string & requested_session,
             const std::vector<int64_t> & prompt,
             size_t maximum_prefix_tokens) {
@@ -1691,8 +1636,9 @@ public:
     }
 
 private:
+    template <typename Model>
     size_t restore_paged(
-            CudaModel & model,
+            Model& model,
             const std::string & requested_session,
             const std::vector<int64_t> & prompt,
             size_t maximum_prefix_tokens) {
@@ -1705,11 +1651,17 @@ private:
         std::vector<int64_t> candidate(
             prompt.begin(),
             prompt.begin() + static_cast<std::ptrdiff_t>(limit));
-        auto match = paged_cache_->match(candidate);
-        if (match.matched_tokens == 0) return 0;
+        auto match = paged_cache_->match(candidate, {}, false);
+        if (match.matched_tokens == 0) {
+            paged_cache_->record_match(0);
+            return 0;
+        }
 
         auto payloads = paged_cache_->load_prefix(match.blocks);
-        if (payloads.empty()) return 0;
+        if (payloads.empty()) {
+            paged_cache_->record_match(0);
+            return 0;
+        }
         if (payloads.size() != match.blocks.size()) {
             match.blocks.resize(payloads.size());
             match.matched_tokens =
@@ -1719,16 +1671,32 @@ private:
             prompt.begin(),
             prompt.begin() + static_cast<std::ptrdiff_t>(
                 match.matched_tokens));
+        std::optional<TextSessionState> state;
         try {
-            auto state = decode_cuda_paged_session(
+            state.emplace(decode_cuda_paged_session(
                 payloads,
                 matched_tokens,
-                paged_cache_->block_size_tokens());
-            model.restore_text_session_state(state);
+                paged_cache_->block_size_tokens()));
+        } catch (const std::exception & error) {
+            if (!match.blocks.empty()) {
+                paged_cache_->invalidate(match.blocks.back());
+            }
+            paged_cache_->record_match(0);
+            model.reset(1);
+            std::cerr
+                << "server_session_cache backend=cuda "
+                << "action=paged_codec_invalidate "
+                << "session=" << requested_session
+                << " error=" << error.what() << std::endl;
+            return 0;
+        }
+        try {
+            model.restore_text_session_state(*state);
             if (!requested_session.empty()) {
                 bind_paged_session(
                     requested_session, match.blocks, match.matched_tokens);
             }
+            paged_cache_->record_match(match.matched_tokens);
             if (trace_) {
                 std::cerr
                     << "server_session_cache backend=cuda action=paged_hit "
@@ -1739,9 +1707,11 @@ private:
             }
             return match.matched_tokens;
         } catch (const std::exception & error) {
+            paged_cache_->record_match(0);
             model.reset(1);
             std::cerr
-                << "server_session_cache backend=cuda action=paged_invalidate "
+                << "server_session_cache backend=cuda "
+                << "action=paged_restore_failed "
                 << "session=" << requested_session
                 << " error=" << error.what() << std::endl;
             return 0;
@@ -1966,11 +1936,13 @@ private:
 
 
 
-using CudaPreparedPromptFactory =
-    std::function<std::optional<CudaPreparedPrompt>(CudaModel&)>;
+template <typename Model>
+using PreparedPromptFactory =
+    std::function<std::optional<CudaPreparedPrompt>(Model&)>;
 
+template <typename Model>
 static int32_t generate_server_tokens(
-    CudaModel & model,
+    Model& model,
     std::mutex & model_mutex,
     ServerDecodeGraphCache & graph_cache,
     ServerTextSessionCache & session_cache,
@@ -1980,9 +1952,9 @@ static int32_t generate_server_tokens(
     const MfqPrefillCallback & on_prefill,
     const MfqPromptCachePlan & cache_plan,
     const MfqTokenConstraintPtr & token_constraint,
-    CudaMtpModule* mtp = nullptr,
+    MtpModule* mtp = nullptr,
     int64_t prefill_chunk_size = 2048,
-    CudaPreparedPromptFactory prepare_prompt = {})
+    PreparedPromptFactory<Model> prepare_prompt = {})
 {
     std::lock_guard<std::mutex> lock(model_mutex);
     const auto prepared = prepare_prompt
@@ -2004,10 +1976,18 @@ static int32_t generate_server_tokens(
         !(mtp_reprefill != nullptr && mtp_reprefill[0] == '1') &&
         !(mtp_trace != nullptr && mtp_trace[0] == '1')) {
         // Predictor state is not in the persistent session snapshot contract.
-        return run_cuda_mtp_generation(
-            model, *mtp, prompt, sampling, on_token, on_prefill,
-            prefill_chunk_size, token_constraint,
-            transformed_prompt ? &*prepared : nullptr);
+        if constexpr (
+                Model::backbone == mfq::cuda::CudaBackbone::generic_qwen ||
+                Model::backbone == mfq::cuda::CudaBackbone::qwen4_exp ||
+                Model::backbone == mfq::cuda::CudaBackbone::glm5_next ||
+                Model::backbone == mfq::cuda::CudaBackbone::deepseek_v41) {
+            return run_mtp_generation<Model::backbone>(
+                model, *mtp, prompt, sampling, on_token, on_prefill,
+                prefill_chunk_size, token_constraint,
+                transformed_prompt ? &*prepared : nullptr);
+        }
+        throw std::runtime_error(
+            "MTP is unavailable for this causal LM type");
     }
     auto options = mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt64).device(mfq_tensor_backend::kCUDA);
     const size_t stable_prefix_tokens = transformed_prompt ? 0 : std::min(
@@ -2027,19 +2007,20 @@ static int32_t generate_server_tokens(
     auto ids = full_ids.narrow(
         1, static_cast<int64_t>(reused_tokens),
         static_cast<int64_t>(prompt.size() - reused_tokens)).contiguous();
-    const bool has_penalties = sampling_has_penalties(sampling);
-    graph_cache.ensure_storage(model.c.vocab_size);
+    graph_cache.ensure_storage(model.vocab_size());
+    auto random_host = mfq_tensor_backend::empty(
+        {1}, mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kFloat32).device(mfq_tensor_backend::kCPU).pinned_memory(true));
+    auto random_cuda = mfq_tensor_backend::empty(
+        {1}, mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kFloat32).device(mfq_tensor_backend::kCUDA));
+    mfq::cuda::Sampler sampler(
+        sampling,
+        mfq::cuda::SamplingOps(random_host, std::move(random_cuda)));
+    const bool has_penalties = sampler.has_penalties();
     auto counts = has_penalties ? graph_cache.counts : mfq_tensor_backend::Tensor();
     if (has_penalties) {
         counts.zero_();
         sample_token_counts_add_cuda(counts, full_ids);
     }
-
-    auto random_host = mfq_tensor_backend::empty(
-        {1}, mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kFloat32).device(mfq_tensor_backend::kCPU).pinned_memory(true));
-    auto random_cuda = mfq_tensor_backend::empty(
-        {1}, mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kFloat32).device(mfq_tensor_backend::kCUDA));
-    std::mt19937_64 rng(sampling.seed);
     const auto store_session_snapshot = [&](size_t token_count) {
         if (!cache_enabled || model.cache_pos !=
                 static_cast<int64_t>(token_count)) {
@@ -2069,7 +2050,7 @@ static int32_t generate_server_tokens(
                 stable_suffix = server_prefill_tail(
                     model, std::move(stable_suffix), prefill_chunk_size);
                 MfqOptional<mfq_tensor_backend::Tensor> stable_seq_len = mfq_nullopt;
-                if (!model.c.is_minicpmo45() && model.cache_pos > 0 &&
+                if (!Model::is_minicpmo45 && model.cache_pos > 0 &&
                         stable_suffix.size(1) == 1) {
                     stable_seq_len = mfq_tensor_backend::full(
                         {1}, model.cache_pos + 1, options);
@@ -2094,18 +2075,16 @@ static int32_t generate_server_tokens(
             MFQ_CUDA_CHECK(cudaEventRecord(
                 prefill_timer.finished_event(),
                 mfq_get_current_cuda_stream()));
-            next = sample_server_logits(
-                std::move(logits), sampling, counts, random_host,
-                random_cuda, rng, token_constraint);
+            next = mfq::cuda::sample_logits(
+                sampler, std::move(logits), counts, token_constraint);
         } else {
             ids = server_prefill_tail(
                 model, std::move(ids), prefill_chunk_size);
             next = sample_server_token(
-                model, ids, sampling, counts, random_host, random_cuda, rng,
-                token_constraint,
+                model, ids, sampler, counts, token_constraint,
                 prefill_timer.finished_event());
         }
-        const int64_t token = next.item<int64_t>();
+        const int64_t token = next.template item<int64_t>();
         const double prefill_ms = prefill_timer.elapsed_ms();
         if (stable_prefix_tokens == prompt.size()) {
             store_session_snapshot(stable_prefix_tokens);
@@ -2158,10 +2137,10 @@ static int32_t generate_server_tokens(
         for (size_t i = 0; i < incremental_trace.size(); ++i) {
             auto got = incremental_trace[i].reshape({-1}).to(mfq_tensor_backend::kFloat64);
             auto ref = full_trace[i].index({Slice(), -1, Slice()}).reshape({-1}).to(mfq_tensor_backend::kFloat64);
-            const double denominator = std::max(ref.norm().item<double>(), 1.0e-30);
-            const double relative_l2 = (got - ref).norm().item<double>() / denominator;
-            const double cosine = mfq_tensor_backend::dot(got, ref).item<double>() /
-                std::max(got.norm().item<double>() * denominator, 1.0e-30);
+            const double denominator = std::max(ref.norm().template item<double>(), 1.0e-30);
+            const double relative_l2 = (got - ref).norm().template item<double>() / denominator;
+            const double cosine = mfq_tensor_backend::dot(got, ref).template item<double>() /
+                std::max(got.norm().template item<double>() * denominator, 1.0e-30);
             std::cerr << "incremental_trace stage="
                       << (i == 0 ? "embedding" : "block_" + std::to_string(i - 1))
                       << " relative_l2=" << relative_l2
@@ -2181,10 +2160,10 @@ static int32_t generate_server_tokens(
             auto full_flat = full_tensor.reshape({-1});
             auto ref = full_flat.narrow(
                 0, full_flat.numel() - got_tensor.numel(), got_tensor.numel()).to(mfq_tensor_backend::kFloat64);
-            const double denominator = std::max(ref.norm().item<double>(), 1.0e-30);
-            const double relative_l2 = (got - ref).norm().item<double>() / denominator;
-            const double cosine = mfq_tensor_backend::dot(got, ref).item<double>() /
-                std::max(got.norm().item<double>() * denominator, 1.0e-30);
+            const double denominator = std::max(ref.norm().template item<double>(), 1.0e-30);
+            const double relative_l2 = (got - ref).norm().template item<double>() / denominator;
+            const double cosine = mfq_tensor_backend::dot(got, ref).template item<double>() /
+                std::max(got.norm().template item<double>() * denominator, 1.0e-30);
             std::cerr << "incremental_gemma_trace stage="
                       << incremental_gemma_trace[i].first
                       << " relative_l2=" << relative_l2
@@ -2195,18 +2174,18 @@ static int32_t generate_server_tokens(
         auto full_logits = model.lm_head.forward(
             full_hidden.index({Slice(), -1, Slice()}).to(mfq_tensor_backend::kFloat16).contiguous());
         const double logits_relative_l2 =
-            (incremental_logits.to(mfq_tensor_backend::kFloat64) - full_logits.to(mfq_tensor_backend::kFloat64)).norm().item<double>() /
-            std::max(full_logits.to(mfq_tensor_backend::kFloat64).norm().item<double>(), 1.0e-30);
+            (incremental_logits.to(mfq_tensor_backend::kFloat64) - full_logits.to(mfq_tensor_backend::kFloat64)).norm().template item<double>() /
+            std::max(full_logits.to(mfq_tensor_backend::kFloat64).norm().template item<double>(), 1.0e-30);
         std::cerr << "incremental_trace logits_relative_l2=" << logits_relative_l2
-                  << " incremental_top=" << incremental_logits.argmax(-1).item<int64_t>()
-                  << " full_top=" << full_logits.argmax(-1).item<int64_t>() << std::endl;
+                  << " incremental_top=" << incremental_logits.argmax(-1).template item<int64_t>()
+                  << " full_top=" << full_logits.argmax(-1).template item<int64_t>() << std::endl;
         return 1;
     }
 
     const char * graph_env = std::getenv("MFQ_SERVER_CUDA_GRAPH");
     const bool graph_enabled =
         (graph_env == nullptr || graph_env[0] != '0') &&
-        !model.c.is_flash_next() &&
+        !Model::is_flash_next &&
         mfq_cuda_graph_capture_supported() &&
         g_dsv4_cpu_offload_layers.empty() &&
         g_dense_cpu_layer_count == 0 &&
@@ -2224,7 +2203,7 @@ static int32_t generate_server_tokens(
         sampling.max_tokens >= graph_min_tokens &&
         sampling.max_tokens <= graph_cache.generated_capacity;
     if (graph_eligible) {
-        const bool greedy = sampling.temperature <= 0.0 || sampling.top_k == 1;
+        const bool greedy = sampler.greedy();
         auto [first, first_token] = sample_first_token();
         int32_t generated = 1;
         if (!on_token(first_token) || generated >= sampling.max_tokens) return generated;
@@ -2244,23 +2223,23 @@ static int32_t generate_server_tokens(
         int64_t len_h = pos_h + 1;
         int64_t step_h = 1;
         MFQ_CUDA_CHECK(cudaMemcpyAsync(
-            graph_cache.static_input.data_ptr<int64_t>(), first.data_ptr<int64_t>(),
+            graph_cache.static_input.template data_ptr<int64_t>(), first.template data_ptr<int64_t>(),
             sizeof(int64_t), cudaMemcpyDeviceToDevice, graph_raw_stream));
         MFQ_CUDA_CHECK(cudaMemcpyAsync(
-            graph_cache.generated.data_ptr<int64_t>(), first.data_ptr<int64_t>(),
+            graph_cache.generated.template data_ptr<int64_t>(), first.template data_ptr<int64_t>(),
             sizeof(int64_t), cudaMemcpyDeviceToDevice, graph_raw_stream));
         MFQ_CUDA_CHECK(cudaMemcpyAsync(
-            graph_cache.static_pos.data_ptr<int64_t>(), &pos_h,
+            graph_cache.static_pos.template data_ptr<int64_t>(), &pos_h,
             sizeof(int64_t), cudaMemcpyHostToDevice, graph_raw_stream));
         MFQ_CUDA_CHECK(cudaMemcpyAsync(
-            graph_cache.static_len.data_ptr<int64_t>(), &len_h,
+            graph_cache.static_len.template data_ptr<int64_t>(), &len_h,
             sizeof(int64_t), cudaMemcpyHostToDevice, graph_raw_stream));
         MFQ_CUDA_CHECK(cudaMemcpyAsync(
-            graph_cache.static_step.data_ptr<int64_t>(), &step_h,
+            graph_cache.static_step.template data_ptr<int64_t>(), &step_h,
             sizeof(int64_t), cudaMemcpyHostToDevice, graph_raw_stream));
-        *random_host.data_ptr<float>() = 0.5f;
+        *random_host.template data_ptr<float>() = 0.5f;
         MFQ_CUDA_CHECK(cudaMemcpyAsync(
-            graph_cache.random.data_ptr<float>(), random_host.data_ptr<float>(),
+            graph_cache.random.template data_ptr<float>(), random_host.template data_ptr<float>(),
             sizeof(float), cudaMemcpyHostToDevice, graph_raw_stream));
         MFQ_CUDA_CHECK(cudaStreamSynchronize(graph_raw_stream));
 
@@ -2273,22 +2252,19 @@ static int32_t generate_server_tokens(
                     graph_cache.static_input, graph_cache.static_pos, graph_cache.static_len)
                 .contiguous().view({1, -1});
             if (has_penalties) {
-                sample_apply_penalties_cuda(
-                    logits, graph_cache.counts, sampling.presence_penalty,
-                    sampling.frequency_penalty, sampling.repetition_penalty);
+                logits = sampler.apply_penalties(
+                    std::move(logits), graph_cache.counts);
             }
-            if (greedy) return sample_greedy_cuda(logits);
-            if (sampling.top_k > 0) {
-                return sample_top_k_top_p_cuda(
-                    logits, graph_cache.random, sampling.temperature,
-                    sampling.top_k, sampling.top_p);
+            if (greedy) {
+                return sampler.ops().sample_greedy(std::move(logits));
             }
-            return sample_softmax_cuda(logits, graph_cache.random, sampling.temperature);
+            return sampler.ops().sample_stochastic(
+                std::move(logits), graph_cache.random, sampler.params());
         };
 
         const int64_t requested_len = model.cache_pos + sampling.max_tokens;
         const int64_t planned_len = server_decode_graph_bucket(
-            requested_len, model.c.max_position_embeddings);
+            requested_len, model.max_position_embeddings());
         const bool cache_hit = graph_cache.matches(planned_len, sampling, greedy);
         if (!cache_hit) {
             graph_cache.invalidate();
@@ -2337,16 +2313,15 @@ static int32_t generate_server_tokens(
                       << " reuses=" << graph_cache.reuses << std::endl;
         }
 
-        std::uniform_real_distribution<float> uniform(0.0f, 1.0f);
         while (generated < sampling.max_tokens) {
             if (!greedy) {
-                *random_host.data_ptr<float>() = uniform(rng);
+                *random_host.template data_ptr<float>() = sampler.next_uniform_float();
                 MFQ_CUDA_CHECK(cudaMemcpyAsync(
-                    graph_cache.random.data_ptr<float>(), random_host.data_ptr<float>(),
+                    graph_cache.random.template data_ptr<float>(), random_host.template data_ptr<float>(),
                     sizeof(float), cudaMemcpyHostToDevice, graph_raw_stream));
             }
             graph_cache.graph->replay();
-            const int64_t token = graph_cache.static_next.item<int64_t>();
+            const int64_t token = graph_cache.static_next.template item<int64_t>();
             ++generated;
             if (!on_token(token)) break;
         }
@@ -2368,9 +2343,8 @@ static int32_t generate_server_tokens(
             token = first.second;
         } else {
             next = sample_server_token(
-                model, ids, sampling, counts, random_host, random_cuda, rng,
-                token_constraint);
-            token = next.item<int64_t>();
+                model, ids, sampler, counts, token_constraint);
+            token = next.template item<int64_t>();
         }
         ++generated;
         if (!on_token(token)) break;
@@ -2385,8 +2359,18 @@ static int32_t generate_server_tokens(
 
 // Real-weight correctness gate; does not require a tokenizer or start a server.
 // It calls the same MTP generator used by the server, with synthetic token IDs.
-static int run_qwen35_mtp_check(CudaModel& model, CudaQwen35Mtp& mtp) {
+static int run_qwen35_mtp_check(
+        mfq::cuda::Qwen35CausalLm& model, Qwen35Mtp& mtp) {
     using Tensor = mfq_tensor_backend::Tensor;
+    const MtpTarget target{
+        [&model](Tensor ids) {
+            return model.embed_forward(std::move(ids));
+        },
+        [&model](Tensor hidden) {
+            return model.logits_from_hidden(std::move(hidden));
+        },
+        &model.rope,
+    };
     // Identity projection isolates both dense gate modes and their dtype casts.
     const auto float_options = mfq_tensor_backend::TensorOptions()
         .device(mfq_tensor_backend::kCUDA).dtype(mfq_tensor_backend::kFloat32);
@@ -2416,7 +2400,7 @@ static int run_qwen35_mtp_check(CudaModel& model, CudaQwen35Mtp& mtp) {
             for (int i = 0; i < m * 33; ++i) {
                 const double activated = (mode == 1 ? 1. : gate[i]) / (1. + std::exp(-double(gate[i])));
                 const double reference = double(input[i]) * activated;
-                const double value = values.data_ptr<float>()[i];
+                const double value = values.template data_ptr<float>()[i];
                 MFQ_RUNTIME_CHECK(std::isfinite(value) &&
                     std::abs(value - reference) <= tolerance * (1. + std::abs(reference)),
                     "dense gate differs from CPU double identity oracle");
@@ -2437,7 +2421,7 @@ static int run_qwen35_mtp_check(CudaModel& model, CudaQwen35Mtp& mtp) {
         auto r = reference.contiguous().to(mfq_tensor_backend::kFloat32).cpu();
         double squared = 0., norm = 0.;
         for (int64_t i = 0; i < a.numel(); ++i) {
-            const double av = a.data_ptr<float>()[i], rv = r.data_ptr<float>()[i];
+            const double av = a.template data_ptr<float>()[i], rv = r.template data_ptr<float>()[i];
             MFQ_RUNTIME_CHECK(std::isfinite(av) && std::isfinite(rv), "nonfinite MTP gate value");
             squared += (av - rv) * (av - rv);
             norm += rv * rv;
@@ -2523,12 +2507,14 @@ static int run_qwen35_mtp_check(CudaModel& model, CudaQwen35Mtp& mtp) {
         g_gemma_trace_layer = 0;
         if (tokens == 2) g_gemma_stage_trace = &batch_stages;
         mtp.reset();
-        auto batched = mtp.forward(model, raw.narrow(1, 0, tokens), next).clone();
+        auto batched = mtp.forward(
+            target, raw.narrow(1, 0, tokens), next).clone();
         mtp.reset();
         if (tokens == 2) g_gemma_stage_trace = &row_stages;
         std::vector<Tensor> serial;
         for (int t = 0; t < tokens; ++t)
-            serial.push_back(mtp.forward(model, raw.narrow(1, t, 1), next.narrow(1, t, 1)));
+            serial.push_back(mtp.forward(
+                target, raw.narrow(1, t, 1), next.narrow(1, t, 1)));
         g_gemma_stage_trace = nullptr;
         if (tokens == 2) {
             MFQ_RUNTIME_CHECK(row_stages.size() == 2 * batch_stages.size(),
@@ -2556,11 +2542,11 @@ static int run_qwen35_mtp_check(CudaModel& model, CudaQwen35Mtp& mtp) {
         std::vector<int64_t> expected;
         for (int step = 0; step < params.max_tokens; ++step) {
             auto next = model.next_token(current);
-            expected.push_back(next.item<int64_t>());
+            expected.push_back(next.template item<int64_t>());
             current = next.reshape({1, 1});
         }
         std::vector<int64_t> got;
-        const int produced = run_cuda_mtp_generation(model, mtp, input, params,
+        const int produced = run_mtp_generation<mfq::cuda::CudaBackbone::generic_qwen>(model, mtp, input, params,
             [&](int64_t token) { got.push_back(token); return true; }, {});
         total_cycles += mtp.last_cycles;
         std::cout << "mtp_check greedy_prompt_tokens=" << input.size() << " produced=" << produced
@@ -2571,7 +2557,7 @@ static int run_qwen35_mtp_check(CudaModel& model, CudaQwen35Mtp& mtp) {
         // Callback stop then a fresh request exercises state reset after an
         // early return, including stopping before a computed bonus is emitted.
         got.clear();
-        const int stopped = run_cuda_mtp_generation(model, mtp, input, params,
+        const int stopped = run_mtp_generation<mfq::cuda::CudaBackbone::generic_qwen>(model, mtp, input, params,
             [&](int64_t token) { got.push_back(token); return got.size() < 3; }, {});
         MFQ_RUNTIME_CHECK(stopped == 3 && got == std::vector<int64_t>(expected.begin(), expected.begin() + 3),
             "MTP callback emitted extra or incorrect tokens");
@@ -2585,7 +2571,7 @@ static int run_qwen35_mtp_check(CudaModel& model, CudaQwen35Mtp& mtp) {
     stochastic.frequency_penalty = .1;
     stochastic.repetition_penalty = 1.05;
     stochastic.seed = 20260907;
-    const int produced = run_cuda_mtp_generation(model, mtp, prompt, stochastic,
+    const int produced = run_mtp_generation<mfq::cuda::CudaBackbone::generic_qwen>(model, mtp, prompt, stochastic,
         [](int64_t) { return true; }, {});
     MFQ_RUNTIME_CHECK(produced == 8 && mtp.last_cycles > 0 && total_cycles > 0,
         "MTP runtime gate did not execute speculative cycles");
@@ -2613,14 +2599,16 @@ static int run_qwen35_mtp_check(CudaModel& model, CudaQwen35Mtp& mtp) {
 
 // Fixed synthetic-ID latency probe through the actual server dispatch. Model
 // loading and the independent serial oracle are outside every timed request.
-static int run_qwen35_mtp_bench(CudaModel& model, CudaQwen35Mtp& mtp,
+static int run_qwen35_mtp_bench(
+        mfq::cuda::Qwen35CausalLm& model, Qwen35Mtp& mtp,
         bool enable_mtp, int generated_tokens, int repetitions) {
     using Clock = std::chrono::steady_clock;
     using Tensor = mfq_tensor_backend::Tensor;
-    MFQ_RUNTIME_CHECK(generated_tokens >= 2 && repetitions > 0 && repetitions <= 100 &&
-        model.c.max_position_embeddings >= generated_tokens + 17,
+    MFQ_RUNTIME_CHECK(
+        generated_tokens >= 2 && repetitions > 0 && repetitions <= 100 &&
+            model.max_position_embeddings() >= generated_tokens + 17,
         "MTP benchmark requires gen>=2, reps1-100 and context>=gen+17");
-    ServerDecodeGraphCache graph_cache(model.c.max_position_embeddings);
+    ServerDecodeGraphCache graph_cache(model.max_position_embeddings());
     ServerTextSessionCache session_cache;
     std::mutex model_mutex;
     MfqSamplingParams params;
@@ -2651,7 +2639,7 @@ static int run_qwen35_mtp_bench(CudaModel& model, CudaQwen35Mtp& mtp,
         reference.reserve(generated_tokens);
         for (int step = 0; step < generated_tokens; ++step) {
             auto next = model.next_token(input);
-            reference.push_back(next.item<int64_t>());
+            reference.push_back(next.template item<int64_t>());
             input = next.reshape({1, 1});
         }
         mfq_cuda_synchronize();
@@ -2732,7 +2720,7 @@ static int32_t generate_server_multimodal_tokens(
     const auto generation_limit = std::min<int32_t>(
         sampling.max_tokens,
         static_cast<int32_t>(
-            runtime.language.c.max_position_embeddings -
+            runtime.language.max_position_embeddings() -
             static_cast<int64_t>(prompt.size()) + 1));
     if (generation_limit <= 0) {
         throw std::invalid_argument(
@@ -2789,22 +2777,25 @@ static int32_t generate_server_multimodal_tokens(
             cpu_i64).clone();
     }
 
-    const bool has_penalties = sampling_has_penalties(sampling);
-    auto counts = has_penalties
-        ? mfq_tensor_backend::zeros(
-              {runtime.language.c.vocab_size},
-              mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt32).device(mfq_tensor_backend::kCUDA))
-        : mfq_tensor_backend::Tensor();
-    if (has_penalties) {
-        sample_token_counts_add_cuda(counts, input_ids);
-    }
     auto random_host = mfq_tensor_backend::empty(
         {1}, mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kFloat32)
             .device(mfq_tensor_backend::kCPU).pinned_memory(true));
     auto random_cuda = mfq_tensor_backend::empty(
         {1}, mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kFloat32)
             .device(mfq_tensor_backend::kCUDA));
-    std::mt19937_64 rng(sampling.seed);
+    mfq::cuda::Sampler sampler(
+        sampling,
+        mfq::cuda::SamplingOps(
+            std::move(random_host), std::move(random_cuda)));
+    const bool has_penalties = sampler.has_penalties();
+    auto counts = has_penalties
+        ? mfq_tensor_backend::zeros(
+              {runtime.language.vocab_size()},
+              mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt32).device(mfq_tensor_backend::kCUDA))
+        : mfq_tensor_backend::Tensor();
+    if (has_penalties) {
+        sample_token_counts_add_cuda(counts, input_ids);
+    }
 
     ServerPrefillCudaTimer prefill_timer;
     auto result = runtime.forward(
@@ -2823,9 +2814,8 @@ static int32_t generate_server_multimodal_tokens(
     MFQ_CUDA_CHECK(cudaEventRecord(
         prefill_timer.finished_event(),
         mfq_get_current_cuda_stream()));
-    auto next = sample_server_logits(
-        std::move(logits), sampling, counts, random_host,
-        random_cuda, rng, token_constraint);
+    auto next = mfq::cuda::sample_logits(
+        sampler, std::move(logits), counts, token_constraint);
     if (on_prefill) {
         const double model_ms = prefill_timer.elapsed_ms();
         // The current CUDA composite timer covers both the multimodal encoder
@@ -2840,20 +2830,14 @@ static int32_t generate_server_multimodal_tokens(
 
     int32_t generated = 0;
     while (generated < generation_limit) {
-        const int64_t token = next.item<int64_t>();
+        const int64_t token = next.template item<int64_t>();
         ++generated;
         if (!on_token(token) || generated >= generation_limit) break;
         if (has_penalties) {
             sample_token_counts_add_cuda(counts, next.contiguous());
         }
         next = sample_server_token(
-            runtime.language,
-            next.reshape({1, 1}),
-            sampling,
-            counts,
-            random_host,
-            random_cuda,
-            rng,
+            runtime.language, next.reshape({1, 1}), sampler, counts,
             token_constraint);
     }
     return generated;
@@ -2877,7 +2861,8 @@ static MfqDuplexBackend make_cuda_minicpmo45_duplex_backend(
                  parameters.temperature <= 0.0)) ||
                 parameters.top_k < 0 ||
                 parameters.top_k >
-                    std::min<int64_t>(runtime.language.c.vocab_size, 1024) ||
+                    std::min<int64_t>(
+                        runtime.language.vocab_size(), 1024) ||
                 !std::isfinite(parameters.top_p) ||
                 parameters.top_p <= 0.0 || parameters.top_p > 1.0 ||
                 !std::isfinite(parameters.listen_probability_scale) ||
@@ -2901,14 +2886,14 @@ static MfqDuplexBackend make_cuda_minicpmo45_duplex_backend(
                     parameters.special_ids.end() - 1,
                     [&](int64_t token) {
                         return token < 0 ||
-                            token >= runtime.language.c.vocab_size;
+                            token >= runtime.language.vocab_size();
                     }) ||
                 std::any_of(
                     parameters.forbidden_ids.begin(),
                     parameters.forbidden_ids.end(),
                     [&](int64_t token) {
                         return token < 0 ||
-                            token >= runtime.language.c.vocab_size;
+                            token >= runtime.language.vocab_size();
                     })) {
             throw std::invalid_argument(
                 "MiniCPM-o duplex token ID is out of range");
@@ -3021,12 +3006,12 @@ static MfqDuplexBackend make_cuda_minicpmo45_duplex_backend(
         MfqDuplexStepResult response;
         auto generated = result.generated_ids
             .to(mfq_tensor_backend::kCPU, mfq_tensor_backend::kInt64).contiguous().reshape({-1});
-        const auto * generated_data = generated.data_ptr<int64_t>();
+        const auto * generated_data = generated.template data_ptr<int64_t>();
         response.generated_tokens.assign(
             generated_data, generated_data + generated.numel());
         auto codes = result.tts_codes
             .to(mfq_tensor_backend::kCPU, mfq_tensor_backend::kInt32).contiguous().reshape({-1});
-        const auto * code_data = codes.data_ptr<int32_t>();
+        const auto * code_data = codes.template data_ptr<int32_t>();
         response.audio_tokens.assign(
             code_data, code_data + codes.numel());
         response.is_listen = result.is_listen;
@@ -3056,16 +3041,19 @@ static MfqDuplexBackend make_cuda_minicpmo45_duplex_backend(
 
 #include "diagnostics/flash_next_mtp.h"
 
-static int run_flash_next_check(CudaModel& model) {
+template <typename Model>
+static int run_flash_next_check(Model& model) {
     namespace tb=mfq_tensor_backend;
-    MFQ_RUNTIME_CHECK(model.c.is_flash_next() && model.c.vocab_size>=8 && model.c.max_position_embeddings>=16,
+    MFQ_RUNTIME_CHECK(
+        Model::is_flash_next && model.vocab_size() >= 8 &&
+            model.max_position_embeddings() >= 16,
         "Flash-Next diagnostic requires a Flash-Next text graph, vocab>=8 and context>=16");
     auto ids=tb::tensor(std::vector<int64_t>{1,2,3,4,5,6,7},
         tb::TensorOptions().device(tb::kCUDA).dtype(tb::kInt64)).reshape({1,7});
     const auto json_tensor=[](const tb::Tensor& value) {
         auto host=value.to(tb::kFloat32).contiguous().cpu();
         return nlohmann::json{{"shape",host.sizes().vec()},
-            {"data",std::vector<float>(host.data_ptr<float>(),host.data_ptr<float>()+host.numel())}};
+            {"data",std::vector<float>(host.template data_ptr<float>(),host.template data_ptr<float>()+host.numel())}};
     };
     nlohmann::json result;
     model.reset(1);
@@ -3091,7 +3079,7 @@ static int run_flash_next_check(CudaModel& model) {
     }
     model.reset(1);
     result["reset"]=json_tensor(model.forward(ids));
-    if (model.c.is_qwen4()) {
+    if constexpr (Model::is_qwen4) {
         auto positions=tb::stack({ids.reshape({7})-1,ids.reshape({7})+1,ids.reshape({7})+3},0);
         model.reset(1);
         result["axis_full"]=json_tensor(model.logits_from_hidden(model.hidden_forward(ids,positions)));
@@ -3105,7 +3093,7 @@ static int run_flash_next_check(CudaModel& model) {
         result["batch_reset"]=json_tensor(model.forward(ids));
         model.reset(1);result["last"]=json_tensor(model.last_logits(ids));
     }
-    result["architecture"]=model.c.model_graph.backbone;
+    result["architecture"] = model.graph.backbone;
     std::cout << "flash_next_check " << result.dump() << '\n';
     return 0;
 }
@@ -3703,7 +3691,8 @@ int mfq::cuda::run_decode(int argc, char ** argv) {
             }
             auto model_source = mfq::open_model_source(model_path);
             const auto& mfq = *model_source;
-            const CudaRuntimeParameters config = mfq::cuda::load_runtime_parameters(mfq, config_path);
+            const auto config = mfq::models::ModelConfig::from_json(
+                mfq::cuda::load_model_config_json(mfq, config_path));
             if (!mfq.has_asset(mfq::cuda::kTokenizerGgufAsset)) {
                 throw std::runtime_error(
                     "model source has no tokenizer GGUF");
@@ -4083,13 +4072,13 @@ int mfq::cuda::run_decode(int argc, char ** argv) {
                 kl_stream_layers, kl_stream_batch,
                 kl_score_count, kl_reference_contract);
         }
+        auto dispatch_source = mfq::open_model_source(model_path);
         if (server_mode) {
             if (!config_path.empty()) {
                 throw std::runtime_error(
                     "model server does not accept an external model config");
             }
-            auto runtime_source = mfq::open_model_source(model_path);
-            const auto& runtime_assets = *runtime_source;
+            const auto& runtime_assets = *dispatch_source;
             if (!runtime_assets.has_asset(mfq::kModelConfigAsset) ||
                 (!runtime_assets.has_asset(mfq::cuda::kTokenizerGgufAsset) &&
                  tokenizer_model.empty())) {
@@ -4097,18 +4086,21 @@ int mfq::cuda::run_decode(int argc, char ** argv) {
                     "model server requires model config and tokenizer GGUF");
             }
         }
+        auto run_loaded = [&]<mfq::cuda::CudaBackbone Backbone>() -> int {
+        using Model = mfq::cuda::CausalLmFor<Backbone>;
         auto t0 = std::chrono::steady_clock::now();
         const bool load_optional_components =
             server_mode || check_qwen35_mtp || check_flash_next_mtp ||
             !bench_qwen35_mtp.empty();
-        CudaModel model = load_model(
+        Model model = mfq::cuda::load_causal_lm<Backbone>(
             model_path,
             config_path,
             context_size,
             true,
-            load_optional_components);
-        CudaRuntimeComponents server_components =
-            load_cuda_runtime_components(model, load_optional_components);
+            load_optional_components,
+            dispatch_source);
+        auto server_components =
+            load_runtime_components(model, load_optional_components);
         if (moe_expert_cache_has_sources() &&
                 !moe_expert_cache_finalized()) {
             finalize_moe_expert_cache();
@@ -4117,34 +4109,64 @@ int mfq::cuda::run_decode(int argc, char ** argv) {
         auto t1 = std::chrono::steady_clock::now();
         report_cuda_memory("loaded");
         if (check_continuous_batching) {
-            return mfq::cuda::continuous::
-                run_qwen_continuous_batching_check(model);
+            if constexpr (
+                    Backbone == mfq::cuda::CudaBackbone::generic_qwen) {
+                return mfq::cuda::continuous::
+                    run_qwen_continuous_batching_check(model);
+            }
+            throw std::runtime_error(
+                "continuous batching requires Qwen35CausalLm");
         }
-        if (check_flash_next) return run_flash_next_check(model);
+        if (check_flash_next) {
+            if constexpr (
+                    Backbone == mfq::cuda::CudaBackbone::qwen4_exp ||
+                    Backbone == mfq::cuda::CudaBackbone::glm5_next) {
+                return run_flash_next_check(model);
+            }
+            throw std::runtime_error(
+                "Flash-Next diagnostic requires a Flash-Next causal LM");
+        }
         if (check_flash_next_mtp) {
-            auto * predictor = dynamic_cast<CudaFlashNextMtp *>(
-                server_components.mtp.get());
-            MFQ_RUNTIME_CHECK(predictor != nullptr,
-                "Flash-Next MTP diagnostic requires a loaded predictor component");
-            return run_flash_next_mtp_check(model, *predictor);
+            if constexpr (
+                    Backbone == mfq::cuda::CudaBackbone::qwen4_exp ||
+                    Backbone == mfq::cuda::CudaBackbone::glm5_next) {
+                auto* predictor = dynamic_cast<FlashNextMtp*>(
+                    server_components.mtp.get());
+                MFQ_RUNTIME_CHECK(predictor != nullptr,
+                    "Flash-Next MTP diagnostic requires a loaded predictor component");
+                return run_flash_next_mtp_check(model, *predictor);
+            }
+            throw std::runtime_error(
+                "Flash-Next MTP diagnostic requires a Flash-Next causal LM");
         }
         if (check_qwen35_mtp) {
-            auto * predictor = dynamic_cast<CudaQwen35Mtp *>(
-                server_components.mtp.get());
-            MFQ_RUNTIME_CHECK(predictor != nullptr,
-                "--check-qwen35-mtp requires a supported model containing MTP weights");
-            return run_qwen35_mtp_check(model, *predictor);
+            if constexpr (
+                    Backbone == mfq::cuda::CudaBackbone::generic_qwen) {
+                auto* predictor = dynamic_cast<Qwen35Mtp*>(
+                    server_components.mtp.get());
+                MFQ_RUNTIME_CHECK(predictor != nullptr,
+                    "--check-qwen35-mtp requires a supported model containing MTP weights");
+                return run_qwen35_mtp_check(model, *predictor);
+            }
+            throw std::runtime_error(
+                "--check-qwen35-mtp requires Qwen35CausalLm");
         }
         if (!bench_qwen35_mtp.empty()) {
-            auto * predictor = dynamic_cast<CudaQwen35Mtp *>(
-                server_components.mtp.get());
-            MFQ_RUNTIME_CHECK(predictor != nullptr,
-                "--bench-qwen35-mtp requires a supported model containing MTP weights");
-            return run_qwen35_mtp_bench(model, *predictor,
-                bench_qwen35_mtp == "mtp", gen, bench_qwen35_mtp_reps);
+            if constexpr (
+                    Backbone == mfq::cuda::CudaBackbone::generic_qwen) {
+                auto* predictor = dynamic_cast<Qwen35Mtp*>(
+                    server_components.mtp.get());
+                MFQ_RUNTIME_CHECK(predictor != nullptr,
+                    "--bench-qwen35-mtp requires a supported model containing MTP weights");
+                return run_qwen35_mtp_bench(model, *predictor,
+                    bench_qwen35_mtp == "mtp", gen,
+                    bench_qwen35_mtp_reps);
+            }
+            throw std::runtime_error(
+                "--bench-qwen35-mtp requires Qwen35CausalLm");
         }
         if (server_mode) {
-            CudaModel & server_model = server_components.language(model);
+            Model& server_model = server_components.language(model);
             if (server_api_key.empty()) {
                 const char * env_key = std::getenv("MFQ_API_KEY");
                 if (env_key != nullptr) server_api_key = env_key;
@@ -4153,7 +4175,7 @@ int mfq::cuda::run_decode(int argc, char ** argv) {
             server_config.host = server_host;
             server_config.port = server_port;
             server_config.model_name = server_model_name;
-            server_config.model_type = server_model.c.model_type;
+            server_config.model_type = server_model.model_type();
             const auto component_state = server_components.state();
             MfqModelCapabilities model_capabilities;
             model_capabilities.family = server_components.graph.architecture;
@@ -4190,8 +4212,8 @@ int mfq::cuda::run_decode(int argc, char ** argv) {
             }
             server_config.api_key = server_api_key;
             server_config.max_context =
-                server_model.c.max_position_embeddings;
-            server_config.vocab_size = server_model.c.vocab_size;
+                server_model.max_position_embeddings();
+            server_config.vocab_size = server_model.vocab_size();
             const auto embedded_profile = runtime_assets.metadata().find(
                 "runtime.sampling.v1");
             server_config.runtime_profile = resolve_mfq_runtime_profile(
@@ -4208,7 +4230,7 @@ int mfq::cuda::run_decode(int argc, char ** argv) {
                 server_sampling_profile);
             std::mutex model_mutex;
             ServerDecodeGraphCache decode_graph_cache(
-                server_model.c.max_position_embeddings);
+                server_model.max_position_embeddings());
             ServerTextSessionCache text_session_cache(
                 make_cuda_paged_prefix_cache(
                     runtime_assets, server_model));
@@ -4216,21 +4238,27 @@ int mfq::cuda::run_decode(int argc, char ** argv) {
                 mfq::cuda::continuous::CudaContinuousBatcher>
                 continuous_batcher;
             if (continuous_batching > 0) {
-                continuous_batcher = std::make_unique<
-                    mfq::cuda::continuous::CudaContinuousBatcher>(
-                        server_model, model_mutex,
-                        continuous_batching,
-                        prefill_chunk_size);
-                std::cerr
-                    << "continuous_batching enabled=1 max_sequences="
-                    << continuous_batching
-                    << " prefill_chunk_size=" << prefill_chunk_size
-                    << " decode=target_only mtp=disabled"
-                    << " paged_kv="
-                    << (continuous_batcher->paged_kv_enabled() ? 1 : 0)
-                    << " page_size="
-                    << continuous_batcher->paged_kv_page_size()
-                    << " prefix_cache=fresh_prefill\n";
+                if constexpr (
+                        Backbone == mfq::cuda::CudaBackbone::generic_qwen) {
+                    continuous_batcher = std::make_unique<
+                        mfq::cuda::continuous::CudaContinuousBatcher>(
+                            server_model, model_mutex,
+                            continuous_batching,
+                            prefill_chunk_size);
+                    std::cerr
+                        << "continuous_batching enabled=1 max_sequences="
+                        << continuous_batching
+                        << " prefill_chunk_size=" << prefill_chunk_size
+                        << " decode=target_only mtp=disabled"
+                        << " paged_kv="
+                        << (continuous_batcher->paged_kv_enabled() ? 1 : 0)
+                        << " page_size="
+                        << continuous_batcher->paged_kv_page_size()
+                        << " prefix_cache=fresh_prefill\n";
+                } else {
+                    throw std::runtime_error(
+                        "continuous batching requires Qwen35CausalLm");
+                }
             }
             std::optional<MiniCPMO45DuplexSession> minicpmo_duplex_session;
             MfqDuplexBackend duplex_backend;
@@ -4267,14 +4295,14 @@ int mfq::cuda::run_decode(int argc, char ** argv) {
                         const MfqTokenCallback& on_token,
                         const MfqPrefillCallback& on_prefill,
                         const MfqTokenConstraintPtr& token_constraint) {
-                        return generate_server_tokens(
+                        return generate_server_tokens<Model>(
                             server_model, model_mutex, decode_graph_cache,
                             text_session_cache, prompt, sampling, on_token,
                             on_prefill, {}, token_constraint,
                             continuous_batching == 0
                                 ? server_components.mtp.get()
                                 : nullptr,
-                            prefill_chunk_size, [&](CudaModel& language) {
+                            prefill_chunk_size, [&](Model& language) {
                                 return std::optional<CudaPreparedPrompt>{
                                     server_components.grid_vision->prepare(
                                         language, prompt, vision)};
@@ -4520,12 +4548,12 @@ int mfq::cuda::run_decode(int argc, char ** argv) {
             auto test_logp = mfq_tensor_backend::log_softmax(test, -1);
             auto kl = (ref_logp.exp() * (ref_logp - test_logp)).sum(-1);
             auto diff = (ref - test).abs();
-            std::cout << "decode_splitk_compare_kl=" << kl.item<float>() << "\n";
-            std::cout << "decode_splitk_compare_rel=" << ((test - ref).norm() / ref.norm()).item<float>() << "\n";
-            std::cout << "decode_splitk_compare_mean_abs=" << diff.mean().item<float>() << "\n";
-            std::cout << "decode_splitk_compare_max_abs=" << diff.max().item<float>() << "\n";
+            std::cout << "decode_splitk_compare_kl=" << kl.template item<float>() << "\n";
+            std::cout << "decode_splitk_compare_rel=" << ((test - ref).norm() / ref.norm()).template item<float>() << "\n";
+            std::cout << "decode_splitk_compare_mean_abs=" << diff.mean().template item<float>() << "\n";
+            std::cout << "decode_splitk_compare_max_abs=" << diff.max().template item<float>() << "\n";
             std::cout << "decode_splitk_compare_same_top="
-                      << (ref.argmax(-1).eq(test.argmax(-1)).item<bool>() ? 1 : 0) << "\n";
+                      << (ref.argmax(-1).eq(test.argmax(-1)).template item<bool>() ? 1 : 0) << "\n";
             return 0;
         }
         if (compare_mma_decode) {
@@ -4540,7 +4568,7 @@ int mfq::cuda::run_decode(int argc, char ** argv) {
             mfq_set_env("MFQ_MMA_ATTENTION_DECODE", "0");
             model.reset(1);
             auto input = model.next_token(ids).reshape({1, 1});
-            const int64_t initial_teacher_token = input.item<int64_t>();
+            const int64_t initial_teacher_token = input.template item<int64_t>();
             for (int step = 0; step < compare_mma_decode_steps; ++step) {
                 const int64_t decode_len = model.cache_pos + 1;
                 auto seq_len = mfq_tensor_backend::tensor({decode_len}, cuda_i64);
@@ -4548,7 +4576,7 @@ int mfq::cuda::run_decode(int argc, char ** argv) {
                 auto last = hidden.index({Slice(), -1, Slice()}).to(mfq_tensor_backend::kFloat16).contiguous();
                 auto logits = model.lm_head.forward(last).to(mfq_tensor_backend::kFloat32);
                 reference_logits.push_back(logits.clone());
-                const int64_t next = logits.argmax(-1).item<int64_t>();
+                const int64_t next = logits.argmax(-1).template item<int64_t>();
                 teacher_tokens.push_back(next);
                 input = mfq_tensor_backend::tensor({next}, cuda_i64).reshape({1, 1});
             }
@@ -4556,7 +4584,8 @@ int mfq::cuda::run_decode(int argc, char ** argv) {
             g_decode_graph_attention_kv_len = compare_mma_decode_planned_len > 0
                 ? compare_mma_decode_planned_len
                 : ids.size(1) + compare_mma_decode_steps;
-            if (g_decode_graph_attention_kv_len > model.c.max_position_embeddings) {
+            if (g_decode_graph_attention_kv_len >
+                    model.max_position_embeddings()) {
                 throw std::runtime_error("decode comparison planned length exceeds context capacity");
             }
             model.reset(1);
@@ -4580,16 +4609,16 @@ int mfq::cuda::run_decode(int argc, char ** argv) {
                 const auto & ref = reference_logits[(size_t)step];
                 auto ref_logp = mfq_tensor_backend::log_softmax(ref, -1);
                 auto test_logp = mfq_tensor_backend::log_softmax(test, -1);
-                const double kl = (ref_logp.exp() * (ref_logp - test_logp)).sum(-1).item<double>();
+                const double kl = (ref_logp.exp() * (ref_logp - test_logp)).sum(-1).template item<double>();
                 auto delta = test - ref;
                 kl_sum += kl;
                 kl_max = std::max(kl_max, kl);
-                abs_sum += delta.abs().sum().item<double>();
-                delta_sq_sum += delta.square().sum().item<double>();
-                reference_sq_sum += ref.square().sum().item<double>();
-                max_abs = std::max(max_abs, delta.abs().max().item<double>());
+                abs_sum += delta.abs().sum().template item<double>();
+                delta_sq_sum += delta.square().sum().template item<double>();
+                reference_sq_sum += ref.square().sum().template item<double>();
+                max_abs = std::max(max_abs, delta.abs().max().template item<double>());
                 values += delta.numel();
-                const bool top_equal = test.argmax(-1).eq(ref.argmax(-1)).item<bool>();
+                const bool top_equal = test.argmax(-1).eq(ref.argmax(-1)).template item<bool>();
                 same_top += top_equal ? 1 : 0;
                 if (!top_equal && first_top_difference < 0) first_top_difference = step;
                 input = mfq_tensor_backend::tensor({teacher_tokens[(size_t)step]}, cuda_i64).reshape({1, 1});
@@ -4625,15 +4654,15 @@ int mfq::cuda::run_decode(int argc, char ** argv) {
             auto kl = (ref_logp.exp() * (ref_logp - test_logp)).sum(-1);
             auto diff = (ref - test).abs();
             auto repeat_diff = (ref - repeat).abs();
-            std::cout << "nvq_vec4_repeat_kl=" << repeat_kl.item<float>() << "\n";
-            std::cout << "nvq_vec4_repeat_max_abs=" << repeat_diff.max().item<float>() << "\n";
-            std::cout << "nvq_vec4_compare_kl=" << kl.item<float>() << "\n";
+            std::cout << "nvq_vec4_repeat_kl=" << repeat_kl.template item<float>() << "\n";
+            std::cout << "nvq_vec4_repeat_max_abs=" << repeat_diff.max().template item<float>() << "\n";
+            std::cout << "nvq_vec4_compare_kl=" << kl.template item<float>() << "\n";
             std::cout << "nvq_vec4_compare_rel="
-                      << ((test - ref).norm() / ref.norm()).item<float>() << "\n";
-            std::cout << "nvq_vec4_compare_mean_abs=" << diff.mean().item<float>() << "\n";
-            std::cout << "nvq_vec4_compare_max_abs=" << diff.max().item<float>() << "\n";
+                      << ((test - ref).norm() / ref.norm()).template item<float>() << "\n";
+            std::cout << "nvq_vec4_compare_mean_abs=" << diff.mean().template item<float>() << "\n";
+            std::cout << "nvq_vec4_compare_max_abs=" << diff.max().template item<float>() << "\n";
             std::cout << "nvq_vec4_compare_same_top="
-                      << (ref.argmax(-1).eq(test.argmax(-1)).item<bool>() ? 1 : 0) << "\n";
+                      << (ref.argmax(-1).eq(test.argmax(-1)).template item<bool>() ? 1 : 0) << "\n";
             return 0;
         }
         if (prefill_repeat > 0) {
@@ -4664,7 +4693,7 @@ int mfq::cuda::run_decode(int argc, char ** argv) {
                 auto run_t1 = std::chrono::steady_clock::now();
                 std::cout << "prefill_repeat=" << (i + 1)
                           << " sec=" << std::chrono::duration<double>(run_t1 - run_t0).count()
-                          << " top=" << logits.argmax(-1).item<int64_t>() << "\n";
+                          << " top=" << logits.argmax(-1).template item<int64_t>() << "\n";
                 if (trace_repeat) {
                     if (reference_trace.empty()) {
                         reference_trace = std::move(trace);
@@ -4673,23 +4702,23 @@ int mfq::cuda::run_decode(int argc, char ** argv) {
                         for (size_t stage = 0; stage < gemma_trace.size(); ++stage) {
                             auto diff = (gemma_trace[stage].second -
                                          reference_gemma_trace[stage].second).abs();
-                            const float max_abs = diff.max().item<float>();
+                            const float max_abs = diff.max().template item<float>();
                             if (max_abs != 0.0f) {
                                 std::cout << "prefill_repeat_first_gemma_stage="
                                           << gemma_trace[stage].first
                                           << " max_abs=" << max_abs
-                                          << " mean_abs=" << diff.mean().item<float>() << "\n";
+                                          << " mean_abs=" << diff.mean().template item<float>() << "\n";
                                 break;
                             }
                         }
                         for (size_t stage = 0; stage < trace.size(); ++stage) {
                             auto diff = (trace[stage] - reference_trace[stage]).abs();
-                            const float max_abs = diff.max().item<float>();
+                            const float max_abs = diff.max().template item<float>();
                             if (max_abs != 0.0f) {
                                 std::cout << "prefill_repeat_first_difference=" << stage
                                           << " layer=" << static_cast<int64_t>(stage) - 1
                                           << " max_abs=" << max_abs
-                                          << " mean_abs=" << diff.mean().item<float>() << "\n";
+                                          << " mean_abs=" << diff.mean().template item<float>() << "\n";
                                 break;
                             }
                         }
@@ -4713,10 +4742,10 @@ int mfq::cuda::run_decode(int argc, char ** argv) {
             auto kl = (ref_logp.exp() * (ref_logp - test_logp)).sum(-1);
             auto diff = (ref - test).abs();
             auto same_top = ref.argmax(-1).eq(test.argmax(-1));
-            std::cout << "attention_compare_kl=" << kl.item<float>() << "\n";
-            std::cout << "attention_compare_max_logit_abs=" << diff.max().item<float>() << "\n";
-            std::cout << "attention_compare_mean_logit_abs=" << diff.mean().item<float>() << "\n";
-            std::cout << "attention_compare_same_top=" << (same_top.item<bool>() ? 1 : 0) << "\n";
+            std::cout << "attention_compare_kl=" << kl.template item<float>() << "\n";
+            std::cout << "attention_compare_max_logit_abs=" << diff.max().template item<float>() << "\n";
+            std::cout << "attention_compare_mean_logit_abs=" << diff.mean().template item<float>() << "\n";
+            std::cout << "attention_compare_same_top=" << (same_top.template item<bool>() ? 1 : 0) << "\n";
             return 0;
         }
         g_profiler.reset();
@@ -4734,7 +4763,7 @@ int mfq::cuda::run_decode(int argc, char ** argv) {
         if (gen == 0) return 0;
         auto generated_cuda = mfq_tensor_backend::empty({gen}, mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt64).device(mfq_tensor_backend::kCUDA));
         cudaStream_t stream = mfq_get_current_cuda_stream().stream();
-        MFQ_CUDA_CHECK(cudaMemcpyAsync(generated_cuda.data_ptr<int64_t>(), next.data_ptr<int64_t>(),
+        MFQ_CUDA_CHECK(cudaMemcpyAsync(generated_cuda.template data_ptr<int64_t>(), next.template data_ptr<int64_t>(),
                                    sizeof(int64_t), cudaMemcpyDeviceToDevice, stream));
         const char* graph_env = std::getenv("MFQ_CUDA_GRAPH");
         const char * profile_graph_env = std::getenv("MFQ_PROFILE_CUDA_GRAPH");
@@ -4742,7 +4771,7 @@ int mfq::cuda::run_decode(int argc, char ** argv) {
             std::atoi(profile_graph_env) != 0;
         bool use_cuda_graph =
             (graph_env == nullptr || graph_env[0] != '0') &&
-            !model.c.is_flash_next() &&
+            !Model::is_flash_next &&
             mfq_cuda_graph_capture_supported() &&
             g_dsv4_cpu_offload_layers.empty() &&
             g_dense_cpu_layer_count == 0 &&
@@ -4772,13 +4801,13 @@ int mfq::cuda::run_decode(int argc, char ** argv) {
             int64_t pos_h = model.cache_pos;
             int64_t len_h = pos_h + 1;
             int64_t step_h = 1;
-            MFQ_CUDA_CHECK(cudaMemcpyAsync(static_input.data_ptr<int64_t>(), next.data_ptr<int64_t>(),
+            MFQ_CUDA_CHECK(cudaMemcpyAsync(static_input.template data_ptr<int64_t>(), next.template data_ptr<int64_t>(),
                                        sizeof(int64_t), cudaMemcpyDeviceToDevice, graph_raw_stream));
-            MFQ_CUDA_CHECK(cudaMemcpyAsync(static_pos.data_ptr<int64_t>(), &pos_h,
+            MFQ_CUDA_CHECK(cudaMemcpyAsync(static_pos.template data_ptr<int64_t>(), &pos_h,
                                        sizeof(int64_t), cudaMemcpyHostToDevice, graph_raw_stream));
-            MFQ_CUDA_CHECK(cudaMemcpyAsync(static_len.data_ptr<int64_t>(), &len_h,
+            MFQ_CUDA_CHECK(cudaMemcpyAsync(static_len.template data_ptr<int64_t>(), &len_h,
                                        sizeof(int64_t), cudaMemcpyHostToDevice, graph_raw_stream));
-            MFQ_CUDA_CHECK(cudaMemcpyAsync(static_step.data_ptr<int64_t>(), &step_h,
+            MFQ_CUDA_CHECK(cudaMemcpyAsync(static_step.template data_ptr<int64_t>(), &step_h,
                                        sizeof(int64_t), cudaMemcpyHostToDevice, graph_raw_stream));
             MFQ_CUDA_CHECK(cudaStreamSynchronize(graph_raw_stream));
 
@@ -4826,8 +4855,8 @@ int mfq::cuda::run_decode(int argc, char ** argv) {
                 });
                 g_profiler.measure("decode.eager_commit", [&]() {
                     MFQ_CUDA_CHECK(cudaMemcpyAsync(
-                        generated_cuda.data_ptr<int64_t>() + i,
-                        next.data_ptr<int64_t>(), sizeof(int64_t),
+                        generated_cuda.template data_ptr<int64_t>() + i,
+                        next.template data_ptr<int64_t>(), sizeof(int64_t),
                         cudaMemcpyDeviceToDevice, stream));
                     return 0;
                 });
@@ -4838,7 +4867,7 @@ int mfq::cuda::run_decode(int argc, char ** argv) {
         auto t3 = std::chrono::steady_clock::now();
         g_profiler.report("decode");
         auto generated_tensor = generated_cuda.to(mfq_tensor_backend::kCPU).contiguous();
-        auto generated_ptr = generated_tensor.data_ptr<int64_t>();
+        auto generated_ptr = generated_tensor.template data_ptr<int64_t>();
         double load_s = std::chrono::duration<double>(t1 - t0).count();
         double prefill_s = std::chrono::duration<double>(t2 - t1).count();
         double decode_s = std::chrono::duration<double>(t3 - t2).count();
@@ -4861,6 +4890,42 @@ int mfq::cuda::run_decode(int argc, char ** argv) {
             print_moe_expert_cache_stats(std::cout);
         }
         return 0;
+        };
+
+        const auto dispatch = mfq::cuda::cuda_model_plan(
+            dispatch_source->resolved_model_graph()).backbone;
+        switch (dispatch) {
+            case mfq::cuda::CudaBackbone::generic_qwen:
+                return run_loaded.template operator()<
+                    mfq::cuda::CudaBackbone::generic_qwen>();
+            case mfq::cuda::CudaBackbone::minicpmo45:
+                return run_loaded.template operator()<
+                    mfq::cuda::CudaBackbone::minicpmo45>();
+            case mfq::cuda::CudaBackbone::minicpmo_tts:
+                return run_loaded.template operator()<
+                    mfq::cuda::CudaBackbone::minicpmo_tts>();
+            case mfq::cuda::CudaBackbone::gemma4:
+                return run_loaded.template operator()<
+                    mfq::cuda::CudaBackbone::gemma4>();
+            case mfq::cuda::CudaBackbone::glm_dsa:
+                return run_loaded.template operator()<
+                    mfq::cuda::CudaBackbone::glm_dsa>();
+            case mfq::cuda::CudaBackbone::glm5_next:
+                return run_loaded.template operator()<
+                    mfq::cuda::CudaBackbone::glm5_next>();
+            case mfq::cuda::CudaBackbone::qwen4_exp:
+                return run_loaded.template operator()<
+                    mfq::cuda::CudaBackbone::qwen4_exp>();
+            case mfq::cuda::CudaBackbone::deepseek_v4:
+                return run_loaded.template operator()<
+                    mfq::cuda::CudaBackbone::deepseek_v4>();
+            case mfq::cuda::CudaBackbone::deepseek_v41:
+                return run_loaded.template operator()<
+                    mfq::cuda::CudaBackbone::deepseek_v41>();
+            case mfq::cuda::CudaBackbone::unsupported:
+                throw std::runtime_error("unsupported CUDA model backbone");
+        }
+        throw std::runtime_error("invalid CUDA model backbone");
     } catch (const MfqBackendError & e) {
         std::cerr << "backend_error: " << e.what() << "\n";
         return 1;

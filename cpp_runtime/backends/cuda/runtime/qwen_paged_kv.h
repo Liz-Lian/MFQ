@@ -25,10 +25,10 @@ public:
     static constexpr int64_t kPageSize = 16;
     static constexpr int64_t kPagesPerChunk = 64;
 
-    QwenPagedKvArena(CudaModel & model, int32_t maximum_sequences)
+    QwenPagedKvArena(mfq::cuda::Qwen35CausalLm & model, int32_t maximum_sequences)
         : maximum_sequences_(maximum_sequences),
           logical_pages_per_sequence_(
-              (model.c.max_position_embeddings + kPageSize - 1) /
+              (model.max_position_embeddings() + kPageSize - 1) /
               kPageSize),
           maximum_physical_pages_(checked_maximum_pages(
               maximum_sequences_, logical_pages_per_sequence_)),
@@ -47,9 +47,9 @@ public:
             auto * block = dynamic_cast<FullBlock *>(block_value.get());
             if (block == nullptr) continue;
             const int64_t heads = block->kv_heads > 0
-                ? block->kv_heads : model.c.num_key_value_heads;
+                ? block->kv_heads : model.num_key_value_heads();
             const int64_t head_dim = block->attention_head_dim > 0
-                ? block->attention_head_dim : model.c.head_dim;
+                ? block->attention_head_dim : model.head_dim();
             MFQ_RUNTIME_CHECK(heads > 0 && head_dim > 0,
                 "Paged KV encountered invalid full-attention geometry");
             const int device = block->cuda_device;

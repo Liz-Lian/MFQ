@@ -1,6 +1,6 @@
 #pragma once
 
-#include "cuda_model.h"
+#include "causal_lm.h"
 #include "grid_vision.h"
 #include "mfq_cuda_ops.h"
 #include "mfq/server.h"
@@ -407,8 +407,9 @@ public:
             std::move(input_contract), std::move(position_policy));
     }
 
+    template <typename Model>
     CudaPreparedPrompt prepare(
-            CudaModel& language,
+            Model& language,
             const std::vector<int64_t>& token_ids,
             const MfqMultimodalInput& media) const {
         if (media.processor != MfqMultimodalProcessor::grid_vision ||

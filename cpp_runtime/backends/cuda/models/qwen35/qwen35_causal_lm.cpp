@@ -3,27 +3,28 @@
 
 #include "../../runtime/cuda_transformer.h"
 #include "../../runtime/cuda_transformer_loader.h"
-#include "../cuda_model_config.h"
 
 namespace mfq::cuda::qwen35 {
 
 std::unique_ptr<::Block> load_block(
         const mfq::ModelSource& source,
-        const ::CudaRuntimeParameters& runtime,
         const Config& config,
         int layer,
-        const std::string& type) {
-    if (runtime.runtime_plan.backbone !=
-            mfq::cuda::CudaBackbone::generic_qwen) {
-        return nullptr;
-    }
-    const auto& c = runtime;
+        const std::string& type,
+        std::string_view tensor_root) {
     const int i = layer;
     const std::string lp =
-        c.tensor_root + ".block." + std::to_string(i) + ".";
+        std::string(tensor_root) + ".block." +
+        std::to_string(i) + ".";
     if (type == "full_attention") {
         auto b = std::make_unique<FullBlock>();
         b->layer = i;
+        b->attention_heads = config.num_attention_heads;
+        b->kv_heads = config.num_key_value_heads;
+        b->attention_head_dim = config.head_dim;
+        b->max_position_embeddings = config.max_position_embeddings;
+        b->rms_norm_eps = config.rms_norm_eps;
+        b->norm_weight_offset = 1.0;
         b->attention_output_gate = config.attention_output_gate;
         b->attn_norm = load_dense_gpu(
             source, lp + "attention.norm.weight");
@@ -59,7 +60,8 @@ std::unique_ptr<::Block> load_block(
             b->k_norm = load_dense_gpu(
                 source, ap + "key_norm.weight");
         }
-        b->ffn = load_ffn(source, runtime, layer);
+        b->ffn = load_ffn(
+            source, config, layer, false, tensor_root);
         return b;
     }
     if (type == "linear_attention") {
@@ -150,15 +152,16 @@ std::unique_ptr<::Block> load_block(
                     "dense linear_attention output projection must be 2D");
             }
         }
-        b->ffn = load_ffn(source, runtime, layer);
+        b->ffn = load_ffn(
+            source, config, layer, false, tensor_root);
         return b;
     }
-    return load_transformer_block(source, runtime, layer, type);
+    return load_transformer_block(
+        source, config, layer, type, false, tensor_root);
 }
 
 void LinearAttentionBlock::clear_speculative() noexcept {
     speculative_recurrent = {};
-    speculative_config = nullptr;
     speculative_start = -1;
     speculative_confirmed = 0;
     speculative_tokens = 0;
@@ -168,11 +171,10 @@ void LinearAttentionBlock::clear_speculative() noexcept {
 mfq_tensor_backend::Tensor LinearAttentionBlock::forward_context(
         mfq_tensor_backend::Tensor input,
         const Block::Context& context,
-        const CudaRuntimeParameters& config,
         const RopeCache& rope) {
     if (context.confirmed_prefix == 0) {
         return Block::forward_context(
-            std::move(input), context, config, rope);
+            std::move(input), context, rope);
     }
     MFQ_RUNTIME_CHECK(
         input.is_cuda() && !speculative_pending &&
@@ -191,7 +193,6 @@ mfq_tensor_backend::Tensor LinearAttentionBlock::forward_context(
         speculative_conv.copy_(conv_state);
         speculative_gdn.copy_(gdn_state);
     }
-    speculative_config = &config;
     speculative_start = context.cache_position;
     speculative_confirmed = context.confirmed_prefix;
     speculative_tokens = input.size(1);
@@ -202,7 +203,7 @@ mfq_tensor_backend::Tensor LinearAttentionBlock::forward_context(
         // once so projections and FFN stay batched. Rollback replays only the
         // recurrent state prefix from this layer's retained projections.
         auto attention = forward_attention_cuda(
-            std::move(input), config, &speculative_recurrent);
+            std::move(input), &speculative_recurrent);
         auto result = forward_ffn_cuda(
             std::move(attention[0]), std::move(attention[1]));
         ++speculative_projection_batches;
@@ -222,7 +223,7 @@ void LinearAttentionBlock::commit_speculative() noexcept {
 
 void LinearAttentionBlock::rollback_speculative(int64_t keep_position) {
     MFQ_RUNTIME_CHECK(
-        speculative_pending && speculative_config != nullptr &&
+        speculative_pending &&
             keep_position >= speculative_start + speculative_confirmed &&
             keep_position < speculative_start + speculative_tokens,
         "invalid Qwen3.5 speculative rollback position");
@@ -232,8 +233,7 @@ void LinearAttentionBlock::rollback_speculative(int64_t keep_position) {
     try {
         // Restore only convolution/GDN state from the retained projected
         // rows; target projections, output projection and FFN are not rerun.
-        replay_recurrent_cuda(
-            speculative_recurrent, retained, *speculative_config);
+        replay_recurrent_cuda(speculative_recurrent, retained);
         clear_speculative();
     } catch (...) {
         clear_speculative();

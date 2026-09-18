@@ -1,8 +1,13 @@
 #pragma once
 
 #include "../../runtime/cuda_transformer.h"
+#include "models/glm_dsa.h"
 
 #include <memory>
+
+namespace mfq::cuda::glm_dsa {
+using Config = mfq::models::glm_dsa::Config;
+}
 
 struct GlmDsaSharedState {
     mfq_tensor_backend::Tensor topk_indices;
@@ -82,6 +87,7 @@ struct GlmDsaSharedState {
 };
 
 struct GlmDsaBlock : Block {
+    mfq::cuda::glm_dsa::Config config;
     int layer = -1;
     bool full_indexer = false;
     std::shared_ptr<GlmDsaSharedState> shared_state;
@@ -140,8 +146,8 @@ struct GlmDsaBlock : Block {
     void update_indexer(
         mfq_tensor_backend::Tensor index_q, mfq_tensor_backend::Tensor index_weights,
         int64_t B, int64_t T, int64_t cache_pos,
-        const MfqOptional<mfq_tensor_backend::Tensor> & seq_len,
-        const CudaRuntimeParameters & c) const {
+        const MfqOptional<mfq_tensor_backend::Tensor> & seq_len) const {
+        const auto& c = config;
         const int64_t logical_len = cache_pos + T;
         if (logical_len <= c.index_topk) {
             shared_state->topk_indices = mfq_tensor_backend::Tensor();
@@ -204,9 +210,10 @@ struct GlmDsaBlock : Block {
     mfq_tensor_backend::Tensor forward(
         mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor pos, int64_t cache_pos,
         const MfqOptional<mfq_tensor_backend::Tensor> & seq_len,
-        const CudaRuntimeParameters & c, const RopeCache & rope,
+        const RopeCache & rope,
         const MfqOptional<mfq_tensor_backend::Tensor> & cache_positions = mfq_nullopt,
         const MfqOptional<mfq_tensor_backend::Tensor> & attention_mask = mfq_nullopt) override {
+        const auto& c = config;
         (void)cache_positions;
         (void)attention_mask;
         const int64_t B = x.size(0);
@@ -317,7 +324,7 @@ struct GlmDsaBlock : Block {
             auto index_weights = first[3].reshape({B, T, c.index_n_heads})
                 .to(mfq_tensor_backend::kFloat32).contiguous();
             update_indexer(
-                index_q, index_weights, B, T, cache_pos, seq_len, c);
+                index_q, index_weights, B, T, cache_pos, seq_len);
         }
 
         auto q_absorbed = g_profiler.measure("glm.embed_q", [&]() {
@@ -383,17 +390,13 @@ struct GlmDsaBlock : Block {
 };
 namespace mfq::cuda::glm_dsa {
 
-struct Config;
-
-bool load_ffn(
+void load_ffn(
     const mfq::ModelSource& source,
-    const ::CudaRuntimeParameters& runtime,
     const Config& config,
     int layer,
     ::FFN& ffn);
 std::unique_ptr<::Block> load_block(
     const mfq::ModelSource& source,
-    const ::CudaRuntimeParameters& runtime,
     const Config& config,
     int layer,
     const std::string& type,

@@ -5,8 +5,22 @@ add_library(mfq-model-graph STATIC
     grid_vision.h
     mfq_model_graph.cpp
     mfq_model_graph.h
+    models/model_config.cpp
+    models/model_config.h
+    models/deepseek_v4.cpp
+    models/deepseek_v4.h
     models/deepseek_v41.cpp
     models/deepseek_v41.h
+    models/flash_next.cpp
+    models/flash_next.h
+    models/gemma4.cpp
+    models/gemma4.h
+    models/glm_dsa.cpp
+    models/glm_dsa.h
+    models/minicpmo45.cpp
+    models/minicpmo45.h
+    models/qwen35.cpp
+    models/qwen35.h
     compat/mfq_legacy_model_graph.cpp
     compat/mfq_legacy_model_graph.h
     compat/mfq_legacy_tensor_names.cpp
@@ -18,7 +32,7 @@ target_include_directories(mfq-model-graph PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/compat
 )
-target_link_libraries(mfq-model-graph PRIVATE mfq-json)
+target_link_libraries(mfq-model-graph PUBLIC mfq-json)
 target_compile_features(mfq-model-graph PUBLIC cxx_std_17)
 set_target_properties(mfq-model-graph PROPERTIES
     POSITION_INDEPENDENT_CODE ON

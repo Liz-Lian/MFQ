@@ -1,7 +1,7 @@
 #pragma once
 
 #include "../../runtime/cuda_transformer.h"
-#include "qwen35_model.h"
+#include "models/qwen35.h"
 
 namespace mfq::cuda::qwen35 {
 
@@ -17,7 +17,7 @@ struct LinearRecurrentInputs {
 };
 
 struct LinearAttentionBlock final : ::Block {
-    Config qwen_config;
+    mfq::models::qwen35::Config qwen_config;
     mfq_tensor_backend::Tensor attn_norm, ffn_norm, conv_weight, conv_bias, dt_bias, a_log, linear_norm;
     bool split_in_proj = false;
     bool split_dense_zab = false;
@@ -41,7 +41,6 @@ struct LinearAttentionBlock final : ::Block {
     int64_t speculative_ffn_batches = 0;
     int64_t speculative_projection_batches = 0;
     LinearRecurrentInputs speculative_recurrent;
-    const CudaRuntimeParameters* speculative_config = nullptr;
     int64_t speculative_start = -1;
     int64_t speculative_confirmed = 0;
     int64_t speculative_tokens = 0;
@@ -50,7 +49,6 @@ struct LinearAttentionBlock final : ::Block {
     mfq_tensor_backend::Tensor forward_context(
         mfq_tensor_backend::Tensor input,
         const Block::Context& context,
-        const CudaRuntimeParameters& config,
         const RopeCache& rope) override;
     void commit_speculative() noexcept override;
     void rollback_speculative(int64_t keep_position) override;
@@ -69,7 +67,8 @@ struct LinearAttentionBlock final : ::Block {
 
     void clear_speculative() noexcept;
 
-    mfq_tensor_backend::Tensor forward_cpu(mfq_tensor_backend::Tensor x, const CudaRuntimeParameters & c) {
+    mfq_tensor_backend::Tensor forward_cpu(
+            mfq_tensor_backend::Tensor x) {
         const int64_t B = x.size(0), T = x.size(1), H = x.size(2);
         const int64_t nk = qwen_config.linear_num_key_heads;
         const int64_t nv = qwen_config.linear_num_value_heads;
@@ -88,7 +87,8 @@ struct LinearAttentionBlock final : ::Block {
         auto residual = x;
         auto xn = qwen_rms_norm(
             x.reshape({B * T, H}).to(mfq_tensor_backend::kFloat32),
-            attn_norm, c).reshape({B, T, H});
+            attn_norm, qwen_config.rms_norm_eps, 1.0)
+            .reshape({B, T, H});
         mfq_tensor_backend::Tensor qkv, qk_part, v_part, z, alpha_raw, beta_raw;
         if (dense_ab_tail) {
             auto parts = in_proj.forward(xn);
@@ -167,9 +167,9 @@ struct LinearAttentionBlock final : ::Block {
         auto v = conv.narrow(-1, 2 * ksz, vsz)
             .reshape({B, T, nv, dv}).transpose(1, 2).contiguous();
         q = q / mfq_tensor_backend::sqrt(q.square().sum(-1, true))
-            .clamp_min(c.rms_norm_eps);
+            .clamp_min(qwen_config.rms_norm_eps);
         k = k / mfq_tensor_backend::sqrt(k.square().sum(-1, true))
-            .clamp_min(c.rms_norm_eps);
+            .clamp_min(qwen_config.rms_norm_eps);
         if (nk != nv) {
             MFQ_RUNTIME_CHECK(nv % nk == 0, "CPU GDN head ratio is invalid");
             const int64_t repeat = nv / nk;
@@ -209,7 +209,8 @@ struct LinearAttentionBlock final : ::Block {
         z = z.reshape({B, T, nv, dv}).transpose(1, 2).contiguous();
         auto y_flat = y.reshape({-1, dv}).to(mfq_tensor_backend::kFloat32);
         auto inverse = mfq_tensor_backend::rsqrt(
-            y_flat.square().mean(-1, true) + c.rms_norm_eps);
+            y_flat.square().mean(-1, true) +
+            qwen_config.rms_norm_eps);
         auto y_norm = (y_flat * inverse *
             linear_norm.to(mfq_tensor_backend::kFloat32)).reshape_as(y);
         auto yf = y_norm.transpose(1, 2).contiguous().reshape({B, T, vsz});
@@ -230,14 +231,15 @@ struct LinearAttentionBlock final : ::Block {
         residual = x;
         xn = qwen_rms_norm(
             x.reshape({B * T, H}).to(mfq_tensor_backend::kFloat32),
-            ffn_norm, c).reshape({B, T, H});
+            ffn_norm, qwen_config.rms_norm_eps, 1.0)
+            .reshape({B, T, H});
         auto ff = ffn.forward(xn.reshape({B * T, H})).reshape({B, T, H});
         return (residual.to(mfq_tensor_backend::kFloat32) + ff.to(mfq_tensor_backend::kFloat32))
             .to(residual.scalar_type()).contiguous();
     }
 
     std::array<mfq_tensor_backend::Tensor, 2> forward_attention_cuda(
-            mfq_tensor_backend::Tensor x, const CudaRuntimeParameters& c,
+            mfq_tensor_backend::Tensor x,
             LinearRecurrentInputs* captured = nullptr) {
         int64_t B = x.size(0), T = x.size(1), H = x.size(2);
         int64_t nk = qwen_config.linear_num_key_heads, nv = qwen_config.linear_num_value_heads;
@@ -250,7 +252,10 @@ struct LinearAttentionBlock final : ::Block {
         }
         auto residual = x;
         auto xn = g_profiler.measure("linear.attn_norm", [&]() {
-            return qwen_rms_norm(x.reshape({B * T, H}).to(mfq_tensor_backend::kFloat32), attn_norm, c).reshape({B, T, H});
+            return qwen_rms_norm(
+                x.reshape({B * T, H}).to(mfq_tensor_backend::kFloat32),
+                attn_norm, qwen_config.rms_norm_eps, 1.0)
+                .reshape({B, T, H});
         });
         mfq_tensor_backend::Tensor qkv, qk_part, v_part, z, alpha_raw, beta_raw;
         if (dense_ab_tail) {
@@ -377,7 +382,7 @@ struct LinearAttentionBlock final : ::Block {
                     nv,
                     dk,
                     dv,
-                    c.rms_norm_eps);
+                    qwen_config.rms_norm_eps);
             });
             q = qkv_fast[0];
             k = qkv_fast[1];
@@ -396,7 +401,7 @@ struct LinearAttentionBlock final : ::Block {
                     nv,
                     dk,
                     dv,
-                    c.rms_norm_eps);
+                    qwen_config.rms_norm_eps);
             });
             q = qkv_fast[0];
             k = qkv_fast[1];
@@ -421,8 +426,16 @@ struct LinearAttentionBlock final : ::Block {
             q = g_profiler.measure("linear.q_view", [&]() { return conv.index({Slice(), Slice(), Slice(0, ksz)}).reshape({B, T, nk, dk}).transpose(1, 2); });
             k = g_profiler.measure("linear.k_view", [&]() { return conv.index({Slice(), Slice(), Slice(ksz, 2 * ksz)}).reshape({B, T, nk, dk}).transpose(1, 2); });
             v = g_profiler.measure("linear.v_view", [&]() { return conv.index({Slice(), Slice(), Slice(2 * ksz, 2 * ksz + vsz)}).reshape({B, T, nv, dv}).transpose(1, 2); });
-            q = g_profiler.measure("linear.q_l2", [&]() { return l2_norm_cuda(q.contiguous().reshape({-1, dk}), c.rms_norm_eps).reshape_as(q); });
-            k = g_profiler.measure("linear.k_l2", [&]() { return l2_norm_cuda(k.contiguous().reshape({-1, dk}), c.rms_norm_eps).reshape_as(k); });
+            q = g_profiler.measure("linear.q_l2", [&]() {
+                return l2_norm_cuda(
+                    q.contiguous().reshape({-1, dk}),
+                    qwen_config.rms_norm_eps).reshape_as(q);
+            });
+            k = g_profiler.measure("linear.k_l2", [&]() {
+                return l2_norm_cuda(
+                    k.contiguous().reshape({-1, dk}),
+                    qwen_config.rms_norm_eps).reshape_as(k);
+            });
         }
         auto gd = g_profiler.measure("linear.gdn", [&]() {
             return recurrent_step(q, k, v, gate_t, beta_t);
@@ -431,7 +444,11 @@ struct LinearAttentionBlock final : ::Block {
         gdn_state = gd[1];
         mfq_tensor_backend::Tensor oo;
         z = g_profiler.measure("linear.z_view", [&]() { return z.reshape({B, T, nv, dv}).transpose(1, 2).contiguous(); });
-        auto y_norm = g_profiler.measure("linear.out_norm", [&]() { return rms_norm_cuda(y.reshape({-1, dv}).to(mfq_tensor_backend::kFloat32), linear_norm, c.rms_norm_eps).reshape_as(y); });
+        auto y_norm = g_profiler.measure("linear.out_norm", [&]() {
+            return rms_norm_cuda(
+                y.reshape({-1, dv}).to(mfq_tensor_backend::kFloat32),
+                linear_norm, qwen_config.rms_norm_eps).reshape_as(y);
+        });
         auto yf = g_profiler.measure("linear.y_view", [&]() { return y_norm.transpose(1, 2).contiguous().reshape({B, T, vsz}); });
         auto zf = g_profiler.measure("linear.zf_view", [&]() { return z.transpose(1, 2).contiguous().reshape({B, T, vsz}); });
         if (dense_out_proj) {
@@ -460,13 +477,16 @@ struct LinearAttentionBlock final : ::Block {
                 return acc_rms_norm_cuda(
                     rr.to(mfq_tensor_backend::kFloat32),
                     oo2.to(mfq_tensor_backend::kFloat32),
-                    ffn_norm, c.rms_norm_eps,
-                    c.norm_weight_offset);
+                    ffn_norm, qwen_config.rms_norm_eps, 1.0);
             }
             if (rr.scalar_type() == mfq_tensor_backend::kFloat16 && oo2.scalar_type() == mfq_tensor_backend::kFloat16) {
-                return acc_rms_norm_f16_cuda(rr, oo2, ffn_norm, c.rms_norm_eps, c.norm_weight_offset);
+                return acc_rms_norm_f16_cuda(
+                    rr, oo2, ffn_norm,
+                    qwen_config.rms_norm_eps, 1.0);
             }
-            return acc_rms_norm_cuda(rr, oo2, ffn_norm, c.rms_norm_eps, c.norm_weight_offset);
+            return acc_rms_norm_cuda(
+                rr, oo2, ffn_norm,
+                qwen_config.rms_norm_eps, 1.0);
         });
         return {attn_pair[0].reshape({B, T, H}),
                 attn_pair[1].reshape({B, T, H})};
@@ -474,8 +494,7 @@ struct LinearAttentionBlock final : ::Block {
 
     void replay_recurrent_cuda(
             const LinearRecurrentInputs& inputs,
-            int64_t retained_tokens,
-            const CudaRuntimeParameters& c) {
+            int64_t retained_tokens) {
         MFQ_RUNTIME_CHECK(
             retained_tokens > 0 && retained_tokens <= inputs.tokens &&
                 inputs.batch > 0 && inputs.split == split_in_proj,
@@ -516,10 +535,10 @@ struct LinearAttentionBlock final : ::Block {
         auto v = conv.narrow(2, 2 * ksz, vsz)
             .reshape({B, T, nv, dv}).transpose(1, 2);
         q = l2_norm_cuda(
-            q.contiguous().reshape({-1, dk}), c.rms_norm_eps)
+            q.contiguous().reshape({-1, dk}), qwen_config.rms_norm_eps)
                 .reshape_as(q);
         k = l2_norm_cuda(
-            k.contiguous().reshape({-1, dk}), c.rms_norm_eps)
+            k.contiguous().reshape({-1, dk}), qwen_config.rms_norm_eps)
                 .reshape_as(k);
         const char* transposed_env = std::getenv("MFQ_GDN_TRANSPOSED_STATE");
         const bool transposed =
@@ -568,22 +587,27 @@ struct LinearAttentionBlock final : ::Block {
                     fp32_residual_env[0] == '1') {
                 rr = rr.to(mfq_tensor_backend::kFloat32);
                 ff2 = ff2.to(mfq_tensor_backend::kFloat32);
+            } else if (ff2.scalar_type() != rr.scalar_type()) {
+                ff2 = ff2.to(rr.scalar_type()).contiguous();
             }
             return acc_cuda(rr, ff2).reshape({B, T, H});
         });
     }
 
-    mfq_tensor_backend::Tensor forward(mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor pos, int64_t cache_pos,
-                          const MfqOptional<mfq_tensor_backend::Tensor> & seq_len,
-                          const CudaRuntimeParameters & c, const RopeCache & rope,
-                          const MfqOptional<mfq_tensor_backend::Tensor> & cache_positions = mfq_nullopt,
-                          const MfqOptional<mfq_tensor_backend::Tensor> & attention_mask = mfq_nullopt) override {
+    mfq_tensor_backend::Tensor forward(
+            mfq_tensor_backend::Tensor x,
+            mfq_tensor_backend::Tensor pos,
+            int64_t cache_pos,
+            const MfqOptional<mfq_tensor_backend::Tensor> & seq_len,
+            const RopeCache & rope,
+            const MfqOptional<mfq_tensor_backend::Tensor> & cache_positions = mfq_nullopt,
+            const MfqOptional<mfq_tensor_backend::Tensor> & attention_mask = mfq_nullopt) override {
         (void)cache_positions;
         (void)attention_mask;
-        if (!x.is_cuda()) return forward_cpu(std::move(x), c);
+        if (!x.is_cuda()) return forward_cpu(std::move(x));
         (void)seq_len;
         (void)pos; (void)cache_pos; (void)rope;
-        auto attention = forward_attention_cuda(std::move(x), c);
+        auto attention = forward_attention_cuda(std::move(x));
         return forward_ffn_cuda(std::move(attention[0]), std::move(attention[1]));
     }
 };

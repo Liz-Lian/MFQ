@@ -237,22 +237,14 @@ function(mfq_configure_cuda_decode_target target)
 endfunction()
 
 set(MFQ_CUDA_MODEL_SOURCES
-    ${MFQ_CUDA_ROOT}/models/deepseek_v4/deepseek_v4_model.cpp
     ${MFQ_CUDA_ROOT}/models/deepseek_v4/deepseek_v4_causal_lm.cpp
-    ${MFQ_CUDA_ROOT}/models/deepseek_v41/deepseek_v41_model.cpp
     ${MFQ_CUDA_ROOT}/models/deepseek_v41/deepseek_v41_causal_lm.cpp
     ${MFQ_CUDA_ROOT}/models/deepseek_v41/deepseek_v41_dspark.cpp
-    ${MFQ_CUDA_ROOT}/models/flash_next/flash_next_model.cpp
     ${MFQ_CUDA_ROOT}/models/flash_next/qwen4_causal_lm.cpp
-    ${MFQ_CUDA_ROOT}/models/gemma4/gemma4_model.cpp
     ${MFQ_CUDA_ROOT}/models/gemma4/gemma4_causal_lm.cpp
-    ${MFQ_CUDA_ROOT}/models/glm_dsa/glm_dsa_model.cpp
     ${MFQ_CUDA_ROOT}/models/glm_dsa/glm_dsa_causal_lm.cpp
-    ${MFQ_CUDA_ROOT}/models/minicpmo45/minicpmo45_model.cpp
     ${MFQ_CUDA_ROOT}/models/minicpmo45/minicpmo45_runtime.cpp
-    ${MFQ_CUDA_ROOT}/models/qwen35/qwen35_model.cpp
     ${MFQ_CUDA_ROOT}/models/qwen35/qwen35_causal_lm.cpp
-    ${MFQ_CUDA_ROOT}/models/cuda_model_config.cpp
     ${MFQ_CUDA_ROOT}/models/registry.cpp
 )
 
@@ -260,8 +252,8 @@ add_library(mfq-cuda-runtime STATIC
     ${MFQ_CUDA_ROOT}/ops/cuda_quantized_ops.cpp
     ${MFQ_CUDA_ROOT}/runtime/cuda_decode_runtime.cpp
     ${MFQ_CUDA_ROOT}/runtime/cuda_execution.cpp
-    ${MFQ_CUDA_ROOT}/runtime/cuda_model.cpp
-    ${MFQ_CUDA_ROOT}/runtime/cuda_model_loader.cpp
+    ${MFQ_CUDA_ROOT}/runtime/causal_lm.cpp
+    ${MFQ_CUDA_ROOT}/runtime/causal_lm_loader.cpp
     ${MFQ_CUDA_ROOT}/runtime/cuda_transformer.cpp
     ${MFQ_CUDA_ROOT}/runtime/cuda_transformer_loader.cpp
     ${MFQ_CUDA_ROOT}/runtime/mtp.cpp
@@ -338,8 +330,8 @@ if(MFQ_BUILD_TORCH_REFERENCE_RUNTIME)
         ${MFQ_CUDA_ROOT}/ops/cuda_quantized_ops.cpp
         ${MFQ_CUDA_ROOT}/runtime/cuda_decode_runtime.cpp
         ${MFQ_CUDA_ROOT}/runtime/cuda_execution.cpp
-        ${MFQ_CUDA_ROOT}/runtime/cuda_model.cpp
-        ${MFQ_CUDA_ROOT}/runtime/cuda_model_loader.cpp
+        ${MFQ_CUDA_ROOT}/runtime/causal_lm.cpp
+        ${MFQ_CUDA_ROOT}/runtime/causal_lm_loader.cpp
         ${MFQ_CUDA_ROOT}/runtime/cuda_transformer.cpp
         ${MFQ_CUDA_ROOT}/runtime/cuda_transformer_loader.cpp
         ${MFQ_CUDA_ROOT}/runtime/mtp.cpp

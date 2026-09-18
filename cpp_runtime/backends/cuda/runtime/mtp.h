@@ -1,5 +1,6 @@
 #pragma once
 
+#include "causal_lm.h"
 #include "mfq_cuda_mtp.h"
 #include "mfq_tensor_backend.h"
 #include "mfq/server.h"
@@ -11,17 +12,23 @@
 #include <vector>
 
 struct CudaPreparedPrompt;
-struct CudaModel;
+struct RopeCache;
 
-struct CudaMtpStep {
+struct MtpTarget {
+    std::function<mfq_tensor_backend::Tensor(mfq_tensor_backend::Tensor)> embed;
+    std::function<mfq_tensor_backend::Tensor(mfq_tensor_backend::Tensor)> logits;
+    const RopeCache* rope = nullptr;
+};
+
+struct MtpStep {
     mfq_tensor_backend::Tensor sample_hidden;
     mfq_tensor_backend::Tensor chain_hidden;
 };
 
-using CudaMtpTokenSelector = std::function<std::int32_t(
+using MtpTokenSelector = std::function<std::int32_t(
     mfq_tensor_backend::Tensor)>;
 
-struct CudaMtpBlockDraft {
+struct MtpBlockDraft {
     mfq_tensor_backend::Tensor tokens;
     mfq_tensor_backend::Tensor logits;
     mfq_tensor_backend::Tensor confidence;
@@ -29,23 +36,23 @@ struct CudaMtpBlockDraft {
 
 // Generation sees one predictor contract. Architecture-specific modules own their
 // equations and cache layout; the server does not branch on architecture.
-struct CudaMtpModule {
-    virtual ~CudaMtpModule() = default;
+struct MtpModule {
+    virtual ~MtpModule() = default;
     virtual void reset(int64_t batch = 1) = 0;
     virtual mfq_tensor_backend::Tensor forward(
-        CudaModel& target,
+        const MtpTarget& target,
         mfq_tensor_backend::Tensor previous_hidden,
         mfq_tensor_backend::Tensor next_ids) = 0;
-    virtual CudaMtpStep step(
-        CudaModel& target,
+    virtual MtpStep step(
+        const MtpTarget& target,
         mfq_tensor_backend::Tensor previous_hidden,
         mfq_tensor_backend::Tensor next_ids) {
         auto hidden = forward(
             target, std::move(previous_hidden), std::move(next_ids));
         return {hidden, hidden};
     }
-    virtual CudaMtpStep step_positioned(
-        CudaModel&,
+    virtual MtpStep step_positioned(
+        const MtpTarget&,
         mfq_tensor_backend::Tensor,
         mfq_tensor_backend::Tensor,
         mfq_tensor_backend::Tensor) {
@@ -71,10 +78,10 @@ struct CudaMtpModule {
         throw std::runtime_error(
             "this CUDA MTP predictor has no target-context adapter");
     }
-    virtual CudaMtpBlockDraft draft_block(
-        CudaModel&,
+    virtual MtpBlockDraft draft_block(
+        const MtpTarget&,
         mfq_tensor_backend::Tensor,
-        const CudaMtpTokenSelector&,
+        const MtpTokenSelector&,
         int) {
         throw std::runtime_error(
             "this CUDA MTP predictor has no block-draft adapter");
@@ -86,9 +93,10 @@ struct CudaMtpModule {
     uint64_t last_rejected = 0;
 };
 
-int32_t run_cuda_mtp_generation(
-    CudaModel& model,
-    CudaMtpModule& mtp,
+template <mfq::cuda::CudaBackbone Backbone>
+int32_t run_mtp_generation(
+    mfq::cuda::CausalLmFor<Backbone>& model,
+    MtpModule& mtp,
     const std::vector<int64_t>& prompt,
     const MfqSamplingParams& sampling,
     const MfqTokenCallback& on_token,

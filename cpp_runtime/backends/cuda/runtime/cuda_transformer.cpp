@@ -7,47 +7,53 @@ std::string layer_name(const std::string & templ, int i) {
     return s;
 }
 
-mfq_tensor_backend::Tensor qwen_rms_norm(mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor weight, const CudaRuntimeParameters & c) {
+mfq_tensor_backend::Tensor qwen_rms_norm(
+        mfq_tensor_backend::Tensor x,
+        mfq_tensor_backend::Tensor weight,
+        double eps,
+        double weight_offset) {
     if (!x.is_cuda()) {
         auto xf = x.contiguous().to(mfq_tensor_backend::kFloat32);
         auto wf = weight.contiguous().to(mfq_tensor_backend::kFloat32);
-        if (c.norm_weight_offset != 0.0) {
-            wf = wf + c.norm_weight_offset;
-        }
+        if (weight_offset != 0.0) wf = wf + weight_offset;
         auto inverse = mfq_tensor_backend::rsqrt(
-            xf.square().mean(-1, true) + c.rms_norm_eps);
+            xf.square().mean(-1, true) + eps);
         return (xf * inverse * wf).contiguous();
     }
-    return rms_norm_offset_cuda(x, weight, c.rms_norm_eps, c.norm_weight_offset);
+    return rms_norm_offset_cuda(x, weight, eps, weight_offset);
 }
 
 mfq_tensor_backend::Tensor qwen_rms_norm_bf16(
-        mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor weight, const CudaRuntimeParameters & c) {
+        mfq_tensor_backend::Tensor x,
+        mfq_tensor_backend::Tensor weight,
+        double eps,
+        double weight_offset) {
     auto input = x.contiguous().to(mfq_tensor_backend::kBFloat16);
     const char * fused_env = std::getenv("MFQ_MINICPM_FUSED_BF16_RMSNORM");
     if (input.is_cuda() &&
             (fused_env == nullptr || fused_env[0] != '0')) {
         return qwen_rms_norm_bf16_cuda(
-            input, weight.contiguous(), c.rms_norm_eps,
-            c.norm_weight_offset);
+            input, weight.contiguous(), eps, weight_offset);
     }
     auto xf = input.to(mfq_tensor_backend::kFloat32);
     auto inverse = mfq_tensor_backend::rsqrt(
-        xf.square().mean(-1, true) + c.rms_norm_eps);
+        xf.square().mean(-1, true) + eps);
     auto normalized = (xf * inverse).to(mfq_tensor_backend::kBFloat16);
     auto scale = weight.contiguous().to(mfq_tensor_backend::kBFloat16);
-    if (c.norm_weight_offset != 0.0) {
-        scale = scale + c.norm_weight_offset;
-    }
+    if (weight_offset != 0.0) scale = scale + weight_offset;
     return (scale * normalized).contiguous();
 }
 
 mfq_tensor_backend::Tensor gemma_rms_norm_f16(
-    mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor weight, const CudaRuntimeParameters & c) {
-    MFQ_RUNTIME_CHECK(x.scalar_type() == mfq_tensor_backend::kFloat16,
-                "gemma_rms_norm_f16: activation must remain f16");
+        mfq_tensor_backend::Tensor x,
+        mfq_tensor_backend::Tensor weight,
+        double eps,
+        double weight_offset) {
+    MFQ_RUNTIME_CHECK(
+        x.scalar_type() == mfq_tensor_backend::kFloat16,
+        "gemma_rms_norm_f16: activation must remain f16");
     return rms_norm_f16_cuda(
-        x.contiguous(), weight, c.rms_norm_eps, c.norm_weight_offset);
+        x.contiguous(), weight, eps, weight_offset);
 }
 
 void prepare_ffn_workspaces(FFN & f) {
@@ -68,7 +74,8 @@ void prepare_ffn_workspaces(FFN & f) {
 
 void load_important_neuron_branch(
         const mfq::ModelSource & mfq,
-        const CudaRuntimeParameters & c,
+        int64_t hidden_size,
+        int64_t intermediate_size,
         FFN & f,
         const std::string & down_name,
         const std::string & gate_name,
@@ -103,12 +110,12 @@ void load_important_neuron_branch(
         high->gate_up.outs.size() != 2 ||
         f.gate_up.outs[0] != f.gate_up.outs[1] ||
         high->gate_up.outs[0] != high->gate_up.outs[1] ||
-        f.down.out() != c.hidden_size ||
-        high->down.out() != c.hidden_size ||
+        f.down.out() != hidden_size ||
+        high->down.out() != hidden_size ||
         f.down.neuron_len() != f.gate_up.outs[0] ||
         high->down.neuron_len() != high->gate_up.outs[0] ||
         f.down.neuron_len() + high->down.neuron_len() !=
-            c.intermediate_size) {
+            intermediate_size) {
         throw std::runtime_error(
             "important-neuron FFN tensor shapes disagree with model config");
     }

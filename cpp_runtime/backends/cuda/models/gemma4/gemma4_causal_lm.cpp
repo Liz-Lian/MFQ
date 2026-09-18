@@ -1,17 +1,15 @@
 #include "gemma4_causal_lm.h"
 
 #include "../../runtime/cuda_transformer.h"
-#include "gemma4_model.h"
 
 namespace mfq::cuda::gemma4 {
 
 std::unique_ptr<::Block> load_block(
         const mfq::ModelSource& mfq,
-        const CudaRuntimeParameters& c,
         const Config& config,
         int i,
         const std::string& type) {
-    if (c.is_gemma4()) {
+        const auto& c = config;
         if (type != "full_attention" && type != "sliding_attention") {
             throw std::runtime_error("unsupported Gemma4 layer type: " + type);
         }
@@ -22,6 +20,9 @@ std::unique_ptr<::Block> load_block(
         b->layer = i;
         b->gemma4 = true;
         b->gemma4_moe = c.num_experts > 0;
+        b->max_position_embeddings = c.max_position_embeddings;
+        b->rms_norm_eps = c.rms_norm_eps;
+        b->norm_weight_offset = 0.0;
         b->sliding = type == "sliding_attention";
         b->value_equals_key =
             !b->sliding && config.attention_key_equals_value;
@@ -110,8 +111,6 @@ std::unique_ptr<::Block> load_block(
                 std::to_string(i));
         }
         return b;
-    }
-    return nullptr;
 }
 
 

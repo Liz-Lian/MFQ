@@ -10,7 +10,7 @@ DECODE = "\n".join(
     for path in sorted(CUDA_ROOT.rglob("*"))
     if path.suffix in {".h", ".cpp"}
 )
-MODEL_LOADER = (CUDA_ROOT / "runtime" / "cuda_model_loader.cpp").read_text(
+MODEL_LOADER = (CUDA_ROOT / "runtime" / "causal_lm_loader.cpp").read_text(
     encoding="utf-8"
 )
 CUDA_RUNTIME = (CUDA_ROOT / "runtime" / "cuda_decode_runtime.cpp").read_text(
@@ -74,7 +74,7 @@ def test_optional_predictor_experts_join_the_shared_moe_cache() -> None:
     assert "bool defer_moe_cache_finalize = false" in DECODE
     assert "!defer_moe_cache_finalize" in MODEL_LOADER
     assert "const bool load_optional_components" in CUDA_RUNTIME
-    assert CUDA_RUNTIME.index("load_cuda_runtime_components(") < CUDA_RUNTIME.index(
+    assert CUDA_RUNTIME.index("load_runtime_components(") < CUDA_RUNTIME.index(
         "finalize_moe_expert_cache();"
     )
 

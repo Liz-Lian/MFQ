@@ -1,7 +1,5 @@
 #pragma once
 
-#include "cuda_model_config.h"
-
 #include "mfq/model_source.h"
 
 #include <string>
@@ -11,8 +9,10 @@ namespace mfq::cuda {
 inline constexpr const char* kTokenizerGgufAsset =
     "__mfq_asset__/tokenizer.gguf";
 
-CudaRuntimeParameters load_runtime_parameters(
+std::string load_model_config_json(
     const mfq::ModelSource& source,
     const std::string& external_path = {});
+
+void validate_model_source(const mfq::ModelSource& source);
 
 } // namespace mfq::cuda

@@ -1,18 +1,16 @@
 #include "deepseek_v4_causal_lm.h"
 
 #include "../../runtime/cuda_transformer.h"
-#include "deepseek_v4_model.h"
 
 namespace mfq::cuda::deepseek_v4 {
 
 std::unique_ptr<::Block> load_block(
         const mfq::ModelSource& mfq,
-        const CudaRuntimeParameters& c,
-        const Config& config,
+        const Config& c,
         int i,
         const std::string& type,
         const std::shared_ptr<::Dsv4SharedState>& state) {
-    if (c.is_dsv4()) {
+        const auto& config = c;
         if (type != "deepseek_v4" || !state) {
             throw std::runtime_error(
                 "invalid DeepSeek V4 block loader state");
@@ -75,7 +73,8 @@ std::unique_ptr<::Block> load_block(
         b->output_b = load_quant_linear(
             mfq, p + "attention.output_b.weight");
         b->attention_rope = Dsv4RopeTable(
-            c, b->compress_ratio,
+            c.max_position_embeddings, c.rope_base,
+            b->compress_ratio,
             config.compress_rope_base,
             config.rope_original_positions,
             config.rope_factor,
@@ -260,16 +259,23 @@ std::unique_ptr<::Block> load_block(
                 std::to_string(i));
         }
         return b;
-    }
-    return nullptr;
 }
 
-void validate_load_options(const ::CudaRuntimeParameters& config) {
-    if (g_dsv4_cpu_offload_layers.empty()) return;
-    if (!config.is_dsv4()) {
+void validate_load_options(const Config& config) {
+    if (config.hidden_size != 4096 || config.num_attention_heads != 64 ||
+            config.head_dim != 512 || config.q_lora_rank != 1024 ||
+            config.qk_rope_head_dim != 64 || config.index_head_dim != 128 ||
+            config.index_n_heads != 64 || config.index_topk != 512 ||
+            config.o_groups != 8 || config.o_lora_rank != 1024 ||
+            config.hc_mult != 4 || config.hc_sinkhorn_iters != 20 ||
+            config.num_experts != 256 || config.num_experts_per_tok != 6 ||
+            config.moe_intermediate_size != 2048 ||
+            config.shared_expert_count != 1 ||
+            config.scoring_func != "sqrtsoftplus") {
         throw std::runtime_error(
-            "--cpu-offload-layers currently supports DeepSeek V4 only");
+            "unsupported DeepSeek V4 CUDA configuration");
     }
+    if (g_dsv4_cpu_offload_layers.empty()) return;
     for (int layer : g_dsv4_cpu_offload_layers) {
         if (layer < 0 || layer >= config.num_hidden_layers) {
             throw std::runtime_error(
@@ -282,9 +288,7 @@ void validate_load_options(const ::CudaRuntimeParameters& config) {
 }
 
 OutputHeadWeights load_output_head(
-        const mfq::ModelSource& source,
-        const ::CudaRuntimeParameters& config) {
-    if (!config.is_dsv4()) return {};
+        const mfq::ModelSource& source) {
     return {
         load_dense_gpu(source, "model.mhc.output.function")
             .to(mfq_tensor_backend::kFloat32).contiguous(),

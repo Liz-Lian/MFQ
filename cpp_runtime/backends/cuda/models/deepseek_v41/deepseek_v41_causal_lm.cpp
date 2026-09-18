@@ -4,7 +4,6 @@ namespace mfq::cuda::deepseek_v41_runtime {
 
 std::unique_ptr<::Block> load_block(
     const mfq::ModelSource& model,
-    const ::CudaRuntimeParameters& runtime,
     std::int64_t layer,
     const std::shared_ptr<SharedState>& shared) {
     MFQ_RUNTIME_CHECK(shared, "missing DeepSeek-V4.1 CUDA state");
@@ -15,7 +14,7 @@ std::unique_ptr<::Block> load_block(
     result->layer = layer;
     result->ratio = config.compress_ratios.at(
         static_cast<std::size_t>(layer));
-    result->max_context = runtime.max_position_embeddings;
+    result->max_context = config.max_position_embeddings;
     result->shared = shared;
     if (config.has_engram(layer)) {
         result->engram = Engram::load(
@@ -87,9 +86,10 @@ std::unique_ptr<::Block> load_block(
         result->index_score = load_quant_linear(
             model, prefix + "attention.indexer.score.weight");
     }
-    result->mlp = load_moe(model, runtime, layer);
+    result->mlp = load_moe(model, config, layer);
     result->rope = Dsv4RopeTable(
-        runtime,
+        config.max_position_embeddings,
+        config.rope_theta,
         result->ratio,
         config.compress_rope_theta,
         config.rope_scaling.original_max_position_embeddings,
@@ -159,8 +159,7 @@ std::unique_ptr<::Block> load_block(
     return result;
 }
 
-void validate_load_options(const ::CudaRuntimeParameters& config) {
-    if (!config.is_deepseek_v41()) return;
+void validate_load_options() {
     if (g_tensor_parallel.enabled() || g_layer_placement.enabled() ||
             g_n_gpu_layers >= 0) {
         throw std::runtime_error(
@@ -171,12 +170,10 @@ void validate_load_options(const ::CudaRuntimeParameters& config) {
 
 std::shared_ptr<SharedState> load_shared_state(
         const mfq::ModelSource& source,
-        const ::CudaRuntimeParameters& config) {
-    if (!config.is_deepseek_v41()) return nullptr;
+        const CommonConfig& config) {
     auto state = std::make_shared<SharedState>();
-    state->config = CommonConfig::from_json(config.resolved_config_json);
-    state->config.max_position_embeddings = config.max_position_embeddings;
-    state->engram_hash = EngramHashState::load(source, state->config);
+    state->config = config;
+    state->engram_hash = EngramHashState::load(source, config);
     return state;
 }
 

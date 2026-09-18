@@ -1,10 +1,14 @@
 #pragma once
 
 #include "cuda_transformer.h"
+#include "cuda_model_plan.h"
 #include "../models/deepseek_v4/deepseek_v4_causal_lm.h"
 #include "../models/deepseek_v41/deepseek_v41_causal_lm.h"
 #include "../models/flash_next/qwen4_causal_lm.h"
 #include "../models/glm_dsa/glm_dsa_causal_lm.h"
+#include "models/gemma4.h"
+#include "models/minicpmo45.h"
+#include "models/qwen35.h"
 #include "mfq_cuda_paged_kv.h"
 #include "prepared_prompt.h"
 
@@ -16,6 +20,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -270,9 +275,81 @@ void restore_dsv4_pool_session_state(
         Dsv4PoolState & target,
         const Dsv4PoolSessionState & state);
 
-struct CudaModel {
+namespace mfq::cuda {
+
+template <CudaBackbone Backbone>
+struct CausalLmArchitectureState;
+
+template <>
+struct CausalLmArchitectureState<CudaBackbone::generic_qwen> {
+    mfq::models::qwen35::Config config;
+};
+
+template <>
+struct CausalLmArchitectureState<CudaBackbone::minicpmo45> {
+    mfq::models::minicpmo45::Config config;
+};
+
+template <>
+struct CausalLmArchitectureState<CudaBackbone::minicpmo_tts> {
+    mfq::models::ModelConfig config;
+};
+
+template <>
+struct CausalLmArchitectureState<CudaBackbone::gemma4> {
+    mfq::models::gemma4::Config config;
+    double embed_scale = 1.0;
+};
+
+template <>
+struct CausalLmArchitectureState<CudaBackbone::glm_dsa> {
+    mfq::models::glm_dsa::Config config;
+};
+
+template <>
+struct CausalLmArchitectureState<CudaBackbone::glm5_next> {
+    mfq::models::flash_next::GlmConfig config{};
+};
+
+template <>
+struct CausalLmArchitectureState<CudaBackbone::qwen4_exp> {
+    mfq::models::flash_next::QwenConfig config{};
+    std::unique_ptr<flash_runtime::Gr> final_mixer;
+    mfq_tensor_backend::Tensor positions;
+    int64_t batch = 0;
+};
+
+template <>
+struct CausalLmArchitectureState<CudaBackbone::deepseek_v4> {
+    mfq::models::deepseek_v4::Config config;
+    mfq_tensor_backend::Tensor hc_head_fn;
+    mfq_tensor_backend::Tensor hc_head_scale;
+    mfq_tensor_backend::Tensor hc_head_base;
+};
+
+template <>
+struct CausalLmArchitectureState<CudaBackbone::deepseek_v41> {
+    mfq::models::deepseek_v41::Config config;
+    std::shared_ptr<deepseek_v41_runtime::SharedState> shared;
+};
+
+template <CudaBackbone Backbone>
+struct CausalLm : CausalLmArchitectureState<Backbone> {
+    static constexpr CudaBackbone backbone = Backbone;
+    static constexpr bool is_qwen4 = Backbone == CudaBackbone::qwen4_exp;
+    static constexpr bool is_glm5 = Backbone == CudaBackbone::glm5_next;
+    static constexpr bool is_flash_next = is_qwen4 || is_glm5;
+    static constexpr bool is_dsv4 =
+        Backbone == CudaBackbone::deepseek_v4 ||
+        Backbone == CudaBackbone::deepseek_v41;
+    static constexpr bool is_deepseek_v41 =
+        Backbone == CudaBackbone::deepseek_v41;
+    static constexpr bool is_minicpmo45 =
+        Backbone == CudaBackbone::minicpmo45;
+    static constexpr bool is_gemma4 = Backbone == CudaBackbone::gemma4;
     std::shared_ptr<const mfq::ModelSource> source;
-    CudaRuntimeParameters c;
+    mfq::ModelGraph graph;
+    CudaModelPlan plan;
     RopeCache rope;
     RopeCache cpu_rope;
     std::unordered_map<int, RopeCache> device_ropes;
@@ -280,63 +357,238 @@ struct CudaModel {
     std::vector<std::unique_ptr<Block>> blocks;
     mfq_tensor_backend::Tensor output_norm;
     QuantLinear lm_head;
-    mfq_tensor_backend::Tensor dsv4_hc_head_fn;
-    mfq_tensor_backend::Tensor dsv4_hc_head_scale;
-    mfq_tensor_backend::Tensor dsv4_hc_head_base;
     int64_t cache_pos = 0;
     int64_t decode_position_delta = 0;
     int64_t speculative_start = -1;
     int64_t speculative_confirmed = 0;
     bool speculative_suffix_forward = false;
-    std::unique_ptr<flash_runtime::Gr> qwen4_final_mixer;
-    mfq_tensor_backend::Tensor qwen4_positions;
-    int64_t qwen4_batch=0;
-    std::shared_ptr<mfq::cuda::deepseek_v41_runtime::SharedState>
-        deepseek_v41_state;
+
+    int64_t vocab_size() const noexcept {
+        if constexpr (is_flash_next || is_deepseek_v41) {
+            return this->config.vocab;
+        } else {
+            return this->config.vocab_size;
+        }
+    }
+
+    int64_t hidden_size() const noexcept {
+        if constexpr (is_flash_next || is_deepseek_v41) {
+            return this->config.hidden;
+        } else {
+            return this->config.hidden_size;
+        }
+    }
+
+    int64_t num_hidden_layers() const noexcept {
+        if constexpr (is_flash_next) {
+            return this->config.layers;
+        } else if constexpr (is_deepseek_v41) {
+            return this->config.n_layers;
+        } else {
+            return this->config.num_hidden_layers;
+        }
+    }
+
+    int64_t num_attention_heads() const noexcept {
+        if constexpr (is_flash_next) {
+            return this->config.heads;
+        } else if constexpr (is_deepseek_v41) {
+            return this->config.n_heads;
+        } else {
+            return this->config.num_attention_heads;
+        }
+    }
+
+    int64_t num_key_value_heads() const noexcept {
+        if constexpr (is_qwen4) {
+            return this->config.kv_heads;
+        } else if constexpr (is_glm5) {
+            return 1;
+        } else if constexpr (is_deepseek_v41) {
+            return this->config.n_kv_heads;
+        } else {
+            return this->config.num_key_value_heads;
+        }
+    }
+
+    int64_t head_dim() const noexcept {
+        if constexpr (is_qwen4) {
+            return this->config.width;
+        } else if constexpr (is_glm5) {
+            return this->config.nope;
+        } else {
+            return this->config.head_dim;
+        }
+    }
+
+    int64_t max_position_embeddings() const noexcept {
+        if constexpr (is_flash_next) {
+            return this->config.maximum;
+        } else {
+            return this->config.max_position_embeddings;
+        }
+    }
+
+    int64_t rotary_dim() const noexcept {
+        return this->config.rotary_dim;
+    }
+
+    double rope_base() const noexcept {
+        return this->config.rope_base;
+    }
+
+    void set_max_position_embeddings(int64_t value) noexcept {
+        if constexpr (is_flash_next) this->config.maximum = value;
+        else this->config.max_position_embeddings = value;
+    }
+
+    double rms_norm_eps() const noexcept {
+        if constexpr (is_flash_next) {
+            return this->config.eps;
+        } else if constexpr (is_deepseek_v41) {
+            return this->config.rms_eps;
+        } else {
+            return this->config.rms_norm_eps;
+        }
+    }
+
+    double norm_weight_offset() const noexcept {
+        if constexpr (
+                is_flash_next || is_dsv4 || is_gemma4 || is_minicpmo45) {
+            return 0.0;
+        } else {
+            return 1.0;
+        }
+    }
+
+    bool tie_word_embeddings() const noexcept {
+        if constexpr (is_flash_next) {
+            return this->config.tied_embeddings;
+        } else if constexpr (is_deepseek_v41) {
+            return false;
+        } else {
+            return this->config.tie_word_embeddings;
+        }
+    }
+
+    int64_t num_experts() const noexcept {
+        if constexpr (is_qwen4 || is_glm5) {
+            return this->config.experts;
+        } else if constexpr (is_deepseek_v41) {
+            return this->config.n_experts;
+        } else if constexpr (Backbone == CudaBackbone::deepseek_v4 ||
+                             Backbone == CudaBackbone::glm_dsa ||
+                             Backbone == CudaBackbone::gemma4) {
+            return this->config.num_experts;
+        } else {
+            return 0;
+        }
+    }
+
+    int64_t hc_mult() const noexcept {
+        if constexpr (is_flash_next) {
+            return this->config.streams;
+        } else if constexpr (is_deepseek_v41 ||
+                             Backbone == CudaBackbone::deepseek_v4) {
+            return this->config.hc_mult;
+        } else {
+            return 1;
+        }
+    }
+
+    double hc_eps() const noexcept {
+        if constexpr (is_glm5 || is_deepseek_v41 ||
+                      Backbone == CudaBackbone::deepseek_v4) {
+            return this->config.hc_eps;
+        } else {
+            return 1e-6;
+        }
+    }
+
+    double final_logit_softcapping() const noexcept {
+        if constexpr (is_gemma4) {
+            return this->config.final_logit_softcapping;
+        } else {
+            return 0.0;
+        }
+    }
+
+    double embedding_scale() const noexcept {
+        if constexpr (is_gemma4) return this->embed_scale;
+        else return 1.0;
+    }
+
+    std::string_view model_type() const noexcept {
+        if constexpr (is_qwen4) {
+            return "qwen4_exp";
+        } else if constexpr (is_glm5) {
+            return "glm5_next";
+        } else if constexpr (is_deepseek_v41) {
+            return this->config.text_model_type;
+        } else {
+            return this->config.model_type;
+        }
+    }
+
+    std::string_view layer_type(int64_t layer) const {
+        if constexpr (is_deepseek_v41) {
+            return "deepseek_v41";
+        } else {
+            return this->config.layer_types.at(
+                static_cast<std::size_t>(layer));
+        }
+    }
 
     bool supports_qwen_speculation() const {
-        return (c.runtime_plan.backbone==mfq::cuda::CudaBackbone::generic_qwen || c.is_flash_next()) &&
-            !blocks.empty() && std::all_of(blocks.begin(),blocks.end(),
-                [](const auto& block) {return block->supports_speculation();});
+        if constexpr (
+                Backbone != CudaBackbone::generic_qwen && !is_flash_next) {
+            return false;
+        }
+        return !blocks.empty() && std::all_of(
+            blocks.begin(), blocks.end(),
+            [](const auto& block) { return block->supports_speculation(); });
     }
 
     bool supports_deepseek_v41_speculation() const {
-        return c.is_deepseek_v41() && !blocks.empty() &&
-            std::all_of(
-                blocks.begin(), blocks.end(),
-                [](const auto& block) {
-                    return block->supports_speculation();
-                });
+        if constexpr (!is_deepseek_v41) return false;
+        return !blocks.empty() && std::all_of(
+            blocks.begin(), blocks.end(),
+            [](const auto& block) { return block->supports_speculation(); });
     }
 
     void begin_speculative_suffix(int64_t draft_tokens) {
-        MFQ_RUNTIME_CHECK(
-            supports_deepseek_v41_speculation() &&
-                speculative_start < 0 && draft_tokens > 0 &&
-                cache_pos + draft_tokens <= c.max_position_embeddings &&
-                deepseek_v41_state,
-            "invalid DeepSeek-V4.1 speculative suffix");
-        speculative_start = cache_pos;
-        speculative_confirmed = 0;
-        deepseek_v41_state->begin_speculative();
-        std::size_t begun = 0;
-        try {
-            for (auto& block : blocks) {
-                MfqCudaGuard guard(block->cuda_device);
-                block->begin_speculative(draft_tokens);
-                ++begun;
-            }
-        } catch (...) {
-            for (std::size_t index = 0; index < begun; ++index) {
-                try {
-                    MfqCudaGuard guard(blocks[index]->cuda_device);
-                    blocks[index]->commit_speculative();
-                } catch (...) {}
-            }
-            try { deepseek_v41_state->rollback_speculative(); } catch (...) {}
-            speculative_start = -1;
+        if constexpr (!is_deepseek_v41) {
+            throw std::runtime_error(
+                "speculative suffix requires DeepseekV41CausalLm");
+        } else {
+            MFQ_RUNTIME_CHECK(
+                supports_deepseek_v41_speculation() &&
+                    speculative_start < 0 && draft_tokens > 0 &&
+                    cache_pos + draft_tokens <= max_position_embeddings() &&
+                    this->shared,
+                "invalid DeepSeek-V4.1 speculative suffix");
+            speculative_start = cache_pos;
             speculative_confirmed = 0;
-            throw;
+            this->shared->begin_speculative();
+            std::size_t begun = 0;
+            try {
+                for (auto& block : blocks) {
+                    MfqCudaGuard guard(block->cuda_device);
+                    block->begin_speculative(draft_tokens);
+                    ++begun;
+                }
+            } catch (...) {
+                for (std::size_t index = 0; index < begun; ++index) {
+                    try {
+                        MfqCudaGuard guard(blocks[index]->cuda_device);
+                        blocks[index]->commit_speculative();
+                    } catch (...) {}
+                }
+                try { this->shared->rollback_speculative(); } catch (...) {}
+                speculative_start = -1;
+                speculative_confirmed = 0;
+                throw;
+            }
         }
     }
 
@@ -346,11 +598,11 @@ struct CudaModel {
             MfqCudaGuard guard(block->cuda_device);
             block->commit_speculative();
         }
-        if (c.is_deepseek_v41()) {
+        if constexpr (is_deepseek_v41) {
             MFQ_RUNTIME_CHECK(
-                deepseek_v41_state,
+                this->shared,
                 "DeepSeek-V4.1 speculative state is unavailable");
-            deepseek_v41_state->commit_speculative();
+            this->shared->commit_speculative();
         }
         speculative_start = -1;
         speculative_confirmed = 0;
@@ -366,16 +618,20 @@ struct CudaModel {
             MfqCudaGuard guard(block->cuda_device);
             block->rollback_speculative(keep);
         }
-        if (c.is_deepseek_v41()) {
+        if constexpr (is_deepseek_v41) {
             MFQ_RUNTIME_CHECK(
-                deepseek_v41_state,
+                this->shared,
                 "DeepSeek-V4.1 speculative state is unavailable");
-            deepseek_v41_state->rollback_speculative();
+            this->shared->rollback_speculative();
         }
         // Full-attention KV slots beyond this logical length are overwritten
         // by the next pass; no history-sized cache copy is needed.
         cache_pos = keep;
-        if (qwen4_positions.defined()) qwen4_positions=qwen4_positions.narrow(-1,0,cache_pos);
+        if constexpr (is_qwen4) {
+            if (this->positions.defined()) {
+                this->positions = this->positions.narrow(-1, 0, cache_pos);
+            }
+        }
         speculative_start = -1;
         speculative_confirmed = 0;
     }
@@ -383,11 +639,10 @@ struct CudaModel {
     mfq_tensor_backend::Tensor embed_forward(mfq_tensor_backend::Tensor ids) const {
         auto token_ids = ids.contiguous().to(mfq_tensor_backend::kCUDA, mfq_tensor_backend::kInt64);
         auto output = quant_embedding_lookup(embed, token_ids);
-        if (c.is_minicpmo45()) {
+        if constexpr (is_minicpmo45) {
             return output.to(mfq_tensor_backend::kBFloat16).contiguous();
         }
-        if (c.runtime_plan.backbone ==
-                mfq::cuda::CudaBackbone::generic_qwen) {
+        if constexpr (Backbone == CudaBackbone::generic_qwen) {
             return output.to(mfq_tensor_backend::kFloat16).contiguous();
         }
         return output;
@@ -396,7 +651,10 @@ struct CudaModel {
     void reset(int64_t B) {
         cache_pos = 0;
         decode_position_delta = 0;
-        qwen4_positions={};qwen4_batch=B;
+        if constexpr (is_qwen4) {
+            this->positions = {};
+            this->batch = B;
+        }
         speculative_start = -1;
         speculative_confirmed = 0;
         speculative_suffix_forward = false;
@@ -408,26 +666,36 @@ struct CudaModel {
 
     TextSessionStateKind text_session_state_kind() const {
         if (blocks.empty()) return TextSessionStateKind::Unsupported;
-        if (std::all_of(
-            blocks.begin(), blocks.end(),
-            [](const std::unique_ptr<Block> & block) {
-                return dynamic_cast<const FullBlock *>(block.get()) != nullptr;
-            })) {
-            return TextSessionStateKind::FullAttention;
-        }
-        if (std::all_of(
-            blocks.begin(), blocks.end(),
-            [](const std::unique_ptr<Block> & block) {
-                return dynamic_cast<const Dsv4Block *>(block.get()) != nullptr;
-            })) {
-            return TextSessionStateKind::DeepseekV4;
-        }
-        if (std::all_of(
-            blocks.begin(), blocks.end(),
-            [](const std::unique_ptr<Block> & block) {
-                return dynamic_cast<const GlmDsaBlock *>(block.get()) != nullptr;
-            })) {
-            return TextSessionStateKind::GlmDsa;
+        if constexpr (
+                Backbone == CudaBackbone::generic_qwen ||
+                Backbone == CudaBackbone::minicpmo45 ||
+                Backbone == CudaBackbone::minicpmo_tts) {
+            return std::all_of(
+                blocks.begin(), blocks.end(),
+                [](const std::unique_ptr<Block>& block) {
+                    return dynamic_cast<const FullBlock*>(block.get()) !=
+                        nullptr;
+                })
+                ? TextSessionStateKind::FullAttention
+                : TextSessionStateKind::Unsupported;
+        } else if constexpr (Backbone == CudaBackbone::deepseek_v4) {
+            return std::all_of(
+                blocks.begin(), blocks.end(),
+                [](const std::unique_ptr<Block>& block) {
+                    return dynamic_cast<const Dsv4Block*>(block.get()) !=
+                        nullptr;
+                })
+                ? TextSessionStateKind::DeepseekV4
+                : TextSessionStateKind::Unsupported;
+        } else if constexpr (Backbone == CudaBackbone::glm_dsa) {
+            return std::all_of(
+                blocks.begin(), blocks.end(),
+                [](const std::unique_ptr<Block>& block) {
+                    return dynamic_cast<const GlmDsaBlock*>(block.get()) !=
+                        nullptr;
+                })
+                ? TextSessionStateKind::GlmDsa
+                : TextSessionStateKind::Unsupported;
         }
         return TextSessionStateKind::Unsupported;
     }
@@ -465,7 +733,10 @@ struct CudaModel {
         state.tokens = tokens;
         state.kind = text_session_state_kind();
         state.cache_pos = cache_pos;
-        if (state.kind == TextSessionStateKind::FullAttention) {
+        if constexpr (
+                Backbone == CudaBackbone::generic_qwen ||
+                Backbone == CudaBackbone::minicpmo45 ||
+                Backbone == CudaBackbone::minicpmo_tts) {
             state.blocks.reserve(blocks.size());
             for (const auto & block : blocks) {
                 MfqCudaGuard guard(block->cuda_device);
@@ -490,7 +761,7 @@ struct CudaModel {
                 state.bytes += session_tensor_bytes(saved.v);
                 state.blocks.push_back(std::move(saved));
             }
-        } else if (state.kind == TextSessionStateKind::DeepseekV4) {
+        } else if constexpr (Backbone == CudaBackbone::deepseek_v4) {
             state.dsv4_blocks.reserve(blocks.size());
             for (const auto & block : blocks) {
                 MfqCudaGuard guard(block->cuda_device);
@@ -511,7 +782,7 @@ struct CudaModel {
                         cache_pos, state.bytes);
                 state.dsv4_blocks.push_back(std::move(saved));
             }
-        } else if (state.kind == TextSessionStateKind::GlmDsa) {
+        } else if constexpr (Backbone == CudaBackbone::glm_dsa) {
             state.glm_dsa_blocks.reserve(blocks.size());
             for (const auto & block : blocks) {
                 MfqCudaGuard guard(block->cuda_device);
@@ -556,7 +827,10 @@ struct CudaModel {
                 static_cast<size_t>(state.cache_pos) != state.tokens.size()) {
             throw std::runtime_error("text session state is incompatible");
         }
-        if (state.kind == TextSessionStateKind::FullAttention) {
+        if constexpr (
+                Backbone == CudaBackbone::generic_qwen ||
+                Backbone == CudaBackbone::minicpmo45 ||
+                Backbone == CudaBackbone::minicpmo_tts) {
             if (state.blocks.size() != blocks.size()) {
                 throw std::runtime_error(
                     "full-attention session layer count changed");
@@ -581,7 +855,7 @@ struct CudaModel {
                     full->cache.v, saved.v, 2, saved.capacity);
                 full->cache.ring = saved.ring;
             }
-        } else if (state.kind == TextSessionStateKind::DeepseekV4) {
+        } else if constexpr (Backbone == CudaBackbone::deepseek_v4) {
             if (state.dsv4_blocks.size() != blocks.size()) {
                 throw std::runtime_error(
                     "DeepSeek V4 session layer count changed");
@@ -607,7 +881,7 @@ struct CudaModel {
                     saved.indexer_compressor);
                 dsv4->shared_state->ensure();
             }
-        } else if (state.kind == TextSessionStateKind::GlmDsa) {
+        } else if constexpr (Backbone == CudaBackbone::glm_dsa) {
             if (state.glm_dsa_blocks.size() != blocks.size()) {
                 throw std::runtime_error(
                     "GLM DSA session layer count changed");
@@ -650,44 +924,49 @@ struct CudaModel {
     }
 
     mfq_tensor_backend::Tensor finalize_hidden(mfq_tensor_backend::Tensor x, int64_t B, int64_t T) {
-        if (c.is_qwen4()) return qwen4_final_mixer->pre(x)[0];
-        if (c.is_glm5_next()) {
-            return mfq::flash_next::rms_norm(x.mean(2),output_norm,c.rms_norm_eps);
+        if constexpr (is_qwen4) return this->final_mixer->pre(x)[0];
+        if constexpr (is_glm5) {
+            return mfq::flash_next::rms_norm(
+                x.mean(2), output_norm, rms_norm_eps());
         }
-        if (c.is_dsv4()) {
+        if constexpr (Backbone == CudaBackbone::deepseek_v4) {
             x = g_profiler.measure("model.dsv4_hc_head", [&]() {
                 auto flat = x.flatten(2).to(mfq_tensor_backend::kFloat32);
                 auto inverse_rms = mfq_tensor_backend::rsqrt(
-                    flat.square().mean(-1, true) + c.rms_norm_eps);
+                    flat.square().mean(-1, true) + rms_norm_eps());
                 auto mixes = mfq_tensor_backend::matmul(
-                    flat, dsv4_hc_head_fn.transpose(0, 1)) *
+                    flat, this->hc_head_fn.transpose(0, 1)) *
                     inverse_rms;
                 auto pre = mfq_tensor_backend::sigmoid(
-                    mixes * dsv4_hc_head_scale +
-                    dsv4_hc_head_base) + c.hc_eps;
+                    mixes * this->hc_head_scale +
+                    this->hc_head_base) + hc_eps();
                 return (
                     pre.unsqueeze(-1) *
-                    flat.reshape({B, T, c.hc_mult, c.hidden_size}))
+                    flat.reshape({B, T, hc_mult(), hidden_size()}))
                     .sum(2).to(mfq_tensor_backend::kFloat16).contiguous();
             });
         }
-        if (c.is_deepseek_v41()) {
+        if constexpr (is_deepseek_v41) {
             MFQ_RUNTIME_CHECK(
-                deepseek_v41_state,
+                this->shared,
                 "DeepSeek-V4.1 final state is unavailable");
             x = g_profiler.measure("model.deepseek_v41.final_collapse", [&]() {
-                return deepseek_v41_state->final_collapse(
-                    x, deepseek_v41_state->config.n_layers);
+                return this->shared->final_collapse(
+                    x, this->shared->config.n_layers);
             });
         }
         return g_profiler.measure("model.output_norm", [&]() {
-            return c.is_minicpmo45()
-                ? qwen_rms_norm_bf16(
-                    x.reshape({B * T, c.hidden_size}), output_norm, c)
-                    .reshape({B, T, c.hidden_size})
-                : qwen_rms_norm(
-                    x.reshape({B * T, c.hidden_size}).to(mfq_tensor_backend::kFloat32),
-                    output_norm, c).reshape({B, T, c.hidden_size});
+            if constexpr (is_minicpmo45) {
+                return qwen_rms_norm_bf16(
+                    x.reshape({B * T, hidden_size()}), output_norm,
+                    rms_norm_eps(), norm_weight_offset())
+                    .reshape({B, T, hidden_size()});
+            }
+            return qwen_rms_norm(
+                x.reshape({B * T, hidden_size()})
+                    .to(mfq_tensor_backend::kFloat32),
+                output_norm, rms_norm_eps(), norm_weight_offset())
+                .reshape({B, T, hidden_size()});
         });
     }
 
@@ -748,22 +1027,24 @@ struct CudaModel {
         if (input_embeddings.dim() != 3 ||
                 input_embeddings.size(0) != ids.size(0) ||
                 input_embeddings.size(1) != ids.size(1) ||
-                input_embeddings.size(2) != c.hidden_size) {
+                input_embeddings.size(2) != hidden_size()) {
             throw std::runtime_error(
                 "inputs_embeds shape must match [batch,tokens,hidden_size]");
         }
         const int64_t B = ids.size(0);
         const int64_t T = ids.size(1);
-        if (c.is_glm5_next() || c.is_deepseek_v41()) {
-            MFQ_RUNTIME_CHECK(T > 0 && cache_pos + T <= c.max_position_embeddings &&
+        if constexpr (is_glm5 || is_deepseek_v41) {
+            MFQ_RUNTIME_CHECK(T > 0 &&
+                cache_pos + T <= max_position_embeddings() &&
                 !pos_override.has_value() && !cache_positions_override.has_value() && !attention_mask.has_value(),
-                c.is_deepseek_v41()
+                is_deepseek_v41
                     ? "DeepSeek-V4.1 currently requires contiguous causal cache positions without an external mask"
                     : "GLM Flash-Next currently requires contiguous causal cache positions without an external mask");
         }
-        if (c.is_qwen4()) {
-            if (qwen4_batch!=0 && qwen4_batch!=B) reset(B);
-            MFQ_RUNTIME_CHECK(T>0 && cache_pos+T<=c.max_position_embeddings &&
+        if constexpr (is_qwen4) {
+            if (this->batch!=0 && this->batch!=B) reset(B);
+            MFQ_RUNTIME_CHECK(T > 0 &&
+                cache_pos + T <= max_position_embeddings() &&
                 !cache_positions_override.has_value() && !attention_mask.has_value(),
                 "Qwen4 requires unpadded causal cache positions");
         }
@@ -771,11 +1052,12 @@ struct CudaModel {
             "commit or roll back the pending speculative pass before forwarding");
         MFQ_RUNTIME_CHECK(confirmed_prefix >= 0 &&
             (confirmed_prefix == 0 || (confirmed_prefix < T && B == 1 && cache_pos > 0 &&
-                (!pos_override.has_value() || c.is_qwen4()) && !cache_positions_override.has_value() &&
+                (!pos_override.has_value() || is_qwen4) && !cache_positions_override.has_value() &&
                 !attention_mask.has_value() && supports_qwen_speculation())),
             "unsupported speculative backbone geometry");
         if (confirmed_prefix > 0) {
-            MFQ_RUNTIME_CHECK(cache_pos + T <= c.max_position_embeddings,
+            MFQ_RUNTIME_CHECK(
+                cache_pos + T <= max_position_embeddings(),
                 "speculative pass exceeds context capacity");
             speculative_start = cache_pos;
             speculative_confirmed = confirmed_prefix;
@@ -801,22 +1083,26 @@ struct CudaModel {
             : (decode_position_delta == 0
                 ? cache_positions
                 : cache_positions + decode_position_delta);
-        if (c.is_qwen4()) {
+        if constexpr (is_qwen4) {
             if ((pos.dim()==2 || pos.dim()==3) && pos.size(0)==4) pos=pos.narrow(0,1,3);
             MFQ_RUNTIME_CHECK((pos.dim()==1 || (pos.dim()==2 && pos.size(0)==3) ||
                 (pos.dim()==3 && pos.size(0)==3 && pos.size(1)==B)) && pos.size(-1)==T,
                 "Qwen4 positions require [T], [3,T], [4,T], [3,B,T] or [4,B,T]");
         } else if (!((pos.dim() == 1 && pos.numel() == T) ||
               (pos.dim() == 2 && pos.size(0) == B && pos.size(1) == T) ||
-              (c.runtime_plan.backbone ==
-                   mfq::cuda::CudaBackbone::generic_qwen &&
+              (Backbone == mfq::cuda::CudaBackbone::generic_qwen &&
                rope.sections.numel() > 0 && pos.dim() == 2 &&
                pos.size(0) == 3 && pos.size(1) == T))) {
             throw std::runtime_error(
                 "position_ids must have shape [tokens], [batch,tokens], or configured grid-MRoPE [3,tokens]");
         }
-        auto qwen4_full_positions=c.is_qwen4() && qwen4_positions.defined()
-            ?mfq_tensor_backend::cat({qwen4_positions,pos},-1):pos;
+        auto full_positions = pos;
+        if constexpr (is_qwen4) {
+            if (this->positions.defined()) {
+                full_positions = mfq_tensor_backend::cat(
+                    {this->positions, pos}, -1);
+            }
+        }
         if (attention_mask.has_value()) {
             auto mask = attention_mask.value();
             if (mask.dim() != 2 || mask.size(0) != B ||
@@ -826,10 +1112,12 @@ struct CudaModel {
             }
         }
         auto effective_attention_mask = attention_mask;
-        if (c.is_minicpmo45() && attention_mask.has_value() &&
-                (T == 1 || cache_pos == 0) &&
-                attention_mask.value().eq(1).all().item<bool>()) {
-            effective_attention_mask = mfq_nullopt;
+        if constexpr (is_minicpmo45) {
+            if (attention_mask.has_value() &&
+                    (T == 1 || cache_pos == 0) &&
+                    attention_mask.value().eq(1).all().item<bool>()) {
+                effective_attention_mask = mfq_nullopt;
+            }
         }
         mfq_tensor_backend::Tensor cpu_ids, cpu_pos, cpu_cache_positions;
         MfqOptional<mfq_tensor_backend::Tensor> cpu_attention_mask = mfq_nullopt;
@@ -850,29 +1138,32 @@ struct CudaModel {
         }
         auto x = tensor_to_cuda_device(
             input_embeddings, primary).contiguous();
-        if (c.is_minicpmo45()) {
+        if constexpr (is_minicpmo45) {
             x = x.to(mfq_tensor_backend::kBFloat16).contiguous();
         }
-        if (c.is_gemma4()) {
+        if constexpr (is_gemma4) {
             x = g_profiler.measure("model.embed_scale", [&]() {
-                return x * c.embed_scale;
+                return x * embedding_scale();
             });
         }
-        if (c.is_dsv4() || c.is_glm5_next() || c.is_deepseek_v41()) {
+        if constexpr (is_dsv4 || is_glm5 || is_deepseek_v41) {
             x = x.to(mfq_tensor_backend::kFloat16)
                 .unsqueeze(2)
-                .expand({B, T, c.hc_mult, c.hidden_size})
+                .expand({B, T, hc_mult(), hidden_size()})
                 .contiguous();
         }
-        if (c.is_deepseek_v41()) {
+        if constexpr (is_deepseek_v41) {
             MFQ_RUNTIME_CHECK(
-                deepseek_v41_state,
+                this->shared,
                 "DeepSeek-V4.1 target capture state is unavailable");
-            deepseek_v41_state->begin_forward(
+            this->shared->begin_forward(
                 raw_hidden != nullptr,
-                deepseek_v41_state->config.dspark_target_layer_ids.size());
+                this->shared->config.dspark_target_layer_ids.size());
         }
-        if (c.is_qwen4()) x=x.to(mfq_tensor_backend::kFloat16).repeat({1,1,c.hc_mult});
+        if constexpr (is_qwen4) {
+            x = x.to(mfq_tensor_backend::kFloat16)
+                .repeat({1, 1, hc_mult()});
+        }
         if (block_trace != nullptr) block_trace->push_back(x.to(mfq_tensor_backend::kFloat32).clone());
         for (auto & b : blocks) {
             MfqCudaGuard block_guard(b->cuda_device);
@@ -885,7 +1176,12 @@ struct CudaModel {
             MfqOptional<mfq_tensor_backend::Tensor> local_cache_positions = mfq_nullopt;
             // Grid-MRoPE semantic coordinates never double as physical KV
             // slots, during either prepared prefill or delta-adjusted decode.
-            if (c.is_minicpmo45() || rope.sections.numel() > 0 ||
+            if constexpr (is_minicpmo45) {
+                local_cache_positions = b->cpu_offloaded
+                    ? cpu_cache_positions
+                    : tensor_to_cuda_device(
+                        cache_positions, b->cuda_device);
+            } else if (rope.sections.numel() > 0 ||
                     cache_positions_override.has_value()) {
                 local_cache_positions = b->cpu_offloaded
                     ? cpu_cache_positions
@@ -917,31 +1213,47 @@ struct CudaModel {
             Block::Context context;
             context.token_ids=local_ids;
             context.positions=local_pos;
-            context.full_positions=c.is_qwen4()
-                ? tensor_to_cuda_device(qwen4_full_positions,b->cuda_device)
-                : local_pos;
+            if constexpr (is_qwen4) {
+                context.full_positions = tensor_to_cuda_device(
+                    full_positions, b->cuda_device);
+            } else {
+                context.full_positions = local_pos;
+            }
             context.cache_position=cache_pos;
             context.confirmed_prefix=confirmed_prefix;
             context.sequence_lengths=local_seq_len;
             context.cache_positions=local_cache_positions;
-            context.attention_mask=c.is_minicpmo45()?local_attention_mask:mfq_nullopt;
-            x=b->forward_context(std::move(x),context,c,active_rope);
+            if constexpr (is_minicpmo45) {
+                context.attention_mask = local_attention_mask;
+            }
+            x = b->forward_context(
+                std::move(x), context, active_rope);
             if (block_trace != nullptr) {
                 block_trace->push_back(
                     tensor_to_cuda_device(x, primary)
                         .to(mfq_tensor_backend::kFloat32).clone());
             }
         }
-        if (c.is_qwen4()) {qwen4_positions=qwen4_full_positions;qwen4_batch=B;}
-        if (!pos_override.has_value() || advance_cache_with_position_ids || c.is_qwen4()) {
+        if constexpr (is_qwen4) {
+            this->positions = full_positions;
+            this->batch = B;
+        }
+        if constexpr (is_qwen4) {
+            cache_pos += T;
+        } else if (!pos_override.has_value() ||
+                advance_cache_with_position_ids) {
             cache_pos += T;
         }
         x = tensor_to_cuda_device(x, primary);
         auto finalized=finalize_hidden(x, B, T);
         if (raw_hidden != nullptr) {
-            *raw_hidden = c.is_deepseek_v41()
-                ? deepseek_v41_state->dspark_target_hidden()
-                : (c.is_glm5_next() ? finalized : x);
+            if constexpr (is_deepseek_v41) {
+                *raw_hidden = this->shared->dspark_target_hidden();
+            } else if constexpr (is_glm5) {
+                *raw_hidden = finalized;
+            } else {
+                *raw_hidden = x;
+            }
         }
         return finalized;
     }
@@ -955,16 +1267,21 @@ struct CudaModel {
             ids, input_embeddings, pos_override, seq_len));
     }
 
+    mfq_tensor_backend::Tensor apply_final_logit_softcap(
+            mfq_tensor_backend::Tensor logits) const {
+        const double cap = final_logit_softcapping();
+        return cap > 0.0
+            ? mfq_tensor_backend::tanh(logits / cap) * cap
+            : logits;
+    }
+
     mfq_tensor_backend::Tensor logits_from_hidden(mfq_tensor_backend::Tensor y) {
-        auto logits = g_profiler.measure("model.lm_head", [&]() { return lm_head.forward(y); });
-        if (c.is_minicpmo45()) {
+        auto logits = g_profiler.measure(
+            "model.lm_head", [&]() { return lm_head.forward(y); });
+        if constexpr (is_minicpmo45) {
             logits = logits.to(mfq_tensor_backend::kBFloat16).contiguous();
         }
-        if (c.final_logit_softcapping > 0.0) {
-            logits = mfq_tensor_backend::tanh(logits / c.final_logit_softcapping) *
-                c.final_logit_softcapping;
-        }
-        return logits;
+        return apply_final_logit_softcap(std::move(logits));
     }
 
     mfq_tensor_backend::Tensor forward(mfq_tensor_backend::Tensor ids) {
@@ -976,8 +1293,7 @@ struct CudaModel {
         MFQ_RUNTIME_CHECK(
             prepared.transformed() && !prepared.token_ids.empty() &&
                 prepared.embeddings.defined() && prepared.positions.defined() &&
-                c.runtime_plan.backbone ==
-                    mfq::cuda::CudaBackbone::generic_qwen,
+                Backbone == mfq::cuda::CudaBackbone::generic_qwen,
             "invalid prepared prompt for CUDA text runtime");
         auto options = mfq_tensor_backend::TensorOptions()
             .dtype(mfq_tensor_backend::kInt64)
@@ -1003,48 +1319,38 @@ struct CudaModel {
         MfqOptional<mfq_tensor_backend::Tensor> seq_len = mfq_nullopt;
         const int64_t token_count = ids.dim() == 1 ? ids.size(0) : ids.size(1);
         const int64_t batch_size = ids.dim() == 1 ? 1 : ids.size(0);
-        if (!c.is_minicpmo45() && cache_pos > 0 && token_count == 1) {
+        if (!is_minicpmo45 && cache_pos > 0 && token_count == 1) {
             seq_len = mfq_tensor_backend::full(
                 {batch_size}, cache_pos + 1,
                 mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt64).device(mfq_tensor_backend::kCUDA));
         }
         auto y = hidden_forward(ids, mfq_nullopt, seq_len);
         auto last = y.index({Slice(), -1, Slice()});
-        if (c.is_flash_next()) return logits_from_hidden(last);
-        if (c.is_minicpmo45()) {
+        if constexpr (is_flash_next) return logits_from_hidden(last);
+        if constexpr (is_minicpmo45) {
             return logits_from_hidden(
                 last.to(mfq_tensor_backend::kBFloat16).contiguous());
         }
         last = last.to(mfq_tensor_backend::kFloat16).contiguous();
-        auto logits = lm_head.forward(last);
-        if (c.final_logit_softcapping > 0.0) {
-            logits = mfq_tensor_backend::tanh(logits / c.final_logit_softcapping) *
-                c.final_logit_softcapping;
-        }
-        return logits;
+        return apply_final_logit_softcap(lm_head.forward(last));
     }
 
     mfq_tensor_backend::Tensor last_logits_static(mfq_tensor_backend::Tensor ids, mfq_tensor_backend::Tensor pos, mfq_tensor_backend::Tensor seq_len) {
         auto y = hidden_forward(ids, pos, seq_len, nullptr, pos);
         auto last = y.index({Slice(), -1, Slice()});
-        if (c.is_minicpmo45()) {
+        if constexpr (is_minicpmo45) {
             return logits_from_hidden(
                 last.to(mfq_tensor_backend::kBFloat16).contiguous());
         }
         last = last.to(mfq_tensor_backend::kFloat16).contiguous();
-        auto logits = lm_head.forward(last);
-        if (c.final_logit_softcapping > 0.0) {
-            logits = mfq_tensor_backend::tanh(logits / c.final_logit_softcapping) *
-                c.final_logit_softcapping;
-        }
-        return logits;
+        return apply_final_logit_softcap(lm_head.forward(last));
     }
 
     mfq_tensor_backend::Tensor next_token(mfq_tensor_backend::Tensor ids) {
         MfqOptional<mfq_tensor_backend::Tensor> seq_len = mfq_nullopt;
         const int64_t token_count = ids.dim() == 1 ? ids.size(0) : ids.size(1);
         const int64_t batch_size = ids.dim() == 1 ? 1 : ids.size(0);
-        if (!c.is_minicpmo45() && cache_pos > 0 && token_count == 1) {
+        if (!is_minicpmo45 && cache_pos > 0 && token_count == 1) {
             seq_len = mfq_tensor_backend::full(
                 {batch_size}, cache_pos + 1,
                 mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt64).device(mfq_tensor_backend::kCUDA));
@@ -1060,8 +1366,8 @@ struct CudaModel {
 
     mfq_tensor_backend::Tensor next_token_from_hidden(mfq_tensor_backend::Tensor y) {
         auto last = y.index({Slice(), -1, Slice()});
-        if (c.is_flash_next()) return mfq_tensor_backend::argmax(logits_from_hidden(last),-1).to(mfq_tensor_backend::kInt64);
-        if (c.is_minicpmo45()) {
+        if constexpr (is_flash_next) return mfq_tensor_backend::argmax(logits_from_hidden(last),-1).to(mfq_tensor_backend::kInt64);
+        if constexpr (is_minicpmo45) {
             auto logits = logits_from_hidden(
                 last.to(mfq_tensor_backend::kBFloat16).contiguous());
             return mfq_tensor_backend::argmax(logits, -1).to(mfq_tensor_backend::kInt64);
@@ -1072,9 +1378,48 @@ struct CudaModel {
     }
 };
 
-CudaModel load_model(
+struct Qwen35CausalLm final : CausalLm<CudaBackbone::generic_qwen> {};
+struct MiniCPMO45CausalLm final : CausalLm<CudaBackbone::minicpmo45> {};
+struct MiniCPMOTtsCausalLm final : CausalLm<CudaBackbone::minicpmo_tts> {};
+struct Gemma4CausalLm final : CausalLm<CudaBackbone::gemma4> {};
+struct GlmDsaCausalLm final : CausalLm<CudaBackbone::glm_dsa> {};
+struct Glm5CausalLm final : CausalLm<CudaBackbone::glm5_next> {};
+struct Qwen4CausalLm final : CausalLm<CudaBackbone::qwen4_exp> {};
+struct DeepseekV4CausalLm final : CausalLm<CudaBackbone::deepseek_v4> {};
+struct DeepseekV41CausalLm final : CausalLm<CudaBackbone::deepseek_v41> {};
+
+template <CudaBackbone Backbone>
+struct CausalLmType;
+
+template <>
+struct CausalLmType<CudaBackbone::generic_qwen> { using type = Qwen35CausalLm; };
+template <>
+struct CausalLmType<CudaBackbone::minicpmo45> { using type = MiniCPMO45CausalLm; };
+template <>
+struct CausalLmType<CudaBackbone::minicpmo_tts> { using type = MiniCPMOTtsCausalLm; };
+template <>
+struct CausalLmType<CudaBackbone::gemma4> { using type = Gemma4CausalLm; };
+template <>
+struct CausalLmType<CudaBackbone::glm_dsa> { using type = GlmDsaCausalLm; };
+template <>
+struct CausalLmType<CudaBackbone::glm5_next> { using type = Glm5CausalLm; };
+template <>
+struct CausalLmType<CudaBackbone::qwen4_exp> { using type = Qwen4CausalLm; };
+template <>
+struct CausalLmType<CudaBackbone::deepseek_v4> { using type = DeepseekV4CausalLm; };
+template <>
+struct CausalLmType<CudaBackbone::deepseek_v41> { using type = DeepseekV41CausalLm; };
+
+template <CudaBackbone Backbone>
+using CausalLmFor = typename CausalLmType<Backbone>::type;
+
+template <CudaBackbone Backbone>
+CausalLmFor<Backbone> load_causal_lm(
     const std::string& model_path,
     const std::string& config_path,
     std::int64_t context_size_override = 0,
     bool load_blocks = true,
-    bool defer_moe_cache_finalize = false);
+    bool defer_moe_cache_finalize = false,
+    std::shared_ptr<const mfq::ModelSource> source = {});
+
+} // namespace mfq::cuda

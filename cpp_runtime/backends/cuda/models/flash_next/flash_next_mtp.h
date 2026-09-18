@@ -1,9 +1,11 @@
 #pragma once
 
+#include <type_traits>
+
 // Appended predictors share the target's embedding and output projection.
 // Generation reuses predictor block zero for every draft position, while the
 // explicit depth argument remains available for per-layer diagnostics.
-struct CudaFlashNextMtp final : CudaMtpModule {
+struct FlashNextMtp final : MtpModule {
     using Tensor=mfq_tensor_backend::Tensor;
     using Linear=mfq::flash_next::Linear;
     struct GlmLayer {
@@ -11,9 +13,8 @@ struct CudaFlashNextMtp final : CudaMtpModule {
         std::unique_ptr<mfq::flash_next::SparseMla> attention;
         Linear ffn;
     };
-    CudaRuntimeParameters c;
-    std::optional<mfq::flash_next::QwenConfig> qwen_config;
-    std::optional<mfq::flash_next::GlmConfig> glm_config;
+    std::optional<mfq::models::flash_next::QwenConfig> qwen_config;
+    std::optional<mfq::models::flash_next::GlmConfig> glm_config;
     Tensor embedding_norm,hidden_norm,output_norm;
     Linear fusion,embedding_fusion,hidden_fusion;
     std::unique_ptr<flash_runtime::Gr> final_mixer;
@@ -23,33 +24,32 @@ struct CudaFlashNextMtp final : CudaMtpModule {
     std::vector<int64_t> lengths;
     int64_t batch=0;
 
-    static std::optional<CudaFlashNextMtp> load_if_present(const mfq::ModelSource& file,const CudaRuntimeParameters& main) {
+    template <typename Config>
+    static std::optional<FlashNextMtp> load_if_present(
+            const mfq::ModelSource& file,
+            const Config& main) {
         using namespace flash_runtime;
+        constexpr bool is_qwen = std::is_same_v<
+            Config, mfq::models::flash_next::QwenConfig>;
         const bool any = std::any_of(
             file.tensors().begin(), file.tensors().end(),
             [](const mfq::TensorMetadata& tensor) {
                 return tensor.name.rfind("predictor.", 0) == 0;
             });
-        std::optional<mfq::flash_next::QwenConfig> qwen;
-        std::optional<mfq::flash_next::GlmConfig> glm;
-        if (main.is_qwen4()) {
-            qwen = mfq::flash_next::QwenConfig::from_json(
-                main.resolved_config_json);
-            qwen->maximum = main.max_position_embeddings;
-        } else {
-            glm = mfq::flash_next::GlmConfig::from_json(
-                main.resolved_config_json);
-            glm->maximum = main.max_position_embeddings;
-        }
-        const auto layers = qwen ? qwen->predictor_layers : glm->predictor_layers;
+        std::optional<mfq::models::flash_next::QwenConfig> qwen;
+        std::optional<mfq::models::flash_next::GlmConfig> glm;
+        if constexpr (is_qwen) qwen = main;
+        else glm = main;
+        const auto layers = qwen
+            ? qwen->predictor_layers : glm->predictor_layers;
         if (!has_tensor(file, "predictor.embedding_norm.weight") || layers<=0) {
             MFQ_RUNTIME_CHECK(!any,"Flash-Next model source contains an incomplete or undeclared MTP head");
             return std::nullopt;
         }
-        CudaFlashNextMtp result;result.c=main;
+        FlashNextMtp result;
         result.embedding_norm=dense(file,"predictor.embedding_norm.weight").to(tb::kFloat32);
         result.hidden_norm=dense(file,"predictor.hidden_norm.weight").to(tb::kFloat32);
-        if (main.is_qwen4()) {
+        if constexpr (is_qwen) {
             const auto& cfg = *qwen;
             result.embedding_fusion=linear(file,"predictor.fusion.embedding.weight");
             result.hidden_fusion=linear(file,"predictor.fusion.hidden.weight");
@@ -77,16 +77,30 @@ struct CudaFlashNextMtp final : CudaMtpModule {
                 result.glm_layers.push_back(std::move(layer));
             }
         }
-        const auto hidden_width = main.hidden_size *
-            (main.is_qwen4() ? qwen->streams : 1);
-        MFQ_RUNTIME_CHECK(result.embedding_norm.dim()==1 && result.embedding_norm.numel()==main.hidden_size &&
-            result.hidden_norm.dim()==1 && result.hidden_norm.numel()==hidden_width,
+        const auto hidden = main.hidden;
+        const auto hidden_width = hidden *
+            (is_qwen ? qwen->streams : 1);
+        MFQ_RUNTIME_CHECK(result.embedding_norm.dim()==1 &&
+            result.embedding_norm.numel()==hidden &&
+            result.hidden_norm.dim()==1 &&
+            result.hidden_norm.numel()==hidden_width,
             "Flash-Next MTP normalization width disagrees with backbone");
-        if (!main.is_qwen4()) MFQ_RUNTIME_CHECK(result.output_norm.numel()==main.hidden_size,"GLM MTP output norm width mismatch");
+        if constexpr (!is_qwen) {
+            MFQ_RUNTIME_CHECK(
+                result.output_norm.numel()==hidden,
+                "GLM MTP output norm width mismatch");
+        }
         result.qwen_config = std::move(qwen);
         result.glm_config = std::move(glm);
         result.positions.resize(layers);result.lengths.resize(layers,0);
         return result;
+    }
+    bool is_qwen4() const noexcept { return qwen_config.has_value(); }
+    int64_t hidden_size() const noexcept {
+        return qwen_config ? qwen_config->hidden : glm_config->hidden;
+    }
+    int64_t maximum_context() const noexcept {
+        return qwen_config ? qwen_config->maximum : glm_config->maximum;
     }
     void reset(int64_t next_batch=1) override {
         MFQ_RUNTIME_CHECK(next_batch>0,"Flash-Next MTP batch must be positive");
@@ -95,22 +109,22 @@ struct CudaFlashNextMtp final : CudaMtpModule {
         for (auto& pos:positions) pos={};
         std::fill(lengths.begin(),lengths.end(),0);batch=next_batch;
     }
-    std::pair<Tensor,Tensor> evaluate(CudaModel& main,const Tensor& hidden,const Tensor& ids,int64_t depth=0,
+    std::pair<Tensor,Tensor> evaluate(const MtpTarget& target,const Tensor& hidden,const Tensor& ids,int64_t depth=0,
         bool cache=true,const Tensor& supplied_positions={},const Tensor& supplied_embeddings={}) {
         namespace tb=mfq_tensor_backend;
         MFQ_RUNTIME_CHECK(ids.dim()==2 && ids.size(0)>0 && ids.size(1)>0 && hidden.dim()==3 &&
             hidden.size(0)==ids.size(0) && hidden.size(1)==ids.size(1) && hidden.size(2)==hidden_norm.numel(),
             "Flash-Next MTP input geometry mismatch");
-        const auto b=ids.size(0),t=ids.size(1),h=c.hidden_size,n=int64_t(lengths.size());
+        const auto b=ids.size(0),t=ids.size(1),h=hidden_size(),n=int64_t(lengths.size());
         const auto layer=(depth%n+n)%n;
         if (cache && batch && batch!=b) reset(b);
         const auto start=cache?lengths[layer]:0;
-        MFQ_RUNTIME_CHECK(start+t<=c.max_position_embeddings,"Flash-Next MTP history exceeds context capacity");
-        auto embeds=supplied_embeddings.defined()?supplied_embeddings:main.embed_forward(ids);
+        MFQ_RUNTIME_CHECK(start+t<=maximum_context(),"Flash-Next MTP history exceeds context capacity");
+        auto embeds=supplied_embeddings.defined()?supplied_embeddings:target.embed(ids);
         MFQ_RUNTIME_CHECK(embeds.sizes().vec()==std::vector<int64_t>({b,t,h}),"Flash-Next MTP embedding shape mismatch");
         auto current=supplied_positions.defined()?supplied_positions:tb::arange(start,start+t,ids.options().dtype(tb::kInt32));
         Tensor output,multi;
-        if (c.is_qwen4()) {
+        if (is_qwen4()) {
             const auto& cfg = *qwen_config;
             if (current.dim()==1) current=current.reshape({1,1,t}).expand({3,1,t}).contiguous();
             else if (current.dim()==2) current=current.unsqueeze(1);
@@ -149,9 +163,9 @@ struct CudaFlashNextMtp final : CudaMtpModule {
         if (cache) {batch=b;lengths[layer]=start+t;}
         return {output,multi};
     }
-    Tensor forward(CudaModel& main,Tensor hidden,Tensor ids) override {return evaluate(main,hidden,ids).first;}
-    CudaMtpStep step(CudaModel& main,Tensor hidden,Tensor ids) override {
-        auto result=evaluate(main,hidden,ids);
+    Tensor forward(const MtpTarget& target,Tensor hidden,Tensor ids) override {return evaluate(target,hidden,ids).first;}
+    MtpStep step(const MtpTarget& target,Tensor hidden,Tensor ids) override {
+        auto result=evaluate(target,hidden,ids);
         return {std::move(result.first),std::move(result.second)};
     }
     int64_t cache_position() const noexcept override {
@@ -169,7 +183,7 @@ struct CudaFlashNextMtp final : CudaMtpModule {
             positions[index]=positions[index].narrow(-1,0,position);
         lengths[index]=position;
     }
-    bool teacher_forced_prompt_prime() const noexcept override {return c.is_qwen4();}
+    bool teacher_forced_prompt_prime() const noexcept override {return is_qwen4();}
     bool target_bootstrap_decode() const noexcept override {return true;}
     bool preserve_output_dtype() const noexcept override {return true;}
 };

@@ -53,8 +53,8 @@ def test_scheduler_supports_dynamic_join_retire_and_per_request_sampling():
     assert "take_qwen_batch_state" in BATCHING
     assert "restore_qwen_batch_states" in BATCHING
     assert "compact_qwen_batch_state" in BATCHING
-    assert "sample_server_logits" in BATCHING
-    assert "request->rng" in BATCHING
+    assert "mfq::cuda::sample_logits" in BATCHING
+    assert "request->sampler" in BATCHING
     assert "request->token_constraint" in BATCHING
     assert "pending_" in BATCHING
     assert "active_" in BATCHING

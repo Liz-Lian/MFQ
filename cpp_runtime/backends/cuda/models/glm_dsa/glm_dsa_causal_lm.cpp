@@ -1,17 +1,15 @@
 #include "glm_dsa_causal_lm.h"
 
 #include "../../runtime/cuda_transformer.h"
-#include "glm_dsa_model.h"
 
 namespace mfq::cuda::glm_dsa {
 
-bool load_ffn(
+void load_ffn(
         const mfq::ModelSource& mfq,
-        const CudaRuntimeParameters& c,
-        const Config& config,
+        const Config& c,
         int i,
         FFN& f) {
-    if (c.is_glm_dsa()) {
+        const auto& config = c;
         const std::string p =
             "model.block." + std::to_string(i) + ".mlp.";
         if (config.mlp_layer_types.at(static_cast<size_t>(i)) == "sparse") {
@@ -56,7 +54,7 @@ bool load_ffn(
                     "GLM DSA MoE tensor shapes disagree with config at layer " +
                     std::to_string(i));
             }
-            return true;
+            return;
         }
         const std::string down_name = p + "down.weight";
         const std::string gate_name = p + "gate.weight";
@@ -66,22 +64,19 @@ bool load_ffn(
             gate_name, up_name},
             f.down);
         load_important_neuron_branch(
-            mfq, c, f, down_name, gate_name, up_name);
+            mfq, c.hidden_size, c.intermediate_size,
+            f, down_name, gate_name, up_name);
         prepare_ffn_workspaces(f);
-        return true;
-    }
-    return false;
 }
 
 
 std::unique_ptr<::Block> load_block(
         const mfq::ModelSource& mfq,
-        const CudaRuntimeParameters& c,
-        const Config& config,
+        const Config& c,
         int i,
         const std::string& type,
         const std::shared_ptr<::GlmDsaSharedState>& state) {
-    if (c.is_glm_dsa()) {
+        const auto& config = c;
         if (type != "glm_dsa" || !state) {
             throw std::runtime_error("invalid GLM DSA block loader state");
         }
@@ -89,6 +84,7 @@ std::unique_ptr<::Block> load_block(
             "model.block." + std::to_string(i) + ".";
         const std::string ap = lp + "attention.";
         auto b = std::make_unique<GlmDsaBlock>();
+        b->config = c;
         b->layer = i;
         b->full_indexer =
             config.indexer_types.at(static_cast<size_t>(i)) == "full";
@@ -123,7 +119,7 @@ std::unique_ptr<::Block> load_block(
         b->unembed_out = load_mfe_gpu(
             mfq, ap + "latent.output_unembedding.weight");
         b->o_proj = load_quant_linear(mfq, ap + "output.weight");
-        load_ffn(mfq, c, config, i, b->ffn);
+        load_ffn(mfq, c, i, b->ffn);
 
         const bool input_shape_ok =
             b->input_proj.outs.size() == (b->full_indexer ? 4u : 2u) &&
@@ -162,8 +158,6 @@ std::unique_ptr<::Block> load_block(
                 std::to_string(i));
         }
         return b;
-    }
-    return nullptr;
 }
 
 

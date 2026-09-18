@@ -1,7 +1,7 @@
 #pragma once
 
-#include "../models/cuda_model_config.h"
 #include "../ops/cuda_quantized_ops.h"
+#include "models/model_config.h"
 #include "cuda_execution.h"
 #include "mfq_cuda_ops.h"
 #include "mfq_cuda_paged_kv.h"
@@ -19,6 +19,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -26,13 +27,23 @@ using mfq_tensor_backend::indexing::Slice;
 
 std::string layer_name(const std::string & templ, int i);
 
-mfq_tensor_backend::Tensor qwen_rms_norm(mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor weight, const CudaRuntimeParameters & c);
+mfq_tensor_backend::Tensor qwen_rms_norm(
+    mfq_tensor_backend::Tensor x,
+    mfq_tensor_backend::Tensor weight,
+    double eps,
+    double weight_offset);
 
 mfq_tensor_backend::Tensor qwen_rms_norm_bf16(
-        mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor weight, const CudaRuntimeParameters & c);
+    mfq_tensor_backend::Tensor x,
+    mfq_tensor_backend::Tensor weight,
+    double eps,
+    double weight_offset);
 
 mfq_tensor_backend::Tensor gemma_rms_norm_f16(
-    mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor weight, const CudaRuntimeParameters & c);
+    mfq_tensor_backend::Tensor x,
+    mfq_tensor_backend::Tensor weight,
+    double eps,
+    double weight_offset);
 
 struct RopeCache {
     mfq_tensor_backend::Tensor cos;
@@ -97,13 +108,6 @@ struct RopeCache {
         sections = mfq_tensor_backend::empty({0}, mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt64).device(mfq_tensor_backend::kCPU));
         empty_sections = sections;
     }
-    explicit RopeCache(
-        const CudaRuntimeParameters & c,
-        mfq_tensor_backend::Device device = mfq_tensor_backend::Device(mfq_tensor_backend::kCUDA))
-        : RopeCache(
-            c.max_position_embeddings, c.rotary_dim, c.rope_base,
-            0, -1, device, c.is_minicpmo45()) {}
-
     void configure_mrope(
             const std::vector<int64_t>& configured_sections,
             bool interleaved,
@@ -153,7 +157,6 @@ struct RopeCache {
     mfq_tensor_backend::Tensor apply(
             mfq_tensor_backend::Tensor x,
             mfq_tensor_backend::Tensor pos,
-            const CudaRuntimeParameters & c,
             bool grid_mrope_positions = false) const {
         if (!x.is_cuda()) {
             MFQ_RUNTIME_CHECK(
@@ -1260,21 +1263,24 @@ struct Block {
     virtual void begin_speculative(int64_t) {}
     virtual void commit_speculative() {}
     virtual void rollback_speculative(int64_t) {}
-    virtual mfq_tensor_backend::Tensor forward(mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor pos, int64_t cache_pos,
-                                  const MfqOptional<mfq_tensor_backend::Tensor> & seq_len,
-                                  const CudaRuntimeParameters & c, const RopeCache & rope,
-                                  const MfqOptional<mfq_tensor_backend::Tensor> & cache_positions = mfq_nullopt,
-                                  const MfqOptional<mfq_tensor_backend::Tensor> & attention_mask = mfq_nullopt) = 0;
+    virtual mfq_tensor_backend::Tensor forward(
+            mfq_tensor_backend::Tensor x,
+            mfq_tensor_backend::Tensor pos,
+            int64_t cache_pos,
+            const MfqOptional<mfq_tensor_backend::Tensor> & seq_len,
+            const RopeCache & rope,
+            const MfqOptional<mfq_tensor_backend::Tensor> & cache_positions = mfq_nullopt,
+            const MfqOptional<mfq_tensor_backend::Tensor> & attention_mask = mfq_nullopt) = 0;
     virtual mfq_tensor_backend::Tensor forward_context(
             mfq_tensor_backend::Tensor x,
             const Context & context,
-            const CudaRuntimeParameters & c,
             const RopeCache & rope) {
         MFQ_RUNTIME_CHECK(
             context.confirmed_prefix == 0 || supports_speculation(),
             "block does not support speculative verification");
-        return forward(std::move(x), context.positions, context.cache_position,
-            context.sequence_lengths, c, rope, context.cache_positions,
+        return forward(
+            std::move(x), context.positions, context.cache_position,
+            context.sequence_lengths, rope, context.cache_positions,
             context.attention_mask);
     }
 };
@@ -1290,7 +1296,11 @@ struct FullBlock : Block {
     int64_t attention_head_dim = 0;
     int64_t attention_rotary_dim = 0;
     int64_t attention_window = 0;
+    int64_t max_position_embeddings = 0;
     double attention_scale = 0.0;
+    double rms_norm_eps = 1e-6;
+    double norm_weight_offset = 1.0;
+    bool official_bf16 = false;
     RopeCache attention_rope;
 
     bool supports_speculation() const noexcept override { return !sliding; }
@@ -1329,11 +1339,14 @@ struct FullBlock : Block {
         decode_mma_meta = mfq_tensor_backend::Tensor();
     }
 
-    mfq_tensor_backend::Tensor forward(mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor pos, int64_t cache_pos,
-                          const MfqOptional<mfq_tensor_backend::Tensor> & seq_len,
-                          const CudaRuntimeParameters & c, const RopeCache & rope,
-                          const MfqOptional<mfq_tensor_backend::Tensor> & cache_positions = mfq_nullopt,
-                          const MfqOptional<mfq_tensor_backend::Tensor> & attention_mask = mfq_nullopt) override {
+    mfq_tensor_backend::Tensor forward(
+            mfq_tensor_backend::Tensor x,
+            mfq_tensor_backend::Tensor pos,
+            int64_t cache_pos,
+            const MfqOptional<mfq_tensor_backend::Tensor> & seq_len,
+            const RopeCache & rope,
+            const MfqOptional<mfq_tensor_backend::Tensor> & cache_positions = mfq_nullopt,
+            const MfqOptional<mfq_tensor_backend::Tensor> & attention_mask = mfq_nullopt) override {
         int64_t B = x.size(0), T = x.size(1), H = x.size(2);
         auto trace_qwen_stage = [&](const char* name, const mfq_tensor_backend::Tensor& value,
                                     int token_axis = 1) {
@@ -1342,20 +1355,20 @@ struct FullBlock : Block {
             auto ordered = token_axis == 1 ? value : value.transpose(1, token_axis).contiguous();
             trace_gemma_stage(layer, name, ordered.reshape({B, T, -1}));
         };
-        const bool official_bf16 = c.uses_minicpmo45_bf16_graph();
-        if (official_bf16 && x.scalar_type() != mfq_tensor_backend::kBFloat16) {
+        if (official_bf16 &&
+                x.scalar_type() != mfq_tensor_backend::kBFloat16) {
             x = x.to(mfq_tensor_backend::kBFloat16).contiguous();
         }
-        const int64_t nh = attention_heads > 0 ? attention_heads : c.num_attention_heads;
-        const int64_t nkh = kv_heads > 0 ? kv_heads : c.num_key_value_heads;
-        const int64_t hd = attention_head_dim > 0 ? attention_head_dim : c.head_dim;
+        const int64_t nh = attention_heads;
+        const int64_t nkh = kv_heads;
+        const int64_t hd = attention_head_dim;
         const int64_t attn_width = nh * hd;
         const int64_t cache_capacity = sliding
             ? attention_window
             : (g_kl_kv_cache_capacity > 0
                    ? std::max<int64_t>(
                          cache_pos + T, g_kl_kv_cache_capacity)
-                   : c.max_position_embeddings);
+                   : max_position_embeddings);
         const RopeCache & active_rope = attention_rope.cos.defined() ? attention_rope : rope;
         if (!cache.defined()) {
             cache = KVCache(
@@ -1382,10 +1395,13 @@ struct FullBlock : Block {
         auto xn = g_profiler.measure("full.attn_norm", [&]() {
             return official_bf16
                 ? qwen_rms_norm_bf16(
-                    x.reshape({B * T, H}), attn_norm, c)
+                    x.reshape({B * T, H}), attn_norm,
+                    rms_norm_eps, norm_weight_offset)
                     .reshape({B, T, H})
                 : qwen_rms_norm(
-                    x.reshape({B * T, H}).to(mfq_tensor_backend::kFloat32), attn_norm, c)
+                    x.reshape({B * T, H})
+                        .to(mfq_tensor_backend::kFloat32),
+                    attn_norm, rms_norm_eps, norm_weight_offset)
                     .reshape({B, T, H});
         });
         trace_qwen_stage("qwen.attn_norm", xn);
@@ -1459,8 +1475,8 @@ struct FullBlock : Block {
                     q_norm, k_norm,
                     pos.contiguous().to(x.device(), mfq_tensor_backend::kInt64),
                     write_positions, active_rope.cos, active_rope.sin,
-                    cache.k, cache.v, c.rms_norm_eps,
-                    c.norm_weight_offset);
+                    cache.k, cache.v, rms_norm_eps,
+                    norm_weight_offset);
             });
             kv = {
                 cache.k.index({Slice(), Slice(), Slice(0, cache_pos + T), Slice()}),
@@ -1477,7 +1493,7 @@ struct FullBlock : Block {
             auto normalized = g_profiler.measure("full.qk_norm", [&]() {
                 return qwen_rms_norm_pair_bf16_cuda(
                     q, k, q_norm, k_norm,
-                    c.rms_norm_eps, c.norm_weight_offset);
+                    rms_norm_eps, norm_weight_offset);
             });
             q = normalized[0].reshape_as(q);
             k = normalized[1].reshape_as(k);
@@ -1487,7 +1503,7 @@ struct FullBlock : Block {
             auto normalized = g_profiler.measure("full.qk_norm", [&]() {
                 return rms_norm_pair_f16_f32_offset_cuda(
                     q, k, q_norm, k_norm,
-                    c.rms_norm_eps, c.norm_weight_offset);
+                    rms_norm_eps, norm_weight_offset);
             });
             q = normalized[0].reshape_as(q);
             k = normalized[1].reshape_as(k);
@@ -1495,26 +1511,34 @@ struct FullBlock : Block {
             if (q_norm.defined()) q = g_profiler.measure("full.q_norm", [&]() {
                 return official_bf16
                     ? qwen_rms_norm_bf16(
-                        q.reshape({-1, hd}), q_norm, c).reshape_as(q)
+                        q.reshape({-1, hd}), q_norm,
+                        rms_norm_eps, norm_weight_offset).reshape_as(q)
                     : qwen_rms_norm(
-                        q.reshape({-1, hd}).to(mfq_tensor_backend::kFloat32), q_norm, c)
+                        q.reshape({-1, hd})
+                            .to(mfq_tensor_backend::kFloat32),
+                        q_norm, rms_norm_eps, norm_weight_offset)
                         .reshape_as(q);
             });
             if (k_norm.defined()) k = g_profiler.measure("full.k_norm", [&]() {
                 return official_bf16
                     ? qwen_rms_norm_bf16(
-                        k.reshape({-1, hd}), k_norm, c).reshape_as(k)
+                        k.reshape({-1, hd}), k_norm,
+                        rms_norm_eps, norm_weight_offset).reshape_as(k)
                     : qwen_rms_norm(
-                        k.reshape({-1, hd}).to(mfq_tensor_backend::kFloat32), k_norm, c)
+                        k.reshape({-1, hd})
+                            .to(mfq_tensor_backend::kFloat32),
+                        k_norm, rms_norm_eps, norm_weight_offset)
                         .reshape_as(k);
             });
         }
         if (v_norm.defined()) v = g_profiler.measure("full.v_norm", [&]() {
             return official_bf16
                 ? qwen_rms_norm_bf16(
-                    v.reshape({-1, hd}), v_norm, c).reshape_as(v)
+                    v.reshape({-1, hd}), v_norm,
+                    rms_norm_eps, norm_weight_offset).reshape_as(v)
                 : qwen_rms_norm(
-                    v.reshape({-1, hd}).to(mfq_tensor_backend::kFloat32), v_norm, c)
+                    v.reshape({-1, hd}).to(mfq_tensor_backend::kFloat32),
+                    v_norm, rms_norm_eps, norm_weight_offset)
                     .reshape_as(v);
         });
         const char * fused_rope_kv_env =
@@ -1540,12 +1564,12 @@ struct FullBlock : Block {
             q = g_profiler.measure("full.q_rope", [&]() {
                 return official_bf16
                     ? active_rope.apply_bf16(q, pos)
-                    : active_rope.apply(q, pos, c, grid_mrope_positions);
+                    : active_rope.apply(q, pos, grid_mrope_positions);
             });
             k = g_profiler.measure("full.k_rope", [&]() {
                 return official_bf16
                     ? active_rope.apply_bf16(k, pos)
-                    : active_rope.apply(k, pos, c, grid_mrope_positions);
+                    : active_rope.apply(k, pos, grid_mrope_positions);
             });
             kv = g_profiler.measure("full.kv_write", [&]() {
                 return cache.append(
@@ -1937,7 +1961,7 @@ struct FullBlock : Block {
                     return gemma4_attn_residual_pre_norms_f16_cuda(
                         residual.reshape({B * T, H}), oo.reshape({B * T, H}),
                         attn_post_norm, ffn_norm, gemma_router_norm_scale,
-                        ffn_pre_norm_2, c.rms_norm_eps);
+                        ffn_pre_norm_2, rms_norm_eps);
                 });
                 x = prepared[0].reshape({B, T, H});
                 residual = x;
@@ -1947,7 +1971,8 @@ struct FullBlock : Block {
             } else {
                 auto attn_post = g_profiler.measure("gemma.attn_post_norm", [&]() {
                     return gemma_rms_norm_f16(
-                        oo.reshape({B * T, H}), attn_post_norm, c);
+                        oo.reshape({B * T, H}), attn_post_norm,
+                        rms_norm_eps, norm_weight_offset);
                 });
                 x = g_profiler.measure("gemma.attn_residual", [&]() {
                     return acc_cuda(residual.reshape({B * T, H}), attn_post).reshape({B, T, H});
@@ -1956,17 +1981,21 @@ struct FullBlock : Block {
                 residual = x;
                 dense_input = g_profiler.measure("gemma.ffn_pre_norm", [&]() {
                     return gemma_rms_norm_f16(
-                        x.reshape({B * T, H}), ffn_norm, c);
+                        x.reshape({B * T, H}), ffn_norm,
+                        rms_norm_eps, norm_weight_offset);
                 });
                 if (gemma4_moe) {
                     router_input = g_profiler.measure("gemma.router_norm", [&]() {
                         return qwen_rms_norm(
-                            x.reshape({B * T, H}).to(mfq_tensor_backend::kFloat32),
-                            gemma_router_norm_scale, c);
+                            x.reshape({B * T, H})
+                                .to(mfq_tensor_backend::kFloat32),
+                            gemma_router_norm_scale,
+                            rms_norm_eps, norm_weight_offset);
                     });
                     moe_input = g_profiler.measure("gemma.ffn_pre_norm_2", [&]() {
                         return gemma_rms_norm_f16(
-                            x.reshape({B * T, H}), ffn_pre_norm_2, c);
+                            x.reshape({B * T, H}), ffn_pre_norm_2,
+                            rms_norm_eps, norm_weight_offset);
                     });
                 }
             }
@@ -1976,10 +2005,13 @@ struct FullBlock : Block {
             if (!gemma4_moe) {
                 auto dense_post = g_profiler.measure("gemma.ffn_post_norm", [&]() {
                     return dense_output.scalar_type() == mfq_tensor_backend::kFloat16
-                        ? gemma_rms_norm_f16(dense_output, ffn_post_norm, c)
+                        ? gemma_rms_norm_f16(
+                            dense_output, ffn_post_norm,
+                            rms_norm_eps, norm_weight_offset)
                         : qwen_rms_norm(
                             dense_output.to(mfq_tensor_backend::kFloat32),
-                            ffn_post_norm, c)
+                            ffn_post_norm,
+                            rms_norm_eps, norm_weight_offset)
                             .to(mfq_tensor_backend::kFloat16)
                             .contiguous();
                 });
@@ -1999,7 +2031,8 @@ struct FullBlock : Block {
             if (!fused_norms) {
                 dense_output = g_profiler.measure("gemma.ffn_post_norm_1", [&]() {
                     return gemma_rms_norm_f16(
-                        dense_output, ffn_post_norm_1, c);
+                        dense_output, ffn_post_norm_1,
+                        rms_norm_eps, norm_weight_offset);
                 });
                 trace_gemma_stage(layer, "dense_output", dense_output);
             }
@@ -2071,19 +2104,22 @@ struct FullBlock : Block {
                     return gemma4_ffn_merge_f16_cuda(
                         dense_output, moe_output, residual.reshape({B * T, H}),
                         ffn_post_norm_1, ffn_post_norm_2, ffn_post_norm,
-                        layer_scale, c.rms_norm_eps).reshape({B, T, H});
+                        layer_scale, rms_norm_eps).reshape({B, T, H});
                 });
                 return result;
             }
             moe_output = g_profiler.measure("gemma.ffn_post_norm_2", [&]() {
                 return gemma_rms_norm_f16(
-                    moe_output, ffn_post_norm_2, c);
+                    moe_output, ffn_post_norm_2,
+                    rms_norm_eps, norm_weight_offset);
             });
             auto combined = g_profiler.measure("gemma.ffn_combine", [&]() {
                 return dense_output + moe_output;
             });
             auto post = g_profiler.measure("gemma.ffn_post_norm", [&]() {
-                return gemma_rms_norm_f16(combined, ffn_post_norm, c);
+                return gemma_rms_norm_f16(
+                    combined, ffn_post_norm,
+                    rms_norm_eps, norm_weight_offset);
             });
             auto result = g_profiler.measure("gemma.ffn_residual", [&]() {
                 return acc_cuda(residual.reshape({B * T, H}), post).reshape({B, T, H});
@@ -2103,9 +2139,11 @@ struct FullBlock : Block {
                 auto summed = (rr.to(mfq_tensor_backend::kFloat32) + oo2.to(mfq_tensor_backend::kFloat32))
                     .to(rr.scalar_type()).contiguous();
                 auto normalized = official_bf16
-                    ? qwen_rms_norm_bf16(summed, ffn_norm, c)
+                    ? qwen_rms_norm_bf16(
+                        summed, ffn_norm, rms_norm_eps, norm_weight_offset)
                     : qwen_rms_norm(
-                        summed.to(mfq_tensor_backend::kFloat32), ffn_norm, c);
+                        summed.to(mfq_tensor_backend::kFloat32), ffn_norm,
+                        rms_norm_eps, norm_weight_offset);
                 return std::vector<mfq_tensor_backend::Tensor>{summed, normalized};
             }
             if (oo2.scalar_type() != rr.scalar_type()) {
@@ -2118,27 +2156,30 @@ struct FullBlock : Block {
                 return acc_rms_norm_cuda(
                     rr.to(mfq_tensor_backend::kFloat32),
                     oo2.to(mfq_tensor_backend::kFloat32),
-                    ffn_norm, c.rms_norm_eps,
-                    c.norm_weight_offset);
+                    ffn_norm, rms_norm_eps,
+                    norm_weight_offset);
             }
             if (rr.scalar_type() == mfq_tensor_backend::kFloat16 && oo2.scalar_type() == mfq_tensor_backend::kFloat16) {
-                return acc_rms_norm_f16_cuda(rr, oo2, ffn_norm, c.rms_norm_eps, c.norm_weight_offset);
+                return acc_rms_norm_f16_cuda(
+                    rr, oo2, ffn_norm, rms_norm_eps, norm_weight_offset);
             }
             if (rr.scalar_type() == mfq_tensor_backend::kBFloat16 &&
                     oo2.scalar_type() == mfq_tensor_backend::kBFloat16) {
                 if (official_bf16) {
                     return acc_rms_norm_bf16_cuda(
-                        rr, oo2, ffn_norm, c.rms_norm_eps,
-                        c.norm_weight_offset);
+                        rr, oo2, ffn_norm, rms_norm_eps,
+                        norm_weight_offset);
                 }
                 auto sum = (rr + oo2).contiguous();
                 auto norm = qwen_rms_norm(
-                    sum.to(mfq_tensor_backend::kFloat32), ffn_norm, c)
+                    sum.to(mfq_tensor_backend::kFloat32), ffn_norm,
+                    rms_norm_eps, norm_weight_offset)
                     .to(mfq_tensor_backend::kBFloat16)
                     .contiguous();
                 return std::vector<mfq_tensor_backend::Tensor>{sum, norm};
             }
-            return acc_rms_norm_cuda(rr, oo2, ffn_norm, c.rms_norm_eps, c.norm_weight_offset);
+            return acc_rms_norm_cuda(
+                rr, oo2, ffn_norm, rms_norm_eps, norm_weight_offset);
         });
         x = attn_pair[0].reshape({B, T, H});
         residual = x;
@@ -2224,12 +2265,15 @@ void prepare_ffn_workspaces(FFN & f);
 
 FFN load_ffn(
     const mfq::ModelSource& source,
-    const CudaRuntimeParameters& config,
-    int layer);
+    const mfq::models::ModelConfig& config,
+    int layer,
+    bool minicpmo45 = false,
+    std::string_view tensor_root = "model");
 
 void load_important_neuron_branch(
         const mfq::ModelSource & mfq,
-        const CudaRuntimeParameters & c,
+        int64_t hidden_size,
+        int64_t intermediate_size,
         FFN & f,
         const std::string & down_name,
         const std::string & gate_name,

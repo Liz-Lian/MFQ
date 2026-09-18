@@ -78,12 +78,11 @@ CUDA_QWEN_LINEAR = (
 ).read_text(encoding="utf-8") + (\
     CUDA_MODELS / "qwen35" / "qwen35_causal_lm.cpp"
 ).read_text(encoding="utf-8")
-CUDA_RUNTIME_PARAMETERS = (CUDA_MODELS / "cuda_model_config.h").read_text(
+CUDA_CAUSAL_LM = (CUDA_RUNTIME / "causal_lm.h").read_text(
     encoding="utf-8"
 )
-CUDA_RUNTIME_PARAMETERS_SOURCE = "\n".join(
-    (CUDA_MODELS / name).read_text(encoding="utf-8")
-    for name in ("cuda_model_config.h", "cuda_model_config.cpp")
+CUDA_CAUSAL_LM_LOADER = (CUDA_RUNTIME / "causal_lm_loader.cpp").read_text(
+    encoding="utf-8"
 )
 SPARSE_OPERATOR = (METAL / "ops" / "mlx_sparse_attention.cpp").read_text(
     encoding="utf-8"
@@ -366,30 +365,43 @@ def test_server_exposes_predictors_by_role_not_architecture_name() -> None:
     ) is None
 
 
-def test_cuda_config_loading_lives_with_each_model() -> None:
-    models = {
-        "minicpmo45": "minicpmo45_model",
-        "flash_next": "flash_next_model",
-        "deepseek_v41": "deepseek_v41_model",
-        "qwen35": "qwen35_model",
-        "glm_dsa": "glm_dsa_model",
-        "gemma4": "gemma4_model",
-        "deepseek_v4": "deepseek_v4_model",
-    }
+def test_model_config_parsing_is_backend_neutral() -> None:
+    shared_configs = (
+        "model_config",
+        "minicpmo45",
+        "flash_next",
+        "qwen35",
+        "glm_dsa",
+        "gemma4",
+        "deepseek_v4",
+        "deepseek_v41",
+    )
 
-    assert (CUDA_MODELS / "config.h").is_file()
-    assert not (CUDA_MODELS / "config_json.h").exists()
-    assert not list(CUDA_MODELS.rglob("config_loader.h"))
+    assert not (CUDA_MODELS / "config.h").exists()
     assert not (CUDA_RUNTIME / "model_config.h").exists()
-    assert "struct CudaRuntimeParameters" in CUDA_RUNTIME_PARAMETERS
-    assert "struct ModelStructure" not in CUDA_RUNTIME_PARAMETERS_SOURCE
-    assert "architecture_config" not in CUDA_RUNTIME_PARAMETERS
-    assert "#include <any>" not in CUDA_RUNTIME_PARAMETERS
-    assert "resolved_config_json" in CUDA_RUNTIME_PARAMETERS
-    assert "resolved_config_json" in CUDA_REGISTRY
-    assert "flash_next::" not in CUDA_RUNTIME_PARAMETERS
-    assert "deepseek_v41::" not in CUDA_RUNTIME_PARAMETERS
-    qwen_config = (CUDA_MODELS / "qwen35" / "qwen35_model.h").read_text(
+    assert not (CUDA_MODELS / "cuda_model_config.h").exists()
+    assert not (CUDA_MODELS / "cuda_model_config.cpp").exists()
+    for stem in shared_configs:
+        assert (CORE / "models" / f"{stem}.h").is_file()
+        assert (CORE / "models" / f"{stem}.cpp").is_file()
+
+    for config in (
+        "mfq::models::qwen35::Config",
+        "mfq::models::minicpmo45::Config",
+        "mfq::models::ModelConfig",
+        "mfq::models::gemma4::Config",
+        "mfq::models::glm_dsa::Config",
+        "mfq::models::deepseek_v4::Config",
+        "mfq::models::deepseek_v41::Config",
+    ):
+        assert f"{config} config;" in CUDA_CAUSAL_LM
+    assert "CudaRuntimeParameters" not in CUDA_BACKEND_SOURCE
+    assert "load_runtime_parameters" not in CUDA_BACKEND_SOURCE
+    assert "resolved_config_json" not in CUDA_BACKEND_SOURCE
+    assert "nlohmann::json" not in CUDA_REGISTRY + CUDA_CAUSAL_LM_LOADER
+    assert "Config::from_json" not in CUDA_REGISTRY
+
+    qwen_config = (CORE / "models" / "qwen35.h").read_text(
         encoding="utf-8"
     )
     for field in (
@@ -407,21 +419,19 @@ def test_cuda_config_loading_lives_with_each_model() -> None:
         "video_token_id",
     ):
         assert field in qwen_config
-        assert field not in CUDA_RUNTIME_PARAMETERS
-    assert '"hidden_size"' not in CUDA_REGISTRY
-    assert "nlohmann::json::parse" not in CUDA_REGISTRY
-    assert "Config::from_json" not in CUDA_REGISTRY
-    for namespace, stem in models.items():
-        model_dir = CUDA_MODELS / namespace
-        header = model_dir / f"{stem}.h"
-        source = model_dir / f"{stem}.cpp"
-        assert header.is_file()
-        assert source.is_file()
-        assert f"{namespace}::load_runtime_parameters" in CUDA_REGISTRY
-        header_source = header.read_text(encoding="utf-8")
-        assert "CudaRuntimeParameters load_runtime_parameters(" in header_source
-        assert "const mfq::ModelSource& source" in header_source
-        assert "CudaRuntimeParameters load_runtime_parameters(" in source.read_text(encoding="utf-8")
+
+    assert CUDA_CAUSAL_LM_LOADER.count("Config::from_json(payload)") == 8
+    for namespace in (
+        "minicpmo45",
+        "flash_next",
+        "deepseek_v41",
+        "qwen35",
+        "glm_dsa",
+        "gemma4",
+        "deepseek_v4",
+    ):
+        assert not (CUDA_MODELS / namespace / f"{namespace}_model.h").exists()
+        assert not (CUDA_MODELS / namespace / f"{namespace}_model.cpp").exists()
 
 
 def test_cuda_model_runtime_uses_compiled_causal_lm_adapters() -> None:
@@ -459,6 +469,24 @@ def test_cuda_model_runtime_uses_compiled_causal_lm_adapters() -> None:
         "class MoeExpertCache",
     ):
         assert concrete_definition not in CUDA_RUNTIME_SOURCE
+    causal_lm = (CUDA_RUNTIME / "causal_lm.h").read_text(encoding="utf-8")
+    causal_lm_loader = (CUDA_RUNTIME / "causal_lm_loader.cpp").read_text(
+        encoding="utf-8"
+    )
+    assert re.search(r"\bCudaModel\b", CUDA_BACKEND_SOURCE) is None
+    assert "switch (m.c.runtime_plan.backbone)" not in causal_lm_loader
+    for runtime in (
+        "Qwen35CausalLm",
+        "MiniCPMO45CausalLm",
+        "Gemma4CausalLm",
+        "GlmDsaCausalLm",
+        "Glm5CausalLm",
+        "Qwen4CausalLm",
+        "DeepseekV4CausalLm",
+        "DeepseekV41CausalLm",
+    ):
+        assert f"struct {runtime} final : CausalLm<" in causal_lm
+
     assert "std::make_unique<FullBlock>" in CUDA_TRANSFORMER_LOADER
     assert "std::make_unique<LinearAttentionBlock>" in CUDA_QWEN_LINEAR
     assert 'type == "linear_attention"' not in CUDA_TRANSFORMER_LOADER
@@ -473,8 +501,8 @@ def test_cuda_ops_and_execution_are_real_compilation_units() -> None:
     required = (
         "ops/cuda_quantized_ops.cpp",
         "runtime/cuda_execution.cpp",
-        "runtime/cuda_model.cpp",
-        "runtime/cuda_model_loader.cpp",
+        "runtime/causal_lm.cpp",
+        "runtime/causal_lm_loader.cpp",
         "runtime/cuda_transformer.cpp",
         "runtime/cuda_transformer_loader.cpp",
         "runtime/mtp.cpp",
@@ -503,10 +531,17 @@ def test_cuda_qwen_speculation_is_model_owned() -> None:
     assert "for (int accepted_drafts : {0, 1, 2})" in CUDA_RUNTIME_SOURCE
 
 
+def test_cuda_qwen_linear_ffn_matches_residual_dtype() -> None:
+    start = CUDA_QWEN_LINEAR.index("linear.ffn_residual")
+    residual = CUDA_QWEN_LINEAR[start : start + 800]
+    assert "ff2.scalar_type() != rr.scalar_type()" in residual
+    assert "ff2 = ff2.to(rr.scalar_type()).contiguous();" in residual
+
+
 def test_cuda_mtp_generation_loop_is_architecture_independent_and_reversible() -> None:
     generation = CUDA_MTP_SOURCE
-    assert "run_cuda_mtp_generation(" in generation
-    assert "int32_t run_cuda_mtp_generation(" not in CUDA_RUNTIME_SOURCE
+    assert "run_mtp_generation(" in generation
+    assert "int32_t run_mtp_generation(" not in CUDA_RUNTIME_SOURCE
     for architecture_name in (
         "Qwen",
         "DeepSeek",

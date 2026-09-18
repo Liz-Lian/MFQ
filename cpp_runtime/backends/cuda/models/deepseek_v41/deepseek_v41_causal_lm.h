@@ -4,7 +4,7 @@
 #include "../deepseek_v4/deepseek_v4_causal_lm.h"
 #include "deepseek_v41_engram.h"
 #include "deepseek_v41_dspark.h"
-#include "deepseek_v41_model.h"
+#include "models/deepseek_v41.h"
 #include "mfq/kernels/cuda/deepseek_v4_attention.h"
 #include "mfq/kernels/cuda/deepseek_v4_hc.h"
 #include "mfq/kernels/cuda/deepseek_v41.h"
@@ -958,7 +958,6 @@ struct Block final : ::Block {
         Tensor positions,
         std::int64_t cache_position,
         const MfqOptional<Tensor>& sequence_lengths,
-        const ::CudaRuntimeParameters&,
         const RopeCache&,
         const MfqOptional<Tensor>& cache_positions = mfq_nullopt,
         const MfqOptional<Tensor>& attention_mask = mfq_nullopt) override {
@@ -1038,7 +1037,7 @@ struct Block final : ::Block {
 
 inline FFN load_moe_at(
     const mfq::ModelSource& model,
-    const ::CudaRuntimeParameters& runtime,
+    const CommonConfig& config,
     const std::string& prefix,
     std::int64_t layer,
     std::int64_t top_k,
@@ -1076,11 +1075,11 @@ inline FFN load_moe_at(
         .contiguous();
     result.moe_top_k = static_cast<int>(top_k);
     result.moe_use_sqrt_softplus = true;
-    result.moe_normalize = runtime.norm_topk_prob;
+    result.moe_normalize = config.norm_topk_prob;
     result.moe_delayed_softmax = false;
     result.moe_shared_ungated = true;
-    result.moe_router_scale = runtime.routed_scaling_factor;
-    result.swiglu_limit = runtime.swiglu_limit;
+    result.moe_router_scale = config.routed_scaling;
+    result.swiglu_limit = config.swiglu_limit;
     result.moe_layer = static_cast<int>(layer);
     result.shared = std::make_unique<FFN>();
     result.shared->down = load_quant_linear(
@@ -1091,33 +1090,32 @@ inline FFN load_moe_at(
          prefix + "shared_expert.up.weight"},
         result.shared->down,
         0);
-    result.shared->swiglu_limit = runtime.swiglu_limit;
+    result.shared->swiglu_limit = config.swiglu_limit;
     prepare_ffn_workspaces(*result.shared);
     return result;
 }
 
 inline FFN load_moe(
     const mfq::ModelSource& model,
-    const ::CudaRuntimeParameters& runtime,
+    const CommonConfig& config,
     std::int64_t layer) {
     return load_moe_at(
         model,
-        runtime,
+        config,
         "model.block." + std::to_string(layer) + ".mlp.",
         layer,
-        runtime.num_experts_per_tok,
+        config.top_k,
         true);
 }
 
 std::unique_ptr<::Block> load_block(
     const mfq::ModelSource& model,
-    const ::CudaRuntimeParameters& runtime,
     std::int64_t layer,
     const std::shared_ptr<SharedState>& shared);
-void validate_load_options(const ::CudaRuntimeParameters& config);
+void validate_load_options();
 std::shared_ptr<SharedState> load_shared_state(
     const mfq::ModelSource& source,
-    const ::CudaRuntimeParameters& config);
+    const CommonConfig& config);
 
 
 

@@ -1,4 +1,4 @@
-#include "cuda_model.h"
+#include "causal_lm.h"
 
 std::vector<CudaPagedPayload> encode_cuda_paged_session(
         const TextSessionState & state,

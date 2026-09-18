@@ -1,21 +1,19 @@
 #pragma once
 
 #include "qwen35_causal_lm.h"
-#include "qwen35_model.h"
 
 // Qwen3.5's predictor shares the main embedding/output head and owns only
 // its fusion/norm/attention/FFN weights and an independent attention history.
-struct CudaQwen35Mtp final : CudaMtpModule {
-    CudaRuntimeParameters c;
+struct Qwen35Mtp final : MtpModule {
     mfq::cuda::qwen35::Config config;
     QuantLinear fusion;
     mfq_tensor_backend::Tensor hidden_norm, embedding_norm, output_norm;
     std::vector<std::unique_ptr<Block>> blocks;
     int64_t cache_pos = 0;
 
-    static std::optional<CudaQwen35Mtp> load_if_present(
+    static std::optional<Qwen35Mtp> load_if_present(
             const mfq::ModelSource& file,
-            const CudaRuntimeParameters& main) {
+            const mfq::cuda::qwen35::Config& main) {
         const bool fusion_present = has_tensor(file, "predictor.fusion.weight");
         const bool any = fusion_present ||
             has_tensor(file, "predictor.hidden_norm.weight") ||
@@ -26,20 +24,12 @@ struct CudaQwen35Mtp final : CudaMtpModule {
             MFQ_RUNTIME_CHECK(!any, "Qwen model source contains an incomplete MTP head");
             return std::nullopt;
         }
-        const auto config = mfq::cuda::qwen35::Config::from_json(
-            main.resolved_config_json, main.model_graph);
         MFQ_RUNTIME_CHECK(
-            config.mtp_num_hidden_layers > 0 &&
-                !config.mtp_use_dedicated_embeddings,
+            main.mtp_num_hidden_layers > 0 &&
+                !main.mtp_use_dedicated_embeddings,
             "Qwen MTP requires declared predictor layers and shared embeddings");
-        CudaQwen35Mtp result;
-        result.c = main;
-        result.config = config;
-        result.c.tensor_root = "predictor";
-        result.c.num_hidden_layers = config.mtp_num_hidden_layers;
-        result.c.layer_types.assign(
-            static_cast<size_t>(config.mtp_num_hidden_layers),
-            "full_attention");
+        Qwen35Mtp result;
+        result.config = main;
         result.hidden_norm = load_dense_gpu(
             file, "predictor.hidden_norm.weight");
         result.embedding_norm = load_dense_gpu(
@@ -54,9 +44,9 @@ struct CudaQwen35Mtp final : CudaMtpModule {
                 result.embedding_norm.numel() == main.hidden_size &&
                 result.output_norm.numel() == main.hidden_size,
             "Qwen MTP component dimensions disagree with the backbone");
-        for (int layer = 0; layer < config.mtp_num_hidden_layers; ++layer) {
+        for (int layer = 0; layer < main.mtp_num_hidden_layers; ++layer) {
             auto block = mfq::cuda::qwen35::load_block(
-                file, result.c, result.config, layer, "full_attention");
+                file, result.config, layer, "full_attention", "predictor");
             block->cuda_device = g_layer_placement.primary_device();
             result.blocks.push_back(std::move(block));
         }
@@ -69,26 +59,26 @@ struct CudaQwen35Mtp final : CudaMtpModule {
     }
 
     mfq_tensor_backend::Tensor forward(
-            CudaModel& main,
+            const MtpTarget& target,
             mfq_tensor_backend::Tensor hidden,
             mfq_tensor_backend::Tensor next_ids) override {
         return evaluate(
-            main, std::move(hidden), std::move(next_ids), {});
+            target, std::move(hidden), std::move(next_ids), {});
     }
 
-    CudaMtpStep step_positioned(
-            CudaModel& main,
+    MtpStep step_positioned(
+            const MtpTarget& target,
             mfq_tensor_backend::Tensor hidden,
             mfq_tensor_backend::Tensor next_ids,
             mfq_tensor_backend::Tensor positions) override {
         auto output = evaluate(
-            main, std::move(hidden), std::move(next_ids),
+            target, std::move(hidden), std::move(next_ids),
             std::move(positions));
         return {output, output};
     }
 
     mfq_tensor_backend::Tensor evaluate(
-            CudaModel& main,
+            const MtpTarget& target,
             mfq_tensor_backend::Tensor hidden,
             mfq_tensor_backend::Tensor next_ids,
             mfq_tensor_backend::Tensor positions) {
@@ -96,23 +86,26 @@ struct CudaQwen35Mtp final : CudaMtpModule {
             hidden.dim() == 3 && next_ids.dim() == 2 &&
                 hidden.size(0) == next_ids.size(0) &&
                 hidden.size(1) == next_ids.size(1) &&
-                hidden.size(2) == c.hidden_size && hidden.size(1) > 0,
+                hidden.size(2) == config.hidden_size &&
+                hidden.size(1) > 0,
             "Qwen MTP inputs must be matching [B,T,H] hidden states and "
             "[B,T] next-token IDs");
         const auto batch = hidden.size(0);
         const auto tokens = hidden.size(1);
         MFQ_RUNTIME_CHECK(
-            cache_pos + tokens <= c.max_position_embeddings,
+            cache_pos + tokens <= config.max_position_embeddings,
             "Qwen MTP history exceeds context capacity");
-        auto embedded = main.embed_forward(next_ids).to(hidden.scalar_type());
+        auto embedded = target.embed(next_ids).to(hidden.scalar_type());
         auto e = qwen_rms_norm(
-            embedded.reshape({batch * tokens, c.hidden_size})
+            embedded.reshape({batch * tokens, config.hidden_size})
                 .to(mfq_tensor_backend::kFloat32),
-            embedding_norm, c).reshape_as(hidden);
+            embedding_norm, config.rms_norm_eps, 1.0)
+            .reshape_as(hidden);
         auto h = qwen_rms_norm(
-            hidden.reshape({batch * tokens, c.hidden_size})
+            hidden.reshape({batch * tokens, config.hidden_size})
                 .to(mfq_tensor_backend::kFloat32),
-            hidden_norm, c).reshape_as(hidden);
+            hidden_norm, config.rms_norm_eps, 1.0)
+            .reshape_as(hidden);
         trace_gemma_stage(0, "mtp.embedding_norm", e);
         trace_gemma_stage(0, "mtp.hidden_norm", h);
         auto x = fusion.forward(mfq_tensor_backend::cat({e, h}, -1));
@@ -145,14 +138,15 @@ struct CudaQwen35Mtp final : CudaMtpModule {
         }
         for (auto& block : blocks) {
             x = block->forward(
-                x, pos, cache_pos, length, c, main.rope,
+                x, pos, cache_pos, length, *target.rope,
                 cache_positions);
         }
         cache_pos += tokens;
         auto output = qwen_rms_norm(
-            x.reshape({batch * tokens, c.hidden_size})
+            x.reshape({batch * tokens, config.hidden_size})
                 .to(mfq_tensor_backend::kFloat32),
-            output_norm, c).reshape({batch, tokens, c.hidden_size});
+            output_norm, config.rms_norm_eps, 1.0)
+            .reshape({batch, tokens, config.hidden_size});
         trace_gemma_stage(0, "mtp.output_norm", output);
         return output;
     }

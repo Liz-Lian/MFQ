@@ -274,6 +274,7 @@ class ManagedRuntimePool:
         self._load_events: dict[str, asyncio.Event] = {}
         self._load_errors: dict[str, ErrorDetail] = {}
         self._load_failures: dict[str, _CachedLoadFailure] = {}
+        self._runtime_revival_at: dict[str, float] = {}
         self._loading_artifact_ids: dict[str, str] = {}
         self._load_requests: dict[str, ModelLoadRequest] = {}
         self._reserved_ports: set[int] = set()
@@ -993,7 +994,7 @@ class ManagedRuntimePool:
             await self._wait_for_model_ready(instance.artifact.resource.name)
             instance = await self._select(model, session_id=session_id)
         if instance is None:
-            instance = await self._ensure_model_loaded(model)
+            instance = await self._ensure_model_loaded_with_revival(model)
         if instance is None:
             if self.fallback is None:
                 raise BackendError(
@@ -1055,7 +1056,7 @@ class ManagedRuntimePool:
             await self._wait_for_model_ready(instance.artifact.resource.name)
             instance = await self._select(model, session_id=session_id)
         if instance is None:
-            instance = await self._ensure_model_loaded(model)
+            instance = await self._ensure_model_loaded_with_revival(model)
         if instance is None:
             if self.fallback is None:
                 raise BackendError("model_not_loaded", f"model is not loaded: {model}")
@@ -1640,6 +1641,46 @@ class ManagedRuntimePool:
             and left.resource.modified_at == right.resource.modified_at
             and left.path == right.path
         )
+
+    def _begin_runtime_revival(self, model: str) -> bool:
+        """Allow one immediate reload after an unexpected runtime exit.
+
+        Returns True at most once per load-failure cooldown window so a
+        runtime that dies again right after revival stays contained instead
+        of spinning reloads on every request.
+        """
+        now = time.monotonic()
+        last = self._runtime_revival_at.get(model)
+        if (
+            last is not None
+            and self.load_failure_cooldown_seconds > 0
+            and now - last < self.load_failure_cooldown_seconds
+        ):
+            return False
+        self._runtime_revival_at[model] = now
+        return True
+
+    async def _ensure_model_loaded_with_revival(
+        self,
+        model: str,
+    ) -> _ManagedRuntime | None:
+        # An unexpected runtime exit is contained by the load-failure cooldown
+        # so a crashing artifact cannot spin reloads. The retryable flag still
+        # promises clients that a retry succeeds, so allow one immediate
+        # revival per cooldown window when a previously ready runtime died.
+        try:
+            return await self._ensure_model_loaded(model)
+        except BackendError as error:
+            if (
+                error.code != "runtime_exited"
+                or not error.retryable
+                or not self._begin_runtime_revival(model)
+            ):
+                raise
+            async with self._lock:
+                self._load_failures.pop(model, None)
+                self._load_errors.pop(model, None)
+            return await self._ensure_model_loaded(model)
 
     async def _ensure_model_loaded(self, model: str) -> _ManagedRuntime | None:
         try:

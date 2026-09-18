@@ -8,6 +8,7 @@ import subprocess
 import sys
 import textwrap
 import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -31,6 +32,7 @@ from mfq.server.catalog import (
 from mfq.server.host_memory import HostMemorySnapshot
 from mfq.server.jobs import JobExecutionError
 from mfq.server.models import (
+    ErrorDetail,
     JobStatus,
     ModelArtifactResource,
     ModelLoadRequest,
@@ -39,7 +41,12 @@ from mfq.server.models import (
     SamplingParams,
 )
 from mfq.server.native import RuntimeRoute
-from mfq.server.runtime_pool import ManagedRuntimePool, RuntimeConflictError, _ManagedRuntime
+from mfq.server.runtime_pool import (
+    ManagedRuntimePool,
+    RuntimeConflictError,
+    _CachedLoadFailure,
+    _ManagedRuntime,
+)
 from mfq.server.service import ServerService
 from mfq.server.storage import SessionStore
 from mfq.tools.split_mfq import split_mfq
@@ -2143,6 +2150,116 @@ def test_unexpected_runtime_exit_is_contained_until_explicit_retry(
         with pytest.raises(BackendError) as contained:
             await pool._ensure_model_loaded("unstable")
         assert contained.value.code == "runtime_exited"
+
+    asyncio.run(run())
+
+
+def test_stream_revives_after_unexpected_exit_within_cooldown(
+    tmp_path: Path,
+) -> None:
+    class RevivedBackend:
+        closed = False
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+        async def stream(self, **_options: object):
+            yield BackendDelta(content_delta="revived", finish_reason="stop")
+
+    async def run() -> None:
+        _model(tmp_path / "unstable.mfq")
+        catalog = ModelCatalog([tmp_path], cache_seconds=0)
+        artifact = await catalog.resolve("unstable")
+        dead = _ManagedRuntime(
+            id=uuid4(),
+            artifact=artifact,
+            process=SimpleNamespace(),  # type: ignore[arg-type]
+            backend=SimpleNamespace(),  # type: ignore[arg-type]
+            port=0,
+            context_size=4096,
+            state=RuntimeInstanceState.FAILED,
+        )
+        pool = ManagedRuntimePool(
+            catalog,
+            tmp_path / "runtime",
+            load_failure_cooldown_seconds=60,
+        )
+        pool._instances[dead.id] = dead
+        detail = ErrorDetail(
+            code="runtime_exited",
+            message="runtime process exited with status 9",
+            retryable=True,
+        )
+        pool._load_errors["unstable"] = detail
+        pool._load_failures["unstable"] = _CachedLoadFailure(
+            artifact_id=artifact.resource.id,
+            detail=detail,
+            failed_at=time.monotonic(),
+        )
+        revived = _ManagedRuntime(
+            id=uuid4(),
+            artifact=artifact,
+            process=SimpleNamespace(),  # type: ignore[arg-type]
+            backend=RevivedBackend(),  # type: ignore[arg-type]
+            port=0,
+            context_size=4096,
+            state=RuntimeInstanceState.READY,
+            request_slots=asyncio.Semaphore(1),
+        )
+        loads: list[str] = []
+
+        async def fake_load(_context: object, request: object) -> None:
+            if isinstance(request, dict):
+                model = request.get("model")
+            else:
+                model = getattr(request, "model", None)
+            loads.append(str(model))
+            # Mirror the real load path: detach failed instances first.
+            for item in list(pool._instances.values()):
+                if (
+                    pool._matches_model(item, "unstable")
+                    and item.state == RuntimeInstanceState.FAILED
+                ):
+                    del pool._instances[item.id]
+            pool._instances[revived.id] = revived
+            pool._load_failures.pop("unstable", None)
+            pool._load_errors.pop("unstable", None)
+
+        pool.load = fake_load  # type: ignore[method-assign]
+
+        deltas = [
+            delta
+            async for delta in pool.stream(
+                model="unstable",
+                messages=[{"role": "user", "content": "hello"}],
+                sampling=SamplingParams(),
+            )
+        ]
+        assert [delta.content_delta for delta in deltas] == ["revived"]
+        assert loads == ["unstable"]
+        assert dead.id not in pool._instances
+
+    asyncio.run(run())
+
+
+def test_stream_revival_is_bounded_to_one_per_cooldown_window() -> None:
+    async def run() -> None:
+        pool = ManagedRuntimePool(
+            ModelCatalog([], cache_seconds=0),
+            "missing-runtime",
+            load_failure_cooldown_seconds=60,
+        )
+        assert pool._begin_runtime_revival("unstable")
+        assert not pool._begin_runtime_revival("unstable")
+        assert pool._runtime_revival_at["unstable"] > 0
+
+        unbounded = ManagedRuntimePool(
+            ModelCatalog([], cache_seconds=0),
+            "missing-runtime",
+            load_failure_cooldown_seconds=0,
+        )
+        assert unbounded._begin_runtime_revival("unstable")
+        assert unbounded._begin_runtime_revival("unstable")
 
     asyncio.run(run())
 

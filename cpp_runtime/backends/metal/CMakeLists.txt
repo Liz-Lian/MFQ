@@ -1171,3 +1171,18 @@ add_test(
     NAME mfq-metal-minicpmo45-test
     COMMAND mfq-metal-minicpmo45-test
 )
+
+add_executable(mfq-metal-qwen35-grouped-parity
+    tools/qwen35_grouped_parity.cpp
+)
+target_link_libraries(
+    mfq-metal-qwen35-grouped-parity PRIVATE
+    mfq-metal-runtime
+)
+target_compile_features(
+    mfq-metal-qwen35-grouped-parity PRIVATE cxx_std_20
+)
+set_target_properties(
+    mfq-metal-qwen35-grouped-parity PROPERTIES
+    BUILD_RPATH "${MFQ_MLX_ROOT}/lib"
+)

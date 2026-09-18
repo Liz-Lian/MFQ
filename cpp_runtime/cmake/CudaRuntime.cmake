@@ -214,6 +214,8 @@ function(mfq_configure_cuda_decode_target target)
         ${MFQ_REPOSITORY_ROOT}
         ${MFQ_CUDA_ROOT}/include
         ${MFQ_CUDA_ROOT}/models
+        ${MFQ_CUDA_ROOT}/ops
+        ${MFQ_CUDA_ROOT}/runtime
         ${MFQ_CUDA_KERNEL_ROOT}
         ${CUDAToolkit_INCLUDE_DIRS}
     )
@@ -234,12 +236,36 @@ function(mfq_configure_cuda_decode_target target)
     endif()
 endfunction()
 
-add_executable(mfq-decode
-    ${MFQ_CUDA_ROOT}/apps/mfq_decode.cpp
-    ${MFQ_CUDA_ROOT}/apps/ggml_cuda_compat.cu
+set(MFQ_CUDA_MODEL_SOURCES
+    ${MFQ_CUDA_ROOT}/models/deepseek_v4/deepseek_v4_causal_lm.cpp
+    ${MFQ_CUDA_ROOT}/models/deepseek_v41/deepseek_v41_causal_lm.cpp
+    ${MFQ_CUDA_ROOT}/models/deepseek_v41/deepseek_v41_dspark.cpp
+    ${MFQ_CUDA_ROOT}/models/flash_next/qwen4_causal_lm.cpp
+    ${MFQ_CUDA_ROOT}/models/gemma4/gemma4_causal_lm.cpp
+    ${MFQ_CUDA_ROOT}/models/glm_dsa/glm_dsa_causal_lm.cpp
+    ${MFQ_CUDA_ROOT}/models/minicpmo45/minicpmo45_runtime.cpp
+    ${MFQ_CUDA_ROOT}/models/qwen35/qwen35_causal_lm.cpp
+    ${MFQ_CUDA_ROOT}/models/registry.cpp
 )
-mfq_configure_cuda_decode_target(mfq-decode)
-target_link_libraries(mfq-decode PRIVATE
+
+add_library(mfq-cuda-runtime STATIC
+    ${MFQ_CUDA_ROOT}/ops/cuda_quantized_ops.cpp
+    ${MFQ_CUDA_ROOT}/runtime/cuda_decode_runtime.cpp
+    ${MFQ_CUDA_ROOT}/runtime/cuda_execution.cpp
+    ${MFQ_CUDA_ROOT}/runtime/causal_lm.cpp
+    ${MFQ_CUDA_ROOT}/runtime/causal_lm_loader.cpp
+    ${MFQ_CUDA_ROOT}/runtime/cuda_transformer.cpp
+    ${MFQ_CUDA_ROOT}/runtime/cuda_transformer_loader.cpp
+    ${MFQ_CUDA_ROOT}/runtime/mtp.cpp
+    ${MFQ_CUDA_ROOT}/runtime/server_components.cpp
+    ${MFQ_CUDA_ROOT}/runtime/diagnostics/backend_checks.cpp
+    ${MFQ_CUDA_ROOT}/runtime/diagnostics/model_checks.cpp
+    ${MFQ_CUDA_ROOT}/apps/ggml_cuda_compat.cu
+    ${MFQ_CUDA_MODEL_SOURCES}
+)
+add_library(mfq::cuda-runtime ALIAS mfq-cuda-runtime)
+mfq_configure_cuda_decode_target(mfq-cuda-runtime)
+target_link_libraries(mfq-cuda-runtime PRIVATE
     CUDA::cuda_driver
     CUDA::cudart
     CUDA::cublas
@@ -247,12 +273,12 @@ target_link_libraries(mfq-decode PRIVATE
     mfq-cuda-native-kernels
     mfq-cuda-storage
 )
-target_compile_definitions(mfq-decode PRIVATE
+target_compile_definitions(mfq-cuda-runtime PRIVATE
     MFQ_NATIVE_CUDA_RUNTIME=1
     NOMINMAX
 )
 if(MSVC)
-    target_compile_options(mfq-decode PRIVATE
+    target_compile_options(mfq-cuda-runtime PRIVATE
         "$<$<COMPILE_LANGUAGE:CXX>:/utf-8>"
         "$<$<COMPILE_LANGUAGE:CXX>:/EHsc>"
         "$<$<COMPILE_LANGUAGE:CXX>:/bigobj>"
@@ -260,10 +286,20 @@ if(MSVC)
         "$<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8>"
     )
 endif()
-set_target_properties(mfq-decode PROPERTIES
+set_target_properties(mfq-cuda-runtime PROPERTIES
     CUDA_ARCHITECTURES "${MFQ_CUDA_ARCHITECTURES}"
     CUDA_RUNTIME_LIBRARY Shared
 )
+
+add_executable(mfq-decode
+    ${MFQ_CUDA_ROOT}/apps/mfq_decode.cpp
+)
+target_link_libraries(mfq-decode PRIVATE mfq-cuda-runtime)
+target_include_directories(mfq-decode PRIVATE
+    ${MFQ_CUDA_ROOT}/runtime
+)
+target_compile_features(mfq-decode PRIVATE cxx_std_20)
+
 if(BUILD_TESTING)
     add_test(
         NAME mfq-deepseek-v41-runtime-check
@@ -291,7 +327,19 @@ if(MFQ_BUILD_TORCH_REFERENCE_RUNTIME)
     find_package(Torch REQUIRED)
     add_executable(mfq-decode-torch
         ${MFQ_CUDA_ROOT}/apps/mfq_decode.cpp
+        ${MFQ_CUDA_ROOT}/ops/cuda_quantized_ops.cpp
+        ${MFQ_CUDA_ROOT}/runtime/cuda_decode_runtime.cpp
+        ${MFQ_CUDA_ROOT}/runtime/cuda_execution.cpp
+        ${MFQ_CUDA_ROOT}/runtime/causal_lm.cpp
+        ${MFQ_CUDA_ROOT}/runtime/causal_lm_loader.cpp
+        ${MFQ_CUDA_ROOT}/runtime/cuda_transformer.cpp
+        ${MFQ_CUDA_ROOT}/runtime/cuda_transformer_loader.cpp
+        ${MFQ_CUDA_ROOT}/runtime/mtp.cpp
+        ${MFQ_CUDA_ROOT}/runtime/server_components.cpp
+        ${MFQ_CUDA_ROOT}/runtime/diagnostics/backend_checks.cpp
+        ${MFQ_CUDA_ROOT}/runtime/diagnostics/model_checks.cpp
         ${MFQ_CUDA_ROOT}/apps/ggml_cuda_compat.cu
+        ${MFQ_CUDA_MODEL_SOURCES}
         ${MFQ_CUDA_KERNEL_SOURCES}
     )
     mfq_configure_cuda_decode_target(mfq-decode-torch)

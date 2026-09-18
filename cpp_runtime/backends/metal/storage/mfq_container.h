@@ -1,6 +1,6 @@
 #pragma once
 
-#include "hf_safetensors_store.h"
+#include "mfq/hf_model_source.h"
 #include "mfq_legacy_tensor_names.h"
 #include "mfq_format_compat.h"
 #include "mfq_model_graph.h"
@@ -78,7 +78,7 @@ public:
     }
 
     bool is_hf_source() const noexcept {
-        return static_cast<bool>(hf_store_);
+        return static_cast<bool>(hf_source_);
     }
 
     const std::unordered_map<std::string, MfqRecord>& records() const noexcept {
@@ -104,9 +104,7 @@ public:
     // buffers, so record staging never enters the process malloc depot.
     MfqMappedBytes map_record(const std::string& name) const;
     std::string read_text(const std::string& name) const;
-    // Best-effort eviction used by storage benchmarks. Native HF checkpoints
-    // delegate to the physical Safetensors store; regular MFQ containers are
-    // left untouched.
+    // Best-effort source cache eviction used by storage benchmarks.
     void drop_source_file_cache() const noexcept;
     // New canonical artifacts describe their executable graph explicitly.
     // A missing asset identifies a pre-schema artifact and is handled only by
@@ -119,18 +117,6 @@ public:
     void install_legacy_aliases(
         std::unordered_map<std::string, std::string> canonical_to_stored,
         mfq::MfqLegacyTensorLayout layout = {});
-    // Native HF checkpoints carry the same canonical map produced by the
-    // quantizer's tensor-schema registry. Unlike legacy aliases, this source
-    // view is valid alongside a schema-v1 model graph.
-    void install_source_aliases(
-        std::unordered_map<std::string, std::string> canonical_to_stored);
-    // Turn per-expert native HF tensors into canonical, virtual MFE
-    // projections. The logical container is assembled from exact tensor
-    // ranges, so callers can stream one expert without materializing its
-    // siblings or rewriting the source checkpoint.
-    void install_hf_mfe_views(
-        const std::unordered_map<std::string, std::string>&
-            canonical_to_stored);
     bool has_legacy_aliases() const noexcept {
         return !legacy_aliases_.empty();
     }
@@ -142,54 +128,12 @@ private:
     using RecordMap = std::unordered_map<std::string, MfqRecord>;
     struct RandomAccessFiles;
 
-    struct HfVirtualRecord {
-        struct Segment {
-            std::uint64_t logical_offset = 0;
-            std::vector<std::uint8_t> inline_bytes;
-            std::string tensor_name;
-            std::uint64_t tensor_offset = 0;
-            std::uint64_t nbytes = 0;
-        };
-
-        std::string values_name;
-        std::string scales_name;
-        std::vector<std::uint8_t> prefix;
-        std::uint64_t values_offset = 0;
-        std::uint64_t scales_offset = 0;
-        std::vector<Segment> segments;
-    };
-
-    static MfqHeader load_records(
-        const std::filesystem::path& path,
-        RecordMap& destination);
-    static std::vector<std::filesystem::path> resolve_shards(
-        const std::filesystem::path& path,
-        std::uint64_t split_no,
-        std::uint64_t split_count);
-    static std::uint64_t metadata_uint(
-        const MfqHeader& header,
-        const std::string& key,
-        std::uint64_t default_value);
     void load_hf_directory(const std::filesystem::path& path);
-    std::vector<std::uint8_t> read_hf_range(
-        const std::string& name,
-        std::uint64_t relative_offset,
-        std::uint64_t nbytes) const;
-    void read_hf_range_into(
-        const std::string& name,
-        std::uint64_t relative_offset,
-        std::span<std::byte> destination) const;
-    void install_aliases(
-        std::unordered_map<std::string, std::string> canonical_to_stored,
-        mfq::MfqLegacyTensorLayout layout,
-        bool reject_model_graph);
 
     MfqHeader header_;
     std::vector<std::filesystem::path> source_paths_;
     RecordMap records_;
-    std::shared_ptr<HfSafetensorStore> hf_store_;
-    std::unordered_map<std::string, HfVirtualRecord> hf_records_;
-    std::unordered_map<std::string, std::vector<std::uint8_t>> hf_assets_;
+    std::shared_ptr<mfq::HfModelSource> hf_source_;
     std::unordered_map<std::string, std::string> legacy_aliases_;
     mfq::MfqLegacyTensorLayout legacy_tensor_layout_;
     std::shared_ptr<RandomAccessFiles> random_access_files_;

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from functools import partial
 from typing import Any, Protocol
 
 from mfq.server.capabilities import (
@@ -72,55 +73,31 @@ class _OutputProtocolRegistration:
     protocol: ModelOutputProtocol
 
 
-def _deepseek_reasoning_parser() -> IncrementalReasoningParser:
-    return TaggedReasoningParser(start_in_reasoning=True)
-
-
-def _deepseek_v41_tool_call_parser(
-    schemas: Mapping[str, Mapping[str, Any]],
-) -> IncrementalToolCallParser:
-    return DSMLStreamParser(schemas, spaced_tags=True)
-
-
-def _prompt_open_reasoning_parser() -> IncrementalReasoningParser:
-    return TaggedReasoningParser(start_in_reasoning=True)
-
-
-def _qwen_tool_call_parser(
-    schemas: Mapping[str, Mapping[str, Any]],
-) -> IncrementalToolCallParser:
-    return XMLToolCallStreamParser(schemas, dialect="qwen")
-
-
-def _glm_tool_call_parser(
-    schemas: Mapping[str, Mapping[str, Any]],
-) -> IncrementalToolCallParser:
-    return XMLToolCallStreamParser(schemas, dialect="glm")
-
+_REASONING_PARSER = partial(TaggedReasoningParser, start_in_reasoning=True)
 
 _DEEPSEEK_V4_PROTOCOL = ModelOutputProtocol(
     reasoning_format="none",
-    reasoning_parser_factory=_deepseek_reasoning_parser,
+    reasoning_parser_factory=_REASONING_PARSER,
     tool_call_parser_factory=DSMLStreamParser,
     tool_call_protocol_name="dsml",
 )
 
 _DEEPSEEK_V41_PROTOCOL = ModelOutputProtocol(
     reasoning_format="none",
-    reasoning_parser_factory=_deepseek_reasoning_parser,
-    tool_call_parser_factory=_deepseek_v41_tool_call_parser,
+    reasoning_parser_factory=_REASONING_PARSER,
+    tool_call_parser_factory=partial(DSMLStreamParser, spaced_tags=True),
     tool_call_protocol_name="dsml_v41",
 )
 
 _QWEN_PROTOCOL = ModelOutputProtocol(
-    reasoning_parser_factory=_prompt_open_reasoning_parser,
-    tool_call_parser_factory=_qwen_tool_call_parser,
+    reasoning_parser_factory=_REASONING_PARSER,
+    tool_call_parser_factory=partial(XMLToolCallStreamParser, dialect="qwen"),
     tool_call_protocol_name="qwen_xml",
 )
 
 _GLM_PROTOCOL = ModelOutputProtocol(
-    reasoning_parser_factory=_prompt_open_reasoning_parser,
-    tool_call_parser_factory=_glm_tool_call_parser,
+    reasoning_parser_factory=_REASONING_PARSER,
+    tool_call_parser_factory=partial(XMLToolCallStreamParser, dialect="glm"),
     tool_call_protocol_name="glm_xml",
 )
 

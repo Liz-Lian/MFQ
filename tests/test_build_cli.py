@@ -134,7 +134,7 @@ def test_default_cuda_cmake_target_has_no_python_or_libtorch_dependency() -> Non
     cmake = (ROOT / "cpp_runtime" / "cmake" / "CudaRuntime.cmake").read_text(
         encoding="utf-8"
     )
-    native_start = cmake.index("add_executable(mfq-decode\n")
+    native_start = cmake.index("add_library(mfq-cuda-runtime STATIC\n")
     reference_start = cmake.index("option(MFQ_BUILD_TORCH_REFERENCE_RUNTIME")
     native_target = cmake[native_start:reference_start]
 
@@ -158,7 +158,8 @@ def test_native_cuda_runtime_compilation_units_do_not_include_torch() -> None:
     source_block = cmake.split("set(MFQ_CUDA_KERNEL_SOURCES", 1)[1].split(")", 1)[0]
     sources = [
         ROOT / "cpp_runtime" / "backends" / "cuda" / "apps" / "mfq_decode.cpp",
-        ROOT / "cpp_runtime" / "backends" / "cuda" / "models" / "minicpmo45_runtime.inc",
+        ROOT / "cpp_runtime" / "backends" / "cuda" / "models" / "minicpmo45" / "minicpmo45_runtime.h",
+        ROOT / "cpp_runtime" / "backends" / "cuda" / "models" / "minicpmo45" / "minicpmo45_runtime.cpp",
         *(
             ROOT / "mfq" / "kernels" / "cuda" / name
             for name in re.findall(r"MFQ_CUDA_KERNEL_ROOT}/([^\s]+\.cu)", source_block)

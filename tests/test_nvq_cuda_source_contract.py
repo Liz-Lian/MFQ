@@ -4,9 +4,11 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 NVQ = (ROOT / "mfq/kernels/cuda/nvq_matmul.cu").read_text()
 ASYNC_COPY = (ROOT / "mfq/kernels/cuda/async_copy.cuh").read_text()
-RUNTIME = (
-    ROOT / "cpp_runtime/backends/cuda/apps/mfq_decode.cpp"
-).read_text()
+CUDA_OPS = ROOT / "cpp_runtime/backends/cuda/ops"
+RUNTIME = "\n".join(
+    (CUDA_OPS / name).read_text()
+    for name in ("cuda_quantized_ops.h", "cuda_quantized_ops.cpp")
+)
 
 
 def test_nvq_moe_overlaps_activation_loads_with_weight_decode() -> None:

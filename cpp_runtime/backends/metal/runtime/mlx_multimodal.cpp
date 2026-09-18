@@ -89,22 +89,6 @@ mlx::core::array replace_multimodal_token_embeddings(
     return output;
 }
 
-namespace {
-
-void validate_grid(
-    const MlxGridShape& grid,
-    int merge,
-    bool image) {
-    if (grid.temporal <= 0 || grid.height <= 0 || grid.width <= 0 ||
-        grid.height % merge != 0 || grid.width % merge != 0 ||
-        (image && grid.temporal != 1)) {
-        throw std::invalid_argument(
-            "multimodal grid is incompatible with the position policy");
-    }
-}
-
-} // namespace
-
 MlxGridMropePositions build_grid_mrope_positions(
     const std::vector<std::int64_t>& token_ids,
     std::int64_t image_token_id,
@@ -112,96 +96,15 @@ MlxGridMropePositions build_grid_mrope_positions(
     int spatial_merge_size,
     const std::vector<MlxGridShape>& image_grids,
     const std::vector<MlxGridShape>& video_grids) {
-    if (token_ids.empty() || spatial_merge_size <= 0 ||
-        image_token_id < 0 || video_token_id < 0 ||
-        image_token_id == video_token_id) {
-        throw std::invalid_argument(
-            "invalid multimodal position-policy configuration");
-    }
-    for (const auto& grid : image_grids) {
-        validate_grid(grid, spatial_merge_size, true);
-    }
-    std::vector<MlxGridShape> video_frames;
-    for (const auto& grid : video_grids) {
-        validate_grid(grid, spatial_merge_size, false);
-        video_frames.insert(
-            video_frames.end(),
-            static_cast<std::size_t>(grid.temporal),
-            MlxGridShape{1, grid.height, grid.width});
-    }
-
-    if (token_ids.size() > static_cast<std::size_t>(
-            std::numeric_limits<int>::max())) {
-        throw std::invalid_argument("multimodal prompt is too long");
-    }
-    std::vector<std::int32_t> positions(3 * token_ids.size());
-    std::size_t image = 0;
-    std::size_t video = 0;
-    std::size_t begin = 0;
-    int current = 0;
-    while (begin < token_ids.size()) {
-        const int modality = token_ids[begin] == image_token_id
-            ? 1
-            : (token_ids[begin] == video_token_id ? 2 : 0);
-        std::size_t end = begin + 1;
-        while (end < token_ids.size()) {
-            const int next = token_ids[end] == image_token_id
-                ? 1
-                : (token_ids[end] == video_token_id ? 2 : 0);
-            if (next != modality) break;
-            ++end;
-        }
-        const auto count = end - begin;
-        if (modality == 0) {
-            for (std::size_t index = 0; index < count; ++index) {
-                const auto value = static_cast<std::int32_t>(current + index);
-                for (std::size_t axis = 0; axis < 3; ++axis) {
-                    positions[axis * token_ids.size() + begin + index] = value;
-                }
-            }
-            current += static_cast<int>(count);
-        } else {
-            const auto& grids = modality == 1 ? image_grids : video_frames;
-            auto& selected = modality == 1 ? image : video;
-            if (selected >= grids.size()) {
-                throw std::invalid_argument(
-                    "prompt contains more multimodal spans than grids");
-            }
-            const auto& grid = grids[selected++];
-            const int rows = grid.height / spatial_merge_size;
-            const int columns = grid.width / spatial_merge_size;
-            const auto expected = static_cast<std::size_t>(
-                grid.temporal * rows * columns);
-            if (count != expected) {
-                throw std::invalid_argument(
-                    "multimodal placeholder span disagrees with its grid");
-            }
-            std::size_t index = 0;
-            for (int temporal = 0; temporal < grid.temporal; ++temporal) {
-                for (int row = 0; row < rows; ++row) {
-                    for (int column = 0; column < columns; ++column, ++index) {
-                        positions[begin + index] = current + temporal;
-                        positions[token_ids.size() + begin + index] = current + row;
-                        positions[2 * token_ids.size() + begin + index] =
-                            current + column;
-                    }
-                }
-            }
-            current += std::max(rows, columns);
-        }
-        begin = end;
-    }
-    if (image != image_grids.size() || video != video_frames.size()) {
-        throw std::invalid_argument(
-            "multimodal grids contain unused image/video entries");
-    }
-    const auto maximum = *std::max_element(positions.begin(), positions.end());
+    auto positions = ::mfq::build_grid_mrope_positions(
+        token_ids, image_token_id, video_token_id, spatial_merge_size,
+        image_grids, video_grids);
     return {
         mlx::core::array(
-            positions.begin(),
-            mlx::core::Shape{3, static_cast<int>(token_ids.size())},
+            positions.values.begin(),
+            mlx::core::Shape{3, static_cast<int>(positions.token_count)},
             mlx::core::int32),
-        static_cast<int>(maximum) + 1 - static_cast<int>(token_ids.size()),
+        positions.decode_delta,
     };
 }
 

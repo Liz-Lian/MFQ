@@ -225,7 +225,7 @@ def test_cpp_runtime_matches_python_for_all_mfe_families(tmp_path, tokens: int):
     env["PATH"] = os.pathsep.join(path_parts)
     command = [
         str(executable),
-        "--mfq",
+        "--model",
         str(model_path),
         "--check-mfe-tensor",
         tensor_name,

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "grid_vision.h"
+
 #include <array>
 #include <cstdint>
 #include <optional>
@@ -28,13 +30,7 @@ struct MlxPreparedPrompt {
     }
 };
 
-struct MlxGridShape {
-    int temporal = 0;
-    int height = 0;
-    int width = 0;
-
-    bool operator==(const MlxGridShape&) const = default;
-};
+using MlxGridShape = ::mfq::GridShape;
 
 // Architecture-neutral output of a patch-grid media processor. Pixel
 // normalization and patchification happen outside the runtime; model adapters

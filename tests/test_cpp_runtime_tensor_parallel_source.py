@@ -1,8 +1,11 @@
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-SOURCE = (ROOT / "cpp_runtime" / "backends" / "cuda" / "apps" / "mfq_decode.cpp").read_text(
-    encoding="utf-8"
+CUDA_ROOT = ROOT / "cpp_runtime" / "backends" / "cuda"
+SOURCE = "\n".join(
+    path.read_text(encoding="utf-8")
+    for path in sorted(CUDA_ROOT.rglob("*"))
+    if path.suffix in {".h", ".cpp"}
 )
 CORE = (ROOT / "cpp_runtime" / "core" / "tensor_parallel.h").read_text(
     encoding="utf-8"
@@ -10,14 +13,10 @@ CORE = (ROOT / "cpp_runtime" / "core" / "tensor_parallel.h").read_text(
 CMAKE = (ROOT / "cpp_runtime" / "tests" / "CMakeLists.txt").read_text(
     encoding="utf-8"
 )
-COMPONENTS = (
-    ROOT
-    / "cpp_runtime"
-    / "backends"
-    / "cuda"
-    / "runtime"
-    / "server_components.h"
-).read_text(encoding="utf-8")
+COMPONENTS = "\n".join(
+    (CUDA_ROOT / "runtime" / name).read_text(encoding="utf-8")
+    for name in ("server_components.h", "server_components.cpp")
+)
 
 
 def test_tensor_parallel_cli_and_weighted_split_are_wired():
@@ -163,14 +162,15 @@ def test_deepseek_v4_split_gate_up_uses_existing_moe_runtime_and_cache():
     assert "mfq_tensor_backend::cat({gate, up}, -1).contiguous()" in SOURCE
 
 
-def test_generic_moe_loader_accepts_independent_gate_up_down_profiles():
-    assert 'const std::string expert_gate = p + "experts.gate.weight"' in SOURCE
-    assert 'const std::string expert_up = p + "experts.up.weight"' in SOURCE
-    assert "has_expert_gate != has_expert_up" in SOURCE
-    assert "has_expert_gate_up == has_expert_gate" in SOURCE
-    assert "f.moe_split_gate_up = has_expert_gate" in SOURCE
-    assert "f.moe_gate.out_per_expert == c.moe_intermediate_size" in SOURCE
-    assert "f.moe_up.out_per_expert == c.moe_intermediate_size" in SOURCE
+def test_generic_ffn_loader_stays_dense_and_model_moe_loaders_are_typed():
+    loader = (
+        CUDA_ROOT / "runtime" / "cuda_transformer_loader.cpp"
+    ).read_text(encoding="utf-8")
+    assert "experts.gate.weight" not in loader
+    assert "const mfq::models::ModelConfig& config" in loader
+    assert "deepseek_v4::load_block(" in SOURCE
+    assert "glm_dsa::load_ffn(" in SOURCE
+    assert "deepseek_v41_runtime::load_moe(" in SOURCE
 
 
 def test_native_float_linears_are_supported_without_forcing_tp_shards():

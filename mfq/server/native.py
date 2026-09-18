@@ -6,22 +6,18 @@ import json
 import math
 import os
 import socket
-import struct
 import subprocess
 import time
 import urllib.error
 import urllib.request
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
-from mfq.architectures.tensor_schema import graph_spec_for_source_names
-from mfq.compat.legacy_model_graph import legacy_model_graph
 from mfq.formats.assets import (
     HF_TOKENIZER_CONFIG_ASSET,
     HF_TOKENIZER_JSON_ASSET,
     MODEL_CONFIG_ASSET,
-    MODEL_GRAPH_ASSET,
     TOKENIZER_GGUF_ASSET,
 )
 from mfq.formats.io import open_mmap
@@ -49,189 +45,17 @@ def append_native_prefill_chunk_override(
         command.extend(["--prefill-chunk-size", str(prefill_chunk_size)])
 
 
-@dataclass(frozen=True)
-class RuntimeRoute:
-    """Resolved runtime ownership for one model artifact."""
-
-    architecture_family: str
-    backbone: str = ""
-    python_mlx_worker: bool = False
-    vision_available: bool = False
-    continuous_batching: bool = False
-
-
-@dataclass(frozen=True)
-class _RuntimeImplementationRegistration:
-    backbone: str
-    python_mlx_worker: bool = False
-    continuous_batching: bool = False
-
-
-_RUNTIME_IMPLEMENTATION_REGISTRY = (
-    _RuntimeImplementationRegistration(
-        backbone="qwen3_5",
-        continuous_batching=True,
-    ),
-    _RuntimeImplementationRegistration(
-        backbone="qwen4_exp",
-    ),
-    _RuntimeImplementationRegistration(
-        backbone="glm5_next",
-        python_mlx_worker=True,
-    ),
-)
-
-
-def _normalize_architecture(architecture: str) -> str:
-    return architecture.strip().lower().replace("-", "_")
-
-
-def _runtime_implementation(
-    backbone: str,
-) -> _RuntimeImplementationRegistration | None:
-    return next(
-        (
-            registration
-            for registration in _RUNTIME_IMPLEMENTATION_REGISTRY
-            if backbone == registration.backbone
-        ),
-        None,
-    )
-
-
-def _runtime_graph(architecture: str, model: str | Path) -> dict[str, object] | None:
-    model_path = Path(model).expanduser().resolve()
-    if model_path.is_dir():
-        try:
-            config = json.loads((model_path / "config.json").read_text(encoding="utf-8"))
-            if not isinstance(config, dict):
-                return None
-            index_path = model_path / "model.safetensors.index.json"
-            if index_path.is_file():
-                index = json.loads(index_path.read_text(encoding="utf-8"))
-                weight_map = index.get("weight_map") if isinstance(index, dict) else None
-                if not isinstance(weight_map, dict) or not weight_map:
-                    return None
-                source_names = tuple(str(name) for name in weight_map)
-            else:
-                names: list[str] = []
-                for shard in sorted(model_path.glob("*.safetensors")):
-                    with shard.open("rb") as stream:
-                        raw_size = stream.read(8)
-                        if len(raw_size) != 8:
-                            return None
-                        size = struct.unpack("<Q", raw_size)[0]
-                        header = json.loads(stream.read(size))
-                    if not isinstance(header, dict):
-                        return None
-                    names.extend(
-                        str(name) for name in header if name != "__metadata__"
-                    )
-                source_names = tuple(names)
-            spec = graph_spec_for_source_names(config, source_names)
-            return None if spec is None else spec.as_dict()
-        except (OSError, TypeError, ValueError, KeyError, json.JSONDecodeError):
-            return None
-    if not model_path.is_file():
-        return None
-    try:
-        with open_mmap(model_path) as store:
-            if MODEL_GRAPH_ASSET in store.records:
-                value = json.loads(store.read_blob(MODEL_GRAPH_ASSET))
-                return value if isinstance(value, dict) else None
-            config = None
-            if MODEL_CONFIG_ASSET in store.records:
-                candidate = json.loads(store.read_blob(MODEL_CONFIG_ASSET))
-                if isinstance(candidate, dict):
-                    config = candidate
-            return legacy_model_graph(architecture, store.records, config)
-    except (OSError, TypeError, ValueError, KeyError, json.JSONDecodeError):
-        return None
-
-
-def resolve_runtime_route(architecture: str, model: str | Path) -> RuntimeRoute:
-    """Resolve runtime ownership from component/backbone implementation IDs."""
-
-    graph = _runtime_graph(architecture, model)
-    if graph is None:
-        return RuntimeRoute(architecture_family=_normalize_architecture(architecture))
-    graph_descriptor = graph.get("graph")
-    backbone = (
-        str(graph_descriptor.get("backbone") or "")
-        if isinstance(graph_descriptor, Mapping)
-        else ""
-    )
-    family = str(graph.get("architecture") or backbone)
-    components = graph.get("components")
-    component_kinds = {
-        str(component.get("kind"))
-        for component in components
-        if isinstance(component, Mapping)
-    } if isinstance(components, list) else set()
-    registration = _runtime_implementation(backbone)
-    if registration is None:
-        return RuntimeRoute(
-            architecture_family=family,
-            backbone=backbone,
-            vision_available="vision" in component_kinds,
-        )
-    return RuntimeRoute(
-        architecture_family=family,
-        backbone=backbone,
-        python_mlx_worker=registration.python_mlx_worker,
-        vision_available="vision" in component_kinds,
-        continuous_batching=registration.continuous_batching,
-    )
-
-
 def native_request_capacity(
     *,
     backend: str,
-    route: RuntimeRoute,
     routed_expert_bytes: int,
     requested: int,
 ) -> int:
-    """Return concurrency actually supported by one native model worker."""
+    """Return the control-plane admission limit requested from a backend worker."""
 
     if requested < 1:
         raise ValueError("requested runtime concurrency must be positive")
-    if (
-        backend == "cuda"
-        and route.continuous_batching
-        and routed_expert_bytes == 0
-    ):
-        return requested
-    return 1
-
-
-def python_mlx_runtime_command(
-    controller_command: Sequence[str],
-    *,
-    model: str | Path,
-    model_name: str,
-    host: str,
-    port: int,
-    context_size: int,
-    prefill_chunk_size: int = 2_048,
-) -> list[str]:
-    if not controller_command:
-        raise NativeRuntimeError("the Python MLX runtime has no MFQ CLI launcher")
-    return [
-        *(str(value) for value in controller_command),
-        "_flash-next-worker",
-        "--model",
-        str(model),
-        "--host",
-        host,
-        "--port",
-        str(port),
-        "--model-name",
-        model_name,
-        "--ctx-size",
-        str(context_size),
-        "--prefill-chunk-size",
-        str(prefill_chunk_size),
-    ]
+    return requested if backend == "cuda" and routed_expert_bytes == 0 else 1
 
 
 def find_native_runtime_resource(executable: str | Path, name: str) -> Path | None:
@@ -282,12 +106,12 @@ def reserve_loopback_port() -> int:
 
 
 def native_tokenizer_arguments(model: str | Path, backend: str) -> list[str]:
-    if backend != "metal":
-        return []
     model_path = Path(model).expanduser().resolve()
     if model_path.is_dir():
         tokenizer = ensure_hf_tokenizer_gguf(model_path)
     elif model_path.is_file():
+        if backend != "metal":
+            return []
         with open_mmap(model_path) as store:
             has_embedded_tokenizer = (
                 TOKENIZER_GGUF_ASSET in store.records
@@ -305,7 +129,7 @@ def native_tokenizer_arguments(model: str | Path, backend: str) -> list[str]:
         tokenizer = ensure_mfq_tokenizer_gguf(model_path)
     else:
         return []
-    return ["--tokenizer-gguf", str(tokenizer)]
+    return ["--tokenizer", str(tokenizer)]
 
 
 @dataclass
@@ -321,8 +145,6 @@ class NativeRuntime:
     moe_gpu_cache_gb: float | None = None
     startup_timeout: float = 1800.0
     environment: Mapping[str, str] | None = None
-    architecture: str = ""
-    controller_command: Sequence[str] = ()
     process: subprocess.Popen[bytes] | None = None
     port: int | None = None
 
@@ -343,26 +165,9 @@ class NativeRuntime:
             not math.isfinite(self.moe_gpu_cache_gb) or self.moe_gpu_cache_gb < 0
         ):
             raise NativeRuntimeError("MoE expert cache size must be finite and non-negative")
-        route = resolve_runtime_route(self.architecture, self.model)
-        if route.python_mlx_worker:
-            if self.backend != "metal":
-                raise NativeRuntimeError("the Python MLX worker currently requires Metal")
-            if self.moe_gpu_cache_gb not in (None, 0):
-                raise NativeRuntimeError(
-                    "the Python MLX worker does not support SSD-streamed experts"
-                )
-            return python_mlx_runtime_command(
-                self.controller_command,
-                model=self.model,
-                model_name=self.model_name,
-                host="127.0.0.1",
-                port=port,
-                context_size=self.context_size,
-                prefill_chunk_size=self.prefill_chunk_size,
-            )
         command = [
             str(self.executable),
-            "--mfq",
+            "--model",
             str(self.model),
             "--server",
             "--host",
@@ -377,7 +182,6 @@ class NativeRuntime:
             command.extend(["--ctx-size", str(self.context_size)])
         request_capacity = native_request_capacity(
             backend=self.backend,
-            route=route,
             routed_expert_bytes=self.routed_expert_bytes,
             requested=max(1, self.continuous_batching),
         )

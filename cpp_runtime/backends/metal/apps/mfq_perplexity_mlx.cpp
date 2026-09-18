@@ -180,8 +180,8 @@ Arguments parse_arguments(int argc, char** argv) {
             }
             return argv[index];
         };
-        if (value == "--mfq" || value == "-m") {
-            result.mfq = require_value(value.c_str());
+        if (value == "--model") {
+            result.mfq = require_value("--model");
         } else if (value == "--file" || value == "-f") {
             result.input = require_value(value.c_str());
         } else if (value == "--kl-base") {
@@ -202,8 +202,8 @@ Arguments parse_arguments(int argc, char** argv) {
             if (result.model_label.empty()) {
                 usage_error("--model-label cannot be empty");
             }
-        } else if (value == "--tokenizer-gguf") {
-            result.tokenizer_gguf = require_value("--tokenizer-gguf");
+        } else if (value == "--tokenizer") {
+            result.tokenizer_gguf = require_value("--tokenizer");
         } else if (value == "--ctx-size" || value == "-c") {
             const auto parsed = parse_integer(
                 require_value(value.c_str()), value.c_str());
@@ -289,11 +289,11 @@ void print_help() {
     std::cout
         << "MFQ native C++/MLX perplexity evaluator\n\n"
         << "Usage:\n"
-        << "  mfq-perplexity --mfq MODEL.mfq --file wiki.test.raw "
+        << "  mfq-perplexity --model MODEL.mfq --file wiki.test.raw "
            "[--ctx-size 512]\n\n"
-        << "  mfq-perplexity --mfq MODEL.mfq --kl-base reference.logits\n\n"
+        << "  mfq-perplexity --model MODEL.mfq --kl-base reference.logits\n\n"
         << "Options:\n"
-        << "  -m, --mfq PATH          MFQ model or any split-model shard\n"
+        << "      --model PATH        MFQ model or any split-model shard\n"
         << "  -f, --file PATH         raw evaluation text\n"
         << "      --kl-base PATH      llama-perplexity reference logits; "
            "enables integrated KLD\n"
@@ -309,7 +309,7 @@ void print_help() {
            "N/ctx controls parallelism\n"
         << " -ub, --ubatch-size N     physical token batch (default n_batch)\n"
         << "      --kl-score-count N  score only the first N stored rows/chunk\n"
-        << "      --tokenizer-gguf P  external tokenizer GGUF; embedded is default\n"
+        << "      --tokenizer PATH    external tokenizer GGUF; embedded is default\n"
         << "      --moe-gpu-cache-gb N bounded disk-backed MFE expert cache\n"
         << "                           default: full unified-memory residency\n\n"
         << "The evaluator follows llama.cpp's non-strided WikiText-2 protocol: "
@@ -885,7 +885,7 @@ MfqTokenizerProbe tokenize(
     }
     if (!model.contains(kTokenizerAsset)) {
         throw std::runtime_error(
-            "MFQ has no embedded tokenizer GGUF; pass --tokenizer-gguf PATH");
+            "MFQ has no embedded tokenizer GGUF; pass --tokenizer PATH");
     }
     return probe_mfq_tokenizer(
         model.read(kTokenizerAsset),
@@ -909,7 +909,7 @@ MfqTokenizerProbe tokenizer_policy(
     if (!model.contains(kTokenizerAsset)) {
         throw std::runtime_error(
             "legacy KLD references require the embedded tokenizer policy; "
-            "pass --tokenizer-gguf PATH");
+            "pass --tokenizer PATH");
     }
     return probe_mfq_tokenizer(
         model.read(kTokenizerAsset),
@@ -2102,7 +2102,7 @@ PerplexityStats run_perplexity(
 
 int run(const Arguments& arguments) {
     if (arguments.mfq.empty()) {
-        usage_error("--mfq is required");
+        usage_error("--model is required");
     }
     if (arguments.input.empty() == arguments.kl_base.empty()) {
         usage_error("pass exactly one of --file or --kl-base");

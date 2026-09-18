@@ -1,10 +1,16 @@
 from pathlib import Path
 
 ROOT = Path(__file__).parents[1]
-DECODE = (ROOT / "cpp_runtime" / "backends" / "cuda" / "apps" / "mfq_decode.cpp").read_text(encoding="utf-8")
-CUDA_COMPONENTS = (
-    ROOT / "cpp_runtime" / "backends" / "cuda" / "runtime" / "server_components.h"
-).read_text(encoding="utf-8")
+CUDA_ROOT = ROOT / "cpp_runtime" / "backends" / "cuda"
+DECODE = "\n".join(
+    path.read_text(encoding="utf-8")
+    for path in sorted(CUDA_ROOT.rglob("*"))
+    if path.suffix in {".h", ".cpp"}
+)
+CUDA_COMPONENTS = "\n".join(
+    (CUDA_ROOT / "runtime" / name).read_text(encoding="utf-8")
+    for name in ("server_components.h", "server_components.cpp")
+)
 ROPE = (ROOT / "mfq" / "kernels" / "cuda" / "rope.cu").read_text(
     encoding="utf-8"
 )
@@ -14,8 +20,9 @@ ATTENTION = (ROOT / "mfq" / "kernels" / "cuda" / "attention.cu").read_text(
 NORM = (ROOT / "mfq" / "kernels" / "cuda" / "norm.cu").read_text(
     encoding="utf-8"
 )
-GRAPH = (ROOT / "cpp_runtime" / "backends" / "cuda" / "models" / "minicpmo45_runtime.inc").read_text(
-    encoding="utf-8"
+GRAPH = "\n".join(
+    (CUDA_ROOT / "models" / "minicpmo45" / name).read_text(encoding="utf-8")
+    for name in ("minicpmo45_runtime.h", "minicpmo45_runtime.cpp")
 )
 METAL_GRAPH = (ROOT / "cpp_runtime" / "backends" / "metal" / "models/minicpmo45" / "mlx_minicpmo45.cpp").read_text(
     encoding="utf-8"
@@ -50,11 +57,11 @@ STUDIO_REALTIME = (
 
 
 def test_minicpmo45_uses_native_composite_graph_and_canonical_names():
-    assert '#include "minicpmo45_runtime.inc"' in DECODE
+    assert "minicpmo45_runtime.h" in DECODE
     assert 'const std::string embed_name = "model.token_embedding.weight"' in DECODE
     assert 'const std::string norm_name = "model.output_norm.weight"' in DECODE
     assert 'const std::string output_name = "model.output.weight"' in DECODE
-    assert "MfqCudaBackbone::minicpmo45" in DECODE
+    assert "CudaBackbone::minicpmo45" in DECODE
     assert "llm.model." not in DECODE
     assert "llm.lm_head.weight" not in DECODE
 
@@ -67,7 +74,7 @@ def test_minicpmo45_graph_binds_all_checkpoint_components():
         "audio.patch_embedding.conv1.weight",
         "audio.block.",
         "audio.projector.input",
-        'result.tensor_root = "tts"',
+        'result.config, index, "full_attention", false, "tts"',
         "tts.text_embedding.weight",
         "tts.code_embedding.0.weight",
         "tts.semantic_projector.input",
@@ -85,9 +92,9 @@ def test_minicpmo45_audio_and_tts_follow_official_attention_contracts():
     assert "mfq_tensor_backend::baddbmm(" in GRAPH
     assert "mfq_linear(" in GRAPH
     assert 'result.model_type = "minicpmtts"' in GRAPH
-    assert "uses_minicpmo45_bf16_graph()" in DECODE
-    assert "MfqCudaBackbone::minicpmo_tts" in DECODE
-    assert "result.norm_weight_offset = 0.0" in GRAPH
+    assert "block->official_bf16 = minicpmo45" in DECODE
+    assert "CudaBackbone::minicpmo_tts" in DECODE
+    assert "norm_weight_offset = 0.0" in GRAPH
     assert "cache_position += tokens" in GRAPH
     assert "generate_official(" in GRAPH
     assert "mfq_tensor_backend::multinomial(" in GRAPH
@@ -150,7 +157,7 @@ def test_minicpmo45_qwen_runtime_follows_official_bfloat16_boundaries():
     assert "cache_pos > 0 && T > 1" in DECODE
     assert "minicpmo45_attention_mask" in DECODE
     assert "std::numeric_limits<mfq_bfloat16>::lowest()" in DECODE
-    assert "!c.is_minicpmo45() && cache_pos > 0" in DECODE
+    assert "!Model::is_minicpmo45 && model.cache_pos > 0" in DECODE
     assert "attention_mask.value().eq(1).all().item<bool>()" in DECODE
 
 
@@ -158,10 +165,11 @@ def test_minicpmo45_preserves_qkv_projection_boundaries():
     assert "bool preserve_projection_boundaries = false" in DECODE
     assert "std::move(layers), preserve_projection_boundaries" in DECODE
     assert (
-        'ap + "query.weight", ap + "key.weight", ap + "value.weight"},\n'
-        "            2, nullptr, c.is_minicpmo45())"
+        'attention + "query.weight",\n'
+        '        attention + "key.weight",\n'
+        '        attention + "value.weight"}, 2, nullptr, minicpmo45)'
     ) in DECODE
-    assert "f.down, 2, c.is_minicpmo45())" in DECODE
+    assert "ffn.down, 2, minicpmo45)" in DECODE
     assert "MFQ_DIAGNOSTIC_DISABLE_NINT_GROUP" in DECODE
 
 
@@ -169,7 +177,7 @@ def test_minicpmo45_matches_official_rope_frequency_construction():
     assert "bool official_reciprocal_frequencies = false" in DECODE
     assert "mfq_tensor_backend::reciprocal(" in DECODE
     assert "freq.copy_(official_freq)" in DECODE
-    assert "0, -1, device, c.is_minicpmo45())" in DECODE
+    assert "Kind == CudaBackbone::minicpmo45" in DECODE
     assert "rope_table_bf16_cuda" in DECODE
     assert "rope_table_bf16_kernel" in ROPE
 
@@ -256,7 +264,7 @@ def test_minicpmo45_cuda_server_binds_the_realtime_backend():
     assert 'a == "--minicpmo-duplex"' not in DECODE
     assert "make_cuda_minicpmo45_duplex_backend(" in DECODE
     assert "if (server_components.minicpmo)" in DECODE
-    assert "load_cuda_runtime_components(" in DECODE
+    assert "load_runtime_components(" in DECODE
     assert 'backend.name = "cuda"' in DECODE
     assert "MiniCPMO45Runtime::load_with_language(" in CUDA_COMPONENTS
     assert "session->prepare(" in DECODE
@@ -278,7 +286,7 @@ def test_minicpmo45_native_servers_share_mfqd_vision_tensors():
     assert "MiniCPM-o image placeholder must contain 64 query tokens" in SERVER_SOURCE
     assert "generate_server_multimodal_tokens(" in DECODE
     assert "runtime.forward(" in DECODE
-    assert "sample_server_logits(" in DECODE
+    assert "mfq::cuda::sample_logits(" in DECODE
     assert "generate_multimodal(" in METAL_HEADER
     assert "MlxMiniCPMO45Runtime::generate_multimodal(" in METAL_GRAPH
     assert "make_mlx_server_components(" in METAL_DECODE

@@ -221,7 +221,6 @@ add_library(mfq-metal-runtime STATIC
     storage/mfq_container.cpp
     storage/mfe_expert_store.cpp
     storage/mlx_mxfp8_row_store.cpp
-    storage/mlx_tensor_schema.cpp
     storage/compat/mlx_legacy_tensor_compat.cpp
     runtime/mlx_axial_patch_vision.cpp
     runtime/mlx_grid_vision.cpp
@@ -685,7 +684,7 @@ add_test(
 target_include_directories(mfq-metal-hf-safetensors-store-test PRIVATE
     ${MFQ_METAL_ROOT}/storage
 )
-target_link_libraries(mfq-metal-hf-safetensors-store-test PRIVATE mfq-json)
+target_link_libraries(mfq-metal-hf-safetensors-store-test PRIVATE mfq-model-source)
 target_compile_features(
     mfq-metal-hf-safetensors-store-test PRIVATE cxx_std_20)
 add_test(

@@ -6,14 +6,18 @@ from mfq.server.output_protocols import output_protocol_for_architecture
 ROOT = Path(__file__).resolve().parents[1]
 SERVER = (ROOT / "cpp_runtime" / "server" / "src" / "server.cpp").read_text(encoding="utf-8")
 CUDA_PLAN = (
-    ROOT / "cpp_runtime" / "backends" / "cuda" / "include" / "mfq_cuda_model_plan.h"
+    ROOT / "cpp_runtime" / "backends" / "cuda" / "include" / "cuda_model_plan.h"
 ).read_text(encoding="utf-8")
-CUDA_DECODE = (ROOT / "cpp_runtime" / "backends" / "cuda" / "apps" / "mfq_decode.cpp").read_text(
-    encoding="utf-8"
+CUDA_ROOT = ROOT / "cpp_runtime" / "backends" / "cuda"
+CUDA_DECODE = "\n".join(
+    path.read_text(encoding="utf-8")
+    for path in sorted(CUDA_ROOT.rglob("*"))
+    if path.suffix in {".h", ".cpp"}
 )
-CUDA_COMPONENTS = (
-    ROOT / "cpp_runtime" / "backends" / "cuda" / "runtime" / "server_components.h"
-).read_text(encoding="utf-8")
+CUDA_COMPONENTS = "\n".join(
+    (CUDA_ROOT / "runtime" / name).read_text(encoding="utf-8")
+    for name in ("server_components.h", "server_components.cpp")
+)
 STUDIO_APP = (ROOT / "MFQStudio" / "src" / "App.tsx").read_text(
     encoding="utf-8"
 )
@@ -199,10 +203,10 @@ def test_cpp_server_keeps_health_metrics_out_of_response_performance() -> None:
 
 
 def test_cuda_uses_one_architecture_and_optional_component_registry() -> None:
-    assert "MfqCudaModelPlan" in CUDA_PLAN
-    assert "MfqCudaComponentState" in CUDA_PLAN
-    assert "mfq_cuda_model_plan(" in CUDA_PLAN
-    assert "mfq_cuda_component_state(" in CUDA_PLAN
+    assert "CudaModelPlan" in CUDA_PLAN
+    assert "CudaComponentState" in CUDA_PLAN
+    assert "cuda_model_plan(" in CUDA_PLAN
+    assert "cuda_component_state(" in CUDA_PLAN
     for implementation in (
         "deepseek_v4",
         "qwen3_5",

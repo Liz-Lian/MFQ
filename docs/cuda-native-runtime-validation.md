@@ -35,10 +35,10 @@ The native runtime accepts either a rank count or an ordered CUDA device list.
 Split weights stay attached to that device order:
 
 ```shell
-mfq-decode --mfq model.mfq --tensor-parallel 4
-mfq-decode --mfq moe.mfq \
+mfq-decode --model model.mfq --tensor-parallel 4
+mfq-decode --model moe.mfq \
   --expert-parallel 0,1,2,3 --expert-split 1,1,1,1
-mfq-decode --mfq moe.mfq \
+mfq-decode --model moe.mfq \
   --tensor-parallel 0,1,2,3 --tensor-split 1,1,1,1 \
   --expert-parallel 0,1,2,3 --expert-split 1,1,2,4
 ```

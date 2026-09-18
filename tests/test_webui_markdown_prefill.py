@@ -11,7 +11,9 @@ SERVER_HEADER = (ROOT / "cpp_runtime" / "server" / "include" / "mfq" / "server.h
     encoding="utf-8"
 )
 SERVER = (ROOT / "cpp_runtime" / "server" / "src" / "server.cpp").read_text(encoding="utf-8")
-RUNTIME = (ROOT / "cpp_runtime" / "backends" / "cuda" / "apps" / "mfq_decode.cpp").read_text(encoding="utf-8")
+RUNTIME = (
+    ROOT / "cpp_runtime" / "backends" / "cuda" / "runtime" / "cuda_decode_runtime.cpp"
+).read_text(encoding="utf-8")
 
 
 def test_studio_bundles_markdown_sanitization_and_latex_dependencies() -> None:
@@ -68,7 +70,7 @@ def test_prefill_speed_uses_cuda_events_around_only_the_first_model_eval() -> No
     first = RUNTIME.split("auto sample_first_token = [&]()", 1)[1]
     first = first.split("const char * reprefill_env", 1)[0]
     assert first.index("ServerPrefillCudaTimer prefill_timer") < first.index(
-        "auto next = sample_server_token("
+        "mfq_tensor_backend::Tensor next;"
     )
     assert first.index("const int64_t token = next.item<int64_t>();") < first.index(
         "prefill_timer.elapsed_ms()"

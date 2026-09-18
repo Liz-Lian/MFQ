@@ -1,15 +1,18 @@
 #pragma once
 
-// Native configuration parsers for the Flash-Next model family.
+// Backend-neutral configuration parsers for the Flash-Next model family.
 #include <nlohmann/json.hpp>
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
+#include <cstdint>
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
-namespace mfq::flash_next {
+namespace mfq::models::flash_next {
 struct QwenConfig {
     int64_t vocab,hidden,layers,maximum,heads,kv_heads,width,rotary,interval,streams,rank;
     int64_t key_heads,value_heads,linear_width,kernel,experts,topk,moe_width,shared_width;
@@ -18,6 +21,17 @@ struct QwenConfig {
     bool interleaved,normalize_routes,silu_gate,tied_embeddings,dedicated_predictor_embeddings;
     std::vector<int64_t> sections,ple_layers;
     std::vector<std::string> layer_types;
+    static QwenConfig from_json(std::string_view payload);
+
+    template <class Source>
+    static QwenConfig from_source(const Source& source) {
+        const auto graph = source.resolved_model_graph();
+        if (graph.backbone != "qwen4_exp") {
+            throw std::runtime_error(
+                "Qwen4-Exp loading requires a qwen4_exp model graph");
+        }
+        return from_json(source.model_config_json());
+    }
     static QwenConfig parse(const nlohmann::json& outer) {
         const auto& text=outer.contains("text_config")?outer.at("text_config"):outer;
         const auto outer_type=outer.value("model_type",std::string{});
@@ -33,7 +47,7 @@ struct QwenConfig {
         c.maximum=positive("max_position_embeddings");c.heads=positive("num_attention_heads");c.kv_heads=positive("num_key_value_heads");
         c.width=positive("head_dim");c.interval=positive("full_attention_interval");c.streams=positive("hc_count");c.rank=positive("hc_lowrank");
         c.layer_types=text.at("layer_types").get<std::vector<std::string>>();
-        if (c.layer_types.size()!=size_t(c.layers)) throw std::runtime_error("Qwen4 layer schedule must describe every layer");
+        if (c.layer_types.size()!=static_cast<std::size_t>(c.layers)) throw std::runtime_error("Qwen4 layer schedule must describe every layer");
         for (int64_t i=0;i<c.layers;++i)
             if (c.layer_types[i]!=((i+1)%c.interval==0?"full_attention":"linear_attention"))
                 throw std::runtime_error("Qwen4 attention schedule disagrees with interval");
@@ -96,6 +110,17 @@ struct GlmConfig {
     bool tail, normalize_routes, tied_embeddings;
     std::vector<std::string> layer_types, mlp_types;
 
+    static GlmConfig from_json(std::string_view payload);
+
+    template <class Source>
+    static GlmConfig from_source(const Source& source) {
+        const auto graph = source.resolved_model_graph();
+        if (graph.backbone != "glm5_next") {
+            throw std::runtime_error(
+                "GLM5-Next loading requires a glm5_next model graph");
+        }
+        return from_json(source.model_config_json());
+    }
     static GlmConfig parse(const nlohmann::json& outer) {
         const auto& text = outer.contains("text_config") ? outer.at("text_config") : outer;
         const auto outer_type = outer.value("model_type", std::string{});
@@ -120,7 +145,7 @@ struct GlmConfig {
         c.layer_types=text.at("layer_types").get<std::vector<std::string>>();
         c.mlp_types=text.at("mlp_layer_types").get<std::vector<std::string>>();
         const auto indexers=text.at("indexer_types").get<std::vector<std::string>>();
-        if (c.layer_types.size()!=size_t(c.layers) || c.mlp_types.size()!=size_t(c.layers) || indexers.size()!=size_t(c.layers))
+        if (c.layer_types.size()!=static_cast<std::size_t>(c.layers) || c.mlp_types.size()!=static_cast<std::size_t>(c.layers) || indexers.size()!=static_cast<std::size_t>(c.layers))
             throw std::runtime_error("GLM layer schedules must describe every layer");
         std::set<int64_t> kda, full;
         for (int64_t i=0;i<c.layers;++i) {
@@ -168,4 +193,4 @@ struct GlmConfig {
         return c;
     }
 };
-} // namespace mfq::flash_next
+} // namespace mfq::models::flash_next

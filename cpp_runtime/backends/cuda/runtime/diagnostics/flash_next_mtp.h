@@ -1,11 +1,23 @@
 #pragma once
 
 // Architecture-specific CLI diagnostics. Production generation uses the
-// common CudaMtpModule path and does not depend on these concrete types.
+// common MtpModule path and does not depend on these concrete types.
 
-static int run_flash_next_mtp_check(Model& model,CudaFlashNextMtp& mtp) {
+template <typename Model>
+static int run_flash_next_mtp_check(Model& model, FlashNextMtp& mtp) {
     namespace tb=mfq_tensor_backend;
-    MFQ_RUNTIME_CHECK(model.c.is_flash_next() && model.c.vocab_size>=8 && model.c.max_position_embeddings>=24,
+    const MtpTarget target{
+        [&model](tb::Tensor ids) {
+            return model.embed_forward(std::move(ids));
+        },
+        [&model](tb::Tensor hidden) {
+            return model.logits_from_hidden(std::move(hidden));
+        },
+        &model.rope,
+    };
+    MFQ_RUNTIME_CHECK(
+        Model::is_flash_next && model.vocab_size() >= 8 &&
+            model.max_position_embeddings() >= 24,
         "Flash-Next MTP diagnostic requires vocab>=8 and context>=24");
     const auto width=mtp.hidden_norm.numel();
     auto options=tb::TensorOptions().device(tb::kCUDA).dtype(tb::kInt64);
@@ -14,33 +26,36 @@ static int run_flash_next_mtp_check(Model& model,CudaFlashNextMtp& mtp) {
     const auto json_tensor=[](const tb::Tensor& value) {
         auto host=value.to(tb::kFloat32).contiguous().cpu();
         return nlohmann::json{{"shape",host.sizes().vec()},
-            {"data",std::vector<float>(host.data_ptr<float>(),host.data_ptr<float>()+host.numel())}};
+            {"data",std::vector<float>(host.template data_ptr<float>(),host.template data_ptr<float>()+host.numel())}};
     };
-    nlohmann::json result;result["architecture"]=model.c.model_graph.backbone;
+    nlohmann::json result;
+    result["architecture"] = model.graph.backbone;
     result["previous"]=json_tensor(previous);
     for (int64_t i=0;i<int64_t(mtp.lengths.size());++i) {
         nlohmann::json row;
-        mtp.reset();auto full=mtp.evaluate(model,previous,ids,i);
+        mtp.reset();auto full=mtp.evaluate(target,previous,ids,i);
         row["full"]=json_tensor(full.first);row["multi"]=json_tensor(full.second);
         row["logits"]=json_tensor(model.logits_from_hidden(full.first));
         const auto saved=mtp.lengths;
-        row["uncached"]=json_tensor(mtp.evaluate(model,previous,ids,i,false).first);
+        row["uncached"]=json_tensor(mtp.evaluate(target,previous,ids,i,false).first);
         MFQ_RUNTIME_CHECK(saved==mtp.lengths,"uncached MTP changed layer positions");
         mtp.reset();std::vector<tb::Tensor> pieces;
         for (auto [begin,count]:std::vector<std::pair<int64_t,int64_t>>{{0,2},{2,1},{3,4}})
-            pieces.push_back(mtp.evaluate(model,previous.narrow(1,begin,count),ids.narrow(1,begin,count),i).first);
+            pieces.push_back(mtp.evaluate(target,previous.narrow(1,begin,count),ids.narrow(1,begin,count),i).first);
         row["chunked"]=json_tensor(tb::cat(pieces,1));
-        mtp.reset();row["reset"]=json_tensor(mtp.evaluate(model,previous,ids,i).first);
+        mtp.reset();row["reset"]=json_tensor(mtp.evaluate(target,previous,ids,i).first);
         // Changing batch resets every layer, not just the selected depth.
-        row["batch"]=json_tensor(mtp.evaluate(model,previous.repeat({2,1,1}),ids.repeat({2,1}),i).first);
-        row["batch_reset"]=json_tensor(mtp.evaluate(model,previous,ids,i).first);
+        row["batch"]=json_tensor(mtp.evaluate(target,previous.repeat({2,1,1}),ids.repeat({2,1}),i).first);
+        row["batch_reset"]=json_tensor(mtp.evaluate(target,previous,ids,i).first);
         auto pos=ids.reshape({7})+2;
-        if (model.c.is_qwen4()) pos=tb::stack({pos+10,pos,pos+2,pos+4},0);
-        row["axis"]=json_tensor(mtp.evaluate(model,previous,ids,i,false,pos).first);
+        if constexpr (Model::is_qwen4) {
+            pos = tb::stack({pos + 10, pos, pos + 2, pos + 4}, 0);
+        }
+        row["axis"]=json_tensor(mtp.evaluate(target,previous,ids,i,false,pos).first);
         mtp.reset();
         for (int64_t other=0;other<int64_t(mtp.lengths.size());++other)
-            if (other!=i) (void)mtp.evaluate(model,previous,ids,other);
-        row["independent"]=json_tensor(mtp.evaluate(model,previous,ids,i).first);
+            if (other!=i) (void)mtp.evaluate(target,previous,ids,other);
+        row["independent"]=json_tensor(mtp.evaluate(target,previous,ids,i).first);
         result["layers"].push_back(std::move(row));
     }
     model.reset(1);tb::Tensor raw;
@@ -52,9 +67,9 @@ static int run_flash_next_mtp_check(Model& model,CudaFlashNextMtp& mtp) {
     std::vector<int64_t> prompt{1,2,3,4,5,6,7},expected,generated;
     model.reset(1);auto current=ids;
     for (int i=0;i<sampling.max_tokens;++i) {
-        auto next=model.next_token(current);expected.push_back(next.item<int64_t>());current=next.reshape({1,1});
+        auto next=model.next_token(current);expected.push_back(next.template item<int64_t>());current=next.reshape({1,1});
     }
-    const auto count=generate_mtp_tokens(model,mtp,prompt,sampling,
+    const auto count=run_mtp_generation<Model::backbone>(model,mtp,prompt,sampling,
         [&](int64_t token) {generated.push_back(token);return true;},{});
     MFQ_RUNTIME_CHECK(count==sampling.max_tokens && generated==expected && mtp.last_cycles>0,
         "Flash-Next MTP greedy tokens disagree with incremental target");
@@ -64,13 +79,13 @@ static int run_flash_next_mtp_check(Model& model,CudaFlashNextMtp& mtp) {
     result["selected_depth"]=mtp.last_stats.selected_depth;
     result["depth_cycles"]=mtp.last_stats.depth_cycles;
     generated.clear();
-    const auto stopped=generate_mtp_tokens(model,mtp,prompt,sampling,
+    const auto stopped=run_mtp_generation<Model::backbone>(model,mtp,prompt,sampling,
         [&](int64_t token) {generated.push_back(token);return generated.size()<3;},{});
     MFQ_RUNTIME_CHECK(stopped==3 && generated==std::vector<int64_t>(expected.begin(),expected.begin()+3),
         "Flash-Next MTP callback emitted extra or incorrect tokens");
     sampling.max_tokens=8;sampling.temperature=.8;sampling.top_k=16;sampling.top_p=.95;
     sampling.presence_penalty=.2;sampling.frequency_penalty=.1;sampling.repetition_penalty=1.05;sampling.seed=20260907;
-    MFQ_RUNTIME_CHECK(generate_mtp_tokens(model,mtp,prompt,sampling,[](int64_t){return true;},{})==8,
+    MFQ_RUNTIME_CHECK(run_mtp_generation<Model::backbone>(model,mtp,prompt,sampling,[](int64_t){return true;},{})==8,
         "Flash-Next stochastic MTP failed to generate requested tokens");
     std::cout<<"flash_next_mtp_check "<<result.dump()<<'\n';return 0;
 }

@@ -8,11 +8,12 @@ import subprocess
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from contextlib import asynccontextmanager, suppress
-from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
+
+from pydantic import BaseModel, ConfigDict, Field, SkipValidation
 
 from mfq.server.backend import (
     BackendDelta,
@@ -41,14 +42,11 @@ from mfq.server.models import (
     UpdateRuntimeInstanceRequest,
 )
 from mfq.server.native import (
-    RuntimeRoute,
     append_native_prefill_chunk_override,
     find_native_runtime_resource,
     native_request_capacity,
     native_runtime_environment,
     native_tokenizer_arguments,
-    python_mlx_runtime_command,
-    resolve_runtime_route,
 )
 
 
@@ -73,19 +71,20 @@ def _job_error(code: str, message: str, *, retryable: bool = False) -> JobExecut
     return JobExecutionError(ErrorDetail(code=code, message=message, retryable=retryable))
 
 
-@dataclass
-class _ManagedRuntime:
+class _Runtime(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
     id: UUID
     artifact: DiscoveredModel
-    process: asyncio.subprocess.Process | subprocess.Popen[bytes]
-    backend: ChatBackend
+    process: SkipValidation[asyncio.subprocess.Process | subprocess.Popen[bytes]]
+    backend: SkipValidation[ChatBackend]
     port: int
     context_size: int
     sampling_defaults: SamplingParams | None = None
     idle_ttl_seconds: int | None = None
     pinned: bool = False
     state: RuntimeInstanceState = RuntimeInstanceState.LOADING
-    started_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    started_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     last_used_at: datetime | None = None
     active_requests: int = 0
     queued_requests: int = 0
@@ -145,8 +144,8 @@ class _LeasedRealtimeConnector:
 
     def __init__(
         self,
-        pool: ManagedRuntimePool,
-        instance: _ManagedRuntime,
+        pool: RuntimePool,
+        instance: _Runtime,
         connector: Any,
     ) -> None:
         self.pool = pool
@@ -188,14 +187,15 @@ class _LeasedRealtimeConnector:
         await self.pool._release_control_lease(self.instance)
 
 
-@dataclass(frozen=True)
-class _CachedLoadFailure:
+class _CachedLoadFailure(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
     artifact_id: str
     detail: ErrorDetail
     failed_at: float
 
 
-class ManagedRuntimePool:
+class RuntimePool:
     """Own local runtime processes while retaining an optional external fallback."""
 
     def __init__(
@@ -215,7 +215,6 @@ class ManagedRuntimePool:
         backend: str = "metal",
         voice_component: Any | None = None,
         runtime_environment: dict[str, str] | None = None,
-        controller_command: Sequence[str] = (),
         startup_loads: Sequence[ModelLoadRequest] = (),
         automatic_memory_budget: bool = True,
         shared_cache_reclaimer: Callable[[], int] | None = None,
@@ -261,7 +260,6 @@ class ManagedRuntimePool:
         self.backend = backend
         self.voice_component = voice_component
         self.runtime_environment = dict(runtime_environment or {})
-        self.controller_command = tuple(str(value) for value in controller_command)
         self._startup_loads = [request.model_copy(deep=True) for request in startup_loads]
         self.shared_cache_reclaimer = shared_cache_reclaimer
         self._shared_cache_reclaims = 0
@@ -269,7 +267,7 @@ class ManagedRuntimePool:
         self._shared_cache_reclaim_failures = 0
         self._shared_cache_pressure_checked_at = 0.0
         self.store = None
-        self._instances: dict[UUID, _ManagedRuntime] = {}
+        self._instances: dict[UUID, _Runtime] = {}
         self._loading_model_names: set[str] = set()
         self._load_events: dict[str, asyncio.Event] = {}
         self._load_errors: dict[str, ErrorDetail] = {}
@@ -383,20 +381,15 @@ class ManagedRuntimePool:
         )
         if active_count >= self.max_instances:
             raise RuntimeConflictError("managed runtime instance limit reached")
-        runtime_route = resolve_runtime_route(
-            artifact.resource.architecture,
-            artifact.path,
-        )
         request_capacity = native_request_capacity(
             backend=self.backend,
-            route=runtime_route,
             routed_expert_bytes=artifact.routed_expert_bytes,
             requested=self.max_requests_per_instance,
         )
         canonical_request = load_request.model_copy(
             update={"model": artifact.resource.name}
         )
-        instance = _ManagedRuntime(
+        instance = _Runtime(
             id=uuid4(),
             artifact=artifact,
             process=process,
@@ -417,7 +410,6 @@ class ManagedRuntimePool:
             reserved_bytes=self._estimated_load_bytes(
                 artifact,
                 canonical_request,
-                runtime_route=runtime_route,
             ),
         )
         self._instances[instance.id] = instance
@@ -446,14 +438,7 @@ class ManagedRuntimePool:
                 ),
                 artifact.resource.error or "model artifact is incomplete",
             )
-        runtime_route = resolve_runtime_route(
-            artifact.resource.architecture,
-            artifact.path,
-        )
-        # Keep the caller's residency intent separate from the decision made
-        # for this launch.  In particular, an automatically selected 0-GiB
-        # (fully resident) cache must not become an explicit setting when an
-        # idle model is later reloaded under a different memory budget.
+        # Automatic residency is recalculated whenever an idle model is restored.
         replay_request = request.model_copy(deep=True)
         async with self._lock:
             if self._closed:
@@ -462,36 +447,17 @@ class ManagedRuntimePool:
         request = self._apply_automatic_expert_residency(
             artifact,
             request,
-            runtime_route=runtime_route,
             memory_ceiling=residency_ceiling,
         )
-        python_mlx_worker = runtime_route.python_mlx_worker
         request_capacity = native_request_capacity(
             backend=self.backend,
-            route=runtime_route,
             routed_expert_bytes=artifact.routed_expert_bytes,
             requested=self.max_requests_per_instance,
         )
-        if python_mlx_worker and self.backend != "metal":
-            raise _job_error(
-                "unsupported_device",
-                "this MFQ model's Python MLX worker currently requires Metal",
-            )
-        if python_mlx_worker and not self.controller_command:
-            raise _job_error(
-                "runtime_launcher_missing",
-                "the Python MLX worker has no MFQ CLI launcher",
-            )
-        if python_mlx_worker and request.moe_gpu_cache_gb not in (None, 0):
-            raise _job_error(
-                "unsupported_runtime_option",
-                "the Python MLX worker does not support SSD-streamed experts",
-            )
         model_name = artifact.resource.name
         incoming_bytes = self._estimated_load_bytes(
             artifact,
             request,
-            runtime_route=runtime_route,
         )
         async with self._lock:
             if self._closed:
@@ -514,7 +480,7 @@ class ManagedRuntimePool:
             additional_bytes=incoming_bytes,
             prospective_model=model_name,
         )
-        evicted: list[_ManagedRuntime] = []
+        evicted: list[_Runtime] = []
         async with self._lock:
             if self._closed:
                 raise RuntimeManagementError("runtime pool is closed")
@@ -648,7 +614,6 @@ class ManagedRuntimePool:
             command, process_environment = self._launch_configuration(
                 artifact,
                 request,
-                runtime_route=runtime_route,
                 port=port,
             )
             await context.progress(0.02, message="Starting runtime process")
@@ -688,7 +653,7 @@ class ManagedRuntimePool:
                 else None
             ),
         )
-        instance = _ManagedRuntime(
+        instance = _Runtime(
             id=uuid4(),
             artifact=artifact,
             process=process,
@@ -1147,7 +1112,7 @@ class ManagedRuntimePool:
 
     @staticmethod
     def _sampling_for_instance(
-        instance: _ManagedRuntime,
+        instance: _Runtime,
         requested: SamplingParams,
     ) -> SamplingParams:
         defaults = instance.sampling_defaults
@@ -1418,7 +1383,7 @@ class ManagedRuntimePool:
 
     async def _activate_realtime_instance(
         self,
-        instance: _ManagedRuntime,
+        instance: _Runtime,
     ) -> dict[str, Any]:
         if not self._supports_voice_output(instance.artifact.resource.architecture):
             return {"active": False, "reason": "model_not_supported"}
@@ -1585,7 +1550,7 @@ class ManagedRuntimePool:
         if first_error is not None:
             raise first_error
 
-    async def _select(self, model: str, *, session_id: UUID | None) -> _ManagedRuntime | None:
+    async def _select(self, model: str, *, session_id: UUID | None) -> _Runtime | None:
         stale_backend: ChatBackend | None = None
         async with self._lock:
             if session_id is not None:
@@ -1627,7 +1592,7 @@ class ManagedRuntimePool:
         return matches[0] if matches else None
 
     @staticmethod
-    def _matches_model(instance: _ManagedRuntime, model: str) -> bool:
+    def _matches_model(instance: _Runtime, model: str) -> bool:
         resource = instance.artifact.resource
         return model == resource.name or model == resource.id
 
@@ -1643,12 +1608,8 @@ class ManagedRuntimePool:
         )
 
     def _begin_runtime_revival(self, model: str) -> bool:
-        """Allow one immediate reload after an unexpected runtime exit.
+        """Allow one immediate reload after an unexpected runtime exit."""
 
-        Returns True at most once per load-failure cooldown window so a
-        runtime that dies again right after revival stays contained instead
-        of spinning reloads on every request.
-        """
         now = time.monotonic()
         last = self._runtime_revival_at.get(model)
         if (
@@ -1663,11 +1624,7 @@ class ManagedRuntimePool:
     async def _ensure_model_loaded_with_revival(
         self,
         model: str,
-    ) -> _ManagedRuntime | None:
-        # An unexpected runtime exit is contained by the load-failure cooldown
-        # so a crashing artifact cannot spin reloads. The retryable flag still
-        # promises clients that a retry succeeds, so allow one immediate
-        # revival per cooldown window when a previously ready runtime died.
+    ) -> _Runtime | None:
         try:
             return await self._ensure_model_loaded(model)
         except BackendError as error:
@@ -1682,7 +1639,7 @@ class ManagedRuntimePool:
                 self._load_errors.pop(model, None)
             return await self._ensure_model_loaded(model)
 
-    async def _ensure_model_loaded(self, model: str) -> _ManagedRuntime | None:
+    async def _ensure_model_loaded(self, model: str) -> _Runtime | None:
         try:
             artifact = await self.catalog.resolve(model)
         except ModelArtifactNotFoundError:
@@ -1763,7 +1720,7 @@ class ManagedRuntimePool:
         self,
         model_name: str,
         artifact: DiscoveredModel,
-    ) -> _ManagedRuntime | None:
+    ) -> _Runtime | None:
         selected = await self._select(model_name, session_id=None)
         if selected is None:
             return None
@@ -1827,7 +1784,7 @@ class ManagedRuntimePool:
         instance_id: UUID | None,
         *,
         allow_unready: bool = False,
-    ) -> AsyncIterator[tuple[_ManagedRuntime | None, ChatBackend | None]]:
+    ) -> AsyncIterator[tuple[_Runtime | None, ChatBackend | None]]:
         async with self._lock:
             if instance_id is None:
                 instance = self._current_instance_locked()
@@ -1862,7 +1819,7 @@ class ManagedRuntimePool:
             if leased and instance is not None:
                 await self._release_control_lease(instance)
 
-    async def _decrement_control_lease(self, instance: _ManagedRuntime) -> None:
+    async def _decrement_control_lease(self, instance: _Runtime) -> None:
         async with self._lock:
             instance.control_leases = max(0, instance.control_leases - 1)
 
@@ -1871,7 +1828,7 @@ class ManagedRuntimePool:
         with suppress(asyncio.CancelledError):
             task.result()
 
-    async def _release_control_lease(self, instance: _ManagedRuntime) -> None:
+    async def _release_control_lease(self, instance: _Runtime) -> None:
         """Release a lease even if its caller is cancelled during cleanup."""
 
         task = asyncio.create_task(
@@ -1889,7 +1846,7 @@ class ManagedRuntimePool:
                 return_exceptions=True,
             )
 
-    def _current_instance_locked(self) -> _ManagedRuntime | None:
+    def _current_instance_locked(self) -> _Runtime | None:
         instance = (
             self._instances.get(self._last_instance_id)
             if self._last_instance_id is not None
@@ -1913,7 +1870,7 @@ class ManagedRuntimePool:
         self,
         *,
         excluded_ids: set[UUID] | None = None,
-    ) -> _ManagedRuntime | None:
+    ) -> _Runtime | None:
         excluded = excluded_ids or set()
         candidates = [
             item
@@ -1933,7 +1890,7 @@ class ManagedRuntimePool:
         )
         return victim
 
-    def _claim_lru_instance_for_unload_locked(self) -> _ManagedRuntime | None:
+    def _claim_lru_instance_for_unload_locked(self) -> _Runtime | None:
         victim = self._lru_instance_for_unload_locked()
         if victim is None:
             return None
@@ -1944,8 +1901,8 @@ class ManagedRuntimePool:
         self,
         *,
         memory_ceiling: int | None = None,
-        pending_releases: Sequence[_ManagedRuntime] = (),
-    ) -> list[_ManagedRuntime]:
+        pending_releases: Sequence[_Runtime] = (),
+    ) -> list[_Runtime]:
         if memory_ceiling is None:
             memory_ceiling = self._effective_runtime_memory_budget_locked()
         if memory_ceiling is None:
@@ -2182,7 +2139,7 @@ class ManagedRuntimePool:
         )
 
     @staticmethod
-    def _committed_runtime_bytes(instance: _ManagedRuntime) -> int:
+    def _committed_runtime_bytes(instance: _Runtime) -> int:
         estimates = [
             value
             for value in (instance.resident_bytes, instance.reserved_bytes)
@@ -2247,19 +2204,11 @@ class ManagedRuntimePool:
         self,
         artifact: DiscoveredModel,
         request: ModelLoadRequest,
-        *,
-        runtime_route: RuntimeRoute | None = None,
     ) -> int:
         total_bytes = artifact.resource.total_bytes
         cache_gb = request.moe_gpu_cache_gb
         streamed_bytes = artifact.routed_expert_bytes
         if streamed_bytes <= 0:
-            return total_bytes
-        route = runtime_route or resolve_runtime_route(
-            artifact.resource.architecture,
-            artifact.path,
-        )
-        if route.python_mlx_worker:
             return total_bytes
         if cache_gb is None:
             if self.backend != "metal" or artifact.resource.format != "hf":
@@ -2282,7 +2231,6 @@ class ManagedRuntimePool:
         artifact: DiscoveredModel,
         request: ModelLoadRequest,
         *,
-        runtime_route: RuntimeRoute,
         memory_ceiling: int | None = None,
     ) -> ModelLoadRequest:
         """Choose native Metal expert residency within the runtime budget."""
@@ -2298,17 +2246,14 @@ class ManagedRuntimePool:
             or ceiling is None
             or artifact.resource.format not in {"hf", "mfq"}
             or artifact.routed_expert_bytes <= 0
-            or runtime_route.python_mlx_worker
         ):
             return request
         if artifact.resource.total_bytes <= ceiling:
-            if artifact.resource.format == "hf":
-                # Native-HF workers interpret an omitted cache budget as
-                # "stream experts".  Make the opposite decision explicit
-                # when the complete checkpoint fits; otherwise a 512-GiB
-                # host needlessly starts a cold SSD LRU for a ~160-GiB MoE.
-                return request.model_copy(update={"moe_gpu_cache_gb": 0.0})
-            return request
+            return (
+                request.model_copy(update={"moe_gpu_cache_gb": 0.0})
+                if artifact.resource.format == "hf"
+                else request
+            )
         dense_bytes = max(
             0,
             artifact.resource.total_bytes - artifact.routed_expert_bytes,
@@ -2356,7 +2301,7 @@ class ManagedRuntimePool:
         observed = max(candidates)
         return observed if observed > 0 else None
 
-    def _unroute_instance_locked(self, instance: _ManagedRuntime) -> None:
+    def _unroute_instance_locked(self, instance: _Runtime) -> None:
         self._session_routes = {
             session_id: instance_id
             for session_id, instance_id in self._session_routes.items()
@@ -2372,11 +2317,11 @@ class ManagedRuntimePool:
                 None,
             )
 
-    def _mark_instance_unloading_locked(self, instance: _ManagedRuntime) -> None:
+    def _mark_instance_unloading_locked(self, instance: _Runtime) -> None:
         instance.state = RuntimeInstanceState.UNLOADING
         self._unroute_instance_locked(instance)
 
-    def _detach_instance_locked(self, instance: _ManagedRuntime) -> None:
+    def _detach_instance_locked(self, instance: _Runtime) -> None:
         self._instances.pop(instance.id, None)
         self._unroute_instance_locked(instance)
 
@@ -2424,7 +2369,7 @@ class ManagedRuntimePool:
                 memory_target_bytes=pressure_target,
             )
 
-            victims: list[tuple[_ManagedRuntime, str]] = []
+            victims: list[tuple[_Runtime, str]] = []
             now = datetime.now(timezone.utc)
             async with self._lock:
                 if self._closed:
@@ -2438,7 +2383,7 @@ class ManagedRuntimePool:
                     and pressure_level == "hard"
                     else None
                 )
-                ttl_victims: list[_ManagedRuntime] = []
+                ttl_victims: list[_Runtime] = []
                 for instance in list(self._instances.values()):
                     if (
                         instance.idle_ttl_seconds is None
@@ -2464,7 +2409,7 @@ class ManagedRuntimePool:
                     )
                 )
             async def retire_victim(
-                instance: _ManagedRuntime,
+                instance: _Runtime,
                 reason: str,
             ) -> None:
                 try:
@@ -2501,7 +2446,7 @@ class ManagedRuntimePool:
                     )
                 )
 
-    async def _retire_instance(self, instance: _ManagedRuntime) -> None:
+    async def _retire_instance(self, instance: _Runtime) -> None:
         """Stop one registered runtime once and detach it only after success."""
 
         async with self._lock:
@@ -2523,7 +2468,7 @@ class ManagedRuntimePool:
         with suppress(asyncio.CancelledError):
             task.exception()
 
-    async def _stop_and_detach_instance(self, instance: _ManagedRuntime) -> None:
+    async def _stop_and_detach_instance(self, instance: _Runtime) -> None:
         try:
             await self._stop_process(instance)
         except BaseException as error:
@@ -2541,7 +2486,7 @@ class ManagedRuntimePool:
             if self._instances.get(instance.id) is instance:
                 self._detach_instance_locked(instance)
 
-    def _schedule_retirement_retry_locked(self, instance: _ManagedRuntime) -> None:
+    def _schedule_retirement_retry_locked(self, instance: _Runtime) -> None:
         if self._closed:
             return
         retry = instance.retirement_retry_task
@@ -2555,7 +2500,7 @@ class ManagedRuntimePool:
         self._background_tasks.add(retry)
         retry.add_done_callback(self._background_task_done)
 
-    async def _retry_retirement(self, instance: _ManagedRuntime) -> None:
+    async def _retry_retirement(self, instance: _Runtime) -> None:
         """Retry a failed teardown until it succeeds or the pool closes."""
 
         while True:
@@ -2579,7 +2524,7 @@ class ManagedRuntimePool:
     def _supports_voice_output(architecture: str) -> bool:
         return "minicpmo" in architecture.casefold()
 
-    async def _pump_output(self, instance: _ManagedRuntime, context: JobContext) -> None:
+    async def _pump_output(self, instance: _Runtime, context: JobContext) -> None:
         process = instance.process
         if isinstance(process, subprocess.Popen):
             return
@@ -2606,7 +2551,7 @@ class ManagedRuntimePool:
                     fields={"source": "runtime.stdout"},
                 )
 
-    async def _monitor(self, instance: _ManagedRuntime) -> None:
+    async def _monitor(self, instance: _Runtime) -> None:
         process = instance.process
         status = (
             await asyncio.to_thread(process.wait)
@@ -2661,7 +2606,7 @@ class ManagedRuntimePool:
             )
         await instance.backend.aclose()
 
-    async def _refresh_instance_usage(self, instance: _ManagedRuntime) -> None:
+    async def _refresh_instance_usage(self, instance: _Runtime) -> None:
         pid = getattr(instance.process, "pid", None)
         resident_task = (
             asyncio.create_task(
@@ -2707,7 +2652,7 @@ class ManagedRuntimePool:
             if kv_bytes is not None:
                 instance.kv_bytes = kv_bytes
 
-    async def _stop_process(self, instance: _ManagedRuntime) -> None:
+    async def _stop_process(self, instance: _Runtime) -> None:
         instance.state = RuntimeInstanceState.UNLOADING
         instance.realtime_gateway = None
         process = instance.process
@@ -2834,54 +2779,38 @@ class ManagedRuntimePool:
         artifact: DiscoveredModel,
         request: ModelLoadRequest,
         *,
-        runtime_route: RuntimeRoute,
         port: int,
     ) -> tuple[list[str], dict[str, str]]:
         request_capacity = native_request_capacity(
             backend=self.backend,
-            route=runtime_route,
             routed_expert_bytes=artifact.routed_expert_bytes,
             requested=self.max_requests_per_instance,
         )
-        if runtime_route.python_mlx_worker:
-            command = python_mlx_runtime_command(
-                self.controller_command,
-                model=artifact.path,
-                model_name=artifact.resource.name,
-                host="127.0.0.1",
-                port=port,
-                context_size=request.context_size,
-                prefill_chunk_size=request.prefill_chunk_size,
+        command = [
+            str(self.executable),
+            "--model",
+            str(artifact.path),
+            "--server",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(port),
+            "--ctx-size",
+            str(request.context_size),
+            "--model-name",
+            artifact.resource.name,
+        ]
+        append_native_prefill_chunk_override(command, request.prefill_chunk_size)
+        if self.backend == "cuda" and request_capacity > 1:
+            command.extend(
+                [
+                    "--continuous-batching",
+                    str(request_capacity),
+                ]
             )
-        else:
-            command = [
-                str(self.executable),
-                "--mfq",
-                str(artifact.path),
-                "--server",
-                "--host",
-                "127.0.0.1",
-                "--port",
-                str(port),
-                "--ctx-size",
-                str(request.context_size),
-                "--model-name",
-                artifact.resource.name,
-            ]
-            append_native_prefill_chunk_override(
-                command,
-                request.prefill_chunk_size,
-            )
-            if self.backend == "cuda" and request_capacity > 1:
-                command.extend(
-                    [
-                        "--continuous-batching",
-                        str(request_capacity),
-                    ]
-                )
-            command.extend(native_tokenizer_arguments(artifact.path, self.backend))
-            if request.moe_gpu_cache_gb is not None:
-                command.extend(["--moe-gpu-cache-gb", str(request.moe_gpu_cache_gb)])
+        command.extend(native_tokenizer_arguments(artifact.path, self.backend))
+        if request.moe_gpu_cache_gb is not None:
+            command.extend(["--moe-gpu-cache-gb", str(request.moe_gpu_cache_gb)])
 
         process_environment = native_runtime_environment(
             self.executable, self.backend, model=artifact.path

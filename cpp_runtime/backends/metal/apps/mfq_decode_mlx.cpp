@@ -116,8 +116,8 @@ Arguments parse_arguments(int argc, char** argv) {
             }
             return argv[index];
         };
-        if (value == "--mfq") {
-            result.mfq = require_value("--mfq");
+        if (value == "--model") {
+            result.mfq = require_value("--model");
         } else if (value == "--tensor") {
             result.tensor = require_value("--tensor");
         } else if (value == "--benchmark-swiglu") {
@@ -232,9 +232,9 @@ Arguments parse_arguments(int argc, char** argv) {
             result.model_name = require_value("--model-name");
         } else if (value == "--api-key") {
             result.api_key = require_value("--api-key");
-        } else if (value == "--tokenizer-gguf") {
+        } else if (value == "--tokenizer") {
             result.tokenizer_gguf =
-                require_value("--tokenizer-gguf");
+                require_value("--tokenizer");
         } else if (value == "--sampling-profile") {
             result.sampling_profile =
                 require_value("--sampling-profile");
@@ -251,16 +251,16 @@ void print_help() {
     std::cout
         << "MFQ native MLX/Metal runtime\n\n"
         << "Usage:\n"
-        << "  mfq-decode-metal --mfq MODEL.mfq --check-mfq-container\n"
-        << "  mfq-decode-metal --mfq MODEL.mfq --list-tensors\n"
-        << "  mfq-decode-metal --mfq MODEL.mfq --tensor NAME\n"
-        << "  mfq-decode-metal --mfq MODEL.mfq --server "
+        << "  mfq-decode-metal --model MODEL.mfq --check-mfq-container\n"
+        << "  mfq-decode-metal --model MODEL.mfq --list-tensors\n"
+        << "  mfq-decode-metal --model MODEL.mfq --tensor NAME\n"
+        << "  mfq-decode-metal --model MODEL.mfq --server "
            "[--host 127.0.0.1 --port 8080]\n"
-        << "  mfq-decode-metal --mfq HF_MODEL_DIR --server "
-           "--tokenizer-gguf TOKENIZER.gguf\n"
+        << "  mfq-decode-metal --model HF_MODEL_DIR --server "
+           "--tokenizer TOKENIZER.gguf\n"
         << "  mfq-decode-metal --self-test-metal\n\n"
         << "Options:\n"
-        << "  --mfq PATH             MFQ model/shard, or an HF Safetensors directory\n"
+        << "  --model PATH           MFQ model/shard, or an HF Safetensors directory\n"
         << "  --check-mfq-container  validate headers, records, and shard set\n"
         << "  --list-tensors         print record dtype, bytes, and name\n"
         << "  --tensor NAME          load and execute one supported linear weight\n"
@@ -281,9 +281,9 @@ void print_help() {
         << "                          capable runtimes may autotune when omitted)\n"
         << "  --moe-gpu-cache-gb N   unified-memory hot-expert cache\n"
         << "                          MFQ default: full residency; HF default: auto\n"
-        << "  --model-name NAME      API model name (default MFQ filename)\n"
+        << "  --model-name NAME      API model name (default model path stem)\n"
         << "  --api-key KEY          optional bearer token\n"
-        << "  --tokenizer-gguf PATH  external tokenizer GGUF when not embedded\n"
+        << "  --tokenizer PATH       external tokenizer GGUF when not embedded\n"
         << "  --sampling-profile P  explicit runtime sampling profile JSON\n";
 }
 
@@ -1971,8 +1971,8 @@ int run_native_server(
     if (!container.contains(tokenizer_asset) &&
         arguments.tokenizer_gguf.empty()) {
         throw std::runtime_error(
-            "MFQ model has no embedded tokenizer.gguf asset; "
-            "pass --tokenizer-gguf PATH");
+            "model has no embedded tokenizer.gguf asset; "
+            "pass --tokenizer PATH");
     }
 
     const auto runtime_stream =
@@ -2271,7 +2271,7 @@ int main(int argc, char** argv) {
         }
         if (arguments.mfq.empty()) {
             if (!arguments.self_test_metal) {
-                usage_error("--mfq is required");
+                usage_error("--model is required");
             }
             return EXIT_SUCCESS;
         }

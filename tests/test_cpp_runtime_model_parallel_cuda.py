@@ -79,7 +79,7 @@ def test_duplicate_rank_tensor_parallel_matches_single_device(
     completed = subprocess.run(
         [
             str(binary),
-            "--mfq",
+            "--model",
             str(model),
             *_duplicate_rank_args("--tensor-parallel", ranks),
             "--check-tp-linear",
@@ -109,7 +109,7 @@ def test_duplicate_rank_expert_ownership_matches_single_device(
     completed = subprocess.run(
         [
             str(binary),
-            "--mfq",
+            "--model",
             str(model),
             *_duplicate_rank_args(option, ranks),
             "--check-ep-moe",
@@ -136,7 +136,7 @@ def test_combined_tensor_and_weighted_expert_parallel(
     completed = subprocess.run(
         [
             str(binary),
-            "--mfq",
+            "--model",
             str(model),
             "--tensor-parallel",
             devices,

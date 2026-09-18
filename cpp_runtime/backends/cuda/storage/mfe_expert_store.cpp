@@ -289,6 +289,10 @@ void MfeMxfp4ExpertStore::read_range_into(
     if (offset > record_.nbytes || nbytes > record_.nbytes - offset) {
         throw std::out_of_range("exact-range read exceeds the MFQ record");
     }
+    if (record_.read_range) {
+        record_.read_range(offset, destination);
+        return;
+    }
     const auto absolute = checked_add(
         record_.offset, offset, "MFQ absolute range offset");
     if (absolute > static_cast<std::uint64_t>(
@@ -438,6 +442,10 @@ struct MfeMxfp4ReadPool::Impl {
         if (part.offset > record.nbytes ||
             part.nbytes > record.nbytes - part.offset) {
             throw std::out_of_range("exact-range read exceeds the MFQ record");
+        }
+        if (record.read_range) {
+            request.store->read_part_into(part, request.destination);
+            return;
         }
         const auto absolute = checked_add(
             record.offset, part.offset, "MFQ absolute range offset");

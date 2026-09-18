@@ -1,88 +1,44 @@
 #pragma once
 
-// Backend-specific optional components are selected only from model_graph.json.
-// The CLI/server consumes this single holder, mirroring Metal's component layer.
-struct CudaRuntimeComponents {
-    mfq::MfqModelGraph graph;
-    mfq::cuda::MfqCudaModelPlan plan;
+#include "causal_lm.h"
+#include "grid_vision_runtime.h"
+#include "mtp.h"
+#include "../models/deepseek_v41/deepseek_v41_dspark.h"
+#include "../models/flash_next/flash_next_mtp.h"
+#include "../models/minicpmo45/minicpmo45_runtime.h"
+#include "../models/qwen35/mtp.h"
+
+#include <memory>
+#include <optional>
+#include <type_traits>
+
+template <typename Model>
+struct RuntimeComponents {
+    mfq::ModelGraph graph;
+    mfq::cuda::CudaModelPlan plan;
     std::optional<MiniCPMO45Runtime> minicpmo;
-    std::unique_ptr<CudaMtpModule> mtp;
+    std::optional<
+        mfq::cuda::grid_vision_runtime::CudaGridVisionPromptComponent>
+        grid_vision;
+    std::unique_ptr<MtpModule> mtp;
     bool vision_available = false;
     bool mtp_available = false;
 
     Model& language(Model& fallback) {
-        return minicpmo ? minicpmo->language : fallback;
+        if constexpr (std::is_same_v<
+                          Model, mfq::cuda::MiniCPMO45CausalLm>) {
+            return minicpmo ? minicpmo->language : fallback;
+        }
+        return fallback;
     }
 
-    mfq::cuda::MfqCudaComponentState state() const noexcept {
-        return mfq::cuda::mfq_cuda_component_state(
+    mfq::cuda::CudaComponentState state() const noexcept {
+        return mfq::cuda::cuda_component_state(
             graph, plan, vision_available, mtp_available);
     }
 };
 
-static CudaRuntimeComponents load_cuda_runtime_components(
-        Model& model,
-        const std::string& mfq_path,
-        bool load_optional_components,
-        const std::string& config_path = {}) {
-    CudaRuntimeComponents result;
-    result.graph = model.c.model_graph;
-    result.plan = model.c.runtime_plan;
-    if (!load_optional_components) return result;
-
-    switch (result.plan.vision) {
-        case mfq::cuda::MfqCudaVisionAdapter::none:
-            break;
-        case mfq::cuda::MfqCudaVisionAdapter::minicpmo45:
-            result.minicpmo.emplace(
-                MiniCPMO45Runtime::load_with_language(
-                    std::move(model), mfq_path));
-            result.vision_available = true;
-            break;
-    }
-    if (result.plan.predictor == mfq::cuda::MfqCudaPredictorAdapter::qwen35) {
-        const bool supported_placement = !g_layer_placement.enabled() &&
-            g_dense_cpu_layer_count == 0 && g_dsv4_cpu_offload_layers.empty() && !g_moe_expert_cache;
-        if (supported_placement && model.c.num_experts == 0 && model.supports_qwen_speculation()) {
-            MfqFile predictor_file(mfq_path);
-            (void)load_config(predictor_file, config_path);
-            auto predictor = CudaQwen35Mtp::load_if_present(predictor_file, model.c);
-            if (predictor) {
-                result.mtp = std::make_unique<CudaQwen35Mtp>(std::move(*predictor));
-            }
-            result.mtp_available = static_cast<bool>(result.mtp);
-        } else {
-            std::cerr << "qwen_mtp unavailable: CUDA adapter requires dense GPU-resident Qwen blocks\n";
-        }
-    }
-    if (result.plan.predictor == mfq::cuda::MfqCudaPredictorAdapter::flash_next) {
-        MFQ_RUNTIME_CHECK(model.c.is_flash_next() && model.supports_qwen_speculation(),
-            "invalid Flash-Next predictor backbone");
-        MfqFile predictor_file(mfq_path);
-        (void)load_config(predictor_file, config_path);
-        auto predictor = CudaFlashNextMtp::load_if_present(predictor_file, model.c);
-        if (predictor) {
-            result.mtp = std::make_unique<CudaFlashNextMtp>(std::move(*predictor));
-        }
-        result.mtp_available = static_cast<bool>(result.mtp);
-    }
-    if (result.plan.predictor ==
-            mfq::cuda::MfqCudaPredictorAdapter::deepseek_v41_dspark) {
-        MFQ_RUNTIME_CHECK(
-            model.c.is_deepseek_v41() &&
-                model.supports_deepseek_v41_speculation(),
-            "invalid DeepSeek-V4.1 DSpark backbone");
-        MfqFile predictor_file(mfq_path);
-        (void)load_config(predictor_file, config_path);
-        auto predictor =
-            mfq::cuda::deepseek_v41_runtime::CudaDeepseekV41Dspark::
-                load_if_present(predictor_file, model.c);
-        if (predictor) {
-            result.mtp = std::make_unique<
-                mfq::cuda::deepseek_v41_runtime::CudaDeepseekV41Dspark>(
-                    std::move(*predictor));
-        }
-        result.mtp_available = static_cast<bool>(result.mtp);
-    }
-    return result;
-}
+template <typename Model>
+RuntimeComponents<Model> load_runtime_components(
+    Model& model,
+    bool load_optional_components);

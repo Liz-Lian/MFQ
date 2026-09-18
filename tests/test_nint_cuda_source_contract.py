@@ -11,9 +11,12 @@ EXTENSION = (ROOT / "mfq/kernels/cuda/_ext.py").read_text()
 CMAKE = (ROOT / "cpp_runtime/cmake/CudaRuntime.cmake").read_text()
 MOE = (ROOT / "mfq/kernels/cuda/moe.cu").read_text()
 MOE_PYTHON = (ROOT / "mfq/kernels/cuda/moe.py").read_text()
-RUNTIME = (
-    ROOT / "cpp_runtime/backends/cuda/apps/mfq_decode.cpp"
-).read_text()
+CUDA_ROOT = ROOT / "cpp_runtime/backends/cuda"
+RUNTIME = "\n".join(
+    path.read_text()
+    for path in sorted(CUDA_ROOT.rglob("*"))
+    if path.suffix in {".h", ".cpp"}
+)
 METAL_NINT = (
     ROOT / "cpp_runtime/backends/metal/ops/mlx_nint.cpp"
 ).read_text()

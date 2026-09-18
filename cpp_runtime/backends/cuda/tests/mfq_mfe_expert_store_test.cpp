@@ -1,5 +1,6 @@
 #include "mfe_expert_store.h"
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <filesystem>
@@ -141,6 +142,31 @@ void test_exact_ranges() {
     }
 }
 
+void test_model_source_ranges() {
+    const auto blob = make_record();
+    mfq::cuda::MfeMxfp4ExpertStore store({
+        "model.block.0.mlp.experts.gate.weight",
+        "MFE",
+        {},
+        0,
+        blob.size(),
+        [&blob](std::uint64_t offset, std::span<std::uint8_t> destination) {
+            std::copy_n(
+                blob.data() + offset, destination.size(), destination.data());
+        },
+    });
+    std::vector<std::uint8_t> values(32);
+    const mfq::cuda::MfeMxfp4ReadRequest request{
+        &store,
+        &store.part(2, mfq::cuda::MfeMxfp4ExpertStore::values),
+        values,
+    };
+    mfq::cuda::MfeMxfp4ReadPool pool(1);
+    const auto stats = pool.read(std::span(&request, 1));
+    require(values.front() == 34, "ModelSource range callback read wrong bytes");
+    require(stats.file_opens == 0, "ModelSource callback opened a physical file");
+}
+
 void test_unsupported_cohort() {
     const auto blob = make_record("NINT4");
     TempFile file(blob);
@@ -273,10 +299,11 @@ void test_concurrent_read_batches() {
 int main() {
     try {
         test_exact_ranges();
+        test_model_source_ranges();
         test_unsupported_cohort();
         test_parallel_read_batch();
         test_concurrent_read_batches();
-        std::cout << "cuda_mfe_expert_store_tests=4 passed=4\n";
+        std::cout << "cuda_mfe_expert_store_tests=5 passed=5\n";
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "cuda_mfe_expert_store_test failure="

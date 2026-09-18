@@ -1,6 +1,16 @@
-// Included by mfq_decode.cpp after the common MTP contract.  DSpark owns its
-// predictor math and ring state; sampling, verification, adaptive depth and
-// accounting remain in the backend-wide CUDA MTP engine.
+#include "deepseek_v41_dspark.h"
+
+#include "../../runtime/causal_lm.h"
+#include "../../runtime/mtp.h"
+#include "deepseek_v41_causal_lm.h"
+
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <memory>
+#include <optional>
+#include <utility>
+#include <vector>
 
 namespace mfq::cuda::deepseek_v41_runtime {
 
@@ -37,9 +47,8 @@ static std::pair<Tensor, Tensor> dspark_full_attention_plan(
     return {std::move(indices), std::move(mask)};
 }
 
-struct CudaDeepseekV41Dspark final : CudaMtpModule {
+struct DeepseekV41Dspark final : MtpModule {
     CommonConfig config;
-    ::Config runtime;
     QuantLinear main_projection;
     Tensor main_norm;
     Tensor output_norm;
@@ -54,8 +63,7 @@ struct CudaDeepseekV41Dspark final : CudaMtpModule {
     std::int64_t position = 0;
 
     static std::unique_ptr<Block> load_stage(
-        const MfqFile& model,
-        const ::Config& runtime,
+        const mfq::ModelSource& model,
         const CommonConfig& config,
         std::int64_t stage) {
         const auto prefix = "predictor.stage." +
@@ -64,7 +72,7 @@ struct CudaDeepseekV41Dspark final : CudaMtpModule {
         result->config = config;
         result->layer = config.n_layers + stage;
         result->ratio = 0;
-        result->max_context = runtime.max_position_embeddings;
+        result->max_context = config.max_position_embeddings;
         result->attention_norm = load_dense_gpu(
             model, prefix + "attention.norm.weight");
         result->mlp_norm = load_dense_gpu(
@@ -113,12 +121,13 @@ struct CudaDeepseekV41Dspark final : CudaMtpModule {
             model, prefix + "attention.output_b.weight");
         result->mlp = load_moe_at(
             model,
-            runtime,
+            config,
             prefix + "mlp.",
             config.n_layers + stage,
             config.dspark_top_k,
             true);
-        result->rope = Dsv4RopeTable(runtime, 0);
+        result->rope = Dsv4RopeTable(
+            config.max_position_embeddings, config.rope_theta, 0);
         result->cuda_device = g_layer_placement.primary_device();
 
         const auto function_width = config.hc_mult * config.hidden;
@@ -168,29 +177,27 @@ struct CudaDeepseekV41Dspark final : CudaMtpModule {
         return result;
     }
 
-    static std::optional<CudaDeepseekV41Dspark> load_if_present(
-        const MfqFile& model,
-        const ::Config& runtime) {
-        const bool root = model.has_record(
+    static std::optional<DeepseekV41Dspark> load_if_present(
+        const mfq::ModelSource& model,
+        const CommonConfig& config) {
+        const bool root = has_tensor(model,
             "predictor.stage.0.main_projection.weight");
         const bool any = root ||
-            model.has_record("predictor.stage.0.attention.query_a.weight") ||
-            model.has_record("predictor.stage.0.mlp.router.weight") ||
-            model.has_record("predictor.stage.0.output_norm.weight");
+            has_tensor(model, "predictor.stage.0.attention.query_a.weight") ||
+            has_tensor(model, "predictor.stage.0.mlp.router.weight") ||
+            has_tensor(model, "predictor.stage.0.output_norm.weight");
         if (!root) {
             MFQ_RUNTIME_CHECK(
                 !any,
-                "DeepSeek-V4.1 MFQ contains an incomplete DSpark head");
+                "DeepSeek-V4.1 model source contains an incomplete DSpark head");
             return std::nullopt;
         }
         MFQ_RUNTIME_CHECK(
-            runtime.is_deepseek_v41() && runtime.deepseek_v41.has_value() &&
-                runtime.deepseek_v41->has_dspark(),
-            "DeepSeek-V4.1 MFQ has DSpark tensors without configuration");
-        CudaDeepseekV41Dspark result;
-        result.config = *runtime.deepseek_v41;
-        result.runtime = runtime;
-        result.maximum_context = runtime.max_position_embeddings;
+            config.has_dspark(),
+            "DeepSeek-V4.1 model source has DSpark tensors without configuration");
+        DeepseekV41Dspark result;
+        result.config = config;
+        result.maximum_context = config.max_position_embeddings;
         const auto first = std::string("predictor.stage.0.");
         const auto last = "predictor.stage." +
             std::to_string(result.config.n_mtp_layers - 1) + ".";
@@ -212,7 +219,7 @@ struct CudaDeepseekV41Dspark final : CudaMtpModule {
              stage < result.config.n_mtp_layers;
              ++stage) {
             result.stages.push_back(load_stage(
-                model, runtime, result.config, stage));
+                model, result.config, stage));
         }
         const auto target_width = result.config.hidden *
             static_cast<std::int64_t>(
@@ -260,7 +267,7 @@ struct CudaDeepseekV41Dspark final : CudaMtpModule {
         position = 0;
     }
 
-    Tensor forward(Model&, Tensor, Tensor) override {
+    Tensor forward(const MtpTarget&, Tensor, Tensor) override {
         throw std::runtime_error(
             "DeepSeek-V4.1 DSpark uses blockwise drafting");
     }
@@ -403,10 +410,10 @@ struct CudaDeepseekV41Dspark final : CudaMtpModule {
         return stage.output_projection(attended);
     }
 
-    CudaMtpBlockDraft draft_block(
-        Model& main,
+    MtpBlockDraft draft_block(
+        const MtpTarget& target,
         Tensor anchor_ids,
-        const CudaMtpTokenSelector& select_token,
+        const MtpTokenSelector& select_token,
         int requested) override {
         const auto physical_width = std::min<std::int64_t>(
             config.dspark_block_size,
@@ -431,7 +438,7 @@ struct CudaDeepseekV41Dspark final : CudaMtpModule {
                      anchor_ids.options())},
                 1).contiguous();
         }
-        auto embedded = main.embed_forward(draft_ids)
+        auto embedded = target.embed(draft_ids)
             .to(mfq_tensor_backend::kFloat16);
         auto hidden = embedded.unsqueeze(2)
             .expand({batch, physical_width, config.hc_mult, config.hidden})
@@ -482,7 +489,7 @@ struct CudaDeepseekV41Dspark final : CudaMtpModule {
                                .sum(2)
                                .to(mfq_tensor_backend::kFloat16)
                                .contiguous();
-        auto base_logits = main.logits_from_hidden(weighted_rms(
+        auto base_logits = target.logits(weighted_rms(
             head_hidden, output_norm, config.rms_eps))
                                .to(mfq_tensor_backend::kFloat32)
                                .contiguous();
@@ -526,7 +533,18 @@ struct CudaDeepseekV41Dspark final : CudaMtpModule {
     }
 };
 
-static void run_dspark_self_check() {
+std::unique_ptr<::MtpModule> load_dspark_if_present(
+        const mfq::ModelSource& source,
+        const CommonConfig& config) {
+    auto predictor = DeepseekV41Dspark::load_if_present(
+        source, config);
+    return predictor
+        ? std::make_unique<DeepseekV41Dspark>(
+              std::move(*predictor))
+        : nullptr;
+}
+
+void run_dspark_self_check() {
     auto plan = dspark_full_attention_plan(
         1,
         2,

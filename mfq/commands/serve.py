@@ -78,26 +78,6 @@ def _byte_size(value: str) -> int:
     return int(number * multipliers[suffix])
 
 
-def _console_script_dir(executable: str | Path) -> Path:
-    return Path(executable).parent
-
-
-def _controller_command() -> tuple[str, ...]:
-    """Command prefix that re-enters this CLI in source and frozen builds."""
-
-    if bool(getattr(sys, "frozen", False)):
-        return (sys.executable,)
-    return (sys.executable, "-m", "mfq.cli")
-
-
-def _environment_paths(name: str) -> list[Path]:
-    return [Path(value) for value in os.environ.get(name, "").split(os.pathsep) if value]
-
-
-def _studio_dir() -> Path:
-    return Path(__file__).resolve().parents[2] / "MFQStudio"
-
-
 def _validate_web_root(path: Path, *, source: str) -> Path:
     root = path.expanduser().resolve()
     if not root.is_dir():
@@ -119,7 +99,7 @@ def _prepare_web_root(configured: Path | None, *, disabled: bool) -> Path | None
             Path(environment_root),
             source="MFQ_SERVER_WEB_ROOT",
         )
-    web_dir = _studio_dir()
+    web_dir = Path(__file__).resolve().parents[2] / "MFQStudio"
     package = web_dir / "package.json"
     output = web_dir / "dist"
     index = output / "index.html"
@@ -244,7 +224,7 @@ def _run(args: argparse.Namespace) -> int:
     from mfq.server.components import VoiceOutputComponent
     from mfq.server.jobs import JobManager
     from mfq.server.models import ModelLoadRequest
-    from mfq.server.runtime_pool import ManagedRuntimePool
+    from mfq.server.runtime_pool import RuntimePool
     from mfq.server.service import ServerService
     from mfq.server.storage import SessionStore
     from mfq.server.tool_jobs import ToolJobHandlers, ToolJobPaths
@@ -279,7 +259,11 @@ def _run(args: argparse.Namespace) -> int:
         )
     configured_roots = [path.expanduser().resolve() for path in args.model_dir]
     if not configured_roots:
-        configured_roots = _environment_paths("MFQ_SERVER_MODEL_DIRS")
+        configured_roots = [
+            Path(value)
+            for value in os.environ.get("MFQ_SERVER_MODEL_DIRS", "").split(os.pathsep)
+            if value
+        ]
     if not configured_roots:
         configured_roots = [data_dir / "models"]
     configured_roots = [path.expanduser().resolve() for path in configured_roots]
@@ -306,7 +290,7 @@ def _run(args: argparse.Namespace) -> int:
                 prefix_cache_block_tokens=args.prefix_cache_block_tokens,
             )
         )
-    runtime_manager = ManagedRuntimePool(
+    runtime_manager = RuntimePool(
         catalog,
         executable,
         startup_timeout_seconds=args.runtime_startup_timeout,
@@ -321,14 +305,13 @@ def _run(args: argparse.Namespace) -> int:
         backend=selected_backend,
         voice_component=voice_component,
         runtime_environment=runtime_environment,
-        controller_command=_controller_command(),
         startup_loads=startup_loads,
         shared_cache_reclaimer=clear_image_decode_cache,
     )
     database_path, media_root = _server_storage_paths(data_dir, args.db)
     store = SessionStore(database_path, media_root=media_root)
     backend = ClusterBackend(runtime_manager, store)
-    binary_dir = _console_script_dir(sys.executable)
+    binary_dir = Path(sys.executable).parent
     perplexity = executable.with_name("mfq-perplexity")
     handlers = ToolJobHandlers(
         catalog,

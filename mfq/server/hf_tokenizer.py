@@ -10,6 +10,7 @@ import struct
 from pathlib import Path
 from typing import Any
 
+from mfq.architectures.hf_config import load_hf_model_config
 from mfq.architectures.tensor_schema import (
     canonical_source_tensor_map,
     graph_spec_for_source_names,
@@ -172,6 +173,7 @@ def _fingerprint(root: Path) -> str:
         (name, path.read_bytes())
         for name in (
             "config.json",
+            "inference/config.json",
             "generation_config.json",
             "tokenizer.json",
             "tokenizer_config.json",
@@ -401,7 +403,10 @@ def ensure_hf_tokenizer_gguf(
 
     tokenizer = _read_json(root / "tokenizer.json")
     tokenizer_config = _read_json(root / "tokenizer_config.json")
-    config = _read_json(root / "config.json")
+    try:
+        config = load_hf_model_config(root)
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as error:
+        raise HfTokenizerError("cannot read model configuration") from error
     generation_path = root / "generation_config.json"
     generation_config = _read_json(generation_path) if generation_path.is_file() else {}
     chat_template_path = root / "chat_template.jinja"
@@ -508,7 +513,10 @@ def native_hf_asset_environment(
     root = Path(model_directory).expanduser().resolve()
     if not root.is_dir():
         return {}
-    config = _read_json(root / "config.json")
+    try:
+        config = load_hf_model_config(root)
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as error:
+        raise HfTokenizerError("cannot read model configuration") from error
     cache_root = (
         Path(cache_directory).expanduser().resolve()
         if cache_directory is not None

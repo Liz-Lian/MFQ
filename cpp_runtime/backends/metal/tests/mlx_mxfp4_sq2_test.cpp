@@ -1,4 +1,5 @@
 #include "mlx_mxfp4_sq.h"
+#include "mlx_grouped_linear.h"
 
 #include <algorithm>
 #include <array>
@@ -378,6 +379,53 @@ void test_adaptive_q1234_dequant_and_small_m() {
                   source_row * static_cast<std::size_t>(fixture.columns)
                   + static_cast<std::size_t>(column)],
           "MXFP4-SQ selected-row payload changed decoded values");
+    }
+  }
+}
+
+void test_projection_group_m1_through_m6() {
+  using namespace mlx::core;
+  const auto first_fixture = make_adaptive_fixture(8, 128);
+  const auto second_fixture = make_fixture(7, 128);
+  const auto first =
+      mfq::metal::MlxMxfp4SqWeight::from_blob(first_fixture.blob);
+  const auto second =
+      mfq::metal::MlxMxfp4SqWeight::from_blob(second_fixture.blob);
+  const mfq::metal::MlxGroupedLinear grouped({&first, &second});
+  require(grouped.uses_zero_copy_storage(),
+          "MXFP4-SQ projection group copied packed storage");
+  require(grouped.copied_packed_nbytes() == 0,
+          "MXFP4-SQ projection group reported a packed copy");
+  require(grouped.supports_single_row_projection_fusion(),
+          "MXFP4-SQ projection group missed decode fusion");
+
+  for (int rows = 1; rows <= 6; ++rows) {
+    std::vector<float> values(static_cast<std::size_t>(rows) * 128);
+    for (std::size_t index = 0; index < values.size(); ++index) {
+      values[index] = static_cast<float>(
+          static_cast<int>((index * 17 + 5) % 43) - 21) / 256.0f;
+    }
+    auto input = astype(array(values.begin(), Shape{rows, 128}), float16);
+    auto actual = grouped(input);
+    std::array<array, 2> expected{
+        first.matmul(input),
+        second.matmul(input),
+    };
+    require(actual.size() == expected.size(),
+            "MXFP4-SQ projection group output count mismatch");
+    for (std::size_t projection = 0; projection < actual.size(); ++projection) {
+      auto difference = contiguous(astype(
+          abs(astype(actual[projection], float32) -
+              astype(expected[projection], float32)),
+          float32));
+      eval(difference);
+      float maximum = 0.0f;
+      for (std::size_t index = 0; index < difference.size(); ++index) {
+        maximum = std::max(maximum, difference.data<float>()[index]);
+      }
+      require(maximum < 2.0e-3f,
+              "MXFP4-SQ projection group M=" + std::to_string(rows) +
+                  " mismatch: max_abs=" + std::to_string(maximum));
     }
   }
 }
@@ -789,6 +837,7 @@ int main() {
   try {
     test_dequantize();
     test_adaptive_q1234_dequant_and_small_m();
+    test_projection_group_m1_through_m6();
     test_fused_gemv();
     test_multirow_buckets();
     test_fp32_multirow_contract();

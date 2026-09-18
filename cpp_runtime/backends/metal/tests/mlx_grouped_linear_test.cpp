@@ -1,4 +1,5 @@
 #include "mlx_grouped_linear.h"
+#include "mlx_tensor.h"
 
 #include "nvq_codebooks.generated.h"
 
@@ -1283,6 +1284,81 @@ int main() {
     try {
         using namespace mlx::core;
 
+        const auto test_dense_projection_batch = [](Dtype dtype) {
+            // DeepSeek-V4 ratio-4 Attention's two compressor pairs and
+            // Indexer score projection use this exact dense geometry.
+            constexpr int inputs = 4096;
+            const std::array<int, 5> widths{1024, 1024, 256, 256, 64};
+            std::vector<mfq::metal::MlxLinear> linears;
+            linears.reserve(widths.size());
+            for (std::size_t projection = 0;
+                 projection < widths.size();
+                 ++projection) {
+                std::vector<float> values(
+                    static_cast<std::size_t>(widths[projection]) * inputs);
+                for (std::size_t index = 0; index < values.size(); ++index) {
+                    values[index] = static_cast<float>(
+                        (index * 13 + projection * 17) % 41 - 20) /
+                        256.0f;
+                }
+                auto weight = contiguous(astype(
+                    array(values.begin(), Shape{widths[projection], inputs}),
+                    dtype));
+                weight.eval();
+                linears.emplace_back(std::move(weight));
+            }
+            std::vector<const mfq::metal::MlxLinear*> references;
+            references.reserve(linears.size());
+            for (const auto& linear : linears) {
+                references.push_back(&linear);
+            }
+            const mfq::metal::MlxProjectionBatch batch(
+                std::move(references));
+            require(
+                batch.grouped_projection_count() == widths.size() &&
+                    batch.projections_share_group(0, widths.size()),
+                "dense projections did not register as one group");
+
+            for (int rows = 1; rows <= 6; ++rows) {
+                std::vector<float> values(
+                    static_cast<std::size_t>(rows) * inputs);
+                for (std::size_t index = 0; index < values.size(); ++index) {
+                    values[index] = static_cast<float>(
+                        (index * 7 + rows * 11) % 37 - 18) /
+                        128.0f;
+                }
+                auto input = contiguous(astype(
+                    array(values.begin(), Shape{rows, inputs}),
+                    dtype));
+                auto actual = batch(input);
+                require(
+                    actual.size() == linears.size(),
+                    "dense grouped projection output count mismatch");
+                for (std::size_t projection = 0;
+                     projection < linears.size();
+                     ++projection) {
+                    auto expected = contiguous(astype(
+                        linears[projection](input), float32));
+                    auto value = contiguous(astype(
+                        actual[projection], float32));
+                    eval(expected, value);
+                    require(
+                        value.shape() == Shape{rows, widths[projection]},
+                        "dense grouped projection shape mismatch");
+                    for (std::size_t index = 0;
+                         index < value.size();
+                         ++index) {
+                        require_close(
+                            value.data<float>()[index],
+                            expected.data<float>()[index],
+                            dtype == bfloat16 ? 0.04f : 0.01f);
+                    }
+                }
+            }
+        };
+        test_dense_projection_batch(float16);
+        test_dense_projection_batch(bfloat16);
+
         std::vector<Fixture> fixtures;
         fixtures.reserve(9);
         std::vector<mfq::metal::MlxNintWeight> nint_weights;
@@ -1294,6 +1370,30 @@ int main() {
                 mfq::metal::MlxNintWeight::from_blob(
                     fixtures.back().blob));
         }
+
+        // A graph-only group spanning the complete list used to mask the
+        // actual NINT projection kernels. The generic projection coordinator
+        // must choose the largest real groups: 3 + 2 + 2 for seven members.
+        std::vector<mfq::metal::MlxLinear> nint_linears;
+        nint_linears.reserve(7);
+        for (int index = 0; index < 7; ++index) {
+            nint_linears.emplace_back(nint_weights[index]);
+        }
+        std::vector<const mfq::metal::MlxLinear*> nint_linear_refs;
+        nint_linear_refs.reserve(nint_linears.size());
+        for (const auto& linear : nint_linears) {
+            nint_linear_refs.push_back(&linear);
+        }
+        const mfq::metal::MlxProjectionBatch nint_projection_batch(
+            std::move(nint_linear_refs));
+        require(
+            nint_projection_batch.grouped_projection_count() == 7 &&
+                nint_projection_batch.projections_share_group(0, 3) &&
+                nint_projection_batch.projections_share_group(3, 2) &&
+                nint_projection_batch.projections_share_group(5, 2) &&
+                !nint_projection_batch.projections_share_group(0, 4) &&
+                !nint_projection_batch.projections_share_group(2, 2),
+            "NINT projection batch retained a graph-only pseudo-group");
         fixtures.push_back(make_q8_fixture(5));
         const auto q8_weight =
             mfq::metal::MlxNint8ZeroWeight::from_blob(

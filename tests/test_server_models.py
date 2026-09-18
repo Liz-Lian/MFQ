@@ -8,6 +8,7 @@ import subprocess
 import sys
 import textwrap
 import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -31,6 +32,7 @@ from mfq.server.catalog import (
 from mfq.server.host_memory import HostMemorySnapshot
 from mfq.server.jobs import JobExecutionError
 from mfq.server.models import (
+    ErrorDetail,
     JobStatus,
     ModelArtifactResource,
     ModelLoadRequest,
@@ -38,7 +40,12 @@ from mfq.server.models import (
     RuntimeInstanceState,
     SamplingParams,
 )
-from mfq.server.runtime_pool import RuntimePool, RuntimeConflictError, _Runtime
+from mfq.server.runtime_pool import (
+    RuntimePool,
+    RuntimeConflictError,
+    _CachedLoadFailure,
+    _Runtime,
+)
 from mfq.server.service import ServerService
 from mfq.server.storage import SessionStore
 from mfq.tools.split_mfq import split_mfq
@@ -279,6 +286,47 @@ def test_startup_models_use_the_managed_load_path(tmp_path: Path) -> None:
             assert remembered.prefix_cache_disk_bytes == 1234
             assert pool._startup_loads == []
         finally:
+            await pool.aclose()
+
+    asyncio.run(run())
+
+
+def test_automatic_expert_residency_is_recomputed_for_later_loads(
+    tmp_path: Path,
+) -> None:
+    async def run() -> None:
+        model = tmp_path / "automatic-residency.mfq"
+        executable = tmp_path / "fake-runtime"
+        _model(model, architecture="qwen35")
+        _fake_runtime(executable)
+        catalog = ModelCatalog([tmp_path], cache_seconds=0)
+        pool = RuntimePool(
+            catalog,
+            executable,
+            startup_timeout_seconds=5,
+        )
+
+        def automatic_residency(
+            _artifact: DiscoveredModel,
+            request: ModelLoadRequest,
+            *,
+            memory_ceiling: int | None = None,
+        ) -> ModelLoadRequest:
+            del memory_ceiling
+            return request.model_copy(update={"moe_gpu_cache_gb": 42.0})
+
+        pool._apply_automatic_expert_residency = (  # type: ignore[method-assign]
+            automatic_residency
+        )
+        context = _TestJobContext()
+        try:
+            await pool.load(
+                context,  # type: ignore[arg-type]
+                {"model": "automatic-residency"},
+            )
+            assert pool._load_requests["automatic-residency"].moe_gpu_cache_gb is None
+        finally:
+            await context.cleanup()
             await pool.aclose()
 
     asyncio.run(run())
@@ -660,6 +708,53 @@ def test_oversized_mfq_moe_gets_an_automatic_metal_expert_budget(
     )
     assert pressure_limited.moe_gpu_cache_gb == 42
     assert pool._estimated_load_bytes(artifact, pressure_limited) == 57 << 30
+
+
+def test_native_hf_moe_uses_the_memory_budget(tmp_path: Path) -> None:
+    model = tmp_path / "native-hf"
+    model.mkdir()
+    artifact = DiscoveredModel(
+        resource=ModelArtifactResource(
+            id="3" * 32,
+            name="native-hf",
+            architecture="deepseek_v4",
+            format="hf",
+            shard_count=16,
+            total_bytes=160 << 30,
+            tensor_count=1,
+            record_count=1,
+            complete=True,
+            loadable=True,
+            modified_at=datetime.now(timezone.utc),
+        ),
+        path=model,
+        routed_expert_bytes=140 << 30,
+    )
+
+    roomy = RuntimePool(
+        ModelCatalog([tmp_path]),
+        tmp_path / "runtime",
+        max_runtime_memory_bytes=506 << 30,
+    )
+    constrained = RuntimePool(
+        ModelCatalog([tmp_path]),
+        tmp_path / "runtime",
+        max_runtime_memory_bytes=120 << 30,
+    )
+
+    full = roomy._apply_automatic_expert_residency(
+        artifact,
+        ModelLoadRequest(model="native-hf"),
+    )
+    bounded = constrained._apply_automatic_expert_residency(
+        artifact,
+        ModelLoadRequest(model="native-hf"),
+    )
+
+    assert full.moe_gpu_cache_gb == 0
+    assert roomy._estimated_load_bytes(artifact, full) == 160 << 30
+    assert bounded.moe_gpu_cache_gb == 96
+    assert constrained._estimated_load_bytes(artifact, bounded) == 116 << 30
 
 
 def test_catalog_loads_registered_external_mfq_files(tmp_path: Path) -> None:
@@ -1227,6 +1322,33 @@ def test_managed_cuda_runtime_connects_explicit_request_concurrency(
         )
 
         assert command[command.index("--continuous-batching") + 1] == "6"
+
+    asyncio.run(run())
+
+
+def test_managed_native_runtime_leaves_default_prefill_chunk_to_model_autotune(
+    tmp_path: Path,
+) -> None:
+    async def run() -> None:
+        model = tmp_path / "tiny.mfq"
+        _model(model, architecture="qwen35")
+        catalog = ModelCatalog([tmp_path], cache_seconds=0)
+        artifact = await catalog.resolve_path(model)
+        pool = RuntimePool(catalog, tmp_path / "mfq-decode-metal", backend="metal")
+
+        automatic, _environment = pool._launch_configuration(
+            artifact,
+            ModelLoadRequest(model="tiny"),
+            port=43123,
+        )
+        explicit, _environment = pool._launch_configuration(
+            artifact,
+            ModelLoadRequest(model="tiny", prefill_chunk_size=4096),
+            port=43124,
+        )
+
+        assert "--prefill-chunk-size" not in automatic
+        assert explicit[explicit.index("--prefill-chunk-size") + 1] == "4096"
 
     asyncio.run(run())
 
@@ -1895,6 +2017,100 @@ def test_unexpected_runtime_exit_is_contained_until_explicit_retry(
         assert contained.value.code == "runtime_exited"
 
     asyncio.run(run())
+
+
+def test_stream_revives_after_unexpected_exit_within_cooldown(
+    tmp_path: Path,
+) -> None:
+    class RevivedBackend:
+        async def aclose(self) -> None:
+            return None
+
+        async def stream(self, **_options: object):
+            yield BackendDelta(content_delta="revived", finish_reason="stop")
+
+    async def run() -> None:
+        _model(tmp_path / "unstable.mfq")
+        catalog = ModelCatalog([tmp_path], cache_seconds=0)
+        artifact = await catalog.resolve("unstable")
+        dead = _Runtime(
+            id=uuid4(),
+            artifact=artifact,
+            process=SimpleNamespace(),  # type: ignore[arg-type]
+            backend=SimpleNamespace(),  # type: ignore[arg-type]
+            port=0,
+            context_size=4096,
+            state=RuntimeInstanceState.FAILED,
+        )
+        pool = RuntimePool(
+            catalog,
+            tmp_path / "runtime",
+            load_failure_cooldown_seconds=60,
+        )
+        pool._instances[dead.id] = dead
+        detail = ErrorDetail(
+            code="runtime_exited",
+            message="runtime process exited with status 9",
+            retryable=True,
+        )
+        pool._load_errors["unstable"] = detail
+        pool._load_failures["unstable"] = _CachedLoadFailure(
+            artifact_id=artifact.resource.id,
+            detail=detail,
+            failed_at=time.monotonic(),
+        )
+        revived = _Runtime(
+            id=uuid4(),
+            artifact=artifact,
+            process=SimpleNamespace(),  # type: ignore[arg-type]
+            backend=RevivedBackend(),  # type: ignore[arg-type]
+            port=0,
+            context_size=4096,
+            state=RuntimeInstanceState.READY,
+            request_slots=asyncio.Semaphore(1),
+        )
+        loads: list[str] = []
+
+        async def fake_load(_context: object, request: object) -> None:
+            model = request.get("model") if isinstance(request, dict) else None
+            loads.append(str(model))
+            pool._instances.pop(dead.id, None)
+            pool._instances[revived.id] = revived
+            pool._load_failures.pop("unstable", None)
+            pool._load_errors.pop("unstable", None)
+
+        pool.load = fake_load  # type: ignore[method-assign]
+
+        deltas = [
+            delta
+            async for delta in pool.stream(
+                model="unstable",
+                messages=[{"role": "user", "content": "hello"}],
+                sampling=SamplingParams(),
+            )
+        ]
+        assert [delta.content_delta for delta in deltas] == ["revived"]
+        assert loads == ["unstable"]
+
+    asyncio.run(run())
+
+
+def test_stream_revival_is_bounded_to_one_per_cooldown_window() -> None:
+    pool = RuntimePool(
+        ModelCatalog([], cache_seconds=0),
+        "missing-runtime",
+        load_failure_cooldown_seconds=60,
+    )
+    assert pool._begin_runtime_revival("unstable")
+    assert not pool._begin_runtime_revival("unstable")
+
+    unbounded = RuntimePool(
+        ModelCatalog([], cache_seconds=0),
+        "missing-runtime",
+        load_failure_cooldown_seconds=0,
+    )
+    assert unbounded._begin_runtime_revival("unstable")
+    assert unbounded._begin_runtime_revival("unstable")
 
 
 def test_request_driven_load_waiters_receive_the_same_startup_error(

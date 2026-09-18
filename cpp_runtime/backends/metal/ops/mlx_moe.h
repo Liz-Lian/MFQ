@@ -209,11 +209,20 @@ public:
         const mlx::core::array& input,
         const mlx::core::array& packed_expert_ids,
         float limit = 0.0f) const;
-    // Decode-only MXFP4 fast path. For one token, project every selected
-    // expert and apply its routing weight in one Metal dispatch, avoiding
-    // the transient [1,routes,hidden] down-projection tensor. Unsupported
-    // shapes and representations transparently use the ordinary projection
-    // followed by moe_weighted_reduce().
+    // Execute independently stored Gate and Up projections without building
+    // a concatenated model-sized pool. Compatible native MXFP4 weights use a
+    // single small-M Metal dispatch; every other representation retains the
+    // exact two-projection fallback.
+    mlx::core::array routed_swiglu_pair(
+        const MlxMfeWeight& up,
+        const mlx::core::array& input,
+        const mlx::core::array& expert_ids,
+        float limit = 0.0f) const;
+    // Decode/small-M MXFP4 fast path. For one through six tokens, project
+    // every selected expert and apply its routing weight in one Metal
+    // dispatch, avoiding the transient [M,routes,hidden] down-projection
+    // tensor. Unsupported shapes and representations transparently use the
+    // ordinary projection followed by moe_weighted_reduce().
     mlx::core::array routed_matmul_reduce(
         const mlx::core::array& input,
         const mlx::core::array& expert_ids,
@@ -341,6 +350,11 @@ public:
     mlx::core::array swiglu_packed(
         const mlx::core::array& input,
         const mlx::core::array& packed_expert_ids,
+        float limit = 0.0f) const;
+    mlx::core::array swiglu_pair(
+        const MlxRoutedLinear& up,
+        const mlx::core::array& input,
+        const mlx::core::array& expert_ids,
         float limit = 0.0f) const;
     mlx::core::array combine(
         const mlx::core::array& input,

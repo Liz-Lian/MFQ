@@ -1234,7 +1234,7 @@ void launch_mxfp4_backward_vec4_small_m(
         cudaStream_t stream) {
     constexpr int kOutputTile = 32;
     const int output_groups = (outputs + kOutputTile - 1) / kOutputTile;
-    auto partials = mfq_tensor_backend::empty(
+    mfq_tensor_backend::Tensor partials = mfq_tensor_backend::empty(
         {output_groups, rows, width},
         values.options().dtype(mfq_tensor_backend::kFloat32));
     const dim3 partial_grid(
@@ -1408,7 +1408,7 @@ void launch_mxfp8_backward_scalar_small_m(
         int width,
         cudaStream_t stream) {
     const int output_groups = (outputs + 127) / 128;
-    auto partials = mfq_tensor_backend::empty(
+    mfq_tensor_backend::Tensor partials = mfq_tensor_backend::empty(
         {output_groups, rows, width},
         values.options().dtype(mfq_tensor_backend::kFloat32));
     const dim3 partial_grid(
@@ -1502,7 +1502,7 @@ void launch_mxfp8_backward_vec4_small_m(
         int width,
         cudaStream_t stream) {
     const int output_groups = (outputs + 31) / 32;
-    auto partials = mfq_tensor_backend::empty(
+    mfq_tensor_backend::Tensor partials = mfq_tensor_backend::empty(
         {output_groups, rows, width},
         values.options().dtype(mfq_tensor_backend::kFloat32));
     const dim3 partial_grid(

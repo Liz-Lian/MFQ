@@ -1,12 +1,17 @@
 #include "mlx_tensor.h"
+#include "mlx_moe_ops.h"
 #include "mlx_reference.h"
+#include "mlx_transformer.h"
 
 #include <mlx/allocator.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstdlib>
 #include <cstdint>
 #include <cstring>
+#include <cmath>
+#include <iterator>
 #include <limits>
 #include <memory>
 #include <span>
@@ -803,6 +808,81 @@ array MlxLinear::grouped_row_matmul(
     return mlx::core::stack(pieces, input.ndim() - 2);
 }
 
+array MlxLinear::grouped_row_matmul_inverse_rope(
+    const array& value,
+    int group_count,
+    const array& cosine,
+    const array& sine,
+    int head_dimension,
+    int rotary_dimension) const {
+    if (value.ndim() != 4 ||
+        group_count <= 0 ||
+        head_dimension <= 0 ||
+        rotary_dimension <= 0 ||
+        rotary_dimension > head_dimension ||
+        rotary_dimension % 2 != 0 ||
+        value.shape(-1) != head_dimension ||
+        value.shape(-2) * head_dimension != group_count * input_size_) {
+        throw std::runtime_error(
+            "inverse-RoPE grouped-row linear shape/group mismatch");
+    }
+    const int batch = value.shape(0);
+    const int tokens = value.shape(1);
+    const auto grouped_shape = Shape{
+        batch,
+        tokens,
+        group_count,
+        input_size_,
+    };
+    auto grouped = mlx::core::reshape(value, grouped_shape);
+
+    if (const auto* packed =
+            std::get_if<MlxNint8ZeroWeight>(&weight_)) {
+        return packed->grouped_row_matmul_inverse_rope(
+            grouped,
+            group_count,
+            cosine,
+            sine,
+            head_dimension,
+            rotary_dimension);
+    }
+    if (const auto* packed = std::get_if<MlxMxWeight>(&weight_)) {
+        const auto rows = static_cast<std::int64_t>(batch) * tokens;
+        const bool block32_eligible =
+            packed->scale_column_block_size() == 32 &&
+            rows == 1 &&
+            value.dtype() == mlx::core::float32;
+        const bool block128_eligible =
+            packed->scale_column_block_size() == 128 &&
+            rows >= 1 && rows <= 6;
+        if (packed->bits() == 8 &&
+            cosine.ndim() == 2 &&
+            cosine.shape(0) == rows &&
+            (block32_eligible || block128_eligible)) {
+            return packed->grouped_row_matmul_inverse_rope(
+                grouped,
+                group_count,
+                cosine,
+                sine,
+                head_dimension,
+                rotary_dimension);
+        }
+    }
+
+    // mlx_rope_adjacent treats rotary_dimension as a suffix width, matching
+    // DeepSeek's decoupled-RoPE layout while preserving the leading content
+    // channels in the same kernel dispatch.
+    auto unrotated = mlx_rope_adjacent(
+        value,
+        rotary_dimension,
+        cosine,
+        sine,
+        true);
+    return grouped_row_matmul(
+        mlx::core::reshape(std::move(unrotated), grouped_shape),
+        group_count);
+}
+
 std::optional<MlxGroupedLinearWeightRef>
 MlxLinear::grouped_weight_ref() const noexcept {
     if (mlx_reference_enabled()) {
@@ -838,13 +918,20 @@ MlxLinear::grouped_weight_ref() const noexcept {
         return MlxGroupedLinearWeightRef{packed};
     }
     if (const auto* packed =
-            std::get_if<MlxMxWeight>(&weight_)) {
-        if (packed->bits() == 8 &&
-            (packed->scale_row_block_size() != 128 ||
-             packed->scale_column_block_size() != 128)) {
-            return std::nullopt;
-        }
+            std::get_if<MlxFp8SqWeight>(&weight_)) {
         return MlxGroupedLinearWeightRef{packed};
+    }
+    if (const auto* packed =
+            std::get_if<MlxMxfp4SqWeight>(&weight_)) {
+        return MlxGroupedLinearWeightRef{packed};
+    }
+    if (const auto* packed =
+            std::get_if<MlxMxWeight>(&weight_)) {
+        return MlxGroupedLinearWeightRef{packed};
+    }
+    if (const auto* dense =
+            std::get_if<array>(&weight_)) {
+        return MlxGroupedLinearWeightRef{dense};
     }
     return std::nullopt;
 }
@@ -872,6 +959,205 @@ void MlxLinear::materialize_fp16() {
     if (std::holds_alternative<array>(weight_)) return;
     auto dense = materialize_weight_fp16(weight_, output_size_);
     weight_ = std::move(dense);
+}
+
+std::optional<MlxGroupedLinear> mlx_group_linears(
+    std::span<const MlxLinear* const> linears) {
+    if (linears.size() < 2) return std::nullopt;
+    std::vector<MlxGroupedLinearWeightRef> references;
+    references.reserve(linears.size());
+    for (const auto* linear : linears) {
+        if (linear == nullptr) return std::nullopt;
+        auto reference = linear->grouped_weight_ref();
+        if (!reference) return std::nullopt;
+        references.push_back(*reference);
+    }
+    try {
+        return MlxGroupedLinear(std::move(references));
+    } catch (const MlxGroupedLinearUnsupported&) {
+        return std::nullopt;
+    }
+}
+
+struct MlxProjectionBatch::Impl {
+    struct Segment {
+        std::size_t begin = 0;
+        std::size_t count = 0;
+        std::optional<MlxGroupedLinear> grouped;
+    };
+
+    explicit Impl(std::vector<const MlxLinear*> sources) {
+        if (sources.empty() || std::any_of(
+                sources.begin(),
+                sources.end(),
+                [](const MlxLinear* linear) {
+                    return linear == nullptr;
+                })) {
+            throw std::invalid_argument(
+                "projection batch requires non-null projections");
+        }
+        linears.reserve(sources.size());
+        for (const auto* source : sources) {
+            linears.push_back(*source);
+        }
+
+        std::vector<const MlxLinear*> references;
+        references.reserve(linears.size());
+        for (const auto& linear : linears) {
+            references.push_back(&linear);
+        }
+
+        std::size_t begin = 0;
+        while (begin < references.size()) {
+            const std::size_t remaining = references.size() - begin;
+            std::optional<MlxGroupedLinear> selected;
+            std::size_t selected_count = 0;
+            for (std::size_t count = remaining; count >= 2; --count) {
+                // Avoid leaving a lone compatible projection when two
+                // balanced groups can cover the same four-member suffix.
+                if (remaining - count == 1 && count > 2) {
+                    continue;
+                }
+                auto candidate = mlx_group_linears(
+                    std::span<const MlxLinear* const>(
+                        references.data() + begin,
+                        count));
+                if (candidate && candidate->has_projection_fusion()) {
+                    selected = std::move(candidate);
+                    selected_count = count;
+                    break;
+                }
+            }
+
+            const std::size_t count = selected ? selected_count : 1;
+            segments.push_back(Segment{
+                .begin = begin,
+                .count = count,
+                .grouped = std::move(selected),
+            });
+            if (segments.back().grouped) {
+                grouped_projection_count += count;
+            }
+            begin += count;
+        }
+    }
+
+    std::vector<MlxLinear> linears;
+    std::vector<Segment> segments;
+    std::size_t grouped_projection_count = 0;
+};
+
+MlxProjectionBatch::MlxProjectionBatch(
+    std::vector<const MlxLinear*> linears)
+    : impl_(std::make_shared<Impl>(std::move(linears))) {}
+
+std::vector<array> MlxProjectionBatch::operator()(
+    const array& input) const {
+    const std::size_t rows =
+        input.ndim() == 0 || input.shape(-1) <= 0
+        ? 0
+        : input.size() /
+            static_cast<std::size_t>(input.shape(-1));
+    std::vector<array> outputs;
+    outputs.reserve(impl_->linears.size());
+    for (const auto& segment : impl_->segments) {
+        const bool use_grouped = segment.grouped &&
+            segment.grouped->supports(input) &&
+            (rows > 1 ||
+             segment.grouped
+                 ->supports_single_row_projection_fusion());
+        if (use_grouped) {
+            auto values = segment.grouped->matmul(input);
+            outputs.insert(
+                outputs.end(),
+                std::make_move_iterator(values.begin()),
+                std::make_move_iterator(values.end()));
+            continue;
+        }
+        for (std::size_t offset = 0;
+             offset < segment.count;
+             ++offset) {
+            outputs.push_back(
+                impl_->linears[segment.begin + offset](input));
+        }
+    }
+    return outputs;
+}
+
+array MlxProjectionBatch::swiglu(
+    const array& input,
+    float limit) const {
+    if (impl_->linears.size() != 2 ||
+        impl_->linears[0].output_size() !=
+            impl_->linears[1].output_size()) {
+        throw std::logic_error(
+            "SwiGLU projection batch requires two equal-width outputs");
+    }
+    if (!std::isfinite(limit) || limit < 0.0f) {
+        throw std::invalid_argument(
+            "SwiGLU projection limit must be finite and non-negative");
+    }
+    if (impl_->segments.size() == 1 &&
+        impl_->segments.front().count == 2 &&
+        impl_->segments.front().grouped) {
+        const auto& grouped = *impl_->segments.front().grouped;
+        if (grouped.supports_single_row_swiglu(input)) {
+            return grouped.single_row_swiglu(input, limit);
+        }
+        if (grouped.supports_small_m_swiglu(input)) {
+            return grouped.small_m_swiglu(input, limit);
+        }
+    }
+    auto projected = (*this)(input);
+    if (limit > 0.0f) {
+        return moe_limited_swiglu_pair(
+            projected.at(0), projected.at(1), limit);
+    }
+    auto gate = std::move(projected.at(0));
+    auto up = std::move(projected.at(1));
+    if (up.dtype() != gate.dtype()) {
+        up = mlx::core::astype(up, gate.dtype());
+    }
+    return gate * mlx::core::sigmoid(gate) * up;
+}
+
+bool MlxProjectionBatch::supports_fused_swiglu(
+    const array& input) const noexcept {
+    if (impl_->linears.size() != 2 ||
+        impl_->segments.size() != 1 ||
+        impl_->segments.front().count != 2 ||
+        !impl_->segments.front().grouped) {
+        return false;
+    }
+    const auto& grouped = *impl_->segments.front().grouped;
+    return grouped.supports_single_row_swiglu(input) ||
+        grouped.supports_small_m_swiglu(input);
+}
+
+std::size_t MlxProjectionBatch::projection_count() const noexcept {
+    return impl_->linears.size();
+}
+
+std::size_t
+MlxProjectionBatch::grouped_projection_count() const noexcept {
+    return impl_->grouped_projection_count;
+}
+
+bool MlxProjectionBatch::projections_share_group(
+    std::size_t begin,
+    std::size_t count) const noexcept {
+    if (count < 2 || begin > impl_->linears.size() ||
+        count > impl_->linears.size() - begin) {
+        return false;
+    }
+    return std::any_of(
+        impl_->segments.begin(),
+        impl_->segments.end(),
+        [begin, count](const Impl::Segment& segment) {
+            return segment.grouped.has_value() &&
+                segment.begin <= begin &&
+                begin + count <= segment.begin + segment.count;
+        });
 }
 
 MlxEmbedding MlxEmbedding::load(

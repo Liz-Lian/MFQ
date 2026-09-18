@@ -47,6 +47,13 @@ public:
     mlx::core::array backward_input(
         const mlx::core::array& output_gradient) const;
 
+    // Projection-fused Q/K/V and gate/up execution.  MXFP8-SQ and FP8-128SQ
+    // remain distinct scale contracts and compile under distinct kernel keys;
+    // grouping never rewrites either packed representation.
+    static std::vector<mlx::core::array> projection_group_matmul(
+        std::span<const MlxFp8SqWeight> weights,
+        const mlx::core::array& input);
+
     const std::string& dtype() const noexcept { return dtype_; }
     int input_size() const noexcept { return layout_.width; }
     int output_size() const noexcept { return layout_.outputs; }

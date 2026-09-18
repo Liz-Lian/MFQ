@@ -42,6 +42,7 @@ from mfq.server.models import (
     UpdateRuntimeInstanceRequest,
 )
 from mfq.server.native import (
+    append_native_prefill_chunk_override,
     find_native_runtime_resource,
     native_request_capacity,
     native_runtime_environment,
@@ -271,6 +272,7 @@ class RuntimePool:
         self._load_events: dict[str, asyncio.Event] = {}
         self._load_errors: dict[str, ErrorDetail] = {}
         self._load_failures: dict[str, _CachedLoadFailure] = {}
+        self._runtime_revival_at: dict[str, float] = {}
         self._loading_artifact_ids: dict[str, str] = {}
         self._load_requests: dict[str, ModelLoadRequest] = {}
         self._reserved_ports: set[int] = set()
@@ -436,6 +438,8 @@ class RuntimePool:
                 ),
                 artifact.resource.error or "model artifact is incomplete",
             )
+        # Automatic residency is recalculated whenever an idle model is restored.
+        replay_request = request.model_copy(deep=True)
         async with self._lock:
             if self._closed:
                 raise RuntimeManagementError("runtime pool is closed")
@@ -781,7 +785,7 @@ class RuntimePool:
                     "runtime exited before model activation completed",
                     retryable=True,
                 )
-            self._load_requests[model_name] = request.model_copy(
+            self._load_requests[model_name] = replay_request.model_copy(
                 update={"model": model_name}
             )
             self._finish_model_load_locked(model_name, load_event, None)
@@ -955,7 +959,7 @@ class RuntimePool:
             await self._wait_for_model_ready(instance.artifact.resource.name)
             instance = await self._select(model, session_id=session_id)
         if instance is None:
-            instance = await self._ensure_model_loaded(model)
+            instance = await self._ensure_model_loaded_with_revival(model)
         if instance is None:
             if self.fallback is None:
                 raise BackendError(
@@ -1017,7 +1021,7 @@ class RuntimePool:
             await self._wait_for_model_ready(instance.artifact.resource.name)
             instance = await self._select(model, session_id=session_id)
         if instance is None:
-            instance = await self._ensure_model_loaded(model)
+            instance = await self._ensure_model_loaded_with_revival(model)
         if instance is None:
             if self.fallback is None:
                 raise BackendError("model_not_loaded", f"model is not loaded: {model}")
@@ -1602,6 +1606,38 @@ class RuntimePool:
             and left.resource.modified_at == right.resource.modified_at
             and left.path == right.path
         )
+
+    def _begin_runtime_revival(self, model: str) -> bool:
+        """Allow one immediate reload after an unexpected runtime exit."""
+
+        now = time.monotonic()
+        last = self._runtime_revival_at.get(model)
+        if (
+            last is not None
+            and self.load_failure_cooldown_seconds > 0
+            and now - last < self.load_failure_cooldown_seconds
+        ):
+            return False
+        self._runtime_revival_at[model] = now
+        return True
+
+    async def _ensure_model_loaded_with_revival(
+        self,
+        model: str,
+    ) -> _Runtime | None:
+        try:
+            return await self._ensure_model_loaded(model)
+        except BackendError as error:
+            if (
+                error.code != "runtime_exited"
+                or not error.retryable
+                or not self._begin_runtime_revival(model)
+            ):
+                raise
+            async with self._lock:
+                self._load_failures.pop(model, None)
+                self._load_errors.pop(model, None)
+            return await self._ensure_model_loaded(model)
 
     async def _ensure_model_loaded(self, model: str) -> _Runtime | None:
         try:
@@ -2197,7 +2233,7 @@ class RuntimePool:
         *,
         memory_ceiling: int | None = None,
     ) -> ModelLoadRequest:
-        """Fit an oversized native MFQ MoE into the Metal residency budget."""
+        """Choose native Metal expert residency within the runtime budget."""
 
         ceiling = (
             memory_ceiling
@@ -2208,11 +2244,16 @@ class RuntimePool:
             request.moe_gpu_cache_gb is not None
             or self.backend != "metal"
             or ceiling is None
-            or artifact.resource.format != "mfq"
+            or artifact.resource.format not in {"hf", "mfq"}
             or artifact.routed_expert_bytes <= 0
-            or artifact.resource.total_bytes <= ceiling
         ):
             return request
+        if artifact.resource.total_bytes <= ceiling:
+            return (
+                request.model_copy(update={"moe_gpu_cache_gb": 0.0})
+                if artifact.resource.format == "hf"
+                else request
+            )
         dense_bytes = max(
             0,
             artifact.resource.total_bytes - artifact.routed_expert_bytes,
@@ -2759,7 +2800,7 @@ class RuntimePool:
             "--model-name",
             artifact.resource.name,
         ]
-        command.extend(["--prefill-chunk-size", str(request.prefill_chunk_size)])
+        append_native_prefill_chunk_override(command, request.prefill_chunk_size)
         if self.backend == "cuda" and request_capacity > 1:
             command.extend(
                 [

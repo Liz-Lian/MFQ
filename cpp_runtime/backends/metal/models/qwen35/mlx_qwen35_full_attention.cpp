@@ -38,21 +38,6 @@ std::optional<MlxRmsNorm> load_optional_norm(
         config.norm_weight_offset);
 }
 
-std::optional<MlxGroupedLinear> make_grouped_linear(
-    std::initializer_list<const MlxLinear*> projections) {
-    std::vector<MlxGroupedLinearWeightRef> weights;
-    weights.reserve(projections.size());
-    for (const auto* projection : projections) {
-        const auto weight =
-            projection->grouped_weight_ref();
-        if (!weight) {
-            return std::nullopt;
-        }
-        weights.push_back(*weight);
-    }
-    return MlxGroupedLinear(std::move(weights));
-}
-
 void validate_position_shape(
     const array& positions,
     int tokens) {
@@ -112,6 +97,7 @@ MlxQwen35DenseSwiGlu::MlxQwen35DenseSwiGlu(
     : gate_(std::move(gate)),
       up_(std::move(up)),
       down_(std::move(down)),
+      gate_up_(std::vector<const MlxLinear*>{&gate_, &up_}),
       important_neurons_(std::move(important_neurons)),
       input_size_(gate_.input_size()),
       intermediate_size_(gate_.output_size()),
@@ -125,7 +111,6 @@ MlxQwen35DenseSwiGlu::MlxQwen35DenseSwiGlu(
         throw std::runtime_error(
             "incompatible Qwen3.5 SwiGLU projection dimensions");
     }
-    gate_up_ = make_grouped_linear({&gate_, &up_});
     if (important_neurons_) {
         if (important_neurons_->input_size() != input_size_ ||
             important_neurons_->output_size() != output_size_) {
@@ -153,35 +138,7 @@ array MlxQwen35DenseSwiGlu::operator()(
 
 array MlxQwen35DenseSwiGlu::forward_branch(
     const array& input) const {
-    // The heterogeneous grouped kernel reduces launch count, but its
-    // descriptor/branching overhead and lower memory throughput make it
-    // slower than two ordinary packed GEMVs for single-token decode. Keep
-    // grouping for multi-row prefill, where launch amortization is useful.
-    const bool use_grouped_rows =
-        detail::qwen35_use_grouped_projection_rows(
-            input.size(), input_size_);
-    if (!use_grouped_rows) {
-        const auto* gate_nint = gate_.nint_weight_ref();
-        const auto* up_nint = up_.nint_weight_ref();
-        if (gate_nint != nullptr &&
-            up_nint != nullptr &&
-            gate_nint->can_fuse_swiglu(*up_nint)) {
-            return down_(
-                gate_nint->swiglu(*up_nint, input));
-        }
-    }
-    if (use_grouped_rows &&
-        gate_up_ &&
-        gate_up_->supports(input)) {
-        auto projected = (*gate_up_)(input);
-        const auto& gate = projected.at(0);
-        const auto& up = projected.at(1);
-        return down_(
-            gate * mlx::core::sigmoid(gate) * up);
-    }
-    const auto gate = gate_(input);
-    const auto up = up_(input);
-    return down_(gate * mlx::core::sigmoid(gate) * up);
+    return down_(gate_up_.swiglu(input));
 }
 
 MlxQwen35FullAttentionBlock
@@ -251,8 +208,11 @@ MlxQwen35FullAttentionBlock::MlxQwen35FullAttentionBlock(
       ffn_norm_(std::move(ffn_norm)),
       ffn_(std::move(ffn)) {
     validate_components();
-    qkv_ = make_grouped_linear(
-        {&query_, &key_, &value_});
+    qkv_.emplace(std::vector<const MlxLinear*>{
+        &query_,
+        &key_,
+        &value_,
+    });
 }
 
 void MlxQwen35FullAttentionBlock::validate_components() const {
@@ -526,23 +486,7 @@ array MlxQwen35FullAttentionBlock::forward_impl(
         static_cast<int>(config_.attention_size());
 
     const auto normalized = attention_norm_(input);
-    std::vector<array> projected;
-    // As with the FFN gate/up pair, the single-row heterogeneous QKV kernel
-    // is bandwidth-limited well below the individual packed GEMVs. Preserve
-    // it for multi-row prefill only.
-    if (detail::qwen35_use_grouped_projection_rows(
-            normalized.size(),
-            static_cast<int>(config_.hidden_size)) &&
-        qkv_ &&
-        qkv_->supports(normalized)) {
-        projected = (*qkv_)(normalized);
-    } else {
-        projected = {
-            query_(normalized),
-            key_(normalized),
-            value_(normalized),
-        };
-    }
+    auto projected = (*qkv_)(normalized);
     auto query_full = std::move(projected.at(0));
     auto key_full = std::move(projected.at(1));
     auto value_full = std::move(projected.at(2));

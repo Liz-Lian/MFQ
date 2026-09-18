@@ -9,10 +9,12 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <utility>
 
 namespace mfq::metal {
@@ -696,6 +698,135 @@ constexpr const char* kMxfp8SmallMExact = R"METAL(
         }
     }
 )METAL";
+
+std::vector<std::string> mxfp8_projection_group_input_names(
+    std::size_t projections) {
+    std::vector<std::string> names;
+    names.reserve(projections * 2 + 1);
+    for (std::size_t projection = 0;
+         projection < projections;
+         ++projection) {
+        const auto suffix = std::to_string(projection);
+        names.push_back("values_" + suffix);
+        names.push_back("scales_" + suffix);
+    }
+    names.emplace_back("x");
+    return names;
+}
+
+std::string make_mxfp8_projection_group_source(
+    std::size_t projections) {
+    std::string source = R"METAL(
+    constexpr uint VALUES_PER_THREAD = 8u;
+    constexpr uint K_BLOCK = VALUES_PER_THREAD * 32u;
+    constexpr uint OUTPUTS_PER_SIMD = 4u;
+    constexpr uint SIMD_GROUPS = 2u;
+    constexpr uint OUTPUTS_PER_TG = OUTPUTS_PER_SIMD * SIMD_GROUPS;
+
+    uint lane = thread_index_in_simdgroup;
+    uint simd_group = simdgroup_index_in_threadgroup;
+    uint global_tile = threadgroup_position_in_grid.y;
+)METAL";
+    for (std::size_t projection = 0;
+         projection < projections;
+         ++projection) {
+        const auto suffix = std::to_string(projection);
+        source += projection == 0 ? "    if (" : "    else if (";
+        source += "global_tile < uint(P" + suffix + "_TILE_END)) {\n";
+        source +=
+            "        uint local_tile = global_tile - uint(P" + suffix
+            + "_TILE_BEGIN);\n"
+              "        uint output_base = local_tile * OUTPUTS_PER_TG"
+              " + simd_group * OUTPUTS_PER_SIMD;\n"
+              "        float accum[M][OUTPUTS_PER_SIMD] = {{0.0f}};\n"
+              "        for (uint k = 0u; k < uint(K); k += K_BLOCK) {\n"
+              "            uint column = k + lane * VALUES_PER_THREAD;\n"
+              "            if (column < uint(K)) {\n"
+              "                half4 activation0[M];\n"
+              "                half4 activation1[M];\n"
+              "                for (uint row = 0u; row < uint(M); ++row) {\n"
+              "                    uint input_base = row * uint(K) + column;\n"
+              "                    activation0[row] = *(device const half4*)"
+              "(x + input_base);\n"
+              "                    activation1[row] = *(device const half4*)"
+              "(x + input_base + 4u);\n"
+              "                }\n"
+              "                for (uint result = 0u;"
+              " result < OUTPUTS_PER_SIMD; ++result) {\n"
+              "                    uint output = output_base + result;\n"
+              "                    if (output >= uint(P" + suffix
+            + "_OUT)) { continue; }\n"
+              "                    uint value_offset = output * uint(K)"
+              " + column;\n"
+              "                    uchar4 code0 = *(device const uchar4*)"
+              "(values_" + suffix + " + value_offset);\n"
+              "                    uchar4 code1 = *(device const uchar4*)"
+              "(values_" + suffix + " + value_offset + 4u);\n"
+              "                    float4 weight0 = float4(\n"
+              "                        mfq_mx_fp8(code0.x),\n"
+              "                        mfq_mx_fp8(code0.y),\n"
+              "                        mfq_mx_fp8(code0.z),\n"
+              "                        mfq_mx_fp8(code0.w));\n"
+              "                    float4 weight1 = float4(\n"
+              "                        mfq_mx_fp8(code1.x),\n"
+              "                        mfq_mx_fp8(code1.y),\n"
+              "                        mfq_mx_fp8(code1.z),\n"
+              "                        mfq_mx_fp8(code1.w));\n"
+              "                    float scale = mfq_mx_e8m0(scales_"
+            + suffix + "[output * (uint(K) / 32u) + column / 32u]);\n"
+              "                    for (uint row = 0u;"
+              " row < uint(M); ++row) {\n"
+              "                        accum[row][result] = fma(scale,\n"
+              "                            dot(float4(activation0[row]), weight0)"
+              " + dot(float4(activation1[row]), weight1),\n"
+              "                            accum[row][result]);\n"
+              "                    }\n"
+              "                }\n"
+              "            }\n"
+              "        }\n"
+              "        for (uint row = 0u; row < uint(M); ++row) {\n"
+              "            for (uint result = 0u;"
+              " result < OUTPUTS_PER_SIMD; ++result) {\n"
+              "                uint output = output_base + result;\n"
+              "                float value = simd_sum(accum[row][result]);\n"
+              "                if (lane == 0u && output < uint(P" + suffix
+            + "_OUT)) {\n"
+              "                    y[row * uint(TOTAL_OUT) + uint(P" + suffix
+            + "_OFFSET) + output] = half(value);\n"
+              "                }\n"
+              "            }\n"
+              "        }\n"
+              "    }\n";
+    }
+    return source;
+}
+
+mlx::core::fast::CustomKernelFunction mxfp8_projection_group_kernel(
+    std::size_t projections) {
+    static std::mutex mutex;
+    static std::unordered_map<
+        std::size_t,
+        mlx::core::fast::CustomKernelFunction> kernels;
+    std::lock_guard<std::mutex> lock(mutex);
+    const auto found = kernels.find(projections);
+    if (found != kernels.end()) {
+        return found->second;
+    }
+    CompileOptions options;
+    options.math_mode = MathMode::Fast;
+    auto kernel = mlx::core::fast::metal_kernel(
+        "mfq_cpp_mxfp8_block32_projection_group_p" +
+            std::to_string(projections),
+        mxfp8_projection_group_input_names(projections),
+        {"y"},
+        make_mxfp8_projection_group_source(projections),
+        kMxHeader,
+        true,
+        false,
+        options);
+    kernels.emplace(projections, kernel);
+    return kernel;
+}
 
 // Diagonal grouped projection for decode and short verifier blocks.
 // The output row selects its diagonal input group, and inverse RoPE is
@@ -1705,6 +1836,122 @@ array MlxMxWeight::matmul(const array& input) const {
         false,
         {});
     return mlx::core::reshape(std::move(outputs.front()), std::move(output_shape));
+}
+
+std::vector<array> MlxMxWeight::projection_group_matmul(
+    std::span<const MlxMxWeight> weights,
+    const array& input) {
+    if (weights.size() < 2 || weights.size() > 14) {
+        throw std::invalid_argument(
+            "MXFP8 projection group requires two through fourteen weights");
+    }
+    const int input_size = weights.front().input_size_;
+    if (input.ndim() == 0 || input.shape(-1) != input_size ||
+        (input.dtype() != mlx::core::float16 &&
+         input.dtype() != mlx::core::bfloat16)) {
+        throw std::invalid_argument(
+            "MXFP8 projection group requires a matching FP16/BF16 input");
+    }
+    const auto rows = input.size() / static_cast<std::size_t>(input_size);
+    if (rows < 1 || rows > 6) {
+        throw std::invalid_argument(
+            "MXFP8 projection group supports one through six rows");
+    }
+
+    std::vector<int> output_sizes;
+    output_sizes.reserve(weights.size());
+    int total_output = 0;
+    int total_tiles = 0;
+    for (const auto& weight : weights) {
+        if (weight.bits_ != 8 || weight.input_size_ != input_size ||
+            weight.mxfp8_scale_column_block_size_ != 32 ||
+            !weight.expanded_mxfp8_scales_.has_value()) {
+            throw std::invalid_argument(
+                "MXFP8 projection group requires native column-32 sidecars");
+        }
+        total_output = checked_dimension(
+            static_cast<std::uint64_t>(total_output) +
+                static_cast<std::uint64_t>(weight.output_size_),
+            "MXFP8 projection-group output width");
+        total_tiles = checked_dimension(
+            static_cast<std::uint64_t>(total_tiles) +
+                static_cast<std::uint64_t>((weight.output_size_ + 7) / 8),
+            "MXFP8 projection-group tile count");
+        output_sizes.push_back(weight.output_size_);
+    }
+
+    Shape prefix(input.shape().begin(), input.shape().end() - 1);
+    const bool preserve_bf16 = input.dtype() == mlx::core::bfloat16;
+    auto source = mlx::core::contiguous(mlx::core::reshape(
+        preserve_bf16
+            ? mlx::core::astype(input, mlx::core::float16)
+            : input,
+        Shape{
+            checked_dimension(rows, "MXFP8 projection-group row count"),
+            input_size,
+        }));
+    std::vector<array> inputs;
+    inputs.reserve(weights.size() * 2 + 1);
+    std::vector<std::pair<std::string, mlx::core::fast::TemplateArg>> arguments{
+        {"M", checked_dimension(rows, "MXFP8 projection-group row count")},
+        {"K", input_size},
+        {"TOTAL_OUT", total_output},
+    };
+    int output_offset = 0;
+    int tile_offset = 0;
+    for (std::size_t projection = 0;
+         projection < weights.size();
+         ++projection) {
+        const auto& weight = weights[projection];
+        const auto name = "P" + std::to_string(projection) + "_";
+        inputs.push_back(weight.values_);
+        inputs.push_back(*weight.expanded_mxfp8_scales_);
+        arguments.emplace_back(name + "OUT", weight.output_size_);
+        arguments.emplace_back(name + "OFFSET", output_offset);
+        arguments.emplace_back(name + "TILE_BEGIN", tile_offset);
+        output_offset += weight.output_size_;
+        tile_offset += (weight.output_size_ + 7) / 8;
+        arguments.emplace_back(name + "TILE_END", tile_offset);
+    }
+    inputs.push_back(std::move(source));
+    auto combined = mxfp8_projection_group_kernel(weights.size())(
+        std::move(inputs),
+        {Shape{
+            checked_dimension(rows, "MXFP8 projection-group row count"),
+            total_output,
+        }},
+        {mlx::core::float16},
+        {32, total_tiles * 2, 1},
+        {32, 2, 1},
+        std::move(arguments),
+        std::nullopt,
+        false,
+        {}).front();
+    if (preserve_bf16) {
+        // Preserve the model boundary once for the whole projection group;
+        // casting every sliced output independently would reintroduce one
+        // dispatch per Q/K/V-like member.
+        combined = mlx::core::astype(combined, mlx::core::bfloat16);
+    }
+
+    std::vector<array> outputs;
+    outputs.reserve(weights.size());
+    int offset = 0;
+    for (const int width : output_sizes) {
+        auto shape = prefix;
+        shape.push_back(width);
+        outputs.push_back(mlx::core::reshape(
+            mlx::core::slice(
+                combined,
+                Shape{0, offset},
+                Shape{
+                    checked_dimension(rows, "MXFP8 projection-group row count"),
+                    offset + width,
+                }),
+            std::move(shape)));
+        offset += width;
+    }
+    return outputs;
 }
 
 array MlxMxWeight::grouped_row_matmul(

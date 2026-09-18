@@ -612,6 +612,31 @@ array scaled_dot_product_attention(
         mask);
 }
 
+array mlx_circular_cache_history(
+    const array& cache,
+    int position) {
+    if (cache.ndim() < 2 || cache.shape(1) <= 0 || position < 0) {
+        throw std::invalid_argument(
+            "invalid circular cache history request");
+    }
+    const int window = cache.shape(1);
+    const int length = std::min(position, window);
+    if (position <= window) {
+        Shape begin(cache.ndim(), 0);
+        Shape end = cache.shape();
+        end[1] = length;
+        return mlx::core::slice(cache, std::move(begin), std::move(end));
+    }
+    auto indices = mlx::core::remainder(
+        mlx::core::arange(
+            position - length,
+            position,
+            1,
+            mlx::core::int32),
+        array(window, mlx::core::int32));
+    return mlx::core::take(cache, indices, 1);
+}
+
 MlxKvCache::MlxKvCache(
     int batch,
     int heads,
@@ -891,6 +916,16 @@ std::pair<array, int> MlxSequenceCache::append(
             Shape{batch_, end, width_}),
         start,
     };
+}
+
+array MlxSequenceCache::view() const {
+    if (!values_) {
+        throw std::runtime_error("MLX sequence cache is not initialized");
+    }
+    return mlx::core::slice(
+        *values_,
+        Shape{0, 0, 0},
+        Shape{batch_, position_, width_});
 }
 
 void MlxSequenceCache::trim(int tokens) {

@@ -391,7 +391,7 @@ void test_attention_copy_move_lifetime_stress() {
             ratio,
             max_context);
 
-        // Reallocation moves the public wrapper while all ProjectionGroup
+        // Reallocation moves the public wrapper while all projection-batch
         // pointers must continue to target the address-stable shared Impl.
         std::vector<MlxDeepseekV4Attention> owners;
         owners.push_back(operation);
@@ -550,9 +550,12 @@ void test_speculative_cache_transaction() {
          }) {
         auto expected_operation = attention(config, layer, ratio, context);
         auto actual_operation = attention(config, layer, ratio, context);
+        auto reference_operation = attention(config, layer, ratio, context);
         auto expected = MlxDeepseekV4LayerState::allocate(
             config, ratio, 1, context);
         auto actual = MlxDeepseekV4LayerState::allocate(
+            config, ratio, 1, context);
+        auto reference = MlxDeepseekV4LayerState::allocate(
             config, ratio, 1, context);
         const std::vector<float> prefix = ratio == 4
             ? std::vector<float>{
@@ -561,8 +564,10 @@ void test_speculative_cache_transaction() {
         const int start = static_cast<int>(prefix.size());
         expected_operation(input_tokens(prefix), expected, 0).eval();
         actual_operation(input_tokens(prefix), actual, 0).eval();
+        reference_operation(input_tokens(prefix), reference, 0).eval();
         materialize_state(expected);
         materialize_state(actual);
+        materialize_state(reference);
 
         actual.begin_speculative(1, 3);
         const auto& checkpoint = actual.speculative_checkpoint();
@@ -580,8 +585,26 @@ void test_speculative_cache_transaction() {
                 "speculative checkpoint copied the indexer pool prefix");
         }
         materialize_state(checkpoint);
-        actual_operation(
-            input_tokens({0.7f, 0.8f, 0.9f}), actual, start).eval();
+        auto speculative_output = actual_operation(
+            input_tokens({0.7f, 0.8f, 0.9f}), actual, start);
+        auto reference_output = reference_operation(
+            input_tokens({0.7f, 0.8f, 0.9f}), reference, start);
+        const auto speculative_values = evaluated_float(speculative_output);
+        require_close(
+            speculative_values,
+            evaluated_float(reference_output),
+            3e-4f,
+            "speculative direct sparse-attention output");
+        materialize_state(actual);
+        actual.restart_speculative_attempt();
+        materialize_state(actual);
+        auto retried_output = actual_operation(
+            input_tokens({0.7f, 0.8f, 0.9f}), actual, start);
+        require_close(
+            evaluated_float(retried_output),
+            speculative_values,
+            3e-4f,
+            "restarted speculative attention output");
         materialize_state(actual);
         actual_operation.rollback_speculative(actual, 1);
         materialize_state(actual);
@@ -1148,6 +1171,47 @@ void test_ratio_four_continuity() {
         "ratio-four index pool continuity");
 }
 
+void test_ratio_four_index_query_projection() {
+    auto config = test_config();
+    config.index_topk = 1;
+    config.validate();
+    auto chunked = attention(config, 1, 4, 8);
+    auto one_shot = attention(config, 1, 4, 8);
+    auto chunked_state = MlxDeepseekV4LayerState::allocate(
+        config, 4, 1, 8);
+    auto one_shot_state = MlxDeepseekV4LayerState::allocate(
+        config, 4, 1, 8);
+    const auto all = input_tokens({
+        0.25f,
+        -0.5f,
+        0.75f,
+        -1.0f,
+        1.25f,
+        -1.5f,
+        1.75f,
+        -2.0f,
+    });
+    std::vector<array> pieces;
+    pieces.reserve(8);
+    for (int token = 0; token < 8; ++token) {
+        pieces.push_back(chunked(
+            token_slice(all, token, token + 1),
+            chunked_state,
+            token));
+    }
+    auto expected = one_shot(all, one_shot_state, 0);
+    require_close(
+        evaluated_float(mlx::core::concatenate(std::move(pieces), 1)),
+        evaluated_float(expected),
+        5e-2f,
+        "ratio-four grouped Indexer query continuity");
+    require(
+        chunked_state.main()->pool_len() == 2 &&
+            chunked_state.indexer()->pool_len() == 2 &&
+            one_shot_state.main()->pool_len() == 2,
+        "ratio-four Indexer query did not cross the sparse threshold");
+}
+
 void test_ratio_128_forward() {
     const auto config = test_config();
     auto operation = attention(
@@ -1463,6 +1527,7 @@ int main() {
         test_local_attention_cpu_reference();
         test_prefill_mma_cpu_reference();
         test_ratio_four_continuity();
+        test_ratio_four_index_query_projection();
         test_ratio_128_forward();
         test_speculative_cache_transaction();
         test_attention_copy_move_lifetime_stress();

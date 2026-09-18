@@ -120,7 +120,7 @@ public:
         return ffn_.uses_grouped_gate_up();
     }
     bool uses_combined_alpha_beta() const noexcept {
-        return alpha_beta_.has_value();
+        return alpha_beta_grouped_;
     }
 
     const std::optional<mlx::core::array>& convolution_state()
@@ -149,6 +149,8 @@ private:
     std::optional<MlxLinear> alpha_;
     std::optional<MlxLinear> beta_;
     std::optional<MlxLinear> alpha_beta_;
+    std::optional<MlxProjectionBatch> input_projections_;
+    bool alpha_beta_grouped_ = false;
     mlx::core::array convolution_weight_;
     std::optional<mlx::core::array> convolution_bias_;
     mlx::core::array dt_bias_;

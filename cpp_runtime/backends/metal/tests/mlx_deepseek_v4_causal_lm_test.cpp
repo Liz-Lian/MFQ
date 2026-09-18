@@ -957,6 +957,9 @@ MlxDeepseekV4CausalLm make_dspark_model(
     auto config = test_config(false, {0, 0, 0});
     config.n_mtp_layers = 1;
     config.dspark_block_size = dspark_block_size;
+    config.sliding_window = std::max(
+        config.sliding_window,
+        static_cast<std::int64_t>(dspark_block_size + 1));
     config.dspark_noise_token_id = kVocab - 1;
     config.dspark_target_layer_ids = {2};
     config.dspark_markov_rank = 4;
@@ -1576,7 +1579,7 @@ void test_dspark_generation_uses_common_mtp_engine() {
             capped_stats.depth_cycles[3] == 0 &&
             capped_stats.depth_cycles[4] == 0 &&
             capped_stats.depth_cycles[5] == 0,
-        "DeepSeek-V4 MTP exceeded its two-position production cap");
+        "DeepSeek-V4 MTP bypassed common adaptive warmup depth");
 
     mfq::metal::MlxSamplingParams penalized = sampling;
     penalized.presence_penalty = 0.2;

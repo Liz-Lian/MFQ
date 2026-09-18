@@ -172,12 +172,15 @@ constexpr double kDepthTimeTauMs = 400.0;
 constexpr double kDepthProbePeriodMs = 1000.0;
 constexpr double kDepthExplorePeriodMs = 5000.0;
 constexpr int kDepthProbeLength = 4;
+constexpr int kDepthTimingWarmupSamples = 3;
 constexpr double kDepthProbeDuty = 0.15;
 constexpr double kDepthProbeMargin = 1.15;
 constexpr double kDepthSpikeRatio = 2.0;
 constexpr double kDepthSpikeDamp = 0.25;
 constexpr double kDepthMarginalMs = 7.0;
 constexpr double kDepthHysteresis = 1.03;
+
+static_assert(kDepthProbeLength >= kDepthTimingWarmupSamples);
 
 } // namespace
 
@@ -198,18 +201,22 @@ MlxMtpDepthController::MlxMtpDepthController(
       cycle_ms_(
           static_cast<std::size_t>(maximum_depth_ + 1)),
       cycle_age_ms_(
+          static_cast<std::size_t>(maximum_depth_ + 1)),
+      timing_warmup_samples_(
+          static_cast<std::size_t>(maximum_depth_ + 1),
+          0),
+      timing_warmup_min_(
           static_cast<std::size_t>(maximum_depth_ + 1)) {
     // Start at two look-ahead positions (or the model's smaller maximum), then
     // pair that probe with a plain-decode baseline. Deeper widths remain in
     // the search space and periodic exploration promotes them when their
     // measured throughput wins; the initial depth is not a hard cap.
-    // Probe the initial depth three times so update_time() can discard both cold
-    // graph shapes seen by recurrent predictors: the first proposal is built
-    // from the prompt state, while the first continuation folds verified
-    // hidden rows before proposing again.  On large models both shapes can
-    // compile independently, so two samples can still leave the controller
-    // with a cold timing and incorrectly pin an otherwise profitable request
-    // to plain decoding.
+    // Probe the initial depth three times so its per-depth timing quarantine
+    // can discard both cold graph shapes seen by recurrent predictors: the
+    // first proposal is built from the prompt state, while the first
+    // continuation folds verified hidden rows before proposing again. Every
+    // later explored depth uses the same quarantine before it can influence
+    // scheduling, so a new JIT shape is never scored as steady-state work.
     warmup_.insert(
         warmup_.end(),
         {current_depth_, current_depth_, current_depth_});
@@ -234,10 +241,11 @@ void MlxMtpDepthController::observe(
         if (!warmup_.empty()) {
             warmup_accepts_[index] += hit > 0.0 ? 1 : 0;
             ++warmup_trials_[index];
-            // Every depth is explicitly probed during warmup. Use those
-            // observations directly; carrying the conservative 0.6 prior
-            // through only one sample per deep position can incorrectly pin
-            // a demonstrably profitable high-acceptance workload at M=1.
+            // The initial draft positions are explicitly observed during
+            // request warmup. Use those observations directly; carrying the
+            // conservative 0.6 prior through only one sample per deep
+            // position can incorrectly pin a demonstrably profitable
+            // high-acceptance workload at M=1.
             estimate = static_cast<double>(warmup_accepts_[index]) /
                 static_cast<double>(warmup_trials_[index]);
         } else {
@@ -328,13 +336,22 @@ std::optional<double> MlxMtpDepthController::measured_cycle_ms(
 void MlxMtpDepthController::update_time(
     int depth,
     double cycle_ms) {
-    auto& estimate = cycle_ms_[static_cast<std::size_t>(depth)];
-    if (!estimate) {
-        estimate = cycle_ms;
+    const auto index = static_cast<std::size_t>(depth);
+    auto& estimate = cycle_ms_[index];
+    auto& warmup_samples = timing_warmup_samples_[index];
+    auto& warmup_min = timing_warmup_min_[index];
+    if (warmup_samples < kDepthTimingWarmupSamples) {
+        warmup_min = warmup_min
+            ? std::min(*warmup_min, cycle_ms)
+            : cycle_ms;
+        ++warmup_samples;
+        if (warmup_samples == kDepthTimingWarmupSamples) {
+            estimate = *warmup_min;
+        }
         return;
     }
-    if (!warmup_.empty()) {
-        *estimate = std::min(*estimate, cycle_ms);
+    if (!estimate) {
+        estimate = cycle_ms;
         return;
     }
     double alpha = 1.0 - std::exp(-cycle_ms / kDepthTimeTauMs);
@@ -718,8 +735,9 @@ std::int32_t run_mlx_mtp_generation(
     MlxMtpGenerationStats& stats) {
     if (request.vocab <= 0 || request.generation_limit <= 0 ||
         request.maximum_context <= 0 ||
-        request.predictor_maximum_depth <= 0 ||
-        request.predictor_maximum_depth > kMlxMtpEngineMaximumDraftDepth ||
+        callbacks.predictor.maximum_depth <= 0 ||
+        callbacks.predictor.maximum_depth >
+            kMlxMtpEngineMaximumDraftDepth ||
         !callbacks.target_cache_position || !callbacks.prepare_draft ||
         !callbacks.verify_target || !callbacks.resolve_target) {
         throw std::invalid_argument("invalid MTP engine configuration");
@@ -820,9 +838,9 @@ std::int32_t run_mlx_mtp_generation(
         (!request.sampling.greedy() && !compact_stochastic)
         ? 1
         : std::min(
-              request.predictor_maximum_depth,
+              callbacks.predictor.maximum_depth,
               std::clamp(request.sampling.mtp_max_draft_tokens, 1, 5));
-    MlxMtpDepthController depth_controller(maximum_depth);
+    MlxMtpDepthController depth_controller(maximum_depth, 2);
 
     auto pending = sample_token(
         request.initial_logits, counts, request.token_constraint);

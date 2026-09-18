@@ -156,21 +156,54 @@ void MlxMxfp4SsdExpertArena::prewarm_metal() {
         std::memset(bytes.data(), 0, bytes.size());
     }
     constexpr std::array<std::int32_t, 1> active{0};
+    constexpr std::array<std::int32_t, 1> packed_active{1 << 8};
+    constexpr std::array<float, 1> unit_route_weight{1.0f};
     const auto& weights = slot_weights();
     const mlx::core::array expert_ids(
         active.data(), Shape{1, 1}, mlx::core::int32);
+    const mlx::core::array packed_expert_ids(
+        packed_active.data(),
+        Shape{1, 1},
+        mlx::core::int32);
+    const mlx::core::array route_weights(
+        unit_route_weight.data(),
+        Shape{1, 1},
+        mlx::core::float32);
+    auto source = mlx::core::zeros(
+        Shape{1, checked_dimension(hidden_size_, "hidden size")},
+        mlx::core::float16);
     auto gate_up = weights.gate_up.swiglu(
-        mlx::core::zeros(
-            Shape{1, checked_dimension(hidden_size_, "hidden size")},
-            mlx::core::float16),
+        source,
         expert_ids,
+        0.0f);
+    auto gate_up_packed = weights.gate_up.swiglu_packed(
+        source,
+        packed_expert_ids,
         0.0f);
     auto down = weights.down.forward(
         mlx::core::zeros(
             Shape{1, checked_dimension(intermediate_size_, "intermediate size")},
             mlx::core::float16),
         expert_ids);
-    mlx::core::eval({std::move(gate_up), std::move(down)});
+    // Decode uses the fused Down+route-reduce operator, and full-residency
+    // route transactions use packed arena IDs. Prewarm those exact variants
+    // as well as the partial-hit standalone Down path so the first request
+    // does not pay one kernel compilation per MoE layer.
+    auto down_reduce = weights.down.combine(
+        gate_up,
+        expert_ids,
+        route_weights);
+    auto down_reduce_packed = weights.down.combine_packed(
+        gate_up_packed,
+        packed_expert_ids,
+        route_weights);
+    mlx::core::eval({
+        std::move(gate_up),
+        std::move(gate_up_packed),
+        std::move(down),
+        std::move(down_reduce),
+        std::move(down_reduce_packed),
+    });
 }
 
 const MlxSsdExpertWeights&

@@ -68,7 +68,13 @@ public:
         const std::optional<mlx::core::array>& image_mask,
         MlxDeepseekV41LayerState& state,
         MlxDeepseekV41SharedAttentionState& shared_attention,
-        int pos0) const;
+        int pos0,
+        MlxSsdPrefetchedExpertLayer* prefetched = nullptr) const;
+
+    std::optional<MlxSsdPrefetchedExpertLayer> prefetch_routed(
+        std::size_t rows) const {
+        return moe_.prefetch_routed(rows);
+    }
 
     std::vector<mlx::core::array> begin_speculative(
         MlxDeepseekV41LayerState& state,
@@ -79,6 +85,13 @@ public:
     std::vector<mlx::core::array> rollback_speculative(
         MlxDeepseekV41LayerState& state,
         int accepted_drafts) const;
+    std::vector<mlx::core::array> begin_route_replay(
+        MlxDeepseekV41LayerState& state,
+        int tokens) const;
+    void commit_route_replay(
+        MlxDeepseekV41LayerState& state) const noexcept;
+    std::vector<mlx::core::array> rollback_route_replay(
+        MlxDeepseekV41LayerState& state) const;
 
     int index() const noexcept { return index_; }
     bool has_engram() const noexcept { return engram_ != nullptr; }

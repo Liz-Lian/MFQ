@@ -317,9 +317,27 @@ bool prefill_autotune_enabled() noexcept {
     return setting != "0" && setting != "false" && setting != "off";
 }
 
+std::optional<std::size_t> native_hf_source_bytes(
+    const mfq::metal::MfqContainer& container) noexcept {
+    std::size_t total = 0;
+    for (const auto& path : container.source_paths()) {
+        std::error_code error;
+        const auto bytes = std::filesystem::file_size(path, error);
+        if (error ||
+            bytes > std::numeric_limits<std::size_t>::max() - total) {
+            return std::nullopt;
+        }
+        total += static_cast<std::size_t>(bytes);
+    }
+    return total > 0
+        ? std::optional<std::size_t>(total)
+        : std::nullopt;
+}
+
 std::size_t requested_cache_bytes(
     const std::optional<double>& cache_gb,
-    bool hf_streaming) {
+    bool hf_streaming,
+    const mfq::metal::MfqContainer& container) {
     constexpr long double bytes_per_gib =
         static_cast<long double>(std::uint64_t{1} << 30);
     if (cache_gb.has_value()) {
@@ -338,11 +356,19 @@ std::size_t requested_cache_bytes(
     if (!hf_streaming) {
         return 0;
     }
-    // Leave one third of UMA for dense weights, KV, the OS, and request
-    // staging. On a 128-GiB machine this gives the expert LRU about 85 GiB.
-    return std::max<std::size_t>(
+    // Raw-HF is not synonymous with SSD streaming.  Keep a checkpoint fully
+    // resident when its complete source fits inside the same conservative
+    // two-thirds-of-UMA envelope used for the expert cache.  This matters for
+    // direct native-server launches, which do not pass through the Python
+    // model pool's more detailed admission controller.
+    const auto automatic_limit = std::max<std::size_t>(
         std::uint64_t{1} << 30,
         physical_memory_bytes() * 2 / 3);
+    const auto source_bytes = native_hf_source_bytes(container);
+    if (source_bytes.has_value() && *source_bytes <= automatic_limit) {
+        return 0;
+    }
+    return automatic_limit;
 }
 
 std::filesystem::path executable_path() {
@@ -1430,6 +1456,12 @@ int serve_loaded_runtime(
     mlx::core::Stream runtime_stream) {
     constexpr const char* tokenizer_asset =
         "__mfq_asset__/tokenizer.gguf";
+    if constexpr (requires(Runtime& value) {
+            value.prewarm_ssd_expert_arena();
+        }) {
+        runtime.prewarm_ssd_expert_arena();
+        release_model_load_staging_memory(runtime_stream);
+    }
     int prefill_chunk_size = arguments.prefill_chunk_size;
     if (!arguments.prefill_chunk_size_explicit &&
         prefill_autotune_enabled()) {
@@ -1638,6 +1670,12 @@ int serve_loaded_runtime(
             try {
                 runtime_holder->emplace(
                     load_runtime(requested_context));
+                if constexpr (requires(Runtime& value) {
+                        value.prewarm_ssd_expert_arena();
+                    }) {
+                    runtime_holder->value()
+                        .prewarm_ssd_expert_arena();
+                }
                 session_cache->replace_paged_cache(
                     paged_cache_factory(requested_context),
                     cache_bytes_from_environment(
@@ -1665,6 +1703,12 @@ int serve_loaded_runtime(
                 try {
                     runtime_holder->emplace(
                         load_runtime(previous_context));
+                    if constexpr (requires(Runtime& value) {
+                            value.prewarm_ssd_expert_arena();
+                        }) {
+                        runtime_holder->value()
+                            .prewarm_ssd_expert_arena();
+                    }
                     session_cache->replace_paged_cache(
                         paged_cache_factory(previous_context),
                         cache_bytes_from_environment(
@@ -1953,7 +1997,7 @@ int run_native_server(
         std::optional<std::size_t> expert_cache_bytes;
         if (arguments.expert_cache_gb.has_value() || native_hf) {
             const auto bytes = requested_cache_bytes(
-                arguments.expert_cache_gb, native_hf);
+                arguments.expert_cache_gb, native_hf, container);
             if (bytes > 0) expert_cache_bytes = bytes;
         }
         std::cout
@@ -1963,7 +2007,6 @@ int run_native_server(
         auto runtime =
             mfq::metal::MlxDeepseekV41CausalLm::load(
                 container, context, expert_cache_bytes);
-        runtime.prewarm_ssd_expert_arena();
         release_model_load_staging_memory(runtime_stream);
         const auto load_seconds =
             std::chrono::duration<double>(
@@ -2013,7 +2056,7 @@ int run_native_server(
         std::optional<std::size_t> expert_cache_bytes;
         if (arguments.expert_cache_gb.has_value() || native_hf) {
             const auto bytes = requested_cache_bytes(
-                arguments.expert_cache_gb, native_hf);
+                arguments.expert_cache_gb, native_hf, container);
             if (bytes > 0) expert_cache_bytes = bytes;
         }
         std::cout
@@ -2122,7 +2165,7 @@ int run_native_server(
         std::optional<std::size_t> expert_cache_bytes;
         if (arguments.expert_cache_gb.has_value() || native_hf) {
             const auto bytes = requested_cache_bytes(
-                arguments.expert_cache_gb, native_hf);
+                arguments.expert_cache_gb, native_hf, container);
             if (bytes > 0) expert_cache_bytes = bytes;
         }
         std::cout
@@ -2132,7 +2175,6 @@ int run_native_server(
         auto runtime =
             mfq::metal::MlxQwen4CausalLm::load(
                 container, context, expert_cache_bytes);
-        runtime.prewarm_ssd_expert_arena();
         release_model_load_staging_memory(runtime_stream);
         const auto load_seconds = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - started).count();

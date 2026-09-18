@@ -203,6 +203,7 @@ AttentionComponents load_attention(
 
 struct RuntimeStage {
     AttentionComponents attention;
+    MlxProjectionBatch input_projections;
     MlxRmsNorm query_norm;
     MlxRmsNorm key_value_norm;
     MlxDeepseekV41Mhc attention_mhc;
@@ -216,6 +217,10 @@ struct RuntimeStage {
         MlxDeepseekV41Moe selected_moe,
         float eps)
         : attention(std::move(selected_attention)),
+          input_projections(std::vector<const MlxLinear*>{
+              &attention.query_a,
+              &attention.key_value,
+          }),
           query_norm(attention.query_norm, eps),
           key_value_norm(attention.key_value_norm, eps),
           attention_mhc(std::move(selected_attention_mhc)),
@@ -467,12 +472,12 @@ struct MlxDeepseekV41DSpark::Impl {
         const int rotary = checked_int(config.rope_head_dim, "rotary width");
         const int groups = checked_int(config.o_groups, "output groups");
         const int rank = checked_int(config.o_lora_rank, "output rank");
+        auto projections = stage.input_projections(input);
         auto query = mlx::core::reshape(
             stage.attention.query_b(
-                stage.query_norm(stage.attention.query_a(input))),
+                stage.query_norm(projections.at(0))),
             Shape{batch, tokens, heads, head_dim});
-        auto key_value = stage.key_value_norm(
-            stage.attention.key_value(input));
+        auto key_value = stage.key_value_norm(projections.at(1));
         auto positions = mlx::core::arange(
             position,
             position + tokens,
@@ -483,27 +488,26 @@ struct MlxDeepseekV41DSpark::Impl {
         query = tail_rope(query, rotary, cosine, sine);
         key_value = tail_rope(key_value, rotary, cosine, sine);
         key_value = mlx_mxfp8_sim(key_value);
-        const int active = std::min(position, ring.shape(1));
-        if (active <= 0) {
+        if (position <= 0) {
             throw std::runtime_error(
                 "DeepSeek-V4.1 DSpark draft requires committed context");
         }
         auto keys = mlx::core::concatenate(
             {
-                slice_axis(ring, 1, 0, active),
+                mlx_circular_cache_history(ring, position),
                 mlx::core::astype(key_value, ring.dtype()),
             },
             1);
         auto attended = full_attention(
             query, keys, stage.attention.sinks);
-        attended = tail_rope(
-            attended, rotary, cosine, sine, true);
-        const int group_input = heads * head_dim / groups;
-        auto grouped = mlx::core::reshape(
+        auto low_rank = stage.attention.output_a
+            .grouped_row_matmul_inverse_rope(
             attended,
-            Shape{batch, tokens, groups, group_input});
-        auto low_rank = stage.attention.output_a.grouped_row_matmul(
-            grouped, groups);
+            groups,
+            cosine,
+            sine,
+            head_dim,
+            rotary);
         return stage.attention.output_b(mlx::core::reshape(
             low_rank,
             Shape{batch, tokens, groups * rank}));

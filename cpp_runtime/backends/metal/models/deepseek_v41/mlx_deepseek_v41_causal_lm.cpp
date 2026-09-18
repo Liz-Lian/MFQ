@@ -6,6 +6,7 @@
 #include "mfe_expert_store.h"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <iterator>
 #include <limits>
@@ -138,7 +139,8 @@ MlxDeepseekV41LayerResult MlxDeepseekV41Layer::forward(
     const std::optional<array>& image_mask,
     MlxDeepseekV41LayerState& state,
     MlxDeepseekV41SharedAttentionState& shared_attention,
-    int pos0) const {
+    int pos0,
+    MlxSsdPrefetchedExpertLayer* prefetched) const {
     if (hidden.ndim() != 4 || hidden.shape(2) != config_.hc_mult ||
         hidden.shape(3) != config_.hidden) {
         throw std::invalid_argument(
@@ -175,7 +177,8 @@ MlxDeepseekV41LayerResult MlxDeepseekV41Layer::forward(
     const auto ffn_residual = value;
     auto ffn_mix = ffn_mhc_.collapse(
         ffn_residual, attention_mix.next_pre);
-    auto ffn_branches = moe_.forward(ffn_mix.branch, image_mask);
+    auto ffn_branches = moe_.forward(
+        ffn_mix.branch, image_mask, prefetched);
     value = ffn_mhc_.expand_sum(
         ffn_branches.routed,
         ffn_branches.shared,
@@ -218,6 +221,22 @@ std::vector<array> MlxDeepseekV41Layer::rollback_speculative(
     int accepted_drafts) const {
     return attention_.rollback_speculative(
         state.attention, accepted_drafts);
+}
+
+std::vector<array> MlxDeepseekV41Layer::begin_route_replay(
+    MlxDeepseekV41LayerState& state,
+    int tokens) const {
+    return attention_.begin_speculative(state.attention, 0, tokens);
+}
+
+void MlxDeepseekV41Layer::commit_route_replay(
+    MlxDeepseekV41LayerState& state) const noexcept {
+    attention_.commit_speculative(state.attention);
+}
+
+std::vector<array> MlxDeepseekV41Layer::rollback_route_replay(
+    MlxDeepseekV41LayerState& state) const {
+    return attention_.rollback_speculative(state.attention, 0);
 }
 
 MlxDeepseekV41CausalLm MlxDeepseekV41CausalLm::load(
@@ -597,26 +616,212 @@ array MlxDeepseekV41CausalLm::forward_impl(
     if (selected_dspark_hidden != nullptr) {
         target_hiddens.resize(config_.dspark_target_layer_ids.size());
     }
-    for (std::size_t index = 0; index < layers_.size(); ++index) {
-        auto result = layers_[index].forward(
-            hidden,
-            previous_pre,
-            &hashes,
-            image_mask,
-            states_[index],
-            shared_attention,
-            cache_position_);
-        hidden = std::move(result.hidden);
-        previous_pre = std::move(result.next_pre);
-        if (selected_dspark_hidden != nullptr) {
-            for (std::size_t target = 0;
-                 target < config_.dspark_target_layer_ids.size();
-                 ++target) {
-                if (config_.dspark_target_layer_ids[target] ==
-                    static_cast<std::int64_t>(index)) {
-                    target_hiddens[target] = result.attention_input;
+    std::array<
+        std::optional<MlxSsdPrefetchedExpertLayer>,
+        2> routed_pipeline;
+    const auto routed_rows = static_cast<std::size_t>(batch) *
+        static_cast<std::size_t>(tokens);
+    if (tokens > 1 && ssd_expert_cache_ && !layers_.empty()) {
+        routed_pipeline[0] = layers_[0].prefetch_routed(routed_rows);
+        if (routed_pipeline[0].has_value() && layers_.size() > 1) {
+            routed_pipeline[1] = layers_[1].prefetch_routed(routed_rows);
+        }
+    }
+    const auto capture_target = [this](
+        std::size_t index,
+        const array& attention_input,
+        std::vector<std::optional<array>>& targets) {
+        if (targets.empty()) return;
+        for (std::size_t target = 0;
+             target < config_.dspark_target_layer_ids.size();
+             ++target) {
+            if (config_.dspark_target_layer_ids[target] ==
+                static_cast<std::int64_t>(index)) {
+                targets[target] = attention_input;
+            }
+        }
+    };
+    const bool route_transaction = ssd_expert_cache_ && tokens == 1 &&
+        !image_mask.has_value() && speculative_cache_start_ < 0 &&
+        mlx_ssd_route_transactions_enabled();
+    if (!route_transaction) {
+        for (std::size_t index = 0; index < layers_.size(); ++index) {
+            auto* prefetched = routed_pipeline[index % 2].has_value()
+                ? &*routed_pipeline[index % 2]
+                : nullptr;
+            auto result = layers_[index].forward(
+                hidden,
+                previous_pre,
+                &hashes,
+                image_mask,
+                states_[index],
+                shared_attention,
+                cache_position_,
+                prefetched);
+            hidden = std::move(result.hidden);
+            previous_pre = std::move(result.next_pre);
+            if (prefetched != nullptr) {
+                routed_pipeline[index % 2].reset();
+                if (index + 2 < layers_.size()) {
+                    routed_pipeline[index % 2] =
+                        layers_[index + 2].prefetch_routed(routed_rows);
                 }
             }
+            capture_target(index, result.attention_input, target_hiddens);
+        }
+    } else {
+        const bool force_transactions =
+            mlx_ssd_force_route_transactions();
+        const auto group_layers = static_cast<std::size_t>(
+            mlx_ssd_route_transaction_group_layers(
+                static_cast<int>(layers_.size())));
+        std::size_t group_begin = 0;
+        while (group_begin < layers_.size()) {
+            if (!force_transactions &&
+                !ssd_expert_cache_->route_layer_likely_hit(group_begin)) {
+                auto result = layers_[group_begin].forward(
+                    hidden,
+                    previous_pre,
+                    &hashes,
+                    image_mask,
+                    states_[group_begin],
+                    shared_attention,
+                    cache_position_);
+                hidden = std::move(result.hidden);
+                previous_pre = std::move(result.next_pre);
+                capture_target(
+                    group_begin,
+                    result.attention_input,
+                    target_hiddens);
+                ++group_begin;
+                continue;
+            }
+            auto group_end = std::min(
+                layers_.size(), group_begin + group_layers);
+            for (std::size_t index = group_begin + 1;
+                 index < group_end;
+                 ++index) {
+                if (!force_transactions &&
+                    !ssd_expert_cache_->route_layer_likely_hit(index)) {
+                    group_end = index;
+                    break;
+                }
+            }
+            const auto hidden_checkpoint = hidden;
+            const auto previous_pre_checkpoint = previous_pre;
+            const auto shared_attention_checkpoint = shared_attention;
+            const auto target_checkpoint = target_hiddens;
+            std::vector<std::optional<MlxSsdPreparedExperts>> pins(
+                group_end - group_begin);
+            bool completed = false;
+            for (std::size_t attempt = 0;
+                 attempt <= group_end - group_begin;
+                 ++attempt) {
+                std::vector<array> backups;
+                try {
+                    for (std::size_t index = group_begin;
+                         index < group_end;
+                         ++index) {
+                        auto values = layers_[index].begin_route_replay(
+                            states_[index], tokens);
+                        backups.insert(
+                            backups.end(),
+                            std::make_move_iterator(values.begin()),
+                            std::make_move_iterator(values.end()));
+                    }
+                    detail::eval_with_timing(std::move(backups));
+                    ssd_expert_cache_->begin_route_transaction();
+                    auto trial_hidden = hidden_checkpoint;
+                    auto trial_previous_pre = previous_pre_checkpoint;
+                    auto trial_shared_attention =
+                        shared_attention_checkpoint;
+                    auto trial_targets = target_checkpoint;
+                    for (std::size_t index = group_begin;
+                         index < group_end;
+                         ++index) {
+                        auto result = layers_[index].forward(
+                            trial_hidden,
+                            trial_previous_pre,
+                            &hashes,
+                            image_mask,
+                            states_[index],
+                            trial_shared_attention,
+                            cache_position_);
+                        trial_hidden = std::move(result.hidden);
+                        trial_previous_pre = std::move(result.next_pre);
+                        capture_target(
+                            index,
+                            result.attention_input,
+                            trial_targets);
+                    }
+                    detail::eval_with_timing(trial_hidden);
+                    auto transaction =
+                        ssd_expert_cache_->resolve_route_transaction();
+                    if (transaction.all_hit) {
+                        for (std::size_t index = group_begin;
+                             index < group_end;
+                             ++index) {
+                            layers_[index].commit_route_replay(
+                                states_[index]);
+                        }
+                        hidden = std::move(trial_hidden);
+                        previous_pre = std::move(trial_previous_pre);
+                        shared_attention =
+                            std::move(trial_shared_attention);
+                        target_hiddens = std::move(trial_targets);
+                        pins.clear();
+                        ssd_expert_cache_->release_deferred();
+                        completed = true;
+                        break;
+                    }
+                    std::vector<array> restored;
+                    for (std::size_t index = group_begin;
+                         index < group_end;
+                         ++index) {
+                        auto values = layers_[index].rollback_route_replay(
+                            states_[index]);
+                        restored.insert(
+                            restored.end(),
+                            std::make_move_iterator(values.begin()),
+                            std::make_move_iterator(values.end()));
+                    }
+                    detail::eval_with_timing(std::move(restored));
+                    for (const auto& route : transaction.routes) {
+                        auto prepared = ssd_expert_cache_->prepare(
+                            route.layer,
+                            route.experts);
+                        pins.at(route.layer - group_begin).emplace(
+                            std::move(prepared));
+                    }
+                    ssd_expert_cache_->release_deferred();
+                } catch (...) {
+                    ssd_expert_cache_->cancel_route_transaction();
+                    for (std::size_t index = group_begin;
+                         index < group_end;
+                         ++index) {
+                        if (states_[index].attention.speculation) {
+                            try {
+                                auto restored =
+                                    layers_[index].rollback_route_replay(
+                                        states_[index]);
+                                detail::eval_with_timing(
+                                    std::move(restored));
+                            } catch (...) {
+                            }
+                        }
+                    }
+                    pins.clear();
+                    ssd_expert_cache_->release_deferred();
+                    throw;
+                }
+            }
+            if (!completed) {
+                pins.clear();
+                ssd_expert_cache_->release_deferred();
+                throw std::runtime_error(
+                    "DeepSeek-V4.1 SSD route group did not converge");
+            }
+            group_begin = group_end;
         }
     }
     auto collapsed = mlx::core::sum(
@@ -885,6 +1090,7 @@ std::int32_t MlxDeepseekV41CausalLm::generate_from_prefill(
     };
     if (mtp_active) {
         MlxMtpEngineCallbacks callbacks;
+        callbacks.predictor = dspark_->mtp_descriptor();
         callbacks.target_cache_position = [this] {
             return cache_position_;
         };
@@ -968,7 +1174,6 @@ std::int32_t MlxDeepseekV41CausalLm::generate_from_prefill(
                 vocab,
                 limit,
                 max_context_,
-                dspark_->block_size(),
                 logits,
                 sampling,
                 counts,

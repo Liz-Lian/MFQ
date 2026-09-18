@@ -69,6 +69,10 @@ public:
     void trim_cache_to(int position);
     void clear_cache() noexcept;
     int cache_position() const noexcept;
+    MlxMtpPredictorDescriptor mtp_descriptor() const noexcept {
+        return MlxMtpPredictorDescriptor::recurrent(
+            kMlxMtpEngineMaximumDraftDepth);
+    }
     std::size_t layer_count() const noexcept {
         return layers_.size();
     }

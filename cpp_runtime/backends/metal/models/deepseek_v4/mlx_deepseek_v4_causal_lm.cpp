@@ -37,30 +37,6 @@ constexpr int kConnections = 4;
 constexpr int kHcProjectionWidth =
     2 * kConnections + kConnections * kConnections;
 
-bool ssd_route_transactions_enabled(bool safe_default) noexcept {
-    const char* value = std::getenv(
-        "MFQ_SSD_DEVICE_ROUTE_TRANSACTION");
-    if (value == nullptr) return safe_default;
-    const auto setting = std::string_view(value);
-    return setting != "0"
-        && setting != "false"
-        && setting != "off";
-}
-
-int ssd_route_transaction_layers() noexcept {
-    const char* value = std::getenv("MFQ_SSD_DEVICE_ROUTE_GROUP");
-    if (value == nullptr) {
-        return 4;
-    }
-    return std::clamp(std::atoi(value), 1, 43);
-}
-
-bool force_ssd_route_transactions() noexcept {
-    const char* value = std::getenv(
-        "MFQ_SSD_DEVICE_ROUTE_FORCE_TRANSACTION");
-    return value != nullptr && std::string_view(value) != "0";
-}
-
 int resident_prefill_eval_group_layers() noexcept {
     const char* value = std::getenv(
         "MFQ_DSV4_PREFILL_EVAL_GROUP");
@@ -1021,6 +997,10 @@ MlxDeepseekV4CausalLm::MlxDeepseekV4CausalLm(
           std::move(expert_offload)),
       ssd_expert_cache_(
           std::move(ssd_expert_cache)),
+      expert_backend_(
+          expert_offload_ || ssd_expert_cache_
+              ? ExpertBackend::streaming
+              : ExpertBackend::resident),
       vision_(std::move(vision)),
       dspark_(std::move(dspark)),
       max_context_(max_context),
@@ -1040,6 +1020,11 @@ void MlxDeepseekV4CausalLm::validate_components() const {
         kConnections,
         hidden,
         "hyper-connection width");
+    const bool streaming_backend =
+        expert_backend_ == ExpertBackend::streaming;
+    const bool has_streaming_provider =
+        static_cast<bool>(expert_offload_)
+        || static_cast<bool>(ssd_expert_cache_);
     if (max_context_ <= 0 ||
         max_context_ >
             config_.max_position_embeddings ||
@@ -1055,6 +1040,8 @@ void MlxDeepseekV4CausalLm::validate_components() const {
         hc_head_fn_.output_size() != kConnections ||
         hc_head_base_.size() != kConnections ||
         hc_head_scale_.size() != 1 ||
+        streaming_backend != has_streaming_provider ||
+        (expert_offload_ && ssd_expert_cache_) ||
         vision_.has_value() != config_.has_vision() ||
         (dspark_.has_value() && !config_.has_dspark()) ||
         layers_.size() !=
@@ -1177,6 +1164,258 @@ void MlxDeepseekV4CausalLm::materialize_states(
         append_state_arrays(state, arrays);
     }
     detail::eval_with_timing(std::move(arrays));
+}
+
+void MlxDeepseekV4CausalLm::materialize_layer_range(
+    const array& hidden,
+    std::size_t begin,
+    std::size_t end) const {
+    if (begin > end || end > states_.size()) {
+        throw std::logic_error(
+            "invalid DeepSeek-V4 layer materialization range");
+    }
+    std::vector<array> outputs{hidden};
+    outputs.reserve(1 + (end - begin) * 12);
+    for (std::size_t index = begin; index < end; ++index) {
+        append_state_arrays(states_[index], outputs);
+    }
+    detail::eval_with_timing(std::move(outputs));
+}
+
+void MlxDeepseekV4CausalLm::capture_dspark_target(
+    std::size_t layer,
+    const array& hidden,
+    std::vector<std::optional<array>>* targets) const {
+    if (targets == nullptr) {
+        return;
+    }
+    for (std::size_t target = 0;
+         target < config_.dspark_target_layer_ids.size();
+         ++target) {
+        if (config_.dspark_target_layer_ids[target] ==
+            static_cast<std::int64_t>(layer)) {
+            targets->at(target) = mlx::core::mean(hidden, 2);
+        }
+    }
+}
+
+array MlxDeepseekV4CausalLm::forward_resident_layers(
+    array hidden,
+    const array& token_ids,
+    int pos0,
+    const MlxDeepseekV4ImageVisibility* visibility,
+    std::vector<std::optional<array>>* targets,
+    bool eager_layer_materialization) {
+    const bool grouped_prefill =
+        eager_layer_materialization
+        && targets == nullptr
+        && visibility == nullptr
+        && !detail::component_profile_active();
+    const int eval_group = grouped_prefill
+        ? resident_prefill_eval_group_layers()
+        : 1;
+    std::size_t eval_begin = 0;
+    for (std::size_t index = 0; index < layers_.size(); ++index) {
+        hidden = layers_[index].forward(
+            hidden,
+            token_ids,
+            states_[index],
+            pos0,
+            nullptr,
+            visibility);
+        capture_dspark_target(index, hidden, targets);
+        const bool eval_boundary =
+            static_cast<int>(index - eval_begin + 1) >= eval_group
+            || index + 1 == layers_.size();
+        if (eager_layer_materialization && eval_boundary) {
+            materialize_layer_range(hidden, eval_begin, index + 1);
+            eval_begin = index + 1;
+        }
+    }
+    return hidden;
+}
+
+array MlxDeepseekV4CausalLm::forward_streaming_layers(
+    array hidden,
+    const array& token_ids,
+    int pos0,
+    const MlxDeepseekV4ImageVisibility* visibility,
+    std::vector<std::optional<array>>* targets,
+    bool eager_layer_materialization) {
+    if (!expert_offload_ && !ssd_expert_cache_) {
+        throw std::logic_error(
+            "DeepSeek-V4 streaming backend has no storage provider");
+    }
+    const int batch = token_ids.shape(0);
+    const int tokens = token_ids.shape(1);
+    const int routed_rows = checked_product(
+        batch, tokens, "routed row count");
+    const bool route_transaction =
+        ssd_expert_cache_
+        && routed_rows >= 1
+        && routed_rows <= 6
+        && mlx_ssd_route_transactions_enabled();
+
+    std::array<
+        std::optional<MlxSsdPrefetchedExpertLayer>,
+        2> routed_pipeline;
+    if (!route_transaction && tokens > 1 && ssd_expert_cache_
+        && !layers_.empty()) {
+        const auto rows = static_cast<std::size_t>(routed_rows);
+        routed_pipeline[0] = layers_[0].prefetch_routed(rows);
+        if (routed_pipeline[0].has_value() && layers_.size() > 1) {
+            routed_pipeline[1] = layers_[1].prefetch_routed(rows);
+        }
+    }
+
+    if (!route_transaction) {
+        for (std::size_t index = 0; index < layers_.size(); ++index) {
+            auto* prefetched = routed_pipeline[index % 2].has_value()
+                ? &*routed_pipeline[index % 2]
+                : nullptr;
+            hidden = layers_[index].forward(
+                hidden,
+                token_ids,
+                states_[index],
+                pos0,
+                prefetched,
+                visibility);
+            capture_dspark_target(index, hidden, targets);
+            if (eager_layer_materialization) {
+                materialize_layer_range(hidden, index, index + 1);
+            }
+            if (prefetched != nullptr) {
+                routed_pipeline[index % 2].reset();
+                if (index + 2 < layers_.size()) {
+                    routed_pipeline[index % 2] =
+                        layers_[index + 2].prefetch_routed(
+                            static_cast<std::size_t>(routed_rows));
+                }
+            }
+        }
+        return hidden;
+    }
+
+    const bool force_transactions = mlx_ssd_force_route_transactions();
+    const auto group_layers = static_cast<std::size_t>(
+        mlx_ssd_route_transaction_group_layers(
+            static_cast<int>(layers_.size())));
+    std::size_t group_begin = 0;
+    while (group_begin < layers_.size()) {
+        if (!force_transactions &&
+            !ssd_expert_cache_->route_layer_likely_hit(group_begin)) {
+            hidden = layers_[group_begin].forward(
+                hidden,
+                token_ids,
+                states_[group_begin],
+                pos0,
+                nullptr,
+                visibility);
+            capture_dspark_target(group_begin, hidden, targets);
+            if (eager_layer_materialization) {
+                materialize_layer_range(
+                    hidden,
+                    group_begin,
+                    group_begin + 1);
+            }
+            ++group_begin;
+            continue;
+        }
+        auto group_end = std::min(
+            layers_.size(),
+            group_begin + group_layers);
+        for (std::size_t index = group_begin + 1;
+             index < group_end;
+             ++index) {
+            if (!force_transactions &&
+                !ssd_expert_cache_->route_layer_likely_hit(index)) {
+                group_end = index;
+                break;
+            }
+        }
+        const auto hidden_checkpoint = hidden;
+        auto state_checkpoint = states_;
+        std::vector<std::optional<MlxSsdPreparedExperts>> pins(
+            group_end - group_begin);
+        bool completed = false;
+        try {
+            for (std::size_t attempt = 0;
+                 attempt <= group_end - group_begin;
+                 ++attempt) {
+                ssd_expert_cache_->begin_route_transaction();
+                auto trial = hidden_checkpoint;
+                auto trial_targets = targets != nullptr
+                    ? *targets
+                    : std::vector<std::optional<array>>{};
+                for (std::size_t index = group_begin;
+                     index < group_end;
+                     ++index) {
+                    trial = layers_[index].forward(
+                        trial,
+                        token_ids,
+                        states_[index],
+                        pos0,
+                        nullptr,
+                        visibility);
+                    capture_dspark_target(
+                        index,
+                        trial,
+                        targets != nullptr ? &trial_targets : nullptr);
+                }
+                detail::eval_with_timing(trial);
+                auto transaction =
+                    ssd_expert_cache_->resolve_route_transaction();
+                if (transaction.all_hit) {
+                    hidden = std::move(trial);
+                    if (targets != nullptr) {
+                        *targets = std::move(trial_targets);
+                    }
+                    pins.clear();
+                    ssd_expert_cache_->release_deferred();
+                    completed = true;
+                    break;
+                }
+                states_ = state_checkpoint;
+                bool restarted_speculation = false;
+                for (std::size_t index = group_begin;
+                     index < group_end;
+                     ++index) {
+                    if (states_[index].has_speculative()) {
+                        states_[index].restart_speculative_attempt();
+                        restarted_speculation = true;
+                    }
+                }
+                if (restarted_speculation) {
+                    materialize_layer_range(
+                        hidden_checkpoint, group_begin, group_end);
+                }
+                for (const auto& route : transaction.routes) {
+                    auto prepared = ssd_expert_cache_->prepare(
+                        route.layer,
+                        route.experts);
+                    pins.at(route.layer - group_begin).emplace(
+                        std::move(prepared));
+                }
+                ssd_expert_cache_->release_deferred();
+            }
+        } catch (...) {
+            ssd_expert_cache_->cancel_route_transaction();
+            states_ = std::move(state_checkpoint);
+            pins.clear();
+            ssd_expert_cache_->release_deferred();
+            throw;
+        }
+        if (!completed) {
+            ssd_expert_cache_->cancel_route_transaction();
+            states_ = std::move(state_checkpoint);
+            pins.clear();
+            ssd_expert_cache_->release_deferred();
+            throw std::runtime_error(
+                "DeepSeek-V4 SSD route group did not converge");
+        }
+        group_begin = group_end;
+    }
+    return hidden;
 }
 
 void MlxDeepseekV4CausalLm::begin_speculative_target(
@@ -1325,193 +1564,38 @@ array MlxDeepseekV4CausalLm::forward_chunk(
         target_hiddens.resize(
             config_.dspark_target_layer_ids.size());
     }
-    const auto capture_target = [&](std::size_t layer) {
-        if (dspark_hidden == nullptr) return;
-        for (std::size_t target = 0;
-             target < config_.dspark_target_layer_ids.size();
-             ++target) {
-            if (config_.dspark_target_layer_ids[target] ==
-                static_cast<std::int64_t>(layer)) {
-                target_hiddens[target] = mlx::core::mean(
-                    hidden_values, 2);
-            }
-        }
-    };
     detail::profile_eval(
         "model.embedding_broadcast",
         hidden_values);
     const bool bounded_prefill = tokens > 1;
     const bool compact_resident_speculation =
         bounded_prefill && tokens <= 6 && dspark_hidden != nullptr &&
-        visibility == nullptr && !expert_offload_ && !ssd_expert_cache_;
+        visibility == nullptr &&
+        expert_backend_ == ExpertBackend::resident;
     const bool materialize_bounded_prefill =
         bounded_prefill && !compact_resident_speculation;
-    const bool group_resident_prefill =
-        materialize_bounded_prefill
-        && !expert_offload_
-        && !ssd_expert_cache_
-        && dspark_hidden == nullptr
-        && visibility == nullptr
-        && !detail::component_profile_active();
-    const int prefill_eval_group = group_resident_prefill
-        ? resident_prefill_eval_group_layers()
-        : 1;
-    std::array<
-        std::optional<MlxSsdPrefetchedExpertLayer>,
-        2> routed_pipeline;
-    if (bounded_prefill && !layers_.empty()) {
-        const auto rows = static_cast<std::size_t>(batch) *
-            static_cast<std::size_t>(tokens);
-        routed_pipeline[0] = layers_[0].prefetch_routed(rows);
-        if (routed_pipeline[0].has_value() && layers_.size() > 1) {
-            routed_pipeline[1] = layers_[1].prefetch_routed(rows);
-        }
-    }
-    const bool grouped_route_transaction =
-        !bounded_prefill && ssd_expert_cache_ &&
-        ssd_route_transactions_enabled(
-            ssd_expert_cache_->has_full_residency_capacity()) &&
-        dspark_hidden == nullptr;
-    if (grouped_route_transaction) {
-        const bool force_transactions = force_ssd_route_transactions();
-        const auto group_layers = static_cast<std::size_t>(
-            ssd_route_transaction_layers());
-        std::size_t group_begin = 0;
-        while (group_begin < layers_.size()) {
-            if (!force_transactions &&
-                !ssd_expert_cache_->route_layer_likely_hit(group_begin)) {
-                hidden_values = layers_[group_begin].forward(
-                    hidden_values,
-                    token_ids,
-                    states_[group_begin],
-                    pos0,
-                    nullptr);
-                ++group_begin;
-                continue;
-            }
-            auto group_end = std::min(
-                layers_.size(),
-                group_begin + group_layers);
-            for (std::size_t index = group_begin + 1;
-                 index < group_end;
-                 ++index) {
-                if (!force_transactions &&
-                    !ssd_expert_cache_->route_layer_likely_hit(index)) {
-                    group_end = index;
-                    break;
-                }
-            }
-            const auto hidden_checkpoint = hidden_values;
-            auto state_checkpoint = states_;
-            std::vector<
-                std::optional<MlxSsdPreparedExperts>> pins(
-                    group_end - group_begin);
-            bool completed = false;
-            try {
-                for (std::size_t attempt = 0;
-                     attempt <= group_end - group_begin;
-                     ++attempt) {
-                    ssd_expert_cache_->begin_route_transaction();
-                    auto trial_hidden = hidden_checkpoint;
-                    for (std::size_t index = group_begin;
-                         index < group_end;
-                         ++index) {
-                        trial_hidden = layers_[index].forward(
-                            trial_hidden,
-                            token_ids,
-                            states_[index],
-                            pos0,
-                            nullptr);
-                    }
-                    // The attention output depends on the in-place cache
-                    // writes required by this group. Materialize only the
-                    // hidden frontier here; cache side branches stay lazy and
-                    // are committed once by the normal final-cache boundary.
-                    detail::eval_with_timing(trial_hidden);
-                    auto transaction =
-                        ssd_expert_cache_->resolve_route_transaction();
-                    if (transaction.all_hit) {
-                        hidden_values = std::move(trial_hidden);
-                        pins.clear();
-                        ssd_expert_cache_->release_deferred();
-                        completed = true;
-                        break;
-                    }
-                    states_ = state_checkpoint;
-                    for (const auto& route : transaction.routes) {
-                        auto prepared = ssd_expert_cache_->prepare(
-                            route.layer,
-                            route.experts);
-                        pins.at(route.layer - group_begin).emplace(
-                            std::move(prepared));
-                    }
-                    ssd_expert_cache_->release_deferred();
-                }
-            } catch (...) {
-                ssd_expert_cache_->cancel_route_transaction();
-                states_ = std::move(state_checkpoint);
-                pins.clear();
-                ssd_expert_cache_->release_deferred();
-                throw;
-            }
-            if (!completed) {
-                ssd_expert_cache_->cancel_route_transaction();
-                states_ = std::move(state_checkpoint);
-                pins.clear();
-                ssd_expert_cache_->release_deferred();
-                throw std::runtime_error(
-                    "DeepSeek-V4 SSD route group did not converge");
-            }
-            group_begin = group_end;
-        }
-    } else {
-        std::size_t eval_group_begin = 0;
-        for (std::size_t index = 0;
-             index < layers_.size();
-             ++index) {
-            auto* prefetched = routed_pipeline[index % 2].has_value()
-                ? &*routed_pipeline[index % 2]
-                : nullptr;
-            hidden_values = layers_[index].forward(
-                hidden_values,
-                token_ids,
-                states_[index],
-                pos0,
-                prefetched,
-                visibility);
-            capture_target(index);
-            const bool eval_group_boundary =
-                static_cast<int>(index - eval_group_begin + 1)
-                    >= prefill_eval_group
-                || index + 1 == layers_.size();
-            if (materialize_bounded_prefill && eval_group_boundary) {
-                // Hidden and cache branches share every projection in this
-                // resident layer group. Submit them together to reduce graph
-                // walks and command-buffer boundaries while keeping bounded
-                // intermediates. SSD/offload and profiling stay at group 1.
-                std::vector<array> layer_outputs{hidden_values};
-                layer_outputs.reserve(
-                    1 + (index - eval_group_begin + 1) * 12);
-                for (std::size_t state_index = eval_group_begin;
-                     state_index <= index;
-                     ++state_index) {
-                    append_state_arrays(
-                        states_[state_index],
-                        layer_outputs);
-                }
-                detail::eval_with_timing(std::move(layer_outputs));
-                eval_group_begin = index + 1;
-            }
-            if (prefetched != nullptr) {
-                routed_pipeline[index % 2].reset();
-                if (index + 2 < layers_.size()) {
-                    const auto rows = static_cast<std::size_t>(batch) *
-                        static_cast<std::size_t>(tokens);
-                    routed_pipeline[index % 2] =
-                        layers_[index + 2].prefetch_routed(rows);
-                }
-            }
-        }
+    auto* target_output = dspark_hidden != nullptr
+        ? &target_hiddens
+        : nullptr;
+    switch (expert_backend_) {
+    case ExpertBackend::resident:
+        hidden_values = forward_resident_layers(
+            std::move(hidden_values),
+            token_ids,
+            pos0,
+            visibility,
+            target_output,
+            materialize_bounded_prefill);
+        break;
+    case ExpertBackend::streaming:
+        hidden_values = forward_streaming_layers(
+            std::move(hidden_values),
+            token_ids,
+            pos0,
+            visibility,
+            target_output,
+            materialize_bounded_prefill);
+        break;
     }
     if (dspark_hidden != nullptr) {
         std::vector<array> captured;
@@ -2073,16 +2157,19 @@ std::int32_t MlxDeepseekV4CausalLm::generate_impl(
         prompt_values.begin(),
         Shape{1, prompt_count},
         mlx::core::int32);
-    auto counts = mlx::core::zeros(
-        Shape{vocab},
-        mlx::core::int32);
-    if (!count_values.empty()) {
-        counts = sample_token_counts_add(
-            counts,
-            array(
-                count_values.begin(),
-                Shape{1, static_cast<int>(count_values.size())},
-                mlx::core::int32));
+    std::optional<array> counts;
+    if (sampling.has_penalties()) {
+        counts = mlx::core::zeros(
+            Shape{vocab},
+            mlx::core::int32);
+        if (!count_values.empty()) {
+            *counts = sample_token_counts_add(
+                *counts,
+                array(
+                    count_values.begin(),
+                    Shape{1, static_cast<int>(count_values.size())},
+                    mlx::core::int32));
+        }
     }
     const std::size_t requested_stable_count = stable_prefix_tokens
         ? std::min(*stable_prefix_tokens, prompt.size())
@@ -2462,6 +2549,7 @@ std::int32_t MlxDeepseekV4CausalLm::generate_impl(
             dspark_->block_size());
 
         MlxMtpEngineCallbacks mtp_callbacks;
+        mtp_callbacks.predictor = dspark_->mtp_descriptor();
         mtp_callbacks.target_cache_position = [this] {
             return cache_position_;
         };
@@ -2539,12 +2627,9 @@ std::int32_t MlxDeepseekV4CausalLm::generate_impl(
                 vocab,
                 max_tokens,
                 max_context_,
-                dspark_->block_size(),
                 logits,
                 mtp_sampling,
-                mtp_sampling.has_penalties()
-                    ? std::optional<array>(counts)
-                    : std::nullopt,
+                counts,
                 std::span<const std::int64_t>(eos),
                 callback,
                 0u,
@@ -2610,9 +2695,9 @@ std::int32_t MlxDeepseekV4CausalLm::generate_impl(
                     << std::endl;
             }
         };
-        auto sampled = sampler.sample(
-            logits,
-            counts);
+        auto sampled = counts
+            ? sampler.sample(logits, *counts)
+            : sampler.sample(logits);
         if (profile_this_step) {
             detail::profile_eval(
                 "model.sampling",
@@ -2629,9 +2714,12 @@ std::int32_t MlxDeepseekV4CausalLm::generate_impl(
         }
         if (token_constraint && token_constraint->allows &&
             !token_constraint->allows(token)) {
-            auto adjusted = mlx::core::contiguous(
+            auto adjusted = counts
+                ? sampler.apply_penalties(logits, *counts)
+                : logits;
+            adjusted = mlx::core::contiguous(
                 mlx::core::astype(
-                    sampler.apply_penalties(logits, counts),
+                    adjusted,
                     mlx::core::float32));
             adjusted.eval();
             std::vector<float> masked(
@@ -2657,9 +2745,11 @@ std::int32_t MlxDeepseekV4CausalLm::generate_impl(
             {token},
             Shape{1, 1},
             mlx::core::int32);
-        counts = sample_token_counts_add(
-            counts,
-            token_ids);
+        if (counts) {
+            *counts = sample_token_counts_add(
+                *counts,
+                token_ids);
+        }
         ++generated;
         if (callback &&
             !callback(

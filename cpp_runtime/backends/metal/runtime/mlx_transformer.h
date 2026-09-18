@@ -108,6 +108,13 @@ mlx::core::array scaled_dot_product_attention(
     float scale = 0.0f,
     const std::optional<mlx::core::array>& mask = std::nullopt);
 
+// Return the visible rows of a [batch,window,...] circular cache in
+// chronological order. `position` is the absolute position immediately after
+// the last committed row.
+mlx::core::array mlx_circular_cache_history(
+    const mlx::core::array& cache,
+    int position);
+
 class MlxKvCache {
 public:
     MlxKvCache(
@@ -188,6 +195,7 @@ public:
     void reset(int batch, int initial_capacity = 16);
     std::pair<mlx::core::array, int> append(
         const mlx::core::array& value);
+    mlx::core::array view() const;
     void trim(int tokens);
     void clear() noexcept;
 

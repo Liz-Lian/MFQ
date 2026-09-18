@@ -25,6 +25,7 @@ import torch
 from safetensors import safe_open
 
 from mfq.architectures.deepseek_v41 import parse_deepseek_v41_config
+from mfq.architectures.hf_config import load_hf_model_config
 from mfq.architectures.tensor_schema import (
     TensorComponent,
     graph_spec_for_plan,
@@ -2452,7 +2453,7 @@ def _linear_attn_qkv_split(root: Path) -> tuple[int, int] | None:
     cfg_path = root / "config.json"
     if not cfg_path.exists():
         return None
-    cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+    cfg = load_hf_model_config(root)
     return _linear_attn_qkv_split_config(cfg)
 
 
@@ -3382,7 +3383,7 @@ def _plan(
     if source_config is None:
         config_path = root / "config.json"
         raw_config = (
-            json.loads(config_path.read_text(encoding="utf-8")) if config_path.exists() else {}
+            load_hf_model_config(root) if config_path.exists() else {}
         )
     else:
         raw_config = source_config
@@ -6709,7 +6710,7 @@ def convert(args: argparse.Namespace) -> None:
         if source_config is None:
             config_path = root / "config.json"
             source_config = (
-                json.loads(config_path.read_text(encoding="utf-8")) if config_path.exists() else {}
+                load_hf_model_config(root) if config_path.exists() else {}
             )
         plan = _apply_standard_preset(
             plan,
@@ -6751,7 +6752,7 @@ def convert(args: argparse.Namespace) -> None:
             source_inventory = _hf_source_inventory(root)
         if source_config is None:
             config_path = root / "config.json"
-            source_config = json.loads(config_path.read_text(encoding="utf-8"))
+            source_config = load_hf_model_config(root)
         plan = _mtp_plan_from_base(
             plan,
             source_inventory,
@@ -7485,7 +7486,7 @@ def convert(args: argparse.Namespace) -> None:
         else:
             config_path = root / "config.json"
             config = (
-                json.loads(config_path.read_text(encoding="utf-8")) if config_path.exists() else {}
+                load_hf_model_config(root) if config_path.exists() else {}
             )
         config_text = config.get("text_config", config)
         mtp_plan_names = [

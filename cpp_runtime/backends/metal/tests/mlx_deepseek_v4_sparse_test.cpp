@@ -1468,11 +1468,44 @@ void test_direct_decode_attention_path() {
         seq_len,
         ratio,
         window);
+    const auto legacy_values = evaluated_float(legacy);
+    const auto direct_values = evaluated_float(direct);
     require_close(
-        evaluated_float(std::move(direct)),
-        evaluated_float(std::move(legacy)),
+        direct_values,
+        legacy_values,
         1e-6f,
         "direct sparse decode attention");
+
+    auto bf16_local = mlx::core::astype(
+        local_array,
+        mlx::core::bfloat16);
+    auto bf16_pool = mlx::core::astype(
+        pool_array,
+        mlx::core::bfloat16);
+    auto bf16_query = mlx::core::astype(
+        float_array(query, Shape{1, heads, 1, dimension}),
+        mlx::core::bfloat16);
+    auto bf16_legacy = mfq::metal::mlx_dsa_sparse_attention(
+        bf16_query,
+        mlx::core::concatenate({bf16_local, bf16_pool}, 1),
+        plan.first,
+        plan.second,
+        sink_array);
+    auto bf16_direct = mfq::metal::mlx_dsa_sparse_decode_attention(
+        bf16_query,
+        bf16_local,
+        bf16_pool,
+        pool_len,
+        topk,
+        sink_array,
+        seq_len,
+        ratio,
+        window);
+    require_close(
+        evaluated_float(std::move(bf16_direct)),
+        evaluated_float(std::move(bf16_legacy)),
+        3e-3f,
+        "BF16 direct sparse decode attention");
 
     auto empty_topk = mlx::core::zeros(
         Shape{1, 1, 0},
@@ -1646,6 +1679,52 @@ void test_short_prefill_plan_matches_circular_decode() {
         plan.first,
         plan.second,
         float_array(sinks, Shape{heads}));
+    auto direct = mfq::metal::mlx_dsa_sparse_multi_attention(
+        query_array,
+        visible_cache,
+        std::nullopt,
+        0,
+        empty_topk,
+        float_array(sinks, Shape{heads}),
+        history,
+        1,
+        window);
+    const auto batched_values = evaluated_float(batched);
+    require_close(
+        evaluated_float(std::move(direct)),
+        batched_values,
+        1e-3f,
+        "direct local multi-query sparse attention");
+    auto bf16_query = mlx::core::astype(
+        query_array,
+        mlx::core::bfloat16);
+    auto bf16_cache = mlx::core::astype(
+        visible_cache,
+        mlx::core::bfloat16);
+    auto bf16_batched = mfq::metal::mlx_dsa_sparse_attention(
+        bf16_query,
+        bf16_cache,
+        plan.first,
+        plan.second,
+        float_array(sinks, Shape{heads}));
+    auto bf16_direct = mfq::metal::mlx_dsa_sparse_multi_attention(
+        bf16_query,
+        bf16_cache,
+        std::nullopt,
+        0,
+        empty_topk,
+        float_array(sinks, Shape{heads}),
+        history,
+        1,
+        window);
+    require(
+        bf16_direct.dtype() == mlx::core::bfloat16,
+        "direct BF16 sparse attention changed cache precision");
+    require_close(
+        evaluated_float(std::move(bf16_direct)),
+        evaluated_float(std::move(bf16_batched)),
+        8e-3f,
+        "direct BF16 local multi-query sparse attention");
     std::vector<array> serial;
     serial.reserve(queries);
     for (int row = 0; row < queries; ++row) {
@@ -1673,7 +1752,7 @@ void test_short_prefill_plan_matches_circular_decode() {
             float_array(sinks, Shape{heads})));
     }
     require_close(
-        evaluated_float(std::move(batched)),
+        batched_values,
         evaluated_float(mlx::core::concatenate(serial, 1)),
         0.0f,
         "short verifier attention decode consistency");

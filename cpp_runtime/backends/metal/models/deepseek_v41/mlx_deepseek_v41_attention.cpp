@@ -384,11 +384,8 @@ array apply_attention(
                 window);
         }
         const int local_length = std::min(pos0 + 1, window);
-        auto local_positions = positions(
-            pos0 + 1 - local_length, pos0 + 1);
-        auto local_slots = mlx::core::remainder(
-            local_positions, array(window, mlx::core::int32));
-        auto chronological = mlx::core::take(local, local_slots, 1);
+        auto chronological = mlx_circular_cache_history(
+            local, pos0 + 1);
         auto plan = mlx_dsa_build_prefill_plan(
             topk,
             pos0,
@@ -406,17 +403,16 @@ array apply_attention(
         return mlx_sparse_selected_mla_attention(
             transposed, unified, plan.first, plan.second, sinks);
     }
-    if (pooled && pool_length > 0 && topk.shape(2) > 0 &&
-        query.shape(2) == 64 && query.shape(3) == 512) {
+    if (query.shape(2) == 64 && query.shape(3) == 512) {
         return mlx_sparse_circular_mla_attention(
             transposed,
             local,
-            *pooled,
+            pooled,
             pool_length,
             topk,
             sinks,
             pos0,
-            ratio,
+            ratio == 0 ? 1 : ratio,
             window);
     }
     auto plan = mlx_dsa_build_prefill_plan(
@@ -686,6 +682,30 @@ MlxDeepseekV41Attention::MlxDeepseekV41Attention(
         kv_source != components_.index_key_norm.has_value()) {
         throw std::runtime_error("DeepSeek-V4.1 CSA2 components disagree with schedule");
     }
+    std::vector<const MlxLinear*> input_projections{
+        &components_.query_a,
+        &components_.key_value,
+    };
+    if (components_.compressor_key_value) {
+        input_projections.push_back(&*components_.compressor_key_value);
+    }
+    if (components_.compressor_gate) {
+        input_projections.push_back(&*components_.compressor_gate);
+    }
+    if (components_.index_score) {
+        // The index score is another projection of the same hidden state.
+        // Keep it in the common projection batch so index-source layers do
+        // not pay a separate small-M dispatch on every decode/verify step.
+        input_projections.push_back(&*components_.index_score);
+    }
+    input_projections_.emplace(std::move(input_projections));
+    if (components_.index_query) {
+        query_projections_.emplace(
+            std::vector<const MlxLinear*>{
+                &components_.query_b,
+                &*components_.index_query,
+            });
+    }
 }
 
 std::vector<array> MlxDeepseekV41Attention::begin_speculative(
@@ -694,7 +714,7 @@ std::vector<array> MlxDeepseekV41Attention::begin_speculative(
     int total_tokens) const {
     const int batch = state.local_kv.shape(0);
     const int window = state.local_kv.shape(1);
-    if (state.speculation || confirmed_tokens <= 0 ||
+    if (state.speculation || confirmed_tokens < 0 ||
         total_tokens <= confirmed_tokens || total_tokens > window ||
         state.position < 0 || state.position + total_tokens > max_context_) {
         throw std::invalid_argument(
@@ -847,14 +867,35 @@ array MlxDeepseekV41Attention::forward(
     auto cosine = slice_axis(rope_.first, 0, pos0, pos0 + tokens);
     auto sine = slice_axis(rope_.second, 0, pos0, pos0 + tokens);
 
+    auto input_projections = (*input_projections_)(input);
+    std::size_t projection_offset = 0;
+    auto query_a = std::move(input_projections.at(projection_offset++));
+    auto key_value = std::move(input_projections.at(projection_offset++));
+    std::optional<array> compressor_key_value;
+    std::optional<array> compressor_gate;
+    std::optional<array> index_score_projection;
+    if (components_.compressor_key_value) {
+        compressor_key_value.emplace(
+            std::move(input_projections.at(projection_offset++)));
+    }
+    if (components_.compressor_gate) {
+        compressor_gate.emplace(
+            std::move(input_projections.at(projection_offset++)));
+    }
+    if (components_.index_score) {
+        index_score_projection.emplace(
+            std::move(input_projections.at(projection_offset++)));
+    }
+    if (projection_offset != input_projections.size()) {
+        throw std::logic_error(
+            "DeepSeek-V4.1 input projection group output mismatch");
+    }
+
     auto q_rank = weighted_rms(
-        components_.query_a(input), components_.query_a_norm, eps);
-    auto query = mlx::core::reshape(
-        components_.query_b(q_rank), Shape{batch, tokens, heads, head_dim});
-    query = rope_tail(query, rotary, cosine, sine);
+        query_a, components_.query_a_norm, eps);
 
     auto local_kv = mlx_weighted_rms_rope_mxfp8_sim(
-        components_.key_value(input),
+        key_value,
         components_.key_value_norm,
         eps,
         rotary,
@@ -878,7 +919,7 @@ array MlxDeepseekV41Attention::forward(
         std::optional<array> latent;
         if (ratio_ == 1) {
             latent = weighted_rms(
-                (*components_.compressor_key_value)(input),
+                *compressor_key_value,
                 *components_.compressor_norm,
                 eps);
         } else {
@@ -888,9 +929,9 @@ array MlxDeepseekV41Attention::forward(
                     "DeepSeek-V4.1 ratio-two compressor state is incomplete");
             }
             auto projected_kv = mlx::core::astype(
-                (*components_.compressor_key_value)(input), mlx::core::float32);
+                *compressor_key_value, mlx::core::float32);
             auto projected_score = mlx::core::astype(
-                (*components_.compressor_gate)(input), mlx::core::float32);
+                *compressor_gate, mlx::core::float32);
             if (state.speculation) {
                 state.speculation->projected_kv = projected_kv;
                 state.speculation->projected_score = projected_score;
@@ -1011,6 +1052,45 @@ array MlxDeepseekV41Attention::forward(
         }
     }
 
+    const bool needs_index_query = [&]() {
+        if (ratio_ <= 0 ||
+            !config_.is_index_source(layer_) ||
+            shared.compressed_length <= 0) {
+            return false;
+        }
+        const int requested_topk = checked_int(
+            config_.index_topk, "index top-k");
+        const int candidate_block_size = checked_int(
+            config_.candidate_block_size, "candidate block size");
+        const int candidate_block_count =
+            (shared.compressed_length + candidate_block_size - 1) /
+            candidate_block_size;
+        const bool all_candidates_fit =
+            layer_ != config_.candidate_source_layer ||
+            candidate_block_count <= checked_int(
+                config_.candidate_topk_blocks,
+                "candidate blocks");
+        return shared.compressed_length > requested_topk ||
+            !all_candidates_fit;
+    }();
+    std::optional<array> index_query_projection;
+    array query_projection = [&]() {
+        if (!needs_index_query) {
+            return components_.query_b(q_rank);
+        }
+        auto values = (*query_projections_)(q_rank);
+        if (values.size() != 2) {
+            throw std::logic_error(
+                "DeepSeek-V4.1 query projection group output mismatch");
+        }
+        index_query_projection.emplace(std::move(values[1]));
+        return std::move(values[0]);
+    }();
+    auto query = mlx::core::reshape(
+        std::move(query_projection),
+        Shape{batch, tokens, heads, head_dim});
+    query = rope_tail(query, rotary, cosine, sine);
+
     array topk = empty_topk(batch, tokens);
     if (ratio_ > 0) {
         const int pool_length = shared.compressed_length;
@@ -1023,15 +1103,7 @@ array MlxDeepseekV41Attention::forward(
                     config_.index_topk, "index top-k");
                 const int candidate_block_size = checked_int(
                     config_.candidate_block_size, "candidate block size");
-                const int candidate_block_count =
-                    (pool_length + candidate_block_size - 1) /
-                    candidate_block_size;
-                const bool all_candidates_fit =
-                    layer_ != config_.candidate_source_layer ||
-                    candidate_block_count <= checked_int(
-                        config_.candidate_topk_blocks,
-                        "candidate blocks");
-                if (pool_length <= requested_topk && all_candidates_fit) {
+                if (!needs_index_query) {
                     topk = all_visible_indices(
                         batch, tokens, pool_length, ratio_, pos0);
                     if (layer_ == config_.candidate_source_layer) {
@@ -1044,8 +1116,12 @@ array MlxDeepseekV41Attention::forward(
                             candidate_block_size);
                     }
                 } else {
+                    if (!index_query_projection) {
+                        throw std::logic_error(
+                            "DeepSeek-V4.1 Indexer query projection is unavailable");
+                    }
                     auto index_query = mlx::core::reshape(
-                        (*components_.index_query)(q_rank),
+                        *index_query_projection,
                         Shape{
                             batch,
                             tokens,
@@ -1055,7 +1131,11 @@ array MlxDeepseekV41Attention::forward(
                     index_query = rope_tail(
                         index_query, rotary, cosine, sine);
                     index_query = mlx_mxfp4_sim(index_query);
-                    auto weights = (*components_.index_score)(input);
+                    if (!index_score_projection) {
+                        throw std::logic_error(
+                            "DeepSeek-V4.1 Indexer score projection is unavailable");
+                    }
+                    const auto& weights = *index_score_projection;
                     auto scores = index_scores(
                         index_query,
                         pool_prefix(*shared.index_k, pool_length),
@@ -1131,6 +1211,8 @@ array MlxDeepseekV41Attention::forward(
     }
 
     array local_for_attention = state.local_kv;
+    std::optional<array> pending_local_values;
+    std::optional<array> pending_local_rows;
     if (tokens == 1) {
         auto rows = mlx::core::full(
             Shape{batch, 1}, pos0 % window, mlx::core::int32);
@@ -1139,27 +1221,20 @@ array MlxDeepseekV41Attention::forward(
         local_for_attention = state.local_kv;
     } else {
         const int history = std::min(pos0, window);
-        array history_values = slice_axis(state.local_kv, 1, 0, 0);
-        if (history > 0) {
-            auto history_positions = positions(pos0 - history, pos0);
-            auto slots = mlx::core::remainder(
-                history_positions, array(window, mlx::core::int32));
-            history_values = mlx::core::take(state.local_kv, slots, 1);
-        }
+        auto history_values = mlx_circular_cache_history(
+            state.local_kv, pos0);
         local_for_attention = mlx::core::concatenate(
             {history_values, local_kv}, 1);
         const int recent = std::min(tokens, window);
-        auto recent_values = slice_axis(
+        pending_local_values = slice_axis(
             local_kv, 1, tokens - recent, tokens);
         auto recent_positions = positions(
             pos0 + tokens - recent, pos0 + tokens);
         auto recent_slots = mlx::core::remainder(
             recent_positions, array(window, mlx::core::int32));
-        auto rows = mlx::core::broadcast_to(
+        pending_local_rows = mlx::core::broadcast_to(
             mlx::core::reshape(recent_slots, Shape{1, recent}),
             Shape{batch, recent});
-        state.local_kv = mlx_cache_write_inplace(
-            state.local_kv, recent_values, rows);
     }
 
     auto attended = apply_attention(
@@ -1172,38 +1247,26 @@ array MlxDeepseekV41Attention::forward(
         pos0,
         ratio_,
         window);
+    if (pending_local_values) {
+        // Multi-token attention reads the previous circular-cache contents.
+        // Preserve that dependency before the in-place write can reuse a
+        // wrapped slot; this is also required by MTP target verification.
+        auto ordered_local = mlx::core::depends(
+            std::vector<array>{state.local_kv},
+            std::vector<array>{attended});
+        state.local_kv = mlx_cache_write_inplace(
+            ordered_local.front(),
+            *pending_local_values,
+            *pending_local_rows);
+    }
     const int groups = checked_int(config_.o_groups, "output groups");
-    const int group_width = heads * head_dim / groups;
-    auto grouped = mlx::core::reshape(
-        attended, Shape{batch, tokens, groups, group_width});
-    const auto* nint8_output =
-        components_.output_a.nint8_zero_weight_ref();
-    const auto* mx_output = components_.output_a.mx_weight_ref();
-    const bool fused_mx_output = mx_output != nullptr && (
-        (mx_output->scale_column_block_size() == 128 && tokens <= 6) ||
-        (mx_output->scale_column_block_size() == 32 &&
-         attended.dtype() == mlx::core::float32 && batch * tokens == 1));
-    auto low_rank = nint8_output
-        ? nint8_output->grouped_row_matmul_inverse_rope(
-              grouped,
-              groups,
-              cosine,
-              sine,
-              head_dim,
-              rotary)
-        : fused_mx_output
-        ? mx_output->grouped_row_matmul_inverse_rope(
-              grouped,
-              groups,
-              cosine,
-              sine,
-              head_dim,
-              rotary)
-        : components_.output_a.grouped_row_matmul(
-              mlx::core::reshape(
-                  rope_tail(attended, rotary, cosine, sine, true),
-                  Shape{batch, tokens, groups, group_width}),
-              groups);
+    auto low_rank = components_.output_a.grouped_row_matmul_inverse_rope(
+        attended,
+        groups,
+        cosine,
+        sine,
+        head_dim,
+        rotary);
     low_rank = mlx::core::reshape(
         low_rank,
         Shape{

@@ -196,6 +196,18 @@ public:
         return dense_matmul(input, expert_ids);
     }
 
+    array routed_matmul_reduce(
+        const array& input,
+        const array& expert_ids,
+        const array& route_weights) const {
+        if (packed_) {
+            return packed_->routed_matmul_reduce(
+                input, expert_ids, route_weights);
+        }
+        return moe_weighted_reduce(
+            dense_matmul(input, expert_ids), route_weights);
+    }
+
     array routed_swiglu(
         const array& input,
         const array& expert_ids) const {
@@ -408,16 +420,19 @@ public:
     }
 
     array operator()(const array& value) const {
-        auto gate = gate_(value);
-        return down_(gate * mlx::core::sigmoid(gate) * up_(value));
+        return down_(gate_up_.swiglu(value));
     }
 
 private:
     DenseFfn(MlxLinear gate, MlxLinear up, MlxLinear down)
-        : gate_(std::move(gate)), up_(std::move(up)), down_(std::move(down)) {}
+        : gate_(std::move(gate)),
+          up_(std::move(up)),
+          down_(std::move(down)),
+          gate_up_(std::vector<const MlxLinear*>{&gate_, &up_}) {}
     MlxLinear gate_;
     MlxLinear up_;
     MlxLinear down_;
+    MlxProjectionBatch gate_up_;
 };
 
 class Qwen4Moe {
@@ -491,7 +506,13 @@ public:
                 static_cast<int>(value.size() /
                     static_cast<std::size_t>(config_.hidden_size)),
                 static_cast<int>(config_.hidden_size)});
-        auto router_logits = router_(source);
+        auto routing_projections = routing_projections_(source);
+        if (routing_projections.size() != 2) {
+            throw std::logic_error(
+                "Qwen4 MoE routing projection group output mismatch");
+        }
+        auto router_logits = std::move(routing_projections[0]);
+        auto shared_gate = std::move(routing_projections[1]);
         if (detail::component_profile_active()) {
             detail::profile_eval("qwen4.moe.router", router_logits);
         }
@@ -506,6 +527,7 @@ public:
         }
         std::optional<array> inverse_route_order;
         bool pairs_are_sorted = false;
+        bool routed_is_reduced = false;
         array pairs = [&] {
             const int tokens = source.shape(0);
             const int route_count = checked_int(
@@ -526,7 +548,13 @@ public:
                         "qwen4.moe.routed_gate_up",
                         intermediate);
                 }
-                auto output = weights.down(intermediate, routes.ids);
+                auto output = tokens <= 6
+                    ? weights.down.combine(
+                          intermediate,
+                          routes.ids,
+                          routes.weights)
+                    : weights.down(intermediate, routes.ids);
+                routed_is_reduced = tokens <= 6;
                 if (detail::component_profile_active()) {
                     detail::profile_eval(
                         "qwen4.moe.routed_down", output);
@@ -544,8 +572,14 @@ public:
                         "qwen4.moe.routed_gate_up",
                         intermediate);
                 }
-                auto output = prepared.weights().down(
-                    intermediate, prepared.expert_ids());
+                auto output = tokens <= 6
+                    ? prepared.weights().down.combine(
+                          intermediate,
+                          prepared.expert_ids(),
+                          routes.weights)
+                    : prepared.weights().down(
+                          intermediate, prepared.expert_ids());
+                routed_is_reduced = tokens <= 6;
                 if (detail::component_profile_active()) {
                     detail::profile_eval(
                         "qwen4.moe.routed_down", output);
@@ -585,21 +619,29 @@ public:
                     global_ids);
                 auto gate = mfe_offload_cache_->grouped_mfe(
                     gate_name_, active);
-                auto gate_up = up_name_.has_value()
-                    ? MlxMfeWeight::concatenate_projections({
-                          std::move(gate),
-                          mfe_offload_cache_->grouped_mfe(*up_name_, active),
-                      })
-                    : std::move(gate);
                 auto down = mfe_offload_cache_->grouped_mfe(
                     down_name_, active);
-                auto intermediate = gate_up.routed_swiglu(
-                    source, local_ids);
+                auto intermediate = [&]() {
+                    if (up_name_) {
+                        auto up = mfe_offload_cache_->grouped_mfe(
+                            *up_name_, active);
+                        return gate.routed_swiglu_pair(
+                            up, source, local_ids);
+                    }
+                    return gate.routed_swiglu(source, local_ids);
+                }();
                 if (detail::component_profile_active()) {
                     detail::profile_eval(
                         "qwen4.moe.routed_gate_up", intermediate);
                 }
-                auto output = down.routed_matmul(intermediate, local_ids);
+                const bool combine_routes = tokens <= 6;
+                auto output = combine_routes
+                    ? down.routed_matmul_reduce(
+                          intermediate,
+                          local_ids,
+                          routes.weights)
+                    : down.routed_matmul(intermediate, local_ids);
+                routed_is_reduced = combine_routes;
                 if (detail::component_profile_active()) {
                     detail::profile_eval(
                         "qwen4.moe.routed_down", output);
@@ -679,7 +721,14 @@ public:
                     "qwen4.moe.routed_gate_up",
                     intermediate);
             }
-            auto output = down_->routed_matmul(intermediate, routes.ids);
+            const bool combine_routes = tokens <= 6;
+            auto output = combine_routes
+                ? down_->routed_matmul_reduce(
+                      intermediate,
+                      routes.ids,
+                      routes.weights)
+                : down_->routed_matmul(intermediate, routes.ids);
+            routed_is_reduced = combine_routes;
             if (detail::component_profile_active()) {
                 detail::profile_eval("qwen4.moe.routed_down", output);
             }
@@ -689,11 +738,15 @@ public:
         if (detail::component_profile_active()) {
             detail::profile_eval("qwen4.moe.shared", shared);
         }
-        auto shared_gate = shared_gate_(source);
         if (detail::component_profile_active()) {
             detail::profile_eval("qwen4.moe.shared_gate", shared_gate);
         }
-        auto output = pairs_are_sorted
+        auto output = routed_is_reduced
+            ? moe_add_shared_gate(
+                  pairs,
+                  shared,
+                  shared_gate)
+            : pairs_are_sorted
             ? moe_weighted_reduce_shared_gate_sorted(
                   pairs,
                   *inverse_route_order,
@@ -731,6 +784,10 @@ private:
           router_(std::move(router)),
           shared_(std::move(shared)),
           shared_gate_(std::move(shared_gate)),
+          routing_projections_(std::vector<const MlxLinear*>{
+              &router_,
+              &shared_gate_,
+          }),
           ssd_expert_cache_(std::move(ssd_expert_cache)),
           mfe_offload_cache_(std::move(mfe_offload_cache)),
           gate_name_(std::move(gate_name)),
@@ -764,6 +821,7 @@ private:
     MlxLinear router_;
     DenseFfn shared_;
     MlxLinear shared_gate_;
+    MlxProjectionBatch routing_projections_;
     std::shared_ptr<MlxMoeSsdExpertCache> ssd_expert_cache_;
     std::shared_ptr<MlxMfeOffloadCache> mfe_offload_cache_;
     std::string gate_name_;
@@ -1134,6 +1192,11 @@ public:
         }
         if (use_cache && batch_ != batch) reset(batch);
         auto embeddings = embedding_.forward(token_ids, use_cache);
+        auto key_value = key_value_(embeddings);
+        if (key_value.size() != 2) {
+            throw std::logic_error(
+                "Qwen4 PLE projection group output mismatch");
+        }
         const Shape stream_shape{
             batch,
             tokens,
@@ -1142,7 +1205,7 @@ public:
         };
         auto key = mlx::core::reshape(
             qwen4_grouped_rms_norm(
-                key_(embeddings), norm_key_,
+                std::move(key_value[0]), norm_key_,
                 static_cast<int>(config_.hidden_size),
                 static_cast<float>(config_.rms_norm_eps)),
             stream_shape);
@@ -1166,7 +1229,9 @@ public:
         auto gated = mlx::core::reshape(
             mlx::core::expand_dims(mlx::core::sigmoid(root), -1) *
                 mlx::core::expand_dims(
-                    mlx::core::astype(value_(embeddings), mlx::core::float32),
+                    mlx::core::astype(
+                        std::move(key_value[1]),
+                        mlx::core::float32),
                     -2),
             Shape{
                 batch,
@@ -1239,6 +1304,7 @@ private:
           embedding_(std::move(embedding)),
           key_(std::move(key)),
           value_(std::move(value)),
+          key_value_(std::vector<const MlxLinear*>{&key_, &value_}),
           norm_key_(std::move(norm_key)),
           norm_query_(std::move(norm_query)),
           norm_conv_(std::move(norm_conv)),
@@ -1256,6 +1322,7 @@ private:
     Qwen4NgramEmbedding embedding_;
     MlxLinear key_;
     MlxLinear value_;
+    MlxProjectionBatch key_value_;
     array norm_key_;
     array norm_query_;
     array norm_conv_;
@@ -1392,17 +1459,24 @@ public:
             }
         }
         if (use_cache && (batch_ != batch || !convolution_state_)) reset(batch);
-        auto projected = qkv_(hidden);
+        auto input_projections = input_projections_(hidden);
+        if (input_projections.size() != 4) {
+            throw std::logic_error(
+                "Qwen4 GDN projection group output mismatch");
+        }
+        auto projected = std::move(input_projections[0]);
         detail::profile_eval("qwen4.gdn.qkv", projected);
         auto qkv_parts = mlx::core::split(
             projected, Shape{2 * key_width()}, -1);
         auto qk = std::move(qkv_parts.at(0));
         auto value = std::move(qkv_parts.at(1));
-        auto z = gate_(hidden);
+        auto z = std::move(input_projections[1]);
         detail::profile_eval("qwen4.gdn.gate", z);
         auto beta = mlx::core::reshape(
             mlx::core::sigmoid(
-                mlx::core::astype(beta_(hidden), mlx::core::float32)),
+                mlx::core::astype(
+                    std::move(input_projections[3]),
+                    mlx::core::float32)),
             Shape{
                 batch,
                 tokens,
@@ -1410,7 +1484,9 @@ public:
             });
         detail::profile_eval("qwen4.gdn.beta", beta);
         auto alpha = mlx::core::reshape(
-            mlx::core::astype(alpha_(hidden), mlx::core::float32),
+            mlx::core::astype(
+                std::move(input_projections[2]),
+                mlx::core::float32),
             beta.shape());
         detail::profile_eval("qwen4.gdn.alpha", alpha);
         auto gate_input = alpha + mlx::core::reshape(
@@ -1545,6 +1621,12 @@ private:
           gate_(std::move(gate)),
           alpha_(std::move(alpha)),
           beta_(std::move(beta)),
+          input_projections_(std::vector<const MlxLinear*>{
+              &qkv_,
+              &gate_,
+              &alpha_,
+              &beta_,
+          }),
           convolution_weight_(std::move(convolution_weight)),
           dt_bias_(std::move(dt_bias)),
           a_log_(std::move(a_log)),
@@ -1565,6 +1647,7 @@ private:
     MlxLinear gate_;
     MlxLinear alpha_;
     MlxLinear beta_;
+    MlxProjectionBatch input_projections_;
     array convolution_weight_;
     array dt_bias_;
     array a_log_;
@@ -1617,6 +1700,7 @@ public:
             maximum_,
             static_cast<int>(config_.head_dim));
         index_cache_.reset(batch);
+        pooled_index_cache_.reset(batch);
         speculative_trim_ = 0;
         batch_ = batch;
     }
@@ -1624,6 +1708,7 @@ public:
     void clear() noexcept override {
         cache_.reset();
         index_cache_.clear();
+        pooled_index_cache_.clear();
         speculative_trim_ = 0;
         batch_ = 0;
     }
@@ -1643,9 +1728,14 @@ public:
             throw std::runtime_error(
                 "Qwen4 QSA speculative boundary disagrees");
         }
-        auto query_full = query_(hidden);
-        auto key_full = key_(hidden);
-        auto value_full = value_(hidden);
+        auto input_projections = input_projections_(hidden);
+        if (input_projections.size() != 4) {
+            throw std::logic_error(
+                "Qwen4 QSA projection group output mismatch");
+        }
+        auto query_full = std::move(input_projections[0]);
+        auto key_full = std::move(input_projections[1]);
+        auto value_full = std::move(input_projections[2]);
         auto query_parts = mlx::core::split(
             mlx::core::reshape(
                 query_full,
@@ -1695,7 +1785,7 @@ public:
             config_.rope_sections,
             config_.mrope_interleaved);
         auto index_parts = mlx::core::split(
-            index_query_key_(hidden),
+            std::move(input_projections[3]),
             Shape{static_cast<int>(
                 config_.indexer_n_heads * config_.indexer_head_dim)},
             -1);
@@ -1739,17 +1829,38 @@ public:
                 ? tokens - speculative_confirmed
                 : 0;
         }
-        array attended = key_cache.shape(2) <= config_.indexer_budget
-            ? qwen4_dense_gqa_attention(
-                  query, key_cache, value_cache, query_offset)
-            : mlx_sparse_block_gqa_attention(
-                  query,
-                  key_cache,
-                  value_cache,
-                  selected_blocks(
-                      index_query, raw_cache, positions_full, query_offset),
-                  query_offset,
-                  static_cast<int>(config_.indexer_compress_ratio));
+        array attended = [&]() {
+            if (key_cache.shape(2) <= config_.indexer_budget) {
+                return qwen4_dense_gqa_attention(
+                    query, key_cache, value_cache, query_offset);
+            }
+            const int ratio = static_cast<int>(
+                config_.indexer_compress_ratio);
+            const int complete = raw_cache.shape(1) / ratio;
+            array pooled = [&]() {
+                if (!use_cache) {
+                    return pool_index_keys(
+                        raw_cache, positions_full, 0, complete);
+                }
+                const int cached = pooled_index_cache_.position();
+                if (cached > complete) {
+                    throw std::runtime_error(
+                        "Qwen4 pooled index cache is ahead of raw keys");
+                }
+                if (cached < complete) {
+                    pooled_index_cache_.append(pool_index_keys(
+                        raw_cache, positions_full, cached, complete));
+                }
+                return pooled_index_cache_.view();
+            }();
+            return mlx_sparse_block_gqa_attention(
+                query,
+                key_cache,
+                value_cache,
+                selected_blocks(index_query, pooled, query_offset),
+                query_offset,
+                ratio);
+        }();
         attended = mlx::core::reshape(
             attended,
             Shape{
@@ -1781,6 +1892,7 @@ public:
         const int rejected = speculative_trim_ - accepted_tokens;
         cache_->trim(rejected);
         index_cache_.trim(rejected);
+        trim_pooled_index_cache();
         speculative_trim_ = 0;
     }
 
@@ -1794,6 +1906,7 @@ public:
         if (count > 0) {
             cache_->trim(count);
             index_cache_.trim(count);
+            trim_pooled_index_cache();
         }
         speculative_trim_ = 0;
     }
@@ -1820,19 +1933,75 @@ private:
           key_norm_(std::move(key_norm)),
           output_(std::move(output)),
           index_query_key_(std::move(index_query_key)),
+          input_projections_(std::vector<const MlxLinear*>{
+              &query_,
+              &key_,
+              &value_,
+              &index_query_key_,
+          }),
           index_query_norm_(std::move(index_query_norm)),
           index_key_norm_(std::move(index_key_norm)),
-          index_cache_(maximum, static_cast<int>(config_.indexer_head_dim)) {}
+          index_cache_(maximum, static_cast<int>(config_.indexer_head_dim)),
+          pooled_index_cache_(
+              (maximum +
+               static_cast<int>(config_.indexer_compress_ratio) - 1) /
+                  static_cast<int>(config_.indexer_compress_ratio),
+              static_cast<int>(config_.indexer_head_dim)) {}
+
+    array pool_index_keys(
+        const array& raw_keys,
+        const array& positions_full,
+        int begin,
+        int end) const {
+        const int ratio = static_cast<int>(config_.indexer_compress_ratio);
+        const int width = static_cast<int>(config_.indexer_head_dim);
+        if (raw_keys.ndim() != 3 || raw_keys.shape(0) <= 0 ||
+            begin < 0 || end <= begin ||
+            end * ratio > raw_keys.shape(1) ||
+            raw_keys.shape(2) != width ||
+            positions_full.shape(-1) < end * ratio) {
+            throw std::runtime_error(
+                "Qwen4 index pool range disagrees with raw keys");
+        }
+        const int batch = raw_keys.shape(0);
+        auto pooled = mlx::core::mean(
+            mlx::core::reshape(
+                mlx::core::slice(
+                    raw_keys,
+                    Shape{0, begin * ratio, 0},
+                    Shape{batch, end * ratio, width}),
+                Shape{batch, end - begin, ratio, width}),
+            -2);
+        pooled = index_key_norm_(pooled);
+        auto starts = mlx::core::arange(
+            begin * ratio, end * ratio, ratio, mlx::core::int32);
+        auto block_positions = mlx::core::take(
+            positions_full, starts, -1);
+        return mlx::core::reshape(
+            apply_rope(
+                mlx::core::expand_dims(pooled, 1),
+                block_positions,
+                static_cast<int>(config_.rotary_dim),
+                static_cast<float>(config_.rope_theta),
+                config_.rope_sections,
+                config_.mrope_interleaved),
+            Shape{batch, end - begin, width});
+    }
 
     array selected_blocks(
         const array& query,
-        const array& raw_keys,
-        const array& positions_full,
+        const array& pooled_keys,
         int query_offset) const {
         const int batch = query.shape(0);
         const int tokens = query.shape(1);
         const int ratio = static_cast<int>(config_.indexer_compress_ratio);
-        const int complete = raw_keys.shape(1) / ratio;
+        if (pooled_keys.ndim() != 3 ||
+            pooled_keys.shape(0) != batch ||
+            pooled_keys.shape(2) != config_.indexer_head_dim) {
+            throw std::runtime_error(
+                "Qwen4 pooled index keys disagree with the query");
+        }
+        const int complete = pooled_keys.shape(1);
         const int block_budget =
             static_cast<int>(config_.indexer_budget) / ratio;
         const int select_count = std::min(
@@ -1847,89 +2016,63 @@ private:
             throw std::runtime_error(
                 "Qwen4 sparse attention has no complete blocks");
         }
-        {
-            auto pooled = mlx::core::mean(
+        auto scores = qwen4_qsa_block_scores(query, pooled_keys);
+        auto starts = mlx::core::arange(
+            0, complete * ratio, ratio, mlx::core::int32);
+        auto ends = starts + array(ratio - 1, mlx::core::int32);
+        auto visible = mlx::core::less(
+            mlx::core::expand_dims(ends, 0),
+            mlx::core::expand_dims(
+                absolute + array(1, mlx::core::int32), 1));
+        visible = mlx::core::broadcast_to(
+            mlx::core::expand_dims(visible, 0),
+            Shape{batch, tokens, complete});
+        scores = mlx::core::where(
+            visible,
+            scores,
+            array(-1e30f, mlx::core::float32));
+        auto canonical = mlx::core::broadcast_to(
+            mlx::core::reshape(
+                mlx::core::arange(select_count, mlx::core::int32),
+                Shape{1, 1, select_count}),
+            Shape{batch, tokens, select_count});
+        auto selected = canonical;
+        if (complete > block_budget) {
+            auto partition = mlx::core::argpartition(
+                scores, complete - block_budget, -1);
+            auto ranked = mlx::core::astype(
+                mlx::core::slice(
+                    partition,
+                    Shape{0, 0, complete - block_budget},
+                    Shape{batch, tokens, complete}),
+                mlx::core::int32);
+            auto complete_counts = mlx::core::floor_divide(
+                absolute + array(1, mlx::core::int32),
+                array(ratio, mlx::core::int32));
+            auto use_canonical = mlx::core::broadcast_to(
                 mlx::core::reshape(
-                    mlx::core::slice(
-                        raw_keys,
-                        Shape{0, 0, 0},
-                        Shape{
-                            batch,
-                            complete * ratio,
-                            static_cast<int>(config_.indexer_head_dim),
-                        }),
-                    Shape{
-                        batch,
-                        complete,
-                        ratio,
-                        static_cast<int>(config_.indexer_head_dim),
-                    }),
-                -2);
-            pooled = index_key_norm_(pooled);
-            auto starts = mlx::core::arange(
-                0, complete * ratio, ratio, mlx::core::int32);
-            auto block_positions = mlx::core::take(
-                positions_full, starts, -1);
-            pooled = mlx::core::reshape(
-                apply_rope(
-                    mlx::core::expand_dims(pooled, 1),
-                    block_positions,
-                    static_cast<int>(config_.rotary_dim),
-                    static_cast<float>(config_.rope_theta),
-                    config_.rope_sections,
-                    config_.mrope_interleaved),
-                Shape{
-                    batch,
-                    complete,
-                    static_cast<int>(config_.indexer_head_dim),
-                });
-            auto scores = qwen4_qsa_block_scores(query, pooled);
-            auto ends = starts + array(ratio - 1, mlx::core::int32);
-            auto visible = mlx::core::less(
-                mlx::core::expand_dims(ends, 0),
-                mlx::core::expand_dims(absolute + array(1, mlx::core::int32), 1));
-            visible = mlx::core::broadcast_to(
-                mlx::core::expand_dims(visible, 0),
-                Shape{batch, tokens, complete});
-            scores = mlx::core::where(
-                visible,
-                scores,
-                array(-1e30f, mlx::core::float32));
-            auto canonical = mlx::core::broadcast_to(
-                mlx::core::reshape(
-                    mlx::core::arange(select_count, mlx::core::int32),
-                    Shape{1, 1, select_count}),
+                    mlx::core::less_equal(
+                        complete_counts,
+                        array(block_budget, mlx::core::int32)),
+                    Shape{1, tokens, 1}),
                 Shape{batch, tokens, select_count});
-            auto selected = canonical;
-            if (complete > block_budget) {
-                auto partition = mlx::core::argpartition(
-                    scores, complete - block_budget, -1);
-                auto ranked = mlx::core::astype(
-                    mlx::core::slice(
-                        partition,
-                        Shape{0, 0, complete - block_budget},
-                        Shape{batch, tokens, complete}),
-                    mlx::core::int32);
-                auto complete_counts = mlx::core::floor_divide(
-                    absolute + array(1, mlx::core::int32),
-                    array(ratio, mlx::core::int32));
-                auto use_canonical = mlx::core::broadcast_to(
-                    mlx::core::reshape(
-                        mlx::core::less_equal(
-                            complete_counts,
-                            array(block_budget, mlx::core::int32)),
-                        Shape{1, tokens, 1}),
-                    Shape{batch, tokens, select_count});
-                selected = mlx::core::where(
-                    use_canonical,
-                    canonical,
-                    ranked);
-            }
-            // Top-k/argpartition order is unspecified. Chronological block
-            // order preserves the checkpoint reduction order and lets the
-            // direct-index kernel treat the first min(visible,budget) entries
-            // as valid.
-            return mlx::core::contiguous(mlx::core::sort(selected, -1));
+            selected = mlx::core::where(
+                use_canonical,
+                canonical,
+                ranked);
+        }
+        // Top-k/argpartition order is unspecified. Chronological block order
+        // preserves the checkpoint reduction order and lets the direct-index
+        // kernel treat the first min(visible,budget) entries as valid.
+        return mlx::core::contiguous(mlx::core::sort(selected, -1));
+    }
+
+    void trim_pooled_index_cache() {
+        const int ratio = static_cast<int>(config_.indexer_compress_ratio);
+        const int target = index_cache_.position() / ratio;
+        if (pooled_index_cache_.position() > target) {
+            pooled_index_cache_.trim(
+                pooled_index_cache_.position() - target);
         }
     }
 
@@ -1942,10 +2085,12 @@ private:
     MlxRmsNorm key_norm_;
     MlxLinear output_;
     MlxLinear index_query_key_;
+    MlxProjectionBatch input_projections_;
     MlxRmsNorm index_query_norm_;
     MlxRmsNorm index_key_norm_;
     std::unique_ptr<MlxKvCache> cache_;
     MlxSequenceCache index_cache_;
+    MlxSequenceCache pooled_index_cache_;
     int speculative_trim_ = 0;
     int batch_ = 0;
 };
@@ -2122,6 +2267,11 @@ struct Qwen4MtpForward {
 
 class Qwen4Mtp {
 public:
+    MlxMtpPredictorDescriptor mtp_descriptor() const noexcept {
+        return MlxMtpPredictorDescriptor::recurrent(
+            kQwen4MtpMaximumDraftDepth);
+    }
+
     static std::optional<Qwen4Mtp> load_if_present(
         const MfqContainer& model,
         const Qwen4Config& config,
@@ -2946,6 +3096,7 @@ std::int32_t MlxQwen4CausalLm::generate(
                 impl_->mtp->cache_position();
 
             MlxMtpEngineCallbacks mtp_callbacks;
+            mtp_callbacks.predictor = impl_->mtp->mtp_descriptor();
             mtp_callbacks.target_cache_position = [&] {
                 return impl_->cache_position;
             };
@@ -3066,7 +3217,6 @@ std::int32_t MlxQwen4CausalLm::generate(
                     vocab,
                     limit,
                     impl_->maximum,
-                    kQwen4MtpMaximumDraftDepth,
                     std::move(logits),
                     sampling,
                     std::move(counts),

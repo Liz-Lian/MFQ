@@ -358,6 +358,83 @@ void test_fused_dense_router_topk() {
             2e-3f);
     }
 
+    constexpr int verifier_rows = 6;
+    std::vector<float> verifier_input_values(
+        verifier_rows * width);
+    for (int row = 0; row < verifier_rows; ++row) {
+        for (int column = 0; column < width; ++column) {
+            verifier_input_values[row * width + column] =
+                input_values[column]
+                + static_cast<float>((row * 3 + column) % 7 - 3)
+                    / 256.0f;
+        }
+    }
+    const auto exercise_verifier = [
+        &verifier_input_values,
+        &weight_values,
+        &bias_array,
+        &available_array
+    ](mlx::core::Dtype dtype, float tolerance) {
+        auto verifier_input = mlx::core::contiguous(
+            mlx::core::astype(
+                array(
+                    verifier_input_values.begin(),
+                    Shape{verifier_rows, width}),
+                dtype));
+        auto verifier_weight = mlx::core::contiguous(
+            mlx::core::astype(
+                array(
+                    weight_values.begin(),
+                    Shape{experts, width}),
+                dtype));
+        require(
+            mfq::metal::moe_dense_router_topk_supported(
+                verifier_input,
+                verifier_weight),
+            "M=6 fused dense router shape was rejected");
+        auto verifier_logits = mlx::core::matmul(
+            mlx::core::astype(verifier_input, mlx::core::float32),
+            mlx::core::transpose(
+                mlx::core::astype(
+                    verifier_weight,
+                    mlx::core::float32)));
+        auto verifier_reference = mfq::metal::moe_topk(
+            verifier_logits,
+            routes,
+            false,
+            true,
+            true,
+            false,
+            bias_array,
+            available_array,
+            1e-20f,
+            1.5f);
+        auto verifier_fused = mfq::metal::moe_dense_router_topk(
+            verifier_input,
+            verifier_weight,
+            bias_array,
+            available_array,
+            1e-20f,
+            1.5f);
+        require(
+            integers(verifier_fused.ids) ==
+                integers(verifier_reference.ids),
+            "M=6 fused dense router selected different experts");
+        const auto reference_values =
+            floats(verifier_reference.weights);
+        const auto fused_values = floats(verifier_fused.weights);
+        for (std::size_t index = 0;
+             index < fused_values.size();
+             ++index) {
+            require_close(
+                fused_values[index],
+                reference_values[index],
+                tolerance);
+        }
+    };
+    exercise_verifier(mlx::core::float16, 8e-4f);
+    exercise_verifier(mlx::core::bfloat16, 2e-3f);
+
     // DeepSeek-V4.1 widens the router from 256 to 384 experts. Exercise the
     // final reduction groups explicitly; the highest-scoring live experts
     // all sit above ID 255 in this fixture.
@@ -443,6 +520,25 @@ void test_fused_dense_router_topk() {
             v41_reference_weights[route],
             2e-3f);
     }
+    const std::vector<std::int32_t> v41_expert_map(v41_experts, 0);
+    bool rejected_wide_packed_ids = false;
+    try {
+        (void)mfq::metal::moe_dense_router_topk_packed(
+            v41_input,
+            v41_weight,
+            array(
+                v41_expert_map.begin(),
+                Shape{v41_experts}),
+            v41_bias_array,
+            v41_available_array,
+            1e-20f,
+            1.5f);
+    } catch (const std::invalid_argument&) {
+        rejected_wide_packed_ids = true;
+    }
+    require(
+        rejected_wide_packed_ids,
+        "packed fused router accepted expert IDs wider than its encoding");
 
     if (std::getenv("MFQ_METAL_MOE_ROUTER_BENCH") != nullptr) {
         constexpr int warmup = 20;
@@ -551,6 +647,144 @@ void test_sqrtsoftplus_weights() {
                 std::sqrt(std::log1p(std::exp(raw))) * 0.75f,
                 7e-5f);
         }
+    }
+}
+
+void test_fused_dense_hash_router() {
+    constexpr int experts = 256;
+    constexpr int width = 128;
+    constexpr int vocab = 17;
+    constexpr int routes = 6;
+    std::vector<float> weight_values(
+        static_cast<std::size_t>(experts) * width);
+    for (int expert = 0; expert < experts; ++expert) {
+        for (int column = 0; column < width; ++column) {
+            weight_values[
+                static_cast<std::size_t>(expert) * width + column
+            ] = static_cast<float>(
+                    ((expert * 11 + column * 7) % 37) - 18)
+                / 512.0f;
+        }
+    }
+    std::vector<std::int32_t> table_values(vocab * routes);
+    for (int token = 0; token < vocab; ++token) {
+        for (int route = 0; route < routes; ++route) {
+            table_values[token * routes + route] =
+                (token * 29 + route * 31 + 7) % experts;
+        }
+    }
+    const array table(
+        table_values.begin(),
+        Shape{vocab, routes});
+
+    const auto exercise = [&](mlx::core::Dtype dtype, float tolerance) {
+        auto weight = mlx::core::contiguous(
+            mlx::core::astype(
+                array(
+                    weight_values.begin(),
+                    Shape{experts, width}),
+                dtype));
+        for (int rows = 1; rows <= 6; ++rows) {
+            std::vector<float> input_values(rows * width);
+            std::vector<std::int32_t> token_values(rows);
+            std::vector<std::int32_t> selected_values(rows * routes);
+            for (int row = 0; row < rows; ++row) {
+                token_values[row] = (row * 5 + rows) % vocab;
+                for (int column = 0; column < width; ++column) {
+                    input_values[row * width + column] =
+                        static_cast<float>(
+                            ((row * 13 + column * 3) % 29) - 14)
+                        / 64.0f;
+                }
+                for (int route = 0; route < routes; ++route) {
+                    selected_values[row * routes + route] =
+                        table_values[
+                            token_values[row] * routes + route];
+                }
+            }
+            auto input = mlx::core::contiguous(
+                mlx::core::astype(
+                    array(
+                        input_values.begin(),
+                        Shape{rows, width}),
+                    dtype));
+            const array token_ids(
+                token_values.begin(),
+                Shape{rows});
+            require(
+                mfq::metal::moe_dense_hash_router_supported(
+                    input,
+                    weight,
+                    token_ids,
+                    table),
+                "valid fused dense hash router shape was rejected");
+            auto fused = mfq::metal::moe_dense_hash_router(
+                input,
+                weight,
+                token_ids,
+                table,
+                1e-20f,
+                1.5f);
+            require(
+                integers(fused.ids) == selected_values,
+                "fused dense hash router selected different experts");
+            auto logits = mlx::core::matmul(
+                mlx::core::astype(input, mlx::core::float32),
+                mlx::core::transpose(
+                    mlx::core::astype(weight, mlx::core::float32)));
+            const auto reference_weights = floats(
+                mfq::metal::moe_selected_sqrtsoftplus_weights(
+                    logits,
+                    array(
+                        selected_values.begin(),
+                        Shape{rows, routes}),
+                    true,
+                    1e-20f,
+                    1.5f));
+            const auto fused_weights = floats(fused.weights);
+            for (std::size_t index = 0;
+                 index < fused_weights.size();
+                 ++index) {
+                require_close(
+                    fused_weights[index],
+                    reference_weights[index],
+                    tolerance);
+            }
+        }
+    };
+    exercise(mlx::core::float16, 1e-3f);
+    exercise(mlx::core::bfloat16, 3e-3f);
+
+    std::vector<float> input_values(width, 0.125f);
+    const std::vector<std::int32_t> token_values{3};
+    std::vector<std::int32_t> expert_map_values(experts);
+    for (int expert = 0; expert < experts; ++expert) {
+        expert_map_values[expert] = (expert * 3) % 41;
+    }
+    auto input = mlx::core::contiguous(
+        mlx::core::astype(
+            array(input_values.begin(), Shape{1, width}),
+            mlx::core::float16));
+    auto weight = mlx::core::contiguous(
+        mlx::core::astype(
+            array(weight_values.begin(), Shape{experts, width}),
+            mlx::core::float16));
+    auto packed = mfq::metal::moe_dense_hash_router_packed(
+        input,
+        weight,
+        array(token_values.begin(), Shape{1}),
+        table,
+        array(expert_map_values.begin(), Shape{experts}),
+        1e-20f,
+        1.5f);
+    const auto packed_ids = integers(packed.ids);
+    for (int route = 0; route < routes; ++route) {
+        const int expert = table_values[3 * routes + route];
+        const int expected =
+            expert | ((expert_map_values[expert] + 1) << 8);
+        require(
+            packed_ids[route] == expected,
+            "fused dense hash router packed a wrong SSD slot");
     }
 }
 
@@ -862,6 +1096,7 @@ int main() {
 #endif
         test_router_modes();
         test_fused_dense_router_topk();
+        test_fused_dense_hash_router();
         test_sqrtsoftplus_weights();
         test_hash_id_repair();
         test_reduce_and_shared_gate();

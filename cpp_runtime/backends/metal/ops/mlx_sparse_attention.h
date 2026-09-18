@@ -46,7 +46,7 @@ mlx::core::array mlx_sparse_selected_mla_attention(
 mlx::core::array mlx_sparse_circular_mla_attention(
     const mlx::core::array& query,
     const mlx::core::array& local_kv,
-    const mlx::core::array& pooled_kv,
+    const std::optional<mlx::core::array>& pooled_kv,
     int pool_len,
     const mlx::core::array& topk,
     const mlx::core::array& sinks,

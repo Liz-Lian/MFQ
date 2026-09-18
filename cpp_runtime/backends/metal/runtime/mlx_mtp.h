@@ -19,6 +19,23 @@ namespace mfq::metal {
 // Each predictor adapter supplies its own maximum depth in the request.
 inline constexpr int kMlxMtpEngineMaximumDraftDepth = 5;
 
+// Predictor adapters describe only the maximum supported draft depth. The
+// common engine owns one reversible, throughput-adaptive scheduling and
+// proposal policy for every architecture.
+struct MlxMtpPredictorDescriptor {
+    int maximum_depth = 0;
+
+    static constexpr MlxMtpPredictorDescriptor recurrent(
+        int maximum_depth) noexcept {
+        return {maximum_depth};
+    }
+
+    static constexpr MlxMtpPredictorDescriptor block(
+        int maximum_depth) noexcept {
+        return {maximum_depth};
+    }
+};
+
 struct MlxMtpVerification {
     std::size_t accepted_drafts = 0;
     std::int32_t next_token = -1;
@@ -101,6 +118,8 @@ struct MlxMtpTargetBatch {
 };
 
 struct MlxMtpEngineCallbacks {
+    MlxMtpPredictorDescriptor predictor;
+
     // Current number of tokens committed in the target-model cache.
     std::function<int()> target_cache_position;
 
@@ -128,7 +147,6 @@ struct MlxMtpEngineRequest {
     int vocab = 0;
     int generation_limit = 0;
     int maximum_context = 0;
-    int predictor_maximum_depth = 0;
     mlx::core::array initial_logits;
     MlxSamplingParams sampling;
     std::optional<mlx::core::array> token_counts;
@@ -201,6 +219,8 @@ private:
     std::vector<int> warmup_trials_;
     std::vector<std::optional<double>> cycle_ms_;
     std::vector<std::optional<double>> cycle_age_ms_;
+    std::vector<int> timing_warmup_samples_;
+    std::vector<std::optional<double>> timing_warmup_min_;
     std::vector<int> warmup_;
 };
 

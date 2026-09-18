@@ -1,4 +1,5 @@
 #include "mlx_tensor.h"
+#include "mlx_staging_allocator.h"
 
 #include <cmath>
 #include <cstdint>
@@ -6,6 +7,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -391,6 +393,40 @@ void test_dense_small_output_m_matches_decode() {
     }
 }
 
+void test_large_packed_storage_layout() {
+    using mfq::metal::detail::packed_storage_layout;
+    constexpr auto int32_max = static_cast<std::size_t>(
+        std::numeric_limits<std::int32_t>::max());
+    const auto small = packed_storage_layout(4096);
+    require(
+        !small.is_matrix() && small.columns == 4096,
+        "small packed storage layout changed");
+
+    const auto boundary = packed_storage_layout(int32_max + 1);
+    require(
+        boundary.is_matrix()
+            && static_cast<std::size_t>(boundary.rows)
+                * static_cast<std::size_t>(boundary.columns)
+                == int32_max + 1,
+        "large packed storage boundary layout is inexact");
+
+    // Full-resident DeepSeek-V4.1 native MXFP4 Gate/Up and Down streams.
+    for (const auto elements : {
+             std::size_t{384} * 2304 * 5120 / 2,
+             std::size_t{384} * 7168 * 2048 / 2,
+             static_cast<std::size_t>(
+                 std::numeric_limits<std::uint32_t>::max()),
+         }) {
+        const auto layout = packed_storage_layout(elements);
+        require(
+            layout.is_matrix()
+                && static_cast<std::size_t>(layout.rows)
+                    * static_cast<std::size_t>(layout.columns)
+                    == elements,
+            "V4.1 packed storage layout is inexact");
+    }
+}
+
 } // namespace
 
 int main() {
@@ -441,6 +477,7 @@ int main() {
 
         test_dense_small_m();
         test_dense_small_output_m_matches_decode();
+        test_large_packed_storage_layout();
 
         const array grouped_weight(
             {

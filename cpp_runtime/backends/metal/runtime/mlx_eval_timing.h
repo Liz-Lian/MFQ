@@ -89,6 +89,12 @@ inline bool component_profile_active() noexcept {
     return active_component_profile != nullptr;
 }
 
+inline void profile_marker(std::string_view component) {
+    if (active_component_profile != nullptr) {
+        active_component_profile->record(component, 0.0);
+    }
+}
+
 class ScopedComponentProfile {
 public:
     explicit ScopedComponentProfile(

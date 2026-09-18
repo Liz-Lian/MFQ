@@ -619,7 +619,7 @@ mfq_tensor_backend::Tensor matmul(
          input.scalar_type() == mfq_tensor_backend::kFloat32),
         "FP8-SQ activation must be contiguous rank-2 CUDA FP16/FP32");
     const MfqCudaGuard guard(blob.device());
-    auto output = mfq_tensor_backend::empty(
+    mfq_tensor_backend::Tensor output = mfq_tensor_backend::empty(
         {input.size(0), layout.outputs}, input.options());
     const int rows = static_cast<int>(input.size(0));
     if (rows == 0) return output;

@@ -143,6 +143,51 @@ int main() {
                     "adaptive MTP warmup retained cold compile latency");
             }
         }
+        {
+            mfq::metal::MlxMtpDepthController controller(5);
+            controller.observe(2, 2, 30.0);
+            controller.observe(2, 2, 29.0);
+            controller.observe(2, 2, 28.0);
+            controller.observe(0, 0, 20.0);
+            controller.observe(0, 0, 20.0);
+            controller.observe(0, 0, 20.0);
+            for (int cycle = 0;
+                 cycle < 100 && controller.depth() != 3;
+                 ++cycle) {
+                const int depth = controller.depth();
+                controller.observe(
+                    depth,
+                    depth,
+                    depth == 0 ? 20.0 : 28.0);
+            }
+            if (controller.depth() != 3) {
+                throw std::runtime_error(
+                    "adaptive MTP did not explore an unmeasured depth");
+            }
+            controller.observe(3, 3, 1000.0);
+            if (controller.measured_cycle_ms(3)) {
+                throw std::runtime_error(
+                    "adaptive MTP exposed the first cold depth sample");
+            }
+            controller.observe(3, 3, 700.0);
+            if (controller.measured_cycle_ms(3)) {
+                throw std::runtime_error(
+                    "adaptive MTP exposed the second cold depth sample");
+            }
+            controller.observe(3, 3, 31.0);
+            if (!controller.measured_cycle_ms(3) ||
+                std::fabs(*controller.measured_cycle_ms(3) - 31.0) > 1e-9) {
+                throw std::runtime_error(
+                    "adaptive MTP retained cold latency for explored depth");
+            }
+            controller.observe(3, 3, 30.0);
+            if (controller.depth() < 3 ||
+                !controller.measured_cycle_ms(3) ||
+                *controller.measured_cycle_ms(3) >= 40.0) {
+                throw std::runtime_error(
+                    "adaptive MTP discouraged a profitable warmed depth");
+            }
+        }
         const std::array<std::int32_t, 4> drafts{11, 12, 13, 14};
         {
             const std::array<std::int32_t, 5> targets{11, 12, 99, 14, 15};

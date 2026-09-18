@@ -219,6 +219,8 @@ private:
     std::vector<int> warmup_trials_;
     std::vector<std::optional<double>> cycle_ms_;
     std::vector<std::optional<double>> cycle_age_ms_;
+    std::vector<int> timing_warmup_samples_;
+    std::vector<std::optional<double>> timing_warmup_min_;
     std::vector<int> warmup_;
 };
 

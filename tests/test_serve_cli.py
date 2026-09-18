@@ -384,14 +384,16 @@ def test_native_runtime_environment_preserves_explicit_resource_paths(tmp_path: 
 
 
 def test_serve_builds_web_ui_when_the_source_is_newer(tmp_path: Path, monkeypatch) -> None:
-    web = tmp_path / "web"
+    web = tmp_path / "MFQStudio"
     source = web / "src" / "App.tsx"
     source.parent.mkdir(parents=True)
     source.write_text("export {};", encoding="utf-8")
     (web / "package.json").write_text("{}", encoding="utf-8")
     (web / "package-lock.json").write_text("{}", encoding="utf-8")
     calls: list[list[str]] = []
-    monkeypatch.setattr("mfq.commands.serve._studio_dir", lambda: web)
+    monkeypatch.setattr(
+        "mfq.commands.serve.__file__", str(tmp_path / "mfq" / "commands" / "serve.py")
+    )
     monkeypatch.setattr("mfq.commands.serve.shutil.which", lambda _: "/usr/bin/npm")
 
     def run(command, **_):
@@ -450,12 +452,7 @@ def test_serve_validates_web_ui_before_backend_build_or_model_load(
         _run(args)
 
 
-def test_serve_can_disable_web_ui_build(monkeypatch) -> None:
-    monkeypatch.setattr(
-        "mfq.commands.serve._studio_dir",
-        lambda: (_ for _ in ()).throw(AssertionError("should not inspect Studio")),
-    )
-
+def test_serve_can_disable_web_ui_build() -> None:
     assert _prepare_web_root(None, disabled=True) is None
 
 

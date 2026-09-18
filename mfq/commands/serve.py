@@ -78,18 +78,6 @@ def _byte_size(value: str) -> int:
     return int(number * multipliers[suffix])
 
 
-def _console_script_dir(executable: str | Path) -> Path:
-    return Path(executable).parent
-
-
-def _environment_paths(name: str) -> list[Path]:
-    return [Path(value) for value in os.environ.get(name, "").split(os.pathsep) if value]
-
-
-def _studio_dir() -> Path:
-    return Path(__file__).resolve().parents[2] / "MFQStudio"
-
-
 def _validate_web_root(path: Path, *, source: str) -> Path:
     root = path.expanduser().resolve()
     if not root.is_dir():
@@ -111,7 +99,7 @@ def _prepare_web_root(configured: Path | None, *, disabled: bool) -> Path | None
             Path(environment_root),
             source="MFQ_SERVER_WEB_ROOT",
         )
-    web_dir = _studio_dir()
+    web_dir = Path(__file__).resolve().parents[2] / "MFQStudio"
     package = web_dir / "package.json"
     output = web_dir / "dist"
     index = output / "index.html"
@@ -271,7 +259,11 @@ def _run(args: argparse.Namespace) -> int:
         )
     configured_roots = [path.expanduser().resolve() for path in args.model_dir]
     if not configured_roots:
-        configured_roots = _environment_paths("MFQ_SERVER_MODEL_DIRS")
+        configured_roots = [
+            Path(value)
+            for value in os.environ.get("MFQ_SERVER_MODEL_DIRS", "").split(os.pathsep)
+            if value
+        ]
     if not configured_roots:
         configured_roots = [data_dir / "models"]
     configured_roots = [path.expanduser().resolve() for path in configured_roots]
@@ -319,7 +311,7 @@ def _run(args: argparse.Namespace) -> int:
     database_path, media_root = _server_storage_paths(data_dir, args.db)
     store = SessionStore(database_path, media_root=media_root)
     backend = ClusterBackend(runtime_manager, store)
-    binary_dir = _console_script_dir(sys.executable)
+    binary_dir = Path(sys.executable).parent
     perplexity = executable.with_name("mfq-perplexity")
     handlers = ToolJobHandlers(
         catalog,

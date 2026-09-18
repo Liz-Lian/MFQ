@@ -8,7 +8,6 @@ from pathlib import Path
 
 import numpy as np
 
-from mfq.commands.serve import _console_script_dir
 from mfq.formats.header import FileHeader
 from mfq.formats.io import save
 from mfq.quantize.imatrix import ImportanceEntry, save_importance_matrix
@@ -22,11 +21,6 @@ from mfq.server.tool_jobs import (
     ToolJobHandlers,
     ToolJobPaths,
 )
-
-
-def test_cli_preserves_the_active_environment_entry_point_directory(tmp_path: Path) -> None:
-    executable = tmp_path / ".venv" / "bin" / "python"
-    assert _console_script_dir(executable) == executable.parent
 
 
 def test_imatrix_jobs_default_to_compact_activation_aware_objective() -> None:

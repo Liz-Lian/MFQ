@@ -26,10 +26,10 @@ jobs:
       - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
 
       - name: Sync dependencies
-        run: uv sync --locked --extra metal
+        run: uv sync --extra daemon --extra metal
 
       - name: Build
-        run: uv run --no-sync mfq build -j 2
+        run: uv run mfq build
 
   linux-cuda:
     name: Linux CUDA
@@ -47,10 +47,10 @@ jobs:
           linux-local-args: '["--toolkit"]'
 
       - name: Sync dependencies
-        run: uv sync --locked
+        run: uv sync --extra daemon
 
       - name: Build
-        run: uv run --no-sync mfq build -j 2
+        run: uv run mfq build
 
   windows-cuda:
     name: Windows CUDA
@@ -67,7 +67,7 @@ jobs:
           method: local
 
       - name: Sync dependencies
-        run: uv sync --locked
+        run: uv sync --extra daemon
 
       - name: Build
-        run: uv run --no-sync mfq build -j 2
+        run: uv run mfq build

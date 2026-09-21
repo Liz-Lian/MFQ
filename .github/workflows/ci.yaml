@@ -23,7 +23,7 @@ jobs:
       - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
 
       - name: Sync dependencies
-        run: uv sync --extra daemon --extra metal
+        run: uv sync --extra metal
 
       - name: Build
         run: uv run mfq build

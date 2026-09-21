@@ -66,7 +66,6 @@ if [[ "${MFQ_RELEASE_REUSE_VENV:-0}" != "1" ]]; then
     --no-default-groups \
     --no-editable \
     --group release \
-    --extra daemon \
     --extra metal
 fi
 

@@ -488,6 +488,13 @@ if (-not [System.OperatingSystem]::IsWindows() -or -not [Environment]::Is64BitOp
     Fail "this release target must be built on 64-bit Windows"
 }
 
+foreach ($name in @("build", "sidecars", "Frameworks", "Resources", "windows-runtime", "dist")) {
+    $path = Join-Path $PSScriptRoot $name
+    if (Test-Path -LiteralPath $path) {
+        Remove-Item -LiteralPath $path -Recurse -Force
+    }
+}
+
 $PythonVersion = if ([string]::IsNullOrWhiteSpace($PythonVersion)) { "3.12" } else { $PythonVersion }
 $CudaArchitectures = if ([string]::IsNullOrWhiteSpace($CudaArchitectures)) { "86" } else { $CudaArchitectures }
 $Jobs = Get-ReleaseJobs $Jobs

@@ -1214,7 +1214,8 @@ struct KVCache {
 
     std::pair<mfq_tensor_backend::Tensor, mfq_tensor_backend::Tensor> append(
             mfq_tensor_backend::Tensor kk, mfq_tensor_backend::Tensor vv, mfq_tensor_backend::Tensor pos,
-            int64_t start_pos, int64_t end_pos) {
+            int64_t start_pos, int64_t end_pos,
+            bool contiguous_prefill_prefix = false) {
         (void)start_pos;
         auto kh = kk.to(scalar_type()).contiguous();
         auto vh = vv.to(scalar_type()).contiguous();
@@ -1227,10 +1228,20 @@ struct KVCache {
             paged_kv_cache_write_cuda(
                 k_chunk_ptrs, v_chunk_ptrs, page_table,
                 kh, vh, pos, page_size, pages_per_chunk);
-            // Continuous-batching prefill starts from an empty sequence, so
-            // the projected K/V tensors are already the logical contiguous
-            // view needed by causal prefill attention. Decode consumes the
-            // physical pages directly below.
+            // Later prefill chunks must attend to the complete previous
+            // prefix, including a final one-token chunk. Decode reads pages
+            // directly and does not materialize a contiguous prefix.
+            if (contiguous_prefill_prefix && start_pos > 0) {
+                auto options = mfq_tensor_backend::TensorOptions()
+                    .device(kh.device()).dtype(kh.scalar_type());
+                auto prefix_k = mfq_tensor_backend::empty(
+                    {paged_batch, paged_heads, end_pos, paged_head_dim}, options);
+                auto prefix_v = mfq_tensor_backend::empty(
+                    {paged_batch, paged_heads, end_pos, paged_head_dim}, options);
+                paged_kv_cache_gather_cuda(k_chunk_ptrs, v_chunk_ptrs,
+                    page_table, prefix_k, prefix_v, page_size, pages_per_chunk);
+                return {prefix_k, prefix_v};
+            }
             return {kh, vh};
         }
         MFQ_RUNTIME_CHECK(
@@ -1614,7 +1625,8 @@ struct FullBlock : Block {
             });
             kv = g_profiler.measure("full.kv_write", [&]() {
                 return cache.append(
-                    k, v, write_positions, cache_pos, cache_pos + T);
+                    k, v, write_positions, cache_pos, cache_pos + T,
+                    !seq_len.has_value());
             });
         }
         }

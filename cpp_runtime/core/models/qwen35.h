@@ -1,6 +1,7 @@
 #pragma once
 
 #include "grid_vision.h"
+#include "mfq_legacy_tensor_names.h"
 #include "mfq_model_graph.h"
 #include "models/model_config.h"
 
@@ -14,6 +15,7 @@
 namespace mfq::models::qwen35 {
 
 struct Config : ModelConfig {
+    MfqLegacyTensorLayout legacy_tensor_layout;
     bool attention_output_gate = false;
     std::int64_t num_experts = 0;
     std::int64_t num_experts_per_tok = 0;

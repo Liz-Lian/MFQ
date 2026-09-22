@@ -134,7 +134,8 @@ std::unique_ptr<::Block> load_block(
         b->attention_head_dim = config.head_dim;
         b->max_position_embeddings = config.max_position_embeddings;
         b->rms_norm_eps = config.rms_norm_eps;
-        b->norm_weight_offset = 1.0;
+        b->norm_weight_offset =
+            config.legacy_tensor_layout.norm_weight_offset;
         b->attention_output_gate = config.attention_output_gate;
         b->attn_norm = load_dense_gpu(
             source, lp + "attention.norm.weight");
@@ -177,6 +178,8 @@ std::unique_ptr<::Block> load_block(
     if (type == "linear_attention") {
         auto b = std::make_unique<LinearAttentionBlock>();
         b->qwen_config = config;
+        b->tiled_v_heads =
+            config.legacy_tensor_layout.qwen_gdn_gguf_layout;
         b->attn_norm = load_dense_gpu(source, lp + "attention.norm.weight");
         b->ffn_norm = load_dense_gpu(source, lp + "mlp.norm.weight");
         const std::string sp = lp + "linear_attention.";
@@ -245,7 +248,10 @@ std::unique_ptr<::Block> load_block(
             b->conv_bias = load_dense_gpu(source, sp + "conv.bias");
         }
         b->dt_bias = load_dense_gpu(source, sp + "dt_bias");
-        b->a_log = load_dense_gpu(source, sp + "a");
+        const auto a_parameter = load_dense_gpu(source, sp + "a");
+        b->a_log = config.legacy_tensor_layout.linear_attention_a_is_log
+            ? a_parameter
+            : mfq_tensor_backend::log(-a_parameter);
         b->linear_norm = load_dense_gpu(source, sp + "norm.weight");
         const std::string out_name = sp + "output.weight";
         if (is_quant_dtype(require_tensor(source, out_name).dtype)) {

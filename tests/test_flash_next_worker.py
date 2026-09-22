@@ -35,8 +35,8 @@ from mfq.runtime.flash_next_worker import (
     create_app,
     load_flash_next_tokenizer,
 )
-from mfq.server.backend import OpenAIChatBackend
-from mfq.server.models import SamplingParams
+from mfq.server.runtime.backend import OpenAIChatBackend
+from mfq.server.protocol.models import SamplingParams
 
 
 def _tiny_tokenizer() -> bytes:

@@ -21,15 +21,15 @@ from mfq.formats.assets import (
 from mfq.formats.header import FileHeader
 from mfq.formats.hf_source import HfSourceTensorStore
 from mfq.formats.io import save
-from mfq.server.catalog import ModelCatalog
-from mfq.server.hf_tokenizer import (
+from mfq.server.runtime.hf_tokenizer import (
     DEEPSEEK_V4_CHAT_TEMPLATE,
     DEEPSEEK_V41_CHAT_TEMPLATE,
     ensure_hf_tokenizer_gguf,
     ensure_mfq_tokenizer_gguf,
     native_hf_asset_environment,
 )
-from mfq.server.native import native_runtime_environment, native_tokenizer_arguments
+from mfq.server.runtime.native import native_runtime_environment, native_tokenizer_arguments
+from mfq.server.state.catalog import ModelCatalog
 
 
 def _hf_fixture(

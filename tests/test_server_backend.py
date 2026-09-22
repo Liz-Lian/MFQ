@@ -7,13 +7,13 @@ from uuid import UUID
 import httpx
 import pytest
 
-from mfq.server.backend import BackendError, BackendProtocolError, OpenAIChatBackend
-from mfq.server.models import (
+from mfq.server.protocol.models import (
     JsonSchemaResponseFormat,
     NamedToolChoice,
     SamplingParams,
     ToolDefinition,
 )
+from mfq.server.runtime.backend import BackendError, BackendProtocolError, OpenAIChatBackend
 
 
 def test_backend_stream_parses_cpp_sse_and_preserves_request_fields() -> None:

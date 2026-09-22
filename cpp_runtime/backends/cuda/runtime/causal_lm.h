@@ -453,7 +453,9 @@ struct CausalLm : CausalLmArchitectureState<Backbone> {
     }
 
     double norm_weight_offset() const noexcept {
-        if constexpr (
+        if constexpr (Backbone == CudaBackbone::generic_qwen) {
+            return this->config.legacy_tensor_layout.norm_weight_offset;
+        } else if constexpr (
                 is_flash_next || is_dsv4 || is_gemma4 || is_minicpmo45) {
             return 0.0;
         } else {

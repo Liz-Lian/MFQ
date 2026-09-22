@@ -79,6 +79,24 @@ def test_scheduler_supports_dynamic_join_retire_and_per_request_sampling():
     assert "DecodeGraphTpProjectionScope tp_projection_scope" in BATCHING
 
 
+def test_scheduler_supports_resident_and_cached_qwen_moe():
+    assert "qwen_continuous_batch_has_moe" in BATCHING
+    assert "continuous_batching_moe" in BATCHING
+    assert "continuous_batching_moe_cached_row_serial" in BATCHING
+    assert "continuous batching requires dense Qwen blocks" not in BATCHING
+    assert "continuous batching cannot use the expert cache" not in BATCHING
+    assert "qwen_continuous_batch_has_cached_moe" in BATCHING
+    assert "uses_moe_expert_cache()" in DECODE
+    assert "MoeContinuousBatchCacheScope moe_cache_scope" in BATCHING
+    assert "g_moe_continuous_batch_cache_serial" in DECODE
+    assert "each routed FFN row independently" in DECODE
+    assert (
+        "cpu_moe_down ||\n"
+        "                        g_moe_continuous_batch_cache_serial"
+        in DECODE
+    )
+
+
 def test_scheduler_services_decode_before_contended_prefill_admission():
     decode_first = "if (decode_was_active) decode_active();"
     limited_join = "? size_t{1}"

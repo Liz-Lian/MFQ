@@ -1613,6 +1613,18 @@ static int run_qwen_continuous_batching_check(mfq::cuda::Qwen35CausalLm & model)
     MFQ_RUNTIME_CHECK(first_produced == first_params.max_tokens &&
         second_produced == second_params.max_tokens,
         "continuous batching generated token count mismatch");
+    const auto print_mismatch = [](const char * name,
+            const std::vector<int64_t> & reference,
+            const std::vector<int64_t> & actual) {
+        if (reference == actual) return;
+        std::cerr << "continuous_batching_check mismatch " << name << " reference=";
+        for (auto token : reference) std::cerr << token << ',';
+        std::cerr << " actual=";
+        for (auto token : actual) std::cerr << token << ',';
+        std::cerr << '\n';
+    };
+    print_mismatch("first", first_reference, first_output);
+    print_mismatch("second", second_reference, second_output);
     MFQ_RUNTIME_CHECK(first_output == first_reference,
         "continuous batching first request differs from serial greedy oracle");
     MFQ_RUNTIME_CHECK(second_output == second_reference,

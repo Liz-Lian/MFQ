@@ -23,6 +23,7 @@ int main() {
     require(pages == std::vector<std::int32_t>({0, 1, 2, 3, 4, 5, 6, 7}),
         "Paged KV allocator did not issue all pages monotonically");
     require(allocator.live_pages() == 8 &&
+            allocator.peak_live_pages() == 8 &&
             allocator.high_watermark() == 8 &&
             allocator.allocation_count() == 8 &&
             allocator.reuse_count() == 0 &&
@@ -38,6 +39,7 @@ int main() {
     }
     require(exhausted, "Paged KV allocator did not report pool exhaustion");
     require(allocator.live_pages() == 8 &&
+            allocator.peak_live_pages() == 8 &&
             allocator.high_watermark() == 8 &&
             allocator.allocation_count() == 8 &&
             allocator.reuse_count() == 0 &&
@@ -48,6 +50,7 @@ int main() {
 
     allocator.release({3});
     require(allocator.live_pages() == 7 &&
+            allocator.peak_live_pages() == 8 &&
             allocator.high_watermark() == 8 &&
             allocator.allocation_count() == 8 &&
             allocator.reuse_count() == 0 &&
@@ -62,6 +65,7 @@ int main() {
     }
     require(invalid_release_rejected &&
             allocator.live_pages() == 7 &&
+            allocator.peak_live_pages() == 8 &&
             allocator.high_watermark() == 8 &&
             allocator.allocation_count() == 8 &&
             allocator.reuse_count() == 0 &&
@@ -72,6 +76,7 @@ int main() {
     require(reused == std::vector<std::int32_t>({3}),
         "Paged KV allocator did not reuse the released page");
     require(allocator.live_pages() == 8 &&
+            allocator.peak_live_pages() == 8 &&
             allocator.high_watermark() == 8 &&
             allocator.allocation_count() == 9 &&
             allocator.reuse_count() == 1 &&

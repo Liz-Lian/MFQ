@@ -27,6 +27,15 @@ ATTENTION_MMA = (
 KV_CACHE = (ROOT / "mfq" / "kernels" / "cuda" / "kv_cache.cu").read_text(
     encoding="utf-8"
 )
+QWEN_LOADER = (
+    CUDA_ROOT / "models" / "qwen35" / "qwen35_causal_lm.cpp"
+).read_text(encoding="utf-8")
+QWEN_CONFIG = (
+    ROOT / "cpp_runtime" / "core" / "models" / "qwen35.cpp"
+).read_text(encoding="utf-8")
+CAUSAL_LM = (CUDA_ROOT / "runtime" / "causal_lm.h").read_text(
+    encoding="utf-8"
+)
 
 
 def test_continuous_batching_is_an_explicit_server_mode():
@@ -95,6 +104,21 @@ def test_scheduler_supports_resident_and_cached_qwen_moe():
         "                        g_moe_continuous_batch_cache_serial"
         in DECODE
     )
+
+
+def test_generic_qwen_loader_constructs_moe_ffns():
+    assert '"experts.gate_up.weight"' in QWEN_LOADER
+    assert '"experts.gate.weight"' in QWEN_LOADER
+    assert '"experts.up.weight"' in QWEN_LOADER
+    assert '"experts.down.weight"' in QWEN_LOADER
+    assert '"shared_expert.router.weight"' in QWEN_LOADER
+    assert "load_mfe_gpu(" in QWEN_LOADER
+    assert "ffn.is_moe = true" in QWEN_LOADER
+    assert "load_qwen_ffn(" in QWEN_LOADER
+    assert "config.num_experts" in QWEN_LOADER
+    assert "return this->config.num_experts" in CAUSAL_LM
+    assert "dense Qwen model config intermediate_size must be positive" in QWEN_CONFIG
+    assert '"Qwen model config intermediate_size must be positive"' not in QWEN_CONFIG
 
 
 def test_scheduler_services_decode_before_contended_prefill_admission():

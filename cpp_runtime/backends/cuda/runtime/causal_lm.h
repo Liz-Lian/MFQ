@@ -474,6 +474,8 @@ struct CausalLm : CausalLmArchitectureState<Backbone> {
     int64_t num_experts() const noexcept {
         if constexpr (is_qwen4 || is_glm5) {
             return this->config.experts;
+        } else if constexpr (Backbone == CudaBackbone::generic_qwen) {
+            return this->config.num_experts;
         } else if constexpr (is_deepseek_v41) {
             return this->config.n_experts;
         } else if constexpr (Backbone == CudaBackbone::deepseek_v4 ||

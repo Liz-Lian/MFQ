@@ -16,6 +16,7 @@ import { errorMessage, formatNumber, formatBytes, formatDuration } from '../../a
 import { runtimeModelNames } from './modelSelection';
 import { displayPrefillMetric, preferPositiveMetric } from './metrics';
 import { RuntimeHero } from './RuntimeHero';
+import { toast } from '../../stores/toastStore';
 
 /** 展示共享运行状态，页面卸载时清理复制提示计时器。 */
 export function OverviewPage() {
@@ -30,7 +31,6 @@ export function OverviewPage() {
     loading: busy,
   } = useRuntime();
   const { tr } = useSettings();
-  const [error, setError] = useState<string | null>(null);
   const [endpointCopied, setEndpointCopied] = useState(false);
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
   useEffect(
@@ -48,10 +48,11 @@ export function OverviewPage() {
     try {
       await navigator.clipboard.writeText(studio?.service_url || 'http://127.0.0.1:8090');
       setEndpointCopied(true);
+      toast.success(tr('服务地址已复制到剪贴板', 'Endpoint URL copied to clipboard'));
       if (timer.current) clearTimeout(timer.current);
       timer.current = setTimeout(() => setEndpointCopied(false), 1600);
     } catch (cause) {
-      setError(errorMessage(cause));
+      toast.error(errorMessage(cause));
     }
   }
   const runtimeMemory = Number(
@@ -81,11 +82,6 @@ export function OverviewPage() {
           </button>
         }
       />
-      {error && (
-        <div className="error-banner" role="alert">
-          {error}
-        </div>
-      )}
       <RuntimeHero />
       {availableModelNames.length > 1 && (
         <>

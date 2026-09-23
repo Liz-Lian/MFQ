@@ -8,13 +8,13 @@ import { errorMessage, formatNumber } from '../../app/formatters';
 import { studioConfirm } from '../../studio';
 import { ToolsRoutingPanel } from '../connections/ToolsRoutingPanel';
 import { RuntimeProfilesPanel } from './RuntimeProfilesPanel';
+import { toast } from '../../stores/toastStore';
 
 /** 管理资源页状态；离开页面后忽略迟到的资源加载结果。 */
 export function CachePage() {
   const { runtime, refreshRuntime } = useRuntime();
   const { tr } = useSettings();
   const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
   const runtimeCache = Number(runtime?.mlx_cache_bytes ?? runtime?.cuda_reserved_bytes ?? 0);
   const prefixCacheQueries = Number(runtime?.prefix_cache_queries || 0);
   const prefixCacheHits = Number(runtime?.prefix_cache_hits || 0);
@@ -47,8 +47,9 @@ export function CachePage() {
     try {
       await api.clearRuntimeCache(runtime?.instance_id);
       await refreshRuntime(false);
+      toast.success(tr('缓存已清除', 'Cache cleared successfully'));
     } catch (cause) {
-      setError(errorMessage(cause));
+      toast.error(errorMessage(cause));
     } finally {
       setBusy(false);
     }
@@ -63,11 +64,6 @@ export function CachePage() {
           'Inspect memory, prefix caching, and runtime profiles.',
         )}
       />
-      {error && (
-        <div className="error-banner" role="alert">
-          {error}
-        </div>
-      )}
 
       <SectionLabel
         title={tr('内存层级', 'Memory hierarchy')}

@@ -9,11 +9,11 @@ import { useRuntime } from '../../app/RuntimeProvider';
 import { useNavigate } from 'react-router';
 import type { HubModelSummary, HubModelInfo, JobKindResource } from '../../api';
 import { parseHubReference } from './hubReference';
+import { toast } from '../../stores/toastStore';
 /** 隔离模型仓库的请求与草稿，将下载任务登记到共享运行时。 */
 export function ModelHubPage() {
   const { tr } = useSettings();
   const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
   const panelLabels = {
     collapse: tr('折叠面板', 'Collapse panel'),
     expand: tr('展开面板', 'Expand panel'),
@@ -33,7 +33,9 @@ export function ModelHubPage() {
         if (active) setJobKinds(items);
       })
       .catch((cause) => {
-        if (active) setError(errorMessage(cause));
+        if (active) {
+          toast.error(errorMessage(cause));
+        }
       });
     return () => {
       active = false;
@@ -62,7 +64,7 @@ export function ModelHubPage() {
       setHubResults(results);
       setHubModel(null);
     } catch (cause) {
-      setError(errorMessage(cause));
+      toast.error(errorMessage(cause));
     } finally {
       setBusy(false);
     }
@@ -74,7 +76,7 @@ export function ModelHubPage() {
     try {
       setHubModel(await api.hubModelInfo(item.provider, item.repo_id));
     } catch (cause) {
-      setError(errorMessage(cause));
+      toast.error(errorMessage(cause));
     } finally {
       setBusy(false);
     }
@@ -88,9 +90,9 @@ export function ModelHubPage() {
         .pop()
         ?.replace(/[^A-Za-z0-9_.-]/g, '-') || 'model';
     const repositoryPath = hubModel.repo_id
-      .split('/')
-      .map((part) => part.replace(/[^A-Za-z0-9_.-]+/g, '-') || 'model')
-      .join('/');
+        .split('/')
+        .map((part) => part.replace(/[^A-Za-z0-9_.-]+/g, '-') || 'model')
+        .join('/');
     setBusy(true);
     try {
       const created = await api.createJob(`download.${hubModel.provider}`, {
@@ -100,20 +102,16 @@ export function ModelHubPage() {
         expected_bytes: hubModel.total_bytes || null,
       });
       addJob(created);
+      toast.success(tr('下载任务已提交', 'Download job submitted'));
       navigate('/quantization', { state: { jobId: created.id } });
     } catch (cause) {
-      setError(errorMessage(cause));
+      toast.error(errorMessage(cause));
     } finally {
       setBusy(false);
     }
   }
   return (
     <>
-      {error && (
-        <div role="alert" className="error-banner">
-          {error}
-        </div>
-      )}
       <PanelDeck labels={panelLabels} page="lab-models">
         <div key="hubs">
           <section className="dashboard-panel hub-panel">

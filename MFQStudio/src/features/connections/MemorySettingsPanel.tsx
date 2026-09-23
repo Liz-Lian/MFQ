@@ -6,12 +6,12 @@ import { useSettings } from '../settings/SettingsProvider';
 import { SectionLabel, SettingRow, TMPanel } from '../../app/display';
 import { errorMessage, formatBytes, formatNumber } from '../../app/formatters';
 import { studioConfirm } from '../../studio';
+import { toast } from '../../stores/toastStore';
 /** 只订阅运行时与上下文设置，重载期间不阻塞其他连接配置。 */
 export function MemorySettingsPanel() {
   const { runtime, refreshRuntime } = useRuntime();
   const { tr, contextSize, setContextSize } = useSettings();
   const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
   const memory = Number(
     runtime?.mlx_active_bytes ??
       runtime?.cuda_allocated_bytes ??
@@ -36,18 +36,17 @@ export function MemorySettingsPanel() {
     )
       return;
     setBusy(true);
-    setError(null);
     try {
       await api.reloadRuntime(contextSize, runtime?.instance_id);
       await refreshRuntime(true);
+      toast.success(tr('模型重载成功', 'Model reloaded successfully'));
     } catch (cause) {
-      setError(errorMessage(cause));
+      toast.error(errorMessage(cause));
     } finally {
       setBusy(false);
     }
   }
   return <>
-    {error && <p role="alert" className="error-banner">{error}</p>}
         <SectionLabel title={tr('内存规划', 'Memory plan')} />
         <TMPanel className="server-settings-panel">
           <div className="setting-list">

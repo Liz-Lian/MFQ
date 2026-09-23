@@ -9,6 +9,7 @@ import { Icon, SectionLabel, TMPanel } from '../../app/display';
 import { errorMessage } from '../../app/formatters';
 import { studioConfirm } from '../../studio';
 import { STUDIO_PATHS } from '../../navigation';
+import { toast } from '../../stores/toastStore';
 
 /** 按需读取模型与配置档案，保存当前实例策略及推理参数。 */
 export function RuntimeProfilesPanel() {
@@ -19,7 +20,6 @@ export function RuntimeProfilesPanel() {
   const [runtimeProfiles, setRuntimeProfiles] = useState<RuntimeProfile[]>([]);
   const [profileName, setProfileName] = useState('');
   const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
   const currentInstance = instances.find((instance) => instance.id === runtime?.instance_id);
   const loadPinned = Boolean(currentInstance?.pinned);
   const loadIdleTtl = currentInstance?.idle_ttl_seconds ?? null;
@@ -38,7 +38,9 @@ export function RuntimeProfilesPanel() {
         }
       })
       .catch((cause) => {
-        if (active) setError(errorMessage(cause));
+        if (active) {
+          toast.error(errorMessage(cause));
+        }
       });
     return () => {
       active = false;
@@ -79,8 +81,9 @@ export function RuntimeProfilesPanel() {
       setProfileName('');
       setRuntimeProfiles(await api.runtimeProfiles());
       await refreshRuntime(false);
+      toast.success(tr('运行配置已保存', 'Runtime profile saved'));
     } catch (cause) {
-      setError(errorMessage(cause));
+      toast.error(errorMessage(cause));
     } finally {
       setBusy(false);
     }
@@ -107,7 +110,7 @@ export function RuntimeProfilesPanel() {
       await refreshRuntime(false);
       setSelectedModel(profile.load.model);
     } catch (cause) {
-      setError(errorMessage(cause));
+      toast.error(errorMessage(cause));
     } finally {
       setBusy(false);
     }
@@ -120,8 +123,9 @@ export function RuntimeProfilesPanel() {
     try {
       await api.deleteRuntimeProfile(id);
       setRuntimeProfiles((current) => current.filter((item) => item.id !== id));
+      toast.success(tr('运行配置已删除', 'Runtime profile deleted'));
     } catch (cause) {
-      setError(errorMessage(cause));
+      toast.error(errorMessage(cause));
     } finally {
       setBusy(false);
     }
@@ -129,11 +133,6 @@ export function RuntimeProfilesPanel() {
 
   return (
     <>
-      {error && (
-        <div className="error-banner" role="alert">
-          {error}
-        </div>
-      )}
       <SectionLabel title={tr('运行配置', 'Runtime profiles')} />
       <TMPanel className="profile-panel">
         <div className="panel-heading">

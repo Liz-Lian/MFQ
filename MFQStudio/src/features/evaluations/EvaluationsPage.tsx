@@ -6,11 +6,11 @@ import { PanelDeck } from '../../app/PanelDeck';
 import { errorMessage, formatNumber } from '../../app/formatters';
 import { useSettings } from '../settings/SettingsProvider';
 import type { DatasetResource, EvaluationResult, EvaluationComparison } from '../../api';
+import { toast } from '../../stores/toastStore';
 /** 挂载时加载评测资源，提交与错误状态仅影响当前页面。 */
 export function EvaluationsPage() {
   const { tr } = useSettings();
   const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
   const panelLabels = {
     collapse: tr('折叠面板', 'Collapse panel'),
     expand: tr('展开面板', 'Expand panel'),
@@ -36,7 +36,9 @@ export function EvaluationsPage() {
         }
       })
       .catch((cause) => {
-        if (active) setError(errorMessage(cause));
+        if (active) {
+          toast.error(errorMessage(cause));
+        }
       });
     return () => {
       active = false;
@@ -55,8 +57,9 @@ export function EvaluationsPage() {
       });
       setDatasetDraft({ name: '', artifact_uri: '', kind: 'custom' });
       setDatasets(await api.datasets());
+      toast.success(tr('数据集已注册', 'Dataset registered'));
     } catch (cause) {
-      setError(errorMessage(cause));
+      toast.error(errorMessage(cause));
     } finally {
       setBusy(false);
     }
@@ -68,18 +71,13 @@ export function EvaluationsPage() {
     try {
       setEvaluationComparison(await api.compareEvaluations(selectedEvaluations));
     } catch (cause) {
-      setError(errorMessage(cause));
+      toast.error(errorMessage(cause));
     } finally {
       setBusy(false);
     }
   }
   return (
     <>
-      {error && (
-        <div role="alert" className="error-banner">
-          {error}
-        </div>
-      )}
       <PanelDeck labels={panelLabels} page="lab-evaluations">
         <section className="dashboard-panel evaluation-panel" key="results">
           <div className="panel-heading">
@@ -234,7 +232,7 @@ export function EvaluationsPage() {
                         .then(() =>
                           setDatasets((current) => current.filter((entry) => entry.id !== item.id)),
                         )
-                        .catch((cause) => setError(errorMessage(cause)))
+                        .catch((cause) => toast.error(errorMessage(cause)))
                     }
                     type="button"
                   >

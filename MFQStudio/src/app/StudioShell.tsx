@@ -4,6 +4,7 @@ import { useLocation, useNavigate, Outlet } from 'react-router';
 import { useRuntime } from './RuntimeProvider';
 import { useSettings } from '../features/settings/SettingsProvider';
 import { useUiStore } from '../stores/uiStore';
+import { ToastContainer } from '../shared/ui/Toast';
 import { Icon } from './display';
 import { formatNumber } from './formatters';
 import { runtimeModelNames } from '../features/runtime/modelSelection';
@@ -97,6 +98,7 @@ export function StudioShell() {
   }
   return (
     <div className="app-shell">
+      <ToastContainer />
       <a className="skip-link" href="#studio-main">
         {tr('跳到主要内容', 'Skip to main content')}
       </a>

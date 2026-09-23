@@ -5,6 +5,7 @@ import { SectionLabel, TMPanel } from '../../app/display';
 import { errorMessage, formatNumber } from '../../app/formatters';
 import { useRuntime } from '../../app/RuntimeProvider';
 import { useSettings } from '../settings/SettingsProvider';
+import { toast } from '../../stores/toastStore';
 
 /** 页面挂载后读取连接资源，所有写入错误仅影响当前连接面板。 */
 export function ToolsRoutingPanel() {
@@ -20,7 +21,6 @@ export function ToolsRoutingPanel() {
   });
   const [nodeDraft, setNodeDraft] = useState({ name: '', url: '', api_key_env: '' });
   const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
   useEffect(() => {
     if (!ready) return;
     let disposed = false;
@@ -33,7 +33,9 @@ export function ToolsRoutingPanel() {
         }
       })
       .catch((cause) => {
-        if (!disposed) setError(errorMessage(cause));
+        if (!disposed) {
+          toast.error(errorMessage(cause));
+        }
       });
     return () => {
       disposed = true;
@@ -44,7 +46,6 @@ export function ToolsRoutingPanel() {
   async function mutate(operation: () => Promise<unknown>) {
     if (busy) return;
     setBusy(true);
-    setError(null);
     try {
       await operation();
       const [nextServers, nextTools, nextNodes] = await Promise.all([
@@ -57,7 +58,7 @@ export function ToolsRoutingPanel() {
       setNodes(nextNodes);
       window.dispatchEvent(new Event('mfq:tools-changed'));
     } catch (cause) {
-      setError(errorMessage(cause));
+      toast.error(errorMessage(cause));
     } finally {
       setBusy(false);
     }
@@ -97,11 +98,6 @@ export function ToolsRoutingPanel() {
         title={tr('工具与路由', 'Tools and routing')}
         subtitle={tr('可选的 MCP 与远程节点', 'Optional MCP and remote nodes')}
       />
-      {error && (
-        <p role="alert" className="error-banner">
-          {error}
-        </p>
-      )}
       <div className="dashboard-grid server-tools-grid">
         <TMPanel className="mcp-panel">
           <div className="panel-heading">

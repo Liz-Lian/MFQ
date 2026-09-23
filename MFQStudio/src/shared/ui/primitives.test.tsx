@@ -1,11 +1,13 @@
 /** 验证模态弹窗、工具提示和即时设置开关的键盘及读屏行为。 */
 import { useRef, useState } from 'react';
-import { render, screen, waitFor } from '@testing-library/react';
+import { act, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { Dialog } from './Dialog';
 import { Switch } from './Switch';
 import { Tooltip } from './Tooltip';
+import { ToastContainer } from './Toast';
+import { toast, useToastStore } from '../../stores/toastStore';
 
 beforeEach(() => {
   // jsdom 无布局观测器；本组仅验证焦点、键盘和无障碍语义。
@@ -126,5 +128,75 @@ describe('Tooltip', () => {
     expect(screen.getByRole('button', { name: '重新生成' })).toHaveFocus();
     await user.keyboard('{Escape}');
     await waitFor(() => expect(screen.queryByRole('tooltip')).not.toBeInTheDocument());
+  });
+});
+
+describe('Toast', () => {
+  beforeEach(() => {
+    useToastStore.getState().clearToasts();
+  });
+
+  it('展示错误与成功通知，支持无障碍语义和手动关闭', async () => {
+    const user = userEvent.setup();
+    render(<ToastContainer />);
+
+    expect(screen.queryByRole('region', { name: '通知提示' })).not.toBeInTheDocument();
+
+    toast.error('模型加载失败', { title: '错误' });
+    toast.success('配置已保存');
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('模型加载失败');
+    expect(screen.getByText('错误')).toBeInTheDocument();
+    expect(screen.getByRole('status')).toHaveTextContent('配置已保存');
+
+    const closeButtons = screen.getAllByRole('button', { name: '关闭通知' });
+    expect(closeButtons).toHaveLength(2);
+
+    await user.click(closeButtons[0]);
+    await waitFor(() => expect(screen.queryByRole('alert')).not.toBeInTheDocument());
+    expect(screen.getByRole('status')).toHaveTextContent('配置已保存');
+  });
+
+  it('到达 duration 时自动销毁通知', async () => {
+    vi.useFakeTimers();
+    render(<ToastContainer />);
+
+    act(() => {
+      toast.info('临时提示', { duration: 1500 });
+    });
+    expect(screen.getByRole('status')).toHaveTextContent('临时提示');
+
+    act(() => {
+      vi.advanceTimersByTime(1600);
+    });
+    expect(screen.queryByRole('status')).not.toBeInTheDocument();
+
+    vi.useRealTimers();
+  });
+
+  it('同 ID 替换后重新计时，旧版本关闭回调不能移除新通知', () => {
+    vi.useFakeTimers();
+    render(<ToastContainer />);
+
+    act(() => {
+      toast.info('旧提示', { id: 'replaceable', duration: 1000 });
+    });
+    const oldRevision = useToastStore.getState().toasts[0].revision;
+    act(() => vi.advanceTimersByTime(900));
+
+    act(() => {
+      toast.info('新提示', { id: 'replaceable', duration: 1000 });
+    });
+    expect(useToastStore.getState().toasts[0].revision).not.toBe(oldRevision);
+
+    act(() => {
+      vi.advanceTimersByTime(200);
+      useToastStore.getState().dismissToast('replaceable', oldRevision);
+    });
+    expect(screen.getByRole('status')).toHaveTextContent('新提示');
+
+    act(() => vi.advanceTimersByTime(800));
+    expect(screen.queryByRole('status')).not.toBeInTheDocument();
+    vi.useRealTimers();
   });
 });

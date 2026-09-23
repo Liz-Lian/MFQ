@@ -216,8 +216,8 @@ def test_cuda_uses_one_architecture_and_optional_component_registry() -> None:
     ):
         assert f'"{implementation}"' in CUDA_PLAN
 
-    assert "load_cuda_runtime_components(" in CUDA_DECODE
-    assert "CudaRuntimeComponents server_components" in CUDA_DECODE
+    assert "load_runtime_components(" in CUDA_DECODE
+    assert "auto server_components" in CUDA_DECODE
     assert "switch (result.plan.vision)" in CUDA_COMPONENTS
     assert "server_minicpmo_runtime" not in CUDA_DECODE
 

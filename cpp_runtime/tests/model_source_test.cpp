@@ -56,7 +56,9 @@ std::string graph_json() {
     })json";
 }
 
-void write_mfq(const std::filesystem::path& path) {
+void write_mfq(
+    const std::filesystem::path& path,
+    std::string_view tensor_name = "model.token_embedding.weight") {
     const std::string config = R"({"model_type":"qwen3_5"})";
     std::ofstream stream(path, std::ios::binary);
     stream.write("MFQ1", 4);
@@ -64,7 +66,7 @@ void write_mfq(const std::filesystem::path& path) {
     write_string(stream, "qwen3_5");
     write_scalar<std::uint32_t>(stream, 0);
     write_scalar<std::uint32_t>(stream, 2);
-    write_string(stream, "model.token_embedding.weight");
+    write_string(stream, tensor_name);
     write_string(stream, "BF16");
     write_scalar<std::uint64_t>(stream, 14);
     write_string(stream, "__mfq_asset__/model_config.json");
@@ -110,9 +112,16 @@ void write_hf_mxfp8(const std::filesystem::path& root) {
     stream.write(payload.data(), static_cast<std::streamsize>(payload.size()));
 }
 
-void write_hf_fp8_128(const std::filesystem::path& root) {
+void write_hf_fp8_128(
+    const std::filesystem::path& root,
+    bool explicit_source_map = false) {
     std::filesystem::create_directories(root);
     std::ofstream(root / "config.json") << R"({"model_type":"qwen3_5"})";
+    if (explicit_source_map) {
+        std::filesystem::create_directories(root / ".mfq-assets" / "hf");
+        std::ofstream(root / ".mfq-assets" / "hf" / "source_tensor_map.json")
+            << R"({"schema":"mfq.hf-source-map","version":1,"canonical_to_source":{"model.block.0.linear_attention.gate.weight":"block.weight","model.block.0.linear_attention.gate.weight_scale":"block.weight_scale_inv"}})";
+    }
     const std::string header =
         R"({"block.weight":{"dtype":"F8_E4M3","shape":[128,128],"data_offsets":[0,16384]},"block.weight_scale_inv":{"dtype":"BF16","shape":[1,1],"data_offsets":[16384,16386]}})";
     std::ofstream stream(root / "model.safetensors", std::ios::binary);
@@ -143,19 +152,47 @@ int main() {
     try {
         std::filesystem::create_directories(root);
         const auto mfq_path = root / "model.mfq";
+        const auto legacy_mfq_path = root / "legacy-model.mfq";
+        const auto legacy_gguf_path = root / "legacy-gguf-model.mfq";
         const auto hf_path = root / "hf";
         write_mfq(mfq_path);
+        write_mfq(
+            legacy_mfq_path,
+            "model.language_model.embed_tokens.weight");
+        write_mfq(legacy_gguf_path, "token_embd.weight");
         write_hf(hf_path);
         write_hf_mxfp8(root / "hf-mxfp8");
         write_hf_fp8_128(root / "hf-fp8-128");
+        write_hf_fp8_128(root / "hf-fp8-128-explicit", true);
 
         mfq::MfqModelSource mfq_source(mfq_path);
+        mfq::MfqModelSource legacy_mfq_source(legacy_mfq_path);
+        mfq::MfqModelSource legacy_gguf_source(legacy_gguf_path);
         mfq::HfModelSource hf_source(hf_path);
         const auto opened_mfq = mfq::open_model_source(mfq_path);
         const auto opened_hf = mfq::open_model_source(hf_path);
 
         require(mfq_source.tensors().size() == 1,
                 "MFQ assets leaked into tensor enumeration");
+        require(
+            legacy_mfq_source.find_tensor("model.token_embedding.weight") !=
+                    nullptr &&
+                legacy_mfq_source.find_tensor(
+                    "model.language_model.embed_tokens.weight") == nullptr,
+            "legacy MFQ tensor name was not canonicalized");
+        require_bytes(
+            legacy_mfq_source.read("model.token_embedding.weight"));
+        const auto& gguf_compatibility =
+            legacy_gguf_source.legacy_tensor_compatibility();
+        require(
+            gguf_compatibility.canonical_to_stored.at(
+                "model.token_embedding.weight") == "token_embd.weight" &&
+                gguf_compatibility.layout.norm_weight_offset == 0.0 &&
+                !gguf_compatibility.layout.linear_attention_a_is_log &&
+                gguf_compatibility.layout.qwen_gdn_gguf_layout,
+            "legacy MFQ tensor layout was not preserved");
+        require_bytes(
+            legacy_gguf_source.read("model.token_embedding.weight"));
 
         for (const mfq::ModelSource* source :
              std::vector<const mfq::ModelSource*>{
@@ -250,6 +287,19 @@ int main() {
                     std::to_integer<unsigned char>(
                         fp8_128_bytes[fp8_128_layout.scales + 1]) == 0x3f,
                 "lossless FP8-128SQ payload differs from HF source bytes");
+
+        mfq::HfModelSource fp8_128_explicit_source(
+            root / "hf-fp8-128-explicit");
+        const auto* fp8_128_explicit = fp8_128_explicit_source.find_tensor(
+            "model.block.0.linear_attention.gate.weight");
+        require(fp8_128_explicit != nullptr &&
+                    fp8_128_explicit->dtype == "FP8-128SQ" &&
+                    fp8_128_explicit->stored_dtype == "FP8-128SQ" &&
+                    fp8_128_explicit->nbytes == 16734,
+                "explicit HF source map did not bind block FP8 scale");
+        require(fp8_128_explicit_source.find_tensor(
+                    "model.block.0.linear_attention.gate.weight_scale") == nullptr,
+                "explicit block FP8 scale leaked into tensor enumeration");
 
         mfq::HfModelSource mxfp8_source(root / "hf-mxfp8");
         for (const auto& [name, nbytes] :

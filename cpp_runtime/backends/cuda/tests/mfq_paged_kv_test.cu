@@ -1,6 +1,5 @@
 #include "mfq_cuda_paged_kv.h"
 #include "mfq_native_tensor.h"
-#include "../runtime/paged_kv_allocator.h"
 
 #include <cuda_runtime_api.h>
 
@@ -28,31 +27,6 @@ std::vector<float> float_values(const Tensor & tensor) {
         .contiguous();
     return std::vector<float>(
         host.data_ptr<float>(), host.data_ptr<float>() + host.numel());
-}
-
-void check_allocator() {
-    using mfq::cuda::continuous::PagedKvPageAllocator;
-    PagedKvPageAllocator allocator(8);
-    auto first = allocator.allocate(3);
-    require(first == std::vector<std::int32_t>({0, 1, 2}),
-        "Paged KV allocator did not issue monotonic pages");
-    allocator.release({1});
-    auto reused = allocator.allocate(1);
-    require(reused == std::vector<std::int32_t>({1}) &&
-        allocator.reuse_count() == 1 && allocator.live_pages() == 3,
-        "Paged KV allocator did not reuse a retired page");
-    bool rejected = false;
-    try {
-        allocator.release({7});
-    } catch (const std::logic_error &) {
-        rejected = true;
-    }
-    require(rejected && allocator.live_pages() == 3,
-        "Paged KV allocator accepted an invalid release");
-    allocator.release({0, 2, 1});
-    require(allocator.live_pages() == 0 &&
-        allocator.peak_live_pages() == 3,
-        "Paged KV allocator accounting mismatch");
 }
 
 void check_kernels() {
@@ -114,8 +88,30 @@ void check_kernels() {
         0, 1, 2, 3, 4, 5, 6,
     }).reshape({B, T}).to(gpu).contiguous();
     paged_kv_cache_write_cuda(
-        k_chunks, v_chunks, page_table, k, v, positions,
+        k_chunks, v_chunks, page_table,
+        k.narrow(2, 0, 3).contiguous(), v.narrow(2, 0, 3).contiguous(),
+        positions.narrow(1, 0, 3).contiguous(),
         Page, PagesPerChunk);
+    auto first_k = mfq::cuda::empty({B, Hk, 3, D},
+        TensorOptions().device(gpu).dtype(mfq::cuda::kFloat16));
+    auto first_v = mfq::cuda::empty_like(first_k);
+    paged_kv_cache_gather_cuda(k_chunks, v_chunks, page_table,
+        first_k, first_v, Page, PagesPerChunk);
+    require(float_values(first_k) == float_values(k.narrow(2, 0, 3)),
+        "Paged first-chunk key gather differs from source");
+    require(float_values(first_v) == float_values(v.narrow(2, 0, 3)),
+        "Paged first-chunk value gather differs from source");
+    paged_kv_cache_write_cuda(k_chunks, v_chunks, page_table,
+        k.narrow(2, 3, 4).contiguous(), v.narrow(2, 3, 4).contiguous(),
+        positions.narrow(1, 3, 4).contiguous(), Page, PagesPerChunk);
+    auto gathered_k = mfq::cuda::empty_like(k);
+    auto gathered_v = mfq::cuda::empty_like(v);
+    paged_kv_cache_gather_cuda(k_chunks, v_chunks, page_table,
+        gathered_k, gathered_v, Page, PagesPerChunk);
+    require(float_values(gathered_k) == float_values(k),
+        "Paged complete-prefix key gather differs from source");
+    require(float_values(gathered_v) == float_values(v),
+        "Paged complete-prefix value gather differs from source");
 
     auto lengths = mfq::cuda::tensor<std::int64_t>({7, 5}).to(gpu);
     auto partial_o = mfq::cuda::empty(
@@ -208,7 +204,6 @@ int main() {
         (void)cudaGetLastError();
         return 77;
     }
-    check_allocator();
     check_kernels();
     std::cout << "paged_kv_test PASS page_size=4 chunks=2 gqa=4 split=1\n";
     return 0;

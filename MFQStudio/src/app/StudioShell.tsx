@@ -12,6 +12,7 @@ import { formatNumber } from './formatters';
 import { runtimeModelNames } from '../features/runtime/modelSelection';
 import {
   resolveStudioLocation,
+  isStudioPath,
   dashboardPath,
   labPath,
   type DashboardPage,
@@ -52,12 +53,15 @@ export function StudioShell() {
     ready,
     reloadService,
   } = useRuntime();
-  const { view, dashboardPage, labPage } = resolveStudioLocation(location.pathname);
+  const currentLocation = resolveStudioLocation(location.pathname);
+  const { dashboardPage, labPage } = currentLocation;
+  const view = isStudioPath(location.pathname) ? currentLocation.view : 'not-found';
   const sidebarOpen = useUiStore((state) => state.sidebarOpen);
   const closeSidebar = useUiStore((state) => state.closeSidebar);
   const openSidebar = useUiStore((state) => state.openSidebar);
   const availableModelNames = runtimeModelNames(models, instances);
   const selectedModelAvailable = availableModelNames.includes(model);
+  const pageAvailable = ready || view === 'not-found' || location.pathname === '/runtime' || location.pathname === '/settings';
   useEffect(() => {
     closeSidebar();
     const title =
@@ -280,7 +284,7 @@ export function StudioShell() {
             {error}
           </div>
         )}
-        {ready || location.pathname === '/runtime' || location.pathname === '/settings' ? (
+        {pageAvailable ? (
           <PageErrorBoundary key={location.pathname}>
             <Suspense fallback={<LoadingPage />}>
               <Outlet />

@@ -45,6 +45,11 @@ export function normalizeStudioPath(pathname: string): string {
   return pathname.length > 1 ? pathname.replace(/\/+$/, '') : pathname;
 }
 
+/** 判断路径是否为已注册的业务页面；未知路径由 404 路由接管。 */
+export function isStudioPath(pathname: string): boolean {
+  return Object.values(STUDIO_PATHS).some((path) => path === normalizeStudioPath(pathname));
+}
+
 /** 根据当前 URL 解析 Studio 应展示的业务页面。 */
 export function resolveStudioLocation(pathname: string): StudioLocation {
   const normalizedPath = normalizeStudioPath(pathname);

@@ -4,10 +4,11 @@
 
 import { Component, StrictMode, type ErrorInfo, type ReactNode } from 'react';
 import { createRoot } from 'react-dom/client';
-import { createHashRouter, RouterProvider } from 'react-router';
+import { createBrowserRouter, createHashRouter, RouterProvider } from 'react-router';
 
 import App from './App';
 import { FailureView } from './app/FailurePage';
+import { isStudio } from './studio';
 import './styles.css';
 
 interface AppErrorBoundaryState {
@@ -39,7 +40,7 @@ class AppErrorBoundary extends Component<{ children: ReactNode }, AppErrorBounda
           detailLabel={chinese ? '查看错误详情' : 'View error details'}
           kind="render"
           leaveLabel={chinese ? '返回概览' : 'Back to overview'}
-          onLeave={() => window.location.assign('#/')}
+          onLeave={() => window.location.assign(isStudio() ? '#/' : '/')}
           onRetry={() => window.location.reload()}
           retryLabel={chinese ? '重新载入' : 'Reload'}
           title={chinese ? '界面暂时无法显示' : 'Interface unavailable'}
@@ -49,7 +50,13 @@ class AppErrorBoundary extends Component<{ children: ReactNode }, AppErrorBounda
   }
 }
 
-const router = createHashRouter([
+// 浏览器清理旧版根路径哈希链接；桌面打包资源仍使用哈希路由。
+if (!isStudio() && window.location.pathname === '/' && window.location.hash.startsWith('#/')) {
+  window.history.replaceState(window.history.state, '', window.location.hash.slice(1));
+}
+
+const createRouter = isStudio() ? createHashRouter : createBrowserRouter;
+const router = createRouter([
   {
     path: '*',
     element: <App />,

@@ -1,12 +1,13 @@
 /** 组合应用级 Provider 与业务路由，页面状态和请求由对应领域拥有。 */
 import { lazy, Suspense } from 'react';
-import { Navigate, Route, Routes } from 'react-router';
+import { Route, Routes } from 'react-router';
 import { SettingsProvider } from './features/settings/SettingsProvider';
 import { RuntimeProvider } from './app/RuntimeProvider';
 import { ChatProvider } from './features/chat/ChatProvider';
 import { StudioShell } from './app/StudioShell';
 import { LabLayout } from './app/LabLayout';
 import { LoadingPage } from './app/LoadingPage';
+import { NotFoundPage } from './app/NotFoundPage';
 import './shared/ui/primitives.css';
 
 const ChatPage = lazy(() =>
@@ -46,7 +47,7 @@ const QuantizationPage = lazy(() =>
   })),
 );
 
-/** 挂载共享服务与独立业务页面，未知地址回退概览。 */
+/** 挂载共享服务与独立业务页面，未知地址显示 404。 */
 export default function App() {
   return (
     <SettingsProvider>
@@ -67,7 +68,7 @@ export default function App() {
                   <Route path="evaluations" element={<EvaluationsPage />} />
                   <Route path="quantization" element={<QuantizationPage />} />
                 </Route>
-                <Route path="*" element={<Navigate to="/" replace />} />
+                <Route path="*" element={<NotFoundPage />} />
               </Route>
             </Routes>
           </Suspense>

@@ -2,6 +2,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   dashboardPath,
+  isStudioPath,
   labPath,
   normalizeStudioPath,
   resolveStudioLocation,
@@ -33,11 +34,10 @@ describe('Studio 页面路由', () => {
     expect(normalizeStudioPath('/')).toBe('/');
   });
 
-  it('未知地址回退到概览页', () => {
-    expect(resolveStudioLocation('/missing')).toEqual({
-      view: 'dashboard',
-      dashboardPage: 'overview',
-      labPage: 'models',
-    });
+  it('未知地址不会被视为业务页面', () => {
+    expect(isStudioPath('/chat')).toBe(true);
+    expect(isStudioPath('/chat/')).toBe(true);
+    expect(isStudioPath('/missing')).toBe(false);
+    expect(isStudioPath('/chat/extra')).toBe(false);
   });
 });

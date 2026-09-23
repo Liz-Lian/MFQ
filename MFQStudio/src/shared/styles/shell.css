@@ -191,9 +191,11 @@
 .failure-page-details pre { overflow-x: auto; margin: 14px 0 0; color: var(--ink-soft); font-size: 11px; line-height: 1.6; white-space: pre-wrap; overflow-wrap: anywhere; }
 .failure-page-footer { display: flex; align-items: center; gap: 8px; border-top: 1px solid var(--line-soft); padding-top: 18px; color: var(--muted-light); font-size: 11px; }
 .failure-page-footer img { width: 20px; height: 20px; }
-.loading-page .failure-page-content { margin: auto; text-align: center; }
-.loading-page .failure-page-heading { justify-content: center; }
-.loading-page .failure-page-footer { justify-content: center; }
+.loading-page .failure-page-content, .not-found-page .failure-page-content { margin: auto; text-align: center; }
+.loading-page .failure-page-heading, .not-found-page .failure-page-heading { justify-content: center; }
+.not-found-page .failure-page-description { margin-inline: auto; }
+.not-found-page .failure-page-actions { justify-content: center; }
+.loading-page .failure-page-footer, .not-found-page .failure-page-footer { justify-content: center; }
 .loading-page-symbol { width: 64px; height: 64px; border: 0; border-radius: 0; background: transparent; }
 .loading-page-symbol::after {
   width: 48px;

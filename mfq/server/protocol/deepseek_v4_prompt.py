@@ -13,7 +13,7 @@ import copy
 from collections.abc import Mapping, Sequence
 from typing import Any
 
-from mfq._vendor.tpq.chat_adapters.dsv4_encoding import encode_messages
+from mfq.server.protocol.deepseek_v4_encoding import encode_messages
 from mfq.server.protocol.models import (
     JsonObjectResponseFormat,
     JsonSchemaResponseFormat,

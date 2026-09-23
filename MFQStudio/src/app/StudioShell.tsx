@@ -6,6 +6,8 @@ import { useSettings } from '../features/settings/SettingsProvider';
 import { useUiStore } from '../stores/uiStore';
 import { ToastContainer } from '../shared/ui/Toast';
 import { Icon } from './display';
+import { FailurePage } from './FailurePage';
+import { LoadingPage } from './LoadingPage';
 import { formatNumber } from './formatters';
 import { runtimeModelNames } from '../features/runtime/modelSelection';
 import {
@@ -17,20 +19,19 @@ import {
 } from '../navigation';
 
 /** 隔离单个业务路由的渲染错误，切换路径后恢复其他页面。 */
-class PageErrorBoundary extends Component<{ children: ReactNode }, { failed: boolean }> {
-  state = { failed: false };
-  static getDerivedStateFromError() {
-    return { failed: true };
+class PageErrorBoundary extends Component<{ children: ReactNode }, { detail: string | null }> {
+  state = { detail: null as string | null };
+  static getDerivedStateFromError(error: unknown) {
+    return { detail: error instanceof Error ? error.message : String(error) };
   }
   render() {
-    if (this.state.failed)
+    if (this.state.detail !== null)
       return (
-        <section role="alert">
-          <p>Unable to display this page.</p>
-          <button type="button" onClick={() => this.setState({ failed: false })}>
-            Retry
-          </button>
-        </section>
+        <FailurePage
+          detail={this.state.detail}
+          kind="render"
+          onRetry={() => this.setState({ detail: null })}
+        />
       );
     return this.props.children;
   }
@@ -281,19 +282,14 @@ export function StudioShell() {
         )}
         {ready || location.pathname === '/runtime' || location.pathname === '/settings' ? (
           <PageErrorBoundary key={location.pathname}>
-            <Suspense fallback={<p role="status">{tr('正在加载…', 'Loading…')}</p>}>
+            <Suspense fallback={<LoadingPage />}>
               <Outlet />
             </Suspense>
           </PageErrorBoundary>
         ) : (
-          <section role="status">
-            <p>{tr('正在连接服务…', 'Connecting to service…')}</p>
-            {error && (
-              <button type="button" onClick={() => void reloadService()}>
-                {tr('重试', 'Retry')}
-              </button>
-            )}
-          </section>
+          error ? (
+            <FailurePage detail={error} kind="connection" onRetry={() => void reloadService()} />
+          ) : <LoadingPage />
         )}
       </main>
     </div>

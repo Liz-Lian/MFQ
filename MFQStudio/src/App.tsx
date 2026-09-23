@@ -6,6 +6,7 @@ import { RuntimeProvider } from './app/RuntimeProvider';
 import { ChatProvider } from './features/chat/ChatProvider';
 import { StudioShell } from './app/StudioShell';
 import { LabLayout } from './app/LabLayout';
+import { LoadingPage } from './app/LoadingPage';
 import './shared/ui/primitives.css';
 
 const ChatPage = lazy(() =>
@@ -51,7 +52,7 @@ export default function App() {
     <SettingsProvider>
       <RuntimeProvider>
         <ChatProvider>
-          <Suspense fallback={<main role="status">Loading…</main>}>
+          <Suspense fallback={<main className="fatal-workspace"><LoadingPage /></main>}>
             <Routes>
               <Route element={<StudioShell />}>
                 <Route index element={<OverviewPage />} />

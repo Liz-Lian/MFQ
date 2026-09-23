@@ -31,11 +31,3 @@
 .model-browser-list > button span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .model-browser-list > button b { color: var(--muted); font-size: 10px; font-weight: 600; }
 .model-browser-list > p { margin: 28px 12px; color: var(--muted); text-align: center; font-size: 10.5px; }
-
-/* ---------- Fatal error ---------- */
-
-.fatal-error { min-height: 100vh; display: grid; place-items: center; padding: 32px; background: var(--canvas); color: var(--ink); }
-.fatal-error section { width: min(640px, 100%); padding: 28px; border: 1px solid var(--line); border-radius: 16px; background: var(--surface); box-shadow: var(--shadow-md); }
-.fatal-error h1 { margin: 8px 0 12px; font-size: 24px; }
-.fatal-error p { color: var(--muted); line-height: 1.6; }
-.fatal-error pre { overflow: auto; margin: 18px 0; padding: 14px; border-radius: 9px; background: var(--surface-subtle); white-space: pre-wrap; word-break: break-word; }

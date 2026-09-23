@@ -1,9 +1,14 @@
-import { Component, StrictMode, type ErrorInfo, type ReactNode } from "react";
-import { createRoot } from "react-dom/client";
-import "katex/dist/katex.min.css";
+/**
+ * MFQ Studio Web 与 Tauri 共用的 React 启动入口，负责路由和顶层错误隔离。
+ */
 
-import App from "./App";
-import "./styles.css";
+import { Component, StrictMode, type ErrorInfo, type ReactNode } from 'react';
+import { createRoot } from 'react-dom/client';
+import { createHashRouter, RouterProvider } from 'react-router';
+import 'katex/dist/katex.min.css';
+
+import App from './App';
+import './styles.css';
 
 interface AppErrorBoundaryState {
   error: Error | null;
@@ -43,10 +48,17 @@ class AppErrorBoundary extends Component<{ children: ReactNode }, AppErrorBounda
   }
 }
 
-createRoot(document.getElementById("root")!).render(
+const router = createHashRouter([
+  {
+    path: '*',
+    element: <App />,
+  },
+]);
+
+createRoot(document.getElementById('root')!).render(
   <StrictMode>
     <AppErrorBoundary>
-      <App />
+      <RouterProvider router={router} />
     </AppErrorBoundary>
   </StrictMode>,
 );

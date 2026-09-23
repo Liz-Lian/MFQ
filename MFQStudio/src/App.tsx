@@ -1,4 +1,9 @@
-import { Children, FormEvent, isValidElement, lazy, ReactNode, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
+/**
+ * MFQ Studio 主业务界面，编排推理、模型工具、任务与桌面运行时能力。
+ */
+
+import { Children, FormEvent, isValidElement, lazy, ReactNode, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useLocation, useNavigate } from 'react-router';
 
 import {
   ApiError,
@@ -57,6 +62,16 @@ import {
   studioCredential,
   studioStatus,
 } from "./studio";
+import {
+  DashboardPage,
+  LabPage,
+  STUDIO_PATHS,
+  dashboardPath,
+  labPath,
+  normalizeStudioPath,
+  resolveStudioLocation,
+} from './navigation';
+import { useUiStore } from './stores/uiStore';
 
 const Markdown = lazy(() => import("./Markdown").then((module) => ({ default: module.Markdown })));
 
@@ -83,9 +98,6 @@ function schemaType(property: JsonSchemaProperty): string | undefined {
     | undefined;
 }
 
-type ViewName = "chat" | "dashboard" | "lab";
-type DashboardPage = "overview" | "models" | "connections" | "cache" | "logs" | "settings";
-type LabPage = "models" | "evaluations" | "quantization";
 type UiLanguage = "system" | "zh-CN" | "en";
 type UiTheme = "system" | "light" | "dark";
 type PresetName = "precise" | "balanced" | "creative" | "custom";
@@ -162,7 +174,6 @@ interface LiveVoiceOutput {
 interface EditDraft {
   messageId: string;
   text: string;
-  reasoning: string;
 }
 
 interface PendingAttachment {
@@ -1096,96 +1107,29 @@ function EmptyPanel({
   icon,
   title,
   message,
+  action,
 }: {
   icon: IconName;
   title: string;
   message: string;
+  action?: ReactNode;
 }) {
   return (
     <TMPanel className="empty-panel">
       <Icon name={icon} size={30} />
       <strong>{title}</strong>
       <p>{message}</p>
+      {action && <div className="empty-panel-action">{action}</div>}
     </TMPanel>
   );
 }
 
-const PANEL_LAYOUT_KEY = "mfq.studio.panel-offsets.v2";
-const PANEL_COLLAPSED_KEY = "mfq.studio.panel-collapsed.v2";
-
-interface PanelPlacement {
-  x: number;
-  y: number;
-  z: number;
-  width?: number;
-  height?: number;
-}
-
-type PanelLayouts = Record<string, Record<string, PanelPlacement>>;
-
-interface PanelOverlap {
-  id: string;
-  left: number;
-  top: number;
-  width: number;
-  height: number;
-  drawTop: boolean;
-  drawRight: boolean;
-  drawBottom: boolean;
-  drawLeft: boolean;
-}
-
-interface PanelResizeState {
-  id: string;
-  edges: string;
-  startClientX: number;
-  startClientY: number;
-  startX: number;
-  startY: number;
-  startWidth: number;
-  startHeight: number;
-  baseLeft: number;
-  baseTop: number;
-  deckWidth: number;
-}
-
-const PANEL_RESIZE_INSET = 7;
-const PANEL_MIN_WIDTH = 180;
-const PANEL_MIN_HEIGHT = 72;
-const STATIC_PANEL_LAYOUT = true;
-
-function panelResizeEdges(node: HTMLElement, clientX: number, clientY: number): string {
-  const rect = node.getBoundingClientRect();
-  const horizontal = clientX - rect.left <= PANEL_RESIZE_INSET
-    ? "w"
-    : rect.right - clientX <= PANEL_RESIZE_INSET ? "e" : "";
-  const vertical = clientY - rect.top <= PANEL_RESIZE_INSET
-    ? "n"
-    : rect.bottom - clientY <= PANEL_RESIZE_INSET ? "s" : "";
-  return `${vertical}${horizontal}`;
-}
-
-function panelResizeCursor(edges: string): string {
-  if (edges === "n" || edges === "s") return "ns-resize";
-  if (edges === "e" || edges === "w") return "ew-resize";
-  if (edges === "ne" || edges === "sw") return "nesw-resize";
-  if (edges === "nw" || edges === "se") return "nwse-resize";
-  return "";
-}
-
-function loadPanelLayout(): PanelLayouts {
-  try {
-    const value = JSON.parse(localStorage.getItem(PANEL_LAYOUT_KEY) || "{}");
-    return value && typeof value === "object" ? value as PanelLayouts : {};
-  } catch {
-    return {};
-  }
-}
+const PANEL_COLLAPSED_KEY = 'mfq.studio.panel-collapsed.v2';
 
 function loadCollapsedPanels(): Record<string, boolean> {
   try {
-    const value = JSON.parse(localStorage.getItem(PANEL_COLLAPSED_KEY) || "{}");
-    return value && typeof value === "object" ? value as Record<string, boolean> : {};
+    const value = JSON.parse(localStorage.getItem(PANEL_COLLAPSED_KEY) || '{}');
+    return value && typeof value === 'object' ? value as Record<string, boolean> : {};
   } catch {
     return {};
   }
@@ -1194,379 +1138,75 @@ function loadCollapsedPanels(): Record<string, boolean> {
 interface PanelDeckProps {
   page: string;
   children: ReactNode;
-  labels: { collapse: string; drag: string; expand: string };
-  resetVersion: number;
+  labels: { collapse: string; expand: string };
 }
 
 function panelKey(panel: React.ReactElement, index: number): string {
   const value = String(panel.key ?? `panel-${index}`);
-  return value.startsWith(".$") ? value.slice(2) : value.startsWith(".") ? value.slice(1) : value;
+  return value.startsWith('.$') ? value.slice(2) : value.startsWith('.') ? value.slice(1) : value;
 }
 
-function PanelDeck({ page, children, labels, resetVersion }: PanelDeckProps) {
+/** 以稳定网格呈现业务面板，并持久化每个面板的折叠状态。 */
+function PanelDeck({ page, children, labels }: PanelDeckProps) {
   const panels = Children.toArray(children).filter(isValidElement);
-  const ids = panels.map(panelKey);
-  const panelSignature = ids.join("\u0000");
-  const [layouts, setLayouts] = useState<PanelLayouts>(loadPanelLayout);
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>(loadCollapsedPanels);
-  const [dragged, setDragged] = useState<string | null>(null);
-  const [resized, setResized] = useState<string | null>(null);
-  const [overlaps, setOverlaps] = useState<PanelOverlap[]>([]);
-  const deckRef = useRef<HTMLDivElement | null>(null);
-  const panelRefs = useRef(new Map<string, HTMLDivElement>());
-  const layoutsRef = useRef(layouts);
-  const resetVersionRef = useRef(resetVersion);
-  const overlapFrameRef = useRef<number | null>(null);
-  const overlapResetTimerRef = useRef<number | null>(null);
-  const overlapResettingRef = useRef(false);
-  const dragRef = useRef<{ id: string; startClientX: number; startClientY: number; startX: number; startY: number } | null>(null);
-  const resizeRef = useRef<PanelResizeState | null>(null);
-  const pageLayout: Record<string, PanelPlacement> = STATIC_PANEL_LAYOUT ? {} : layouts[page] ?? {};
-  const byId = new Map(panels.map((panel, index) => [panelKey(panel, index), panel]));
-  const panelClasses = `panel-deck static page-${page}${panels.length === 1 ? " single" : ""}`;
-  const defaultFullWidth: Record<string, string[]> = {
-    "dashboard-overview": ["metrics"],
-    "dashboard-cache": ["prefix-cache", "profiles"],
-    "dashboard-connections": ["mcp", "nodes"],
-    "lab-models": ["hubs"],
-    "lab-quantization": ["imatrix", "detail"],
-  };
+  const panelClasses = `panel-deck page-${page}${panels.length === 1 ? ' single' : ''}`;
 
-  useEffect(() => { layoutsRef.current = layouts; }, [layouts]);
-
-  useEffect(() => {
-    if (resetVersionRef.current === resetVersion) return;
-    resetVersionRef.current = resetVersion;
-    overlapResettingRef.current = true;
-    if (overlapFrameRef.current !== null) {
-      cancelAnimationFrame(overlapFrameRef.current);
-      overlapFrameRef.current = null;
-    }
-    if (overlapResetTimerRef.current !== null) clearTimeout(overlapResetTimerRef.current);
-    setLayouts((current) => {
-      const updated = { ...current };
-      delete updated[page];
-      layoutsRef.current = updated;
-      localStorage.setItem(PANEL_LAYOUT_KEY, JSON.stringify(updated));
-      return updated;
-    });
-    setCollapsed((current) => {
-      const updated = Object.fromEntries(Object.entries(current).filter(([key]) => !key.startsWith(`${page}:`)));
-      localStorage.setItem(PANEL_COLLAPSED_KEY, JSON.stringify(updated));
-      return updated;
-    });
-    panelRefs.current.forEach((node) => {
-      node.style.cursor = "";
-      node.querySelectorAll<HTMLElement>(".panel-item-clipped").forEach((item) => item.classList.remove("panel-item-clipped"));
-    });
-    resizeRef.current = null;
-    dragRef.current = null;
-    setResized(null);
-    setDragged(null);
-    setOverlaps([]);
-    document.body.style.cursor = "";
-    document.body.classList.remove("panel-resizing", "panel-reordering");
-    overlapResetTimerRef.current = window.setTimeout(() => {
-      overlapResetTimerRef.current = null;
-      overlapResettingRef.current = false;
-      requestAnimationFrame(() => {
-        fitPanelItems();
-        measureOverlaps();
-      });
-    }, 180);
-  }, [page, resetVersion]);
-
-  const fitPanelItems = useCallback(() => {
-    const groupSelector = [
-      ".metric-grid", ".request-stats", ".cache-stats", ".model-list", ".request-table",
-      ".runtime-log-list", ".profile-list", ".node-list", ".mcp-server-list", ".hub-results",
-      ".evaluation-list", ".dataset-list", ".imatrix-list", ".lineage-list", ".job-list",
-      ".comparison-table",
-    ].join(",");
-    panelRefs.current.forEach((panelNode) => {
-      panelNode.querySelectorAll<HTMLElement>(".panel-item-clipped").forEach((item) => item.classList.remove("panel-item-clipped"));
-      if (!panelNode.classList.contains("custom-sized")) return;
-      const panelRect = panelNode.getBoundingClientRect();
-      const bottom = panelRect.bottom - 8;
-      const right = panelRect.right - 8;
-      panelNode.querySelectorAll<HTMLElement>(groupSelector).forEach((group) => {
-        [...group.children].forEach((child) => {
-          if (!(child instanceof HTMLElement)) return;
-          const rect = child.getBoundingClientRect();
-          if (rect.width > 0 && rect.height > 0 && (rect.bottom > bottom + 0.5 || rect.right > right + 0.5)) {
-            child.classList.add("panel-item-clipped");
-          }
-        });
-      });
-      panelNode.querySelectorAll<HTMLElement>(".dashboard-panel > :not(.panel-heading)").forEach((item) => {
-        if (item.matches(groupSelector)) return;
-        const rect = item.getBoundingClientRect();
-        if (rect.width > 0 && rect.height > 0 && (rect.bottom > bottom + 0.5 || rect.right > right + 0.5)) {
-          item.classList.add("panel-item-clipped");
-        }
-      });
-    });
-  }, []);
-
-  const measureOverlaps = useCallback(() => {
-    const deck = deckRef.current;
-    if (!deck) return;
-    const deckRect = deck.getBoundingClientRect();
-    const entries = [...panelRefs.current.entries()].filter(([, node]) => node.isConnected);
-    const next: PanelOverlap[] = [];
-    for (let index = 0; index < entries.length; index += 1) {
-      const [firstId, firstNode] = entries[index];
-      const first = firstNode.getBoundingClientRect();
-      for (let otherIndex = index + 1; otherIndex < entries.length; otherIndex += 1) {
-        const [secondId, secondNode] = entries[otherIndex];
-        const second = secondNode.getBoundingClientRect();
-        const left = Math.max(first.left, second.left);
-        const right = Math.min(first.right, second.right);
-        const top = Math.max(first.top, second.top);
-        const bottom = Math.min(first.bottom, second.bottom);
-        if (left >= right || top >= bottom) continue;
-        const firstZ = Number.parseInt(firstNode.style.zIndex || "1", 10);
-        const secondZ = Number.parseInt(secondNode.style.zIndex || "1", 10);
-        const covering = firstZ > secondZ ? first : second;
-        const edgeTolerance = 0.5;
-        next.push({
-          id: `${firstId}:${secondId}`,
-          left: left - deckRect.left,
-          top: top - deckRect.top,
-          width: right - left,
-          height: bottom - top,
-          drawTop: Math.abs(top - covering.top) < edgeTolerance,
-          drawRight: Math.abs(right - covering.right) < edgeTolerance,
-          drawBottom: Math.abs(bottom - covering.bottom) < edgeTolerance,
-          drawLeft: Math.abs(left - covering.left) < edgeTolerance,
-        });
-      }
-    }
-    setOverlaps((current) => {
-      if (current.length === next.length && current.every((overlap, index) => {
-        const candidate = next[index];
-        return overlap.id === candidate.id
-          && Math.abs(overlap.left - candidate.left) < 0.25
-          && Math.abs(overlap.top - candidate.top) < 0.25
-          && Math.abs(overlap.width - candidate.width) < 0.25
-          && Math.abs(overlap.height - candidate.height) < 0.25
-          && overlap.drawTop === candidate.drawTop
-          && overlap.drawRight === candidate.drawRight
-          && overlap.drawBottom === candidate.drawBottom
-          && overlap.drawLeft === candidate.drawLeft;
-      })) return current;
-      return next;
-    });
-  }, []);
-
-  const scheduleOverlapCheck = useCallback(() => {
-    if (overlapFrameRef.current !== null) cancelAnimationFrame(overlapFrameRef.current);
-    overlapFrameRef.current = requestAnimationFrame(() => {
-      overlapFrameRef.current = null;
-      if (overlapResettingRef.current) {
-        setOverlaps([]);
-        return;
-      }
-      fitPanelItems();
-      measureOverlaps();
-    });
-  }, [fitPanelItems, measureOverlaps]);
-
-  useEffect(() => { scheduleOverlapCheck(); }, [collapsed, layouts, page, panelSignature, scheduleOverlapCheck]);
-
-  useEffect(() => {
-    const observer = new ResizeObserver(scheduleOverlapCheck);
-    if (deckRef.current) observer.observe(deckRef.current);
-    panelRefs.current.forEach((node) => observer.observe(node));
-    window.addEventListener("resize", scheduleOverlapCheck);
-    return () => {
-      observer.disconnect();
-      window.removeEventListener("resize", scheduleOverlapCheck);
-      if (overlapFrameRef.current !== null) cancelAnimationFrame(overlapFrameRef.current);
-      if (overlapResetTimerRef.current !== null) clearTimeout(overlapResetTimerRef.current);
-    };
-  }, [page, panelSignature, scheduleOverlapCheck]);
-
-  useEffect(() => () => {
-    overlapResettingRef.current = false;
-    document.body.style.cursor = "";
-    document.body.classList.remove("panel-resizing", "panel-reordering");
-  }, []);
-
-  function bringPanelToFront(id: string) {
-    setLayouts((current) => {
-      const existing = current[page] ?? {};
-      const placement = existing[id] ?? { x: 0, y: 0, z: 1 };
-      const maximumZ = Math.max(1, ...ids.map((panelId) => existing[panelId]?.z ?? 1));
-      if (placement.z > maximumZ) return current;
-      const updated = { ...current, [page]: { ...existing, [id]: { ...placement, z: maximumZ + 1 } } };
-      layoutsRef.current = updated;
-      localStorage.setItem(PANEL_LAYOUT_KEY, JSON.stringify(updated));
-      return updated;
-    });
-  }
-
-  function updatePlacement(id: string, x: number, y: number) {
-    setLayouts((current) => {
-      const existing = current[page] ?? {};
-      const placement = existing[id] ?? { x: 0, y: 0, z: 1 };
-      const updated = { ...current, [page]: { ...existing, [id]: { ...placement, x, y } } };
-      layoutsRef.current = updated;
-      return updated;
-    });
-  }
-
-  function updatePanelSize(id: string, placement: PanelPlacement) {
-    setLayouts((current) => {
-      const existing = current[page] ?? {};
-      const updated = { ...current, [page]: { ...existing, [id]: placement } };
-      layoutsRef.current = updated;
-      return updated;
-    });
-  }
-
-  function beginPanelResize(event: React.PointerEvent<HTMLDivElement>, id: string, isCollapsed: boolean): boolean {
-    if (STATIC_PANEL_LAYOUT || isCollapsed || window.matchMedia("(max-width: 860px)").matches || !event.isPrimary || event.button !== 0 || dragRef.current) return false;
-    const node = event.currentTarget;
-    const edges = panelResizeEdges(node, event.clientX, event.clientY);
-    if (!edges) return false;
-    event.preventDefault();
-    event.stopPropagation();
-    node.setPointerCapture(event.pointerId);
-    const deck = deckRef.current;
-    const current = layoutsRef.current[page]?.[id] ?? { x: 0, y: 0, z: 1 };
-    bringPanelToFront(id);
-    resizeRef.current = {
-      id,
-      edges,
-      startClientX: event.clientX,
-      startClientY: event.clientY,
-      startX: current.x,
-      startY: current.y,
-      startWidth: node.offsetWidth,
-      startHeight: node.offsetHeight,
-      baseLeft: node.offsetLeft,
-      baseTop: node.offsetTop,
-      deckWidth: deck?.clientWidth ?? node.offsetWidth,
-    };
-    const cursor = panelResizeCursor(edges);
-    node.style.cursor = cursor;
-    document.body.style.cursor = cursor;
-    document.body.classList.add("panel-resizing");
-    setResized(id);
-    return true;
-  }
-
-  function movePanelResize(event: React.PointerEvent<HTMLDivElement>, id: string, isCollapsed: boolean) {
-    const activeResize = resizeRef.current;
-    if (!activeResize || activeResize.id !== id) {
-      const narrowViewport = window.matchMedia("(max-width: 860px)").matches;
-      event.currentTarget.style.cursor = STATIC_PANEL_LAYOUT || isCollapsed || narrowViewport ? "" : panelResizeCursor(panelResizeEdges(event.currentTarget, event.clientX, event.clientY));
-      return;
-    }
-    event.preventDefault();
-    const deltaX = event.clientX - activeResize.startClientX;
-    const deltaY = event.clientY - activeResize.startClientY;
-    const current = layoutsRef.current[page]?.[id] ?? { x: activeResize.startX, y: activeResize.startY, z: 1 };
-    let x = activeResize.startX;
-    let y = activeResize.startY;
-    let width = activeResize.startWidth;
-    let height = activeResize.startHeight;
-    if (activeResize.edges.includes("w")) {
-      const startingRight = activeResize.baseLeft + activeResize.startX + activeResize.startWidth;
-      const left = Math.min(startingRight - PANEL_MIN_WIDTH, Math.max(0, activeResize.baseLeft + activeResize.startX + deltaX));
-      x = left - activeResize.baseLeft;
-      width = startingRight - left;
-    } else if (activeResize.edges.includes("e")) {
-      const startingLeft = activeResize.baseLeft + activeResize.startX;
-      const right = Math.min(Math.max(activeResize.deckWidth, startingLeft + PANEL_MIN_WIDTH), Math.max(startingLeft + PANEL_MIN_WIDTH, startingLeft + activeResize.startWidth + deltaX));
-      width = right - startingLeft;
-    }
-    if (activeResize.edges.includes("n")) {
-      const startingBottom = activeResize.baseTop + activeResize.startY + activeResize.startHeight;
-      const top = Math.min(startingBottom - PANEL_MIN_HEIGHT, Math.max(0, activeResize.baseTop + activeResize.startY + deltaY));
-      y = top - activeResize.baseTop;
-      height = startingBottom - top;
-    } else if (activeResize.edges.includes("s")) {
-      height = Math.max(PANEL_MIN_HEIGHT, activeResize.startHeight + deltaY);
-    }
-    updatePanelSize(id, { ...current, x, y, width, height });
-  }
-
-  function finishPanelResize(event: React.PointerEvent<HTMLDivElement>) {
-    const activeResize = resizeRef.current;
-    if (!activeResize) return;
-    if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId);
-    resizeRef.current = null;
-    setResized(null);
-    event.currentTarget.style.cursor = "";
-    document.body.style.cursor = "";
-    document.body.classList.remove("panel-resizing");
-    localStorage.setItem(PANEL_LAYOUT_KEY, JSON.stringify(layoutsRef.current));
-    scheduleOverlapCheck();
-  }
-
-  function finishPanelDrag(event: React.PointerEvent<HTMLButtonElement>) {
-    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
-      event.currentTarget.releasePointerCapture(event.pointerId);
-    }
-    dragRef.current = null;
-    setDragged(null);
-    document.body.classList.remove("panel-reordering");
-    localStorage.setItem(PANEL_LAYOUT_KEY, JSON.stringify(layoutsRef.current));
-  }
-
-  return <div className={panelClasses} ref={deckRef}>{ids.map((id) => {
-    const panel = byId.get(id);
-    if (!panel) return null;
-    const isCollapsed = Boolean(collapsed[`${page}:${id}`]);
-    const placement = pageLayout[id];
-    const wide = panels.length === 1 || defaultFullWidth[page]?.includes(id);
-    const positionStyle = {
-      "--panel-x": `${placement?.x ?? 0}px`,
-      "--panel-y": `${placement?.y ?? 0}px`,
-      width: placement?.width ? `${placement.width}px` : undefined,
-      height: isCollapsed ? "47px" : placement?.height ? `${placement.height}px` : undefined,
-      zIndex: placement?.z ?? 1,
-    } as React.CSSProperties;
-    return <div className={`panel-shell ${wide ? "wide" : ""} ${placement?.width || placement?.height ? "custom-sized" : ""} ${isCollapsed ? "collapsed" : ""} ${resized === id ? "resizing" : ""} ${dragged === id ? "dragging" : ""}`} data-panel-id={id} key={id} onDoubleClick={() => bringPanelToFront(id)} onPointerCancel={finishPanelResize} onPointerDown={(event) => { void beginPanelResize(event, id, isCollapsed); }} onPointerLeave={(event) => { if (!resizeRef.current) event.currentTarget.style.cursor = ""; }} onPointerMove={(event) => movePanelResize(event, id, isCollapsed)} onPointerUp={finishPanelResize} ref={(node) => { if (node) panelRefs.current.set(id, node); else panelRefs.current.delete(id); }} style={positionStyle}>
-      <button aria-label={labels.drag} className="panel-drag" onPointerCancel={finishPanelDrag} onPointerDown={(event) => {
-        if (!event.isPrimary || event.button !== 0) return;
-        event.preventDefault();
-        event.currentTarget.setPointerCapture(event.pointerId);
-        const current = layoutsRef.current[page]?.[id] ?? { x: 0, y: 0, z: 1 };
-        bringPanelToFront(id);
-        dragRef.current = { id, startClientX: event.clientX, startClientY: event.clientY, startX: current.x, startY: current.y };
-        setDragged(id);
-        document.body.classList.add("panel-reordering");
-      }} onPointerMove={(event) => {
-        const activeDrag = dragRef.current;
-        if (!activeDrag) return;
-        event.preventDefault();
-        const deck = deckRef.current;
-        const node = panelRefs.current.get(activeDrag.id);
-        const baseLeft = node?.offsetLeft ?? 0;
-        const baseTop = node?.offsetTop ?? 0;
-        const minimumX = -baseLeft;
-        const maximumX = Math.max(minimumX, (deck?.clientWidth ?? 0) - baseLeft - (node?.offsetWidth ?? 0));
-        const minimumY = -baseTop;
-        const proposedX = activeDrag.startX + event.clientX - activeDrag.startClientX;
-        const proposedY = activeDrag.startY + event.clientY - activeDrag.startClientY;
-        const x = Math.min(maximumX, Math.max(minimumX, proposedX));
-        const y = Math.max(minimumY, proposedY);
-        updatePlacement(activeDrag.id, x, y);
-      }} onPointerUp={finishPanelDrag} tabIndex={-1} type="button"><span /><span /><span /><span /><span /><span /></button>
-      <button aria-expanded={!isCollapsed} aria-label={isCollapsed ? labels.expand : labels.collapse} className="panel-collapse" onClick={() => setCollapsed((current) => {
-        const updated = { ...current, [`${page}:${id}`]: !isCollapsed };
-        localStorage.setItem(PANEL_COLLAPSED_KEY, JSON.stringify(updated));
-        return updated;
-      })} type="button">⌄</button>
-      {panel}
-    </div>;
-  })}<div aria-hidden="true" className="panel-overlap-layer">{overlaps.map((overlap) => <span className={`panel-overlap-boundary${overlap.drawTop ? " edge-top" : ""}${overlap.drawRight ? " edge-right" : ""}${overlap.drawBottom ? " edge-bottom" : ""}${overlap.drawLeft ? " edge-left" : ""}`} key={overlap.id} style={{ height: overlap.height, left: overlap.left, top: overlap.top, width: overlap.width }} />)}</div></div>;
+  return (
+    <div className={panelClasses}>
+      {panels.map((panel, index) => {
+        const id = panelKey(panel, index);
+        const storageKey = `${page}:${id}`;
+        const isCollapsed = Boolean(collapsed[storageKey]);
+        return (
+          <div className={`panel-shell${panels.length === 1 ? ' wide' : ''}${isCollapsed ? ' collapsed' : ''}`} data-panel-id={id} key={id}>
+            <button
+              aria-expanded={!isCollapsed}
+              aria-label={isCollapsed ? labels.expand : labels.collapse}
+              className="panel-collapse"
+              onClick={() => setCollapsed((current) => {
+                const updated = { ...current, [storageKey]: !isCollapsed };
+                localStorage.setItem(PANEL_COLLAPSED_KEY, JSON.stringify(updated));
+                return updated;
+              })}
+              type="button"
+            >
+              <span aria-hidden="true">⌄</span>
+            </button>
+            {panel}
+          </div>
+        );
+      })}
+    </div>
+  );
 }
 
 export default function App() {
+  const location = useLocation();
+  const navigate = useNavigate();
+  const { view, dashboardPage, labPage } = resolveStudioLocation(location.pathname);
+  const normalizedPathname = normalizeStudioPath(location.pathname);
+  useEffect(() => {
+    const titles: Record<string, string> = {
+      '/': 'MFQ Studio',
+      '/chat': 'Chat · MFQ Studio',
+      '/models': 'Models · MFQ Studio',
+      '/runtime': 'Runtime · MFQ Studio',
+      '/resources': 'Resources · MFQ Studio',
+      '/model-hub': 'Model hub · MFQ Studio',
+      '/evaluations': 'Evaluations · MFQ Studio',
+      '/quantization': 'Quantization · MFQ Studio',
+      '/logs': 'Logs · MFQ Studio',
+      '/settings': 'Settings · MFQ Studio',
+    };
+    document.title = titles[normalizedPathname] ?? 'MFQ Studio';
+  }, [normalizedPathname]);
+  const sidebarOpen = useUiStore((state) => state.sidebarOpen);
+  const closeSidebar = useUiStore((state) => state.closeSidebar);
+  const openSidebar = useUiStore((state) => state.openSidebar);
+  useEffect(() => {
+    closeSidebar();
+  }, [closeSidebar, location.pathname]);
   const [sessions, setSessions] = useState<Session[]>([]);
   const [activeId, setActiveId] = useState<string | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
@@ -1609,10 +1249,6 @@ export default function App() {
   const [runtimeLogs, setRuntimeLogs] = useState<RuntimeLogEntry[]>([]);
   const [model, setModel] = useState("");
   const [mode, setMode] = useState<SessionMode>("text");
-  const [view, setView] = useState<ViewName>("dashboard");
-  const [dashboardPage, setDashboardPage] = useState<DashboardPage>("overview");
-  const [labPage, setLabPage] = useState<LabPage>("models");
-  const labLayoutReset = 0;
   const [draft, setDraft] = useState("");
   const [attachments, setAttachments] = useState<PendingAttachment[]>([]);
   const [live, setLive] = useState<LiveOutput | null>(null);
@@ -1622,6 +1258,8 @@ export default function App() {
   const [error, setError] = useState<string | null>(null);
   const [capabilities, setCapabilities] = useState<RuntimeCapabilities | null>(null);
   const [runtime, setRuntime] = useState<RuntimeStatus | null>(null);
+  const [modelFilter, setModelFilter] = useState('');
+  const [chatSessionsOpen, setChatSessionsOpen] = useState(true);
   const [realtime, setRealtime] = useState<RealtimeCapabilities | null>(null);
   const [realtimeAvailable, setRealtimeAvailable] = useState(false);
   const [voiceComponent, setVoiceComponent] = useState<VoiceOutputComponentStatus | null>(null);
@@ -1633,7 +1271,6 @@ export default function App() {
   const [selectedStoredPreset, setSelectedStoredPreset] = useState("");
   const [storedPresetName, setStoredPresetName] = useState("");
   const [presetStatus, setPresetStatus] = useState<{ error: boolean; text: string } | null>(null);
-  const [sidebarOpen, setSidebarOpen] = useState(false);
   const [contextSize, setContextSize] = useState(32768);
   const [loadPinned, setLoadPinned] = useState(false);
   const [loadIdleTtl, setLoadIdleTtl] = useState<number | null>(null);
@@ -1667,7 +1304,6 @@ export default function App() {
   const canUseNativeModelPicker = isStudio() && studio?.config.mode !== "remote";
   const panelLabels = useMemo(() => ({
     collapse: tr("收起面板", "Collapse panel"),
-    drag: tr("拖动面板", "Drag panel"),
     expand: tr("展开面板", "Expand panel"),
   }), [tr]);
   const active = useMemo(
@@ -1678,6 +1314,14 @@ export default function App() {
     () => runtimeModelNames(models, instances),
     [instances, models],
   );
+  const filteredInstances = useMemo(() => {
+    const query = modelFilter.trim().toLowerCase();
+    return instances.filter((instance) => !query || instance.model.toLowerCase().includes(query));
+  }, [instances, modelFilter]);
+  const filteredArtifacts = useMemo(() => {
+    const query = modelFilter.trim().toLowerCase();
+    return artifacts.filter((artifact) => !query || artifact.name.toLowerCase().includes(query));
+  }, [artifacts, modelFilter]);
   const selectedModelAvailable = Boolean(model && availableModelNames.includes(model));
   const conversationReady = Boolean(
     active && selectedModelAvailable && active.model === model,
@@ -2316,10 +1960,16 @@ export default function App() {
   }
 
   function openStudioPage(nextView: "dashboard" | "lab", page: DashboardPage | LabPage) {
-    setView(nextView);
-    if (nextView === "dashboard") setDashboardPage(page as DashboardPage);
-    else setLabPage(page as LabPage);
-    setSidebarOpen(false);
+    navigate(nextView === 'dashboard'
+      ? dashboardPath(page as DashboardPage)
+      : labPath(page as LabPage));
+    closeSidebar();
+  }
+
+  /** 打开对话页并关闭移动端侧栏。 */
+  function openChatPage() {
+    navigate(STUDIO_PATHS.chat);
+    closeSidebar();
   }
 
   function selectModel(nextModel: string) {
@@ -2337,8 +1987,7 @@ export default function App() {
     setActiveId(session.id);
     setMessages([]);
     setResponses({});
-    setView("chat");
-    setSidebarOpen(false);
+    openChatPage();
   }
 
   async function createSession() {
@@ -2351,8 +2000,7 @@ export default function App() {
       setSessions((current) => [created, ...current]);
       setActiveId(created.id);
       setMessages([]);
-      setView("chat");
-      setSidebarOpen(false);
+      openChatPage();
     } catch (cause) {
       setError(errorMessage(cause));
     } finally {
@@ -2658,9 +2306,7 @@ export default function App() {
     const messageIndex = messages.findIndex((item) => item.id === message.id);
     if (messageIndex < 0) return;
     const text = editDraft.text.trim();
-    const reasoning = editDraft.reasoning.trim();
-    if (message.role === "user" && !text && !message.parts.some(isMediaPart)) return;
-    if (message.role === "assistant" && !text && !reasoning) return;
+    if (!text && !message.parts.some(isMediaPart)) return;
     setBusy(true);
     try {
       const rewound = await api.rewindSession(
@@ -2670,7 +2316,6 @@ export default function App() {
         false,
       );
       const parts: ContentPart[] = [];
-      if (reasoning) parts.push({ type: "reasoning", text: reasoning });
       if (text) parts.push({ type: "text", text });
       parts.push(...message.parts.filter(isMediaPart));
       const rewoundMessages = messages.slice(0, messageIndex);
@@ -2685,21 +2330,8 @@ export default function App() {
         ),
       );
       setEditDraft(null);
-      if (message.role === "user") {
-        setMessages([...rewoundMessages, { ...message, parts }]);
-        await generate(rewound, parts, false);
-      } else {
-        const appended = await api.appendMessage(
-          rewound.id,
-          rewound.revision,
-          message.role,
-          parts,
-        );
-        setSessions((current) =>
-          current.map((session) => session.id === appended.session.id ? appended.session : session),
-        );
-        setMessages([...rewoundMessages, appended.message]);
-      }
+      setMessages([...rewoundMessages, { ...message, parts }]);
+      await generate(rewound, parts, false);
     } catch (cause) {
       setError(errorMessage(cause));
     } finally {
@@ -2904,7 +2536,7 @@ export default function App() {
   useEffect(() => {
     function handleKeydown(event: KeyboardEvent) {
       if (event.key === "Escape") {
-        setSidebarOpen(false);
+        closeSidebar();
       } else if ((event.metaKey || event.ctrlKey) && event.key === ",") {
         event.preventDefault();
         openSettings();
@@ -3224,7 +2856,7 @@ export default function App() {
       const created = await api.createJob(selectedJobKind, clean);
       setSelectedJobId(created.id);
       setJobs((current) => [created, ...current]);
-      setView("lab");
+      navigate(STUDIO_PATHS.quantization);
     } catch (cause) {
       setError(errorMessage(cause));
     } finally {
@@ -3500,8 +3132,7 @@ export default function App() {
         idle_ttl_seconds: loadIdleTtl,
       });
       setSelectedJobId(accepted.operation_id);
-      setDashboardPage("models");
-      setView("dashboard");
+      navigate(STUDIO_PATHS.models);
       await refreshRuntime(false);
       setModel(name);
     } catch (cause) {
@@ -3534,8 +3165,7 @@ export default function App() {
       }
     }
     setModelBrowserOpen(false);
-    setDashboardPage("models");
-    setView("dashboard");
+    navigate(STUDIO_PATHS.models);
     await refreshRuntime(false);
     if (registered.length === 1) setModel(registered[0].name);
   }
@@ -3642,8 +3272,7 @@ export default function App() {
     try {
       const accepted = await api.loadRuntimeProfile(profile.id, profile.drifted);
       setSelectedJobId(accepted.operation_id);
-      setDashboardPage("models");
-      setView("dashboard");
+      navigate(STUDIO_PATHS.models);
       await refreshRuntime(false);
       setModel(profile.load.model);
     } catch (cause) {
@@ -3672,8 +3301,7 @@ export default function App() {
     try {
       const accepted = await api.unloadModel(id);
       setSelectedJobId(accepted.operation_id);
-      setDashboardPage("models");
-      setView("dashboard");
+      navigate(STUDIO_PATHS.models);
       await refreshRuntime(false);
     } catch (cause) {
       setError(errorMessage(cause));
@@ -4141,6 +3769,7 @@ export default function App() {
 
   return (
     <div className="app-shell">
+      <a className="skip-link" href="#studio-main">{tr("跳到主要内容", "Skip to main content")}</a>
       <aside className={`sidebar ${sidebarOpen ? "open" : ""}`} id="studio-sidebar">
         <div className="brand">
           <img src="/mfq-mark.svg" alt="" />
@@ -4150,19 +3779,25 @@ export default function App() {
           <nav className="sectioned-nav" aria-label={tr("推理", "Inference")}>
             <section>
               <div className="sidebar-group-label">{tr("推理", "Inference")}</div>
-              <button className={view === "dashboard" && dashboardPage === "overview" ? "active" : ""} onClick={() => openStudioPage("dashboard", "overview")} type="button"><Icon name="gauge" />{tr("概览", "Overview")}{Number(runtime?.active_requests || 0) > 0 && <span>{formatNumber(runtime?.active_requests || 0)}</span>}</button>
-              <button className={view === "dashboard" && dashboardPage === "models" ? "active" : ""} onClick={() => openStudioPage("dashboard", "models")} type="button"><Icon name="folder" />{tr("模型", "Models")}</button>
-              <button className={view === "dashboard" && dashboardPage === "connections" ? "active" : ""} onClick={openServerPage} type="button"><Icon name="server-rack" />{tr("服务器", "Server")}</button>
-              <button className={view === "dashboard" && dashboardPage === "cache" ? "active" : ""} onClick={() => openStudioPage("dashboard", "cache")} type="button"><Icon name="memory" />{tr("资源", "Resources")}</button>
+              <button aria-current={view === "dashboard" && dashboardPage === "overview" ? "page" : undefined} className={view === "dashboard" && dashboardPage === "overview" ? "active" : ""} onClick={() => openStudioPage("dashboard", "overview")} type="button"><Icon name="gauge" />{tr("概览", "Overview")}{Number(runtime?.active_requests || 0) > 0 && <span>{formatNumber(runtime?.active_requests || 0)}</span>}</button>
+              <button aria-current={view === "dashboard" && dashboardPage === "models" ? "page" : undefined} className={view === "dashboard" && dashboardPage === "models" ? "active" : ""} onClick={() => openStudioPage("dashboard", "models")} type="button"><Icon name="folder" />{tr("模型", "Models")}</button>
+              <button aria-current={view === "dashboard" && dashboardPage === "connections" ? "page" : undefined} className={view === "dashboard" && dashboardPage === "connections" ? "active" : ""} onClick={openServerPage} type="button"><Icon name="server-rack" />{tr("服务器", "Server")}</button>
+              <button aria-current={view === "dashboard" && dashboardPage === "cache" ? "page" : undefined} className={view === "dashboard" && dashboardPage === "cache" ? "active" : ""} onClick={() => openStudioPage("dashboard", "cache")} type="button"><Icon name="memory" />{tr("资源", "Resources")}</button>
             </section>
             <section>
               <div className="sidebar-group-label">{tr("交互", "Playground")}</div>
-              <button className={view === "chat" ? "active" : ""} onClick={() => { setView("chat"); setSidebarOpen(false); }} type="button"><Icon name="chat" />{tr("对话", "Chat")}</button>
+              <button aria-current={view === "chat" ? "page" : undefined} className={view === "chat" ? "active" : ""} onClick={openChatPage} type="button"><Icon name="chat" />{tr("对话", "Chat")}</button>
+            </section>
+            <section>
+              <div className="sidebar-group-label">{tr("模型工具", "Model tools")}</div>
+              <button className={view === "lab" && labPage === "models" ? "active" : ""} onClick={() => openStudioPage("lab", "models")} type="button"><Icon name="download" />{tr("模型仓库", "Model hub")}</button>
+              <button className={view === "lab" && labPage === "evaluations" ? "active" : ""} onClick={() => openStudioPage("lab", "evaluations")} type="button"><Icon name="activity" />{tr("评测与数据集", "Evaluations")}</button>
+              <button className={view === "lab" && labPage === "quantization" ? "active" : ""} onClick={() => openStudioPage("lab", "quantization")} type="button"><Icon name="memory" />{tr("量化工作台", "Quantization")}</button>
             </section>
             <section>
               <div className="sidebar-group-label">{tr("系统", "System")}</div>
-              <button className={view === "dashboard" && dashboardPage === "logs" ? "active" : ""} onClick={() => openStudioPage("dashboard", "logs")} type="button"><Icon name="activity" />{tr("日志", "Logs")}</button>
-              <button className={view === "dashboard" && dashboardPage === "settings" ? "active" : ""} onClick={openSettings} type="button"><Icon name="settings" />{tr("设置", "Settings")}</button>
+              <button aria-current={view === "dashboard" && dashboardPage === "logs" ? "page" : undefined} className={view === "dashboard" && dashboardPage === "logs" ? "active" : ""} onClick={() => openStudioPage("dashboard", "logs")} type="button"><Icon name="activity" />{tr("日志", "Logs")}</button>
+              <button aria-current={view === "dashboard" && dashboardPage === "settings" ? "page" : undefined} className={view === "dashboard" && dashboardPage === "settings" ? "active" : ""} onClick={openSettings} type="button"><Icon name="settings" />{tr("设置", "Settings")}</button>
             </section>
           </nav>
         </div>
@@ -4175,28 +3810,28 @@ export default function App() {
           <Icon name="activity" size={14} />
         </button>
       </aside>
-      <button aria-label={tr("关闭侧栏", "Close sidebar")} className={`mobile-scrim ${sidebarOpen ? "open" : ""}`} onClick={() => setSidebarOpen(false)} type="button" />
+      <button
+        aria-controls="studio-sidebar"
+        aria-expanded={sidebarOpen}
+        aria-label={tr("打开侧栏", "Open sidebar")}
+        className="mobile-menu-trigger"
+        onClick={openSidebar}
+        type="button"
+      >
+        <Icon name="menu" size={17} />
+      </button>
+      <button aria-label={tr("关闭侧栏", "Close sidebar")} className={`mobile-scrim ${sidebarOpen ? "open" : ""}`} onClick={closeSidebar} type="button" />
 
-      <main className="workspace">
+      <main className="workspace" id="studio-main">
         {view === "chat" ? (
-          <section className="chat-view">
+          <section className={"chat-view " + (chatSessionsOpen ? "sessions-open" : "sessions-collapsed")}>
+            <aside className={"chat-session-sidebar" + (chatSessionsOpen ? ' open' : '')} aria-label={tr('会话列表', 'Conversations')}>
+              <div className="chat-session-sidebar-header"><strong>{tr('对话', 'Chats')}</strong><button aria-label={tr('新建会话', 'New chat')} className="chat-icon-button" disabled={busy || sessionTransitioning || !selectedModelAvailable} onClick={() => void createSession()} title={tr('新建会话', 'New chat')} type="button"><Icon name="plus" size={15} /></button></div>
+              <div className="chat-session-list">{sessions.length ? sessions.map((session) => <button aria-current={session.id === activeId ? 'page' : undefined} className={session.id === activeId ? 'active' : ''} disabled={busy || sessionTransitioning} key={session.id} onClick={() => selectSession(session.id)} title={session.title || tr('未命名会话', 'Untitled chat')} type="button"><strong>{session.title || tr('未命名会话', 'Untitled chat')}</strong><small>{session.model}</small></button>) : <p>{tr('暂无会话', 'No conversations yet')}</p>}</div>
+            </aside>
             <header className="chat-screen-header">
-              <div className="chat-screen-title">
-                <h1>{tr("对话", "Chat")}</h1>
-                <select aria-label={tr("会话", "Session")} className="chat-session-select" disabled={busy || sessionTransitioning || !sessions.length} onChange={(event) => selectSession(event.target.value)} value={activeId ?? ""}>
-                  {!sessions.length && <option value="">{tr("暂无会话", "No sessions")}</option>}
-                  {sessions.map((session) => <option key={session.id} value={session.id}>{session.title || tr("未命名会话", "Untitled session")} · {session.model}</option>)}
-                </select>
-                <button aria-label={tr("新建会话", "New session")} className="chat-icon-button" disabled={busy || sessionTransitioning || !selectedModelAvailable} onClick={() => void createSession()} title={tr("新建会话", "New session")} type="button"><Icon name="plus" size={14} /></button>
-              </div>
-              <div className="chat-screen-actions">
-                <div className="chat-model-summary">
-                  {availableModelNames.length > 1 ? <select aria-label={tr("对话模型", "Chat model")} disabled={busy || sessionTransitioning} onChange={(event) => selectModel(event.target.value)} value={model}>{availableModelNames.map((name) => <option key={name} value={name}>{name}</option>)}</select> : <strong>{model || tr("尚未加载模型", "No model loaded")}</strong>}
-                  <small>{tr(`最多 ${formatNumber(effectiveSettings.maxTokens)} tokens`, `${formatNumber(effectiveSettings.maxTokens)} max tokens`)} · {tr("温度", "temperature")} {formatNumber(effectiveSettings.temperature, 2)} · {tr("流式", "streaming")}</small>
-                </div>
-                <span className={`runtime-status-pill ${conversationReady ? "running" : "stopped"}`}><i />{conversationReady ? tr("就绪", "Ready") : selectedModelLoading ? tr("加载中", "Loading") : tr("空闲", "Idle")}</span>
-                <button aria-label={tr("清空对话", "Clear conversation")} className="chat-icon-button" disabled={!conversationReady || busy || (!messages.length && !currentVoiceMessages.length)} onClick={() => void clearActiveConversation()} title={tr("清空对话", "Clear conversation")} type="button"><Icon name="trash" size={14} /></button>
-              </div>
+              <div className="chat-screen-title"><button aria-expanded={chatSessionsOpen} aria-label={chatSessionsOpen ? tr('收起会话列表', 'Collapse conversations') : tr('展开会话列表', 'Expand conversations')} className="chat-sidebar-toggle" onClick={() => setChatSessionsOpen((open) => !open)} title={chatSessionsOpen ? tr('收起会话列表', 'Collapse conversations') : tr('展开会话列表', 'Expand conversations')} type="button"><span aria-hidden="true">{chatSessionsOpen ? '‹' : '›'}</span></button><h1>{active?.title || tr('对话', 'Chat')}</h1></div>
+              <div className="chat-screen-actions"><div className="chat-model-summary">{availableModelNames.length > 1 ? <select aria-label={tr('对话模型', 'Chat model')} disabled={busy || sessionTransitioning} onChange={(event) => selectModel(event.target.value)} value={model}>{availableModelNames.map((name) => <option key={name} value={name}>{name}</option>)}</select> : <strong>{model || tr('尚未加载模型', 'No model loaded')}</strong>}<small>{tr('最多 ' + formatNumber(effectiveSettings.maxTokens) + ' tokens', formatNumber(effectiveSettings.maxTokens) + ' max tokens')} · {tr('温度', 'temperature')} {formatNumber(effectiveSettings.temperature, 2)} · {tr('流式', 'streaming')}</small></div><span className={'runtime-status-pill ' + (conversationReady ? 'running' : 'stopped')}><i />{conversationReady ? tr('就绪', 'Ready') : selectedModelLoading ? tr('加载中', 'Loading') : tr('空闲', 'Idle')}</span><button aria-label={tr('清空对话', 'Clear conversation')} className="chat-icon-button" disabled={!conversationReady || busy || (!messages.length && !currentVoiceMessages.length)} onClick={() => void clearActiveConversation()} title={tr('清空对话', 'Clear conversation')} type="button"><Icon name="trash" size={14} /></button></div>
             </header>
             <div className="message-scroller" onScroll={handleMessageScroll} ref={messageScrollerRef}>
               <div className="message-list" aria-live="polite">
@@ -4211,20 +3846,19 @@ export default function App() {
                     response?.performance?.complete_prefill_ms,
                   );
                   return <article className={`message message-${message.role}`} key={message.id}>
-                    <div className="message-avatar">{message.role === "assistant" ? <img src="/mfq-mark.svg" alt="MFQ" /> : <span>{message.role === "user" ? tr("你", "You") : message.role}</span>}</div>
                     <div className="message-body">
+                      <time className="message-time" dateTime={message.created_at}>{new Date(message.created_at).toLocaleString()}</time>
                       <div className="message-content">
-                        <div className="message-meta"><strong>{message.role === "assistant" ? "MFQ" : message.role === "user" ? tr("你", "You") : message.role}</strong><span>{new Date(message.created_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</span></div>
-                        {editing ? <div className="message-editor">{message.role === "assistant" && <textarea aria-label={tr("思考过程", "Reasoning")} onChange={(event) => setEditDraft((current) => current && ({ ...current, reasoning: event.target.value }))} placeholder={tr("思考过程", "Reasoning")} value={editDraft.reasoning} />}<textarea aria-label={tr("消息", "Message")} onChange={(event) => setEditDraft((current) => current && ({ ...current, text: event.target.value }))} value={editDraft.text} /><div><button onClick={() => setEditDraft(null)} type="button">{tr("取消", "Cancel")}</button><button className="primary" onClick={() => void saveEdit(message)} type="button">{tr("保存", "Save")}</button></div></div> : <>{parts.reasoning && <details className="reasoning"><summary>{tr("思考过程", "Reasoning")}</summary>{renderMarkdown(parts.reasoning, false, message.role === "assistant")}</details>}{message.parts.filter(isMediaPart).map((part, index) => <MediaPartView key={`${part.media.id}-${index}`} part={part} />)}{message.parts.filter((part) => part.type === "document").map((part, index) => <DocumentPartView key={`${part.media.id}-${index}`} part={part} />)}{parts.text && renderMarkdown(parts.text, false, message.role === "assistant")}{message.parts.filter((part) => part.type === "tool_call" || part.type === "tool_result").map((part, index) => <div className="tool-call" key={index}><pre>{part.type === "tool_call" ? `${part.name}(${JSON.stringify(part.arguments, null, 2)})` : JSON.stringify(part.result, null, 2)}</pre></div>)}{message.parts.some((part) => part.type === "tool_call" && mcpTools.some((tool) => tool.qualified_name === part.name)) && <div className="tool-confirm"><button disabled={busy} onClick={() => void executeToolCalls(message)} type="button">{tr("确认并执行所有工具", "Confirm and run all tools")}</button></div>}</>}
+                        {editing ? <div className="message-editor"><textarea aria-label={tr("消息", "Message")} onChange={(event) => setEditDraft((current) => current && ({ ...current, text: event.target.value }))} value={editDraft.text} /><div><button onClick={() => setEditDraft(null)} type="button">{tr("取消", "Cancel")}</button><button className="primary" onClick={() => void saveEdit(message)} type="button">{tr("保存", "Save")}</button></div></div> : <>{parts.reasoning && <details className="reasoning"><summary>{tr("思考过程", "Reasoning")}</summary>{renderMarkdown(parts.reasoning, false, message.role === "assistant")}</details>}{message.parts.filter(isMediaPart).map((part, index) => <MediaPartView key={`${part.media.id}-${index}`} part={part} />)}{message.parts.filter((part) => part.type === "document").map((part, index) => <DocumentPartView key={`${part.media.id}-${index}`} part={part} />)}{parts.text && renderMarkdown(parts.text, false, message.role === "assistant")}{message.parts.filter((part) => part.type === "tool_call" || part.type === "tool_result").map((part, index) => <div className="tool-call" key={index}><pre>{part.type === "tool_call" ? `${part.name}(${JSON.stringify(part.arguments, null, 2)})` : JSON.stringify(part.result, null, 2)}</pre></div>)}{message.parts.some((part) => part.type === "tool_call" && mcpTools.some((tool) => tool.qualified_name === part.name)) && <div className="tool-confirm"><button disabled={busy} onClick={() => void executeToolCalls(message)} type="button">{tr("确认并执行所有工具", "Confirm and run all tools")}</button></div>}</>}
                       </div>
                       {response?.performance && <details className="response-metrics"><summary><span>{formatNumber(response.performance.decode_tps, 1)} tok/s</span><span>{formatNumber(responsePrefill.tokensPerSecond, 1)} pp</span><span>{formatNumber(responseTtftMs, 1)} ms TTFT</span></summary><div><span>{response.performance.prefill_tokens} prompt tokens</span><span>{response.usage?.completion_tokens ?? 0} output tokens</span>{response.performance.processor_ms > 0 && <span>{tr("媒体准备", "Media preparation")} {formatNumber(response.performance.processor_ms, 1)} ms</span>}{response.performance.multimodal_ms > 0 && <span>{tr("多模态编码", "Multimodal encoding")} {formatNumber(response.performance.multimodal_ms, 1)} ms</span>}{response.performance.model_prefill_ms > response.performance.multimodal_ms && <span>LLM {formatNumber(response.performance.prefill_ms, 1)} ms</span>}<span>{response.finish_reason || "stop"}</span><span>T {formatNumber(response.performance.sampling.temperature, 2)}</span><span>top-p {formatNumber(response.performance.sampling.top_p, 2)}</span><span>repeat {formatNumber(response.performance.sampling.repetition_penalty, 2)}</span>{response.performance.sampling.reasoning_effort && <span>{response.performance.sampling.reasoning_effort}</span>}</div></details>}
-                      {!editing && <div className="message-actions"><button onClick={() => void copyMessage(message)} type="button">{tr("复制", "Copy")}</button>{(message.role === "user" || message.role === "assistant") && <button onClick={() => setEditDraft({ messageId: message.id, ...parts })} type="button">{tr("编辑", "Edit")}</button>}{message.role === "assistant" && <button onClick={() => void regenerate(message)} type="button">{tr("重新生成", "Regenerate")}</button>}</div>}
+                      {!editing && <div className="message-actions"><button aria-label={tr("复制", "Copy")} onClick={() => void copyMessage(message)} title={tr("复制", "Copy")} type="button"><Icon name="copy" size={14} /></button>{message.role === "user" && <button aria-label={tr("编辑", "Edit")} onClick={() => setEditDraft({ messageId: message.id, text: parts.text })} title={tr("编辑", "Edit")} type="button"><Icon name="edit" size={14} /></button>}{message.role === "assistant" && <button aria-label={tr("重新生成", "Regenerate")} onClick={() => void regenerate(message)} title={tr("重新生成", "Regenerate")} type="button"><Icon name="refresh" size={14} /></button>}</div>}
                     </div>
                   </article>;
                 })}
-                {currentVoiceMessages.map((message) => <article className={`message message-${message.role}`} key={message.id}><div className="message-avatar">{message.role === "assistant" ? <img src="/mfq-mark.svg" alt="MFQ" /> : <span>{tr("你", "You")}</span>}</div><div className="message-body"><div className="message-meta"><strong>{message.role === "assistant" ? "MFQ" : tr("你", "You")}</strong><span>{tr("语音", "Voice")}</span></div>{message.text && renderMarkdown(message.text, false, message.role === "assistant")}{message.audioId && <AudioClip audioId={message.audioId} />}</div></article>)}
-                {liveVoice?.sessionId === activeId && liveVoice.text && <article className="message message-assistant live-message"><div className="message-avatar"><img src="/mfq-mark.svg" alt="MFQ" /></div><div className="message-body"><div className="message-meta"><strong>MFQ</strong><span>{tr("生成中", "Generating")}</span></div>{renderMarkdown(liveVoice.text, true, true)}</div></article>}
-                {live && <article className="message message-assistant live-message"><div className="message-avatar"><img src="/mfq-mark.svg" alt="MFQ" /></div><div className="message-body"><div className="message-meta"><strong>MFQ</strong><span>{tr("生成中", "Generating")}</span></div>{live.reasoning && <details className="reasoning" open><summary>{tr("正在思考", "Thinking")}</summary>{renderMarkdown(live.reasoning, true, true)}</details>}{live.text && renderMarkdown(live.text, true, true)}{live.tools.map((tool, index) => <pre className="tool-call" key={index}>{tool}</pre>)}{!live.reasoning && !live.text && live.tools.length === 0 && <span className="thinking"><i /><i /><i /></span>}</div></article>}
+                {currentVoiceMessages.map((message) => <article className={`message message-${message.role}`} key={message.id}><div className="message-body">{message.text && renderMarkdown(message.text, false, message.role === "assistant")}{message.audioId && <AudioClip audioId={message.audioId} />}</div></article>)}
+                {liveVoice?.sessionId === activeId && liveVoice.text && <article className="message message-assistant live-message"><div className="message-body">{renderMarkdown(liveVoice.text, true, true)}</div></article>}
+                {live && <article className="message message-assistant live-message"><div className="message-body">{live.reasoning && <details className="reasoning" open><summary>{tr("正在思考", "Thinking")}</summary>{renderMarkdown(live.reasoning, true, true)}</details>}{live.text && renderMarkdown(live.text, true, true)}{live.tools.map((tool, index) => <pre className="tool-call" key={index}>{tool}</pre>)}{!live.reasoning && !live.text && live.tools.length === 0 && <span className="thinking"><i /><i /><i /></span>}</div></article>}
               </div>
             </div>
             {error && <div className="error-banner" role="alert"><span>{error}</span><button onClick={() => setError(null)} type="button">×</button></div>}
@@ -4266,7 +3900,7 @@ export default function App() {
               </div>
               <div className="runtime-hero-actions">
                 <button onClick={() => openStudioPage("dashboard", "models")} type="button"><Icon name="folder" size={15} />{tr("模型", "Models")}</button>
-                <button className="primary" onClick={() => { setView("chat"); setSidebarOpen(false); }} type="button"><Icon name="chat" size={15} />{tr("对话", "Chat")}</button>
+                <button className="primary" onClick={openChatPage} type="button"><Icon name="chat" size={15} />{tr("对话", "Chat")}</button>
               </div>
             </TMPanel>}
             {dashboardPage === "overview" && <>
@@ -4384,13 +4018,20 @@ export default function App() {
               {toolsRoutingPanel}
             </>}
             {dashboardPage === "models" && <>
+              <div className="model-workbench-summary">
+                <div><span>{tr("运行中的模型", "Loaded models")}</span><strong>{availableModelNames.length}</strong><small>{tr("可直接用于对话", "Ready for chat")}</small></div>
+                <div><span>{tr("本地检查点", "Local checkpoints")}</span><strong>{artifacts.length}</strong><small>{tr("已登记到 MFQ", "Registered in MFQ")}</small></div>
+                <div><span>{tr("当前对话模型", "Chat model")}</span><strong title={model || undefined}>{model || tr("未选择", "None")}</strong><small>{model ? tr("切换会话模型不会重新注册资产", "Switching keeps the registered asset") : tr("加载后从这里选择", "Choose one after loading")}</small></div>
+                <div className="model-workbench-links"><button onClick={() => openStudioPage("lab", "models")} type="button"><Icon name="download" size={13} />{tr("打开模型仓库", "Open model hub")}</button><button onClick={() => openStudioPage("lab", "quantization")} type="button"><Icon name="memory" size={13} />{tr("去量化", "Quantize")}</button></div>
+              </div>
+              <div className="model-catalog-toolbar"><div><strong>{tr("模型资产", "Model assets")}</strong><span>{tr("注册、加载和切换对话模型", "Register, load, and switch chat models")}</span></div><label><span aria-hidden="true">/</span><input aria-label={tr("筛选模型", "Filter models")} onChange={(event) => setModelFilter(event.target.value)} placeholder={tr("按名称筛选", "Filter by name")} value={modelFilter} /></label></div>
               <SectionLabel title={tr("已加载模型", "Loaded models")} subtitle={tr(`${availableModelNames.length} 个可用于推理`, `${availableModelNames.length} available for inference`)} />
-              {instances.length > 0 ? <TMPanel className="model-catalog-panel loaded-model-panel"><div className="model-list">{instances.map((instance) => {
+              {filteredInstances.length > 0 ? <TMPanel className="model-catalog-panel loaded-model-panel"><div className="model-list">{filteredInstances.map((instance) => {
                 const ready = instance.state === "ready" || instance.state === "busy";
                 const selected = instance.model === model;
                 const stateLabel = instance.state === "loading" ? tr("加载中", "Loading") : instance.state === "unloading" ? tr("卸载中", "Unloading") : instance.state === "failed" ? tr("失败", "Failed") : instance.state === "busy" ? tr("使用中", "Busy") : tr("就绪", "Ready");
                 return <div className="model-row" key={instance.id}><span className={instance.state === "failed" ? "model-state failed" : ready ? "model-state active" : "model-state"} /><div><strong>{instance.model}</strong><small>{stateLabel} · {formatNumber(instance.context_size)} ctx{instance.pinned ? ` · ${tr("固定", "Pinned")}` : instance.idle_ttl_seconds != null ? ` · TTL ${instance.idle_ttl_seconds}s` : ""}</small></div><div className="model-row-actions">{ready && <button className={selected ? "selected" : ""} disabled={busy || sessionTransitioning || selected} onClick={() => selectModel(instance.model)} type="button">{selected ? tr("当前", "Current") : tr("用于对话", "Use in chat")}</button>}<button disabled={busy || instance.state !== "ready"} onClick={() => void unloadInstance(instance.id)} type="button">{tr("卸载", "Unload")}</button></div></div>;
-              })}</div></TMPanel> : <div className="inline-empty model-runtime-empty">{tr("当前没有已加载模型。", "No models are currently loaded.")}</div>}
+              })}</div></TMPanel> : <EmptyPanel icon="memory" title={tr(modelFilter ? "没有匹配的已加载模型" : "当前没有已加载模型", modelFilter ? "No loaded model matches" : "No models loaded")} message={tr("从本地检查点加载一个模型后即可开始对话。", "Load a local checkpoint to start chatting.")} action={<button className="primary" disabled={busy} onClick={() => void chooseModelDirectory()} type="button"><Icon name="folder" size={14} />{tr("添加模型", "Add model")}</button>} />}
               <TMPanel className="model-catalog-panel">
                 <div className="panel-heading"><div><h2>{tr("加载策略", "Load policy")}</h2><p>{tr("控制模型的驻留与自动卸载。", "Control model residency and automatic unloading.")}</p></div></div>
                 <div className="setting-list model-policy-panel">
@@ -4399,12 +4040,12 @@ export default function App() {
                 </div>
               </TMPanel>
               <SectionLabel title={tr("本地检查点", "Local checkpoints")} subtitle={`${artifacts.length} ${tr("个本地模型", "local models")}`} />
-              {artifacts.length > 0 ? <TMPanel className="model-catalog-panel model-library-panel"><div className="model-list">{artifacts.map((item) => {
+              {filteredArtifacts.length > 0 ? <TMPanel className="model-catalog-panel model-library-panel"><div className="model-list">{filteredArtifacts.map((item) => {
                   const instance = instances.find((candidate) => candidate.model === item.name && candidate.state !== "failed");
                   const loaded = Boolean(instance) || item.name === runtime?.model;
                   const policy = instance?.pinned ? tr("固定", "Pinned") : instance?.idle_ttl_seconds != null ? `TTL ${instance.idle_ttl_seconds}s` : null;
                   return <div className="model-row" key={item.id}><span className={loaded ? "model-state active" : item.loadable ? "model-state" : "model-state failed"} /><div><strong>{item.name}</strong><small>{item.architecture} · {item.shard_count} shards · {formatNumber(item.total_bytes / 2 ** 30, 1)} GB{policy ? ` · ${policy}` : ""}</small></div>{instance ? <button disabled={busy || instance.state !== "ready"} onClick={() => void unloadInstance(instance.id)} type="button">{tr("卸载", "Unload")}</button> : loaded ? <em>{tr("已加载", "Loaded")}</em> : !item.loadable ? <em className="failed" title={item.error || undefined}>{item.complete && item.format === "hf" ? tr("需先转换", "Convert first") : tr("不可用", "Invalid")}</em> : <button disabled={busy} onClick={() => void loadArtifact(item.name)} type="button">{tr("加载", "Load")}</button>}</div>;
-                })}</div></TMPanel> : <EmptyPanel icon="folder" title={tr("还没有本地模型", "No local models yet")} message={tr("添加一个模型文件夹即可开始。", "Add a model folder to get started.")} />}
+                })}</div></TMPanel> : <EmptyPanel icon="folder" title={tr(modelFilter ? "没有匹配的本地模型" : "还没有本地模型", modelFilter ? "No local model matches" : "No local models yet")} message={tr("添加一个模型文件夹即可开始。", "Add a model folder to get started.")} action={<button className="primary" disabled={busy} onClick={() => void chooseModelDirectory()} type="button"><Icon name="folder" size={14} />{tr("选择模型文件夹", "Choose model folder")}</button>} />}
             </>}
             {dashboardPage === "logs" && <>
               <SectionLabel title={tr("Runtime 活动", "Runtime activity")} subtitle={tr("请求、任务与事件", "Requests, jobs, and events")} />
@@ -4424,23 +4065,28 @@ export default function App() {
             {dashboardPage === "connections" && serverPage}
           </section>
         ) : (
-          <section aria-label="Lab" className="lab-view">
+          <section aria-label={tr("模型工具", "Model tools")} className="lab-view">
             <div className="page-heading"><div><h1>{labPage === "models" ? tr("模型仓库", "Model hubs") : labPage === "evaluations" ? tr("评测与数据集", "Evaluations") : tr("量化工作台", "Quantization workspace")}</h1><p>{labPage === "models" ? tr("浏览模型来源并登记本地资产。", "Browse model sources and register local assets.") : labPage === "evaluations" ? tr("组织数据集、评测结果与可复现评测流程。", "Organize datasets, results, and reproducible evaluation workflows.") : tr("配置并运行 MFQ 量化流程。", "Configure and run MFQ quantization workflows.")}</p></div></div>
-            {labPage === "models" && <PanelDeck labels={panelLabels} page="lab-models" resetVersion={labLayoutReset}><div key="hubs"><section className="dashboard-panel hub-panel"><div className="panel-heading"><div><h2>{tr("模型仓库", "Model hubs")}</h2><p>{tr("搜索、粘贴仓库链接并启动可续传下载", "Search or paste a repository link to start a resumable download")}</p></div></div><form className="hub-search" onSubmit={searchHub}><select onChange={(event) => setHubProvider(event.target.value as HubModelSummary["provider"])} value={hubProvider}><option value="modelscope">ModelScope</option><option value="huggingface">Hugging Face</option></select><input onChange={(event) => setHubQuery(event.target.value)} placeholder={tr("模型名称、仓库或链接", "Model, repository, or URL")} value={hubQuery} /><button disabled={busy || !hubQuery.trim()} type="submit">{tr("查找", "Find")}</button></form>{hubResults.length > 0 && <div className="hub-results">{hubResults.map((item) => <button className={hubModel?.repo_id === item.repo_id ? "active" : ""} key={`${item.provider}:${item.repo_id}`} onClick={() => void inspectHubModel(item)} type="button"><div><strong>{item.repo_id}</strong><small>{formatNumber(item.downloads)} downloads · {formatNumber(item.likes)} likes</small></div><span>{item.total_bytes ? `${formatNumber(item.total_bytes / 2 **30, 1)} GB` : "--"}</span></button>)}</div>}{hubModel && <div className="hub-detail"><div><strong>{hubModel.repo_id}</strong><small>{hubModel.revision} · {hubModel.files.length} files · {formatNumber(hubModel.total_bytes / 2 ** 30, 2)} GB</small></div><button disabled={busy || !jobKinds.some((item) => item.kind === `download.${hubModel.provider}`)} onClick={() => void downloadHubModel()} type="button"><Icon name="download" size={14} />{tr("下载", "Download")}</button></div>}</section></div></PanelDeck>}
-            {labPage === "evaluations" && <PanelDeck labels={panelLabels} page="lab-evaluations" resetVersion={labLayoutReset}>
+            <nav aria-label={tr("模型工具页面", "Model tools pages")} className="workspace-tabs">
+              <button aria-current={labPage === "models" ? "page" : undefined} className={labPage === "models" ? "active" : ""} onClick={() => openStudioPage("lab", "models")} type="button"><Icon name="download" size={14} />{tr("模型仓库", "Model hub")}</button>
+              <button aria-current={labPage === "evaluations" ? "page" : undefined} className={labPage === "evaluations" ? "active" : ""} onClick={() => openStudioPage("lab", "evaluations")} type="button"><Icon name="activity" size={14} />{tr("评测与数据集", "Evaluations")}</button>
+              <button aria-current={labPage === "quantization" ? "page" : undefined} className={labPage === "quantization" ? "active" : ""} onClick={() => openStudioPage("lab", "quantization")} type="button"><Icon name="memory" size={14} />{tr("量化工作台", "Quantization")}</button>
+            </nav>
+            {labPage === "models" && <PanelDeck labels={panelLabels} page="lab-models"><div key="hubs"><section className="dashboard-panel hub-panel"><div className="panel-heading"><div><h2>{tr("模型仓库", "Model hubs")}</h2><p>{tr("搜索、粘贴仓库链接并启动可续传下载", "Search or paste a repository link to start a resumable download")}</p></div></div><form aria-busy={busy} className="hub-search" onSubmit={searchHub}><select onChange={(event) => setHubProvider(event.target.value as HubModelSummary["provider"])} value={hubProvider}><option value="modelscope">ModelScope</option><option value="huggingface">Hugging Face</option></select><input onChange={(event) => setHubQuery(event.target.value)} placeholder={tr("模型名称、仓库或链接", "Model, repository, or URL")} value={hubQuery} /><button disabled={busy || !hubQuery.trim()} type="submit">{busy ? tr("搜索中…", "Searching…") : tr("查找", "Find")}</button></form>{hubQuery.trim() && hubResults.length === 0 && !hubModel && <div className="inline-empty hub-empty">{tr("没有匹配的模型仓库。检查名称、组织名或仓库链接。", "No model hub matches. Check the model name, organization, or repository URL.")}</div>}{hubResults.length > 0 && <div className="hub-results">{hubResults.map((item) => <button className={hubModel?.repo_id === item.repo_id ? "active" : ""} key={`${item.provider}:${item.repo_id}`} onClick={() => void inspectHubModel(item)} type="button"><div><strong>{item.repo_id}</strong><small>{formatNumber(item.downloads)} downloads · {formatNumber(item.likes)} likes</small></div><span>{item.total_bytes ? `${formatNumber(item.total_bytes / 2 **30, 1)} GB` : "--"}</span></button>)}</div>}{hubModel && <div className="hub-detail"><div><strong>{hubModel.repo_id}</strong><small>{hubModel.revision} · {hubModel.files.length} files · {formatNumber(hubModel.total_bytes / 2 ** 30, 2)} GB</small></div><button disabled={busy || !jobKinds.some((item) => item.kind === `download.${hubModel.provider}`)} onClick={() => void downloadHubModel()} type="button"><Icon name="download" size={14} />{tr("下载", "Download")}</button></div>}</section></div></PanelDeck>}
+            {labPage === "evaluations" && <PanelDeck labels={panelLabels} page="lab-evaluations">
               <section className="dashboard-panel evaluation-panel" key="results">
                 <div className="panel-heading"><div><h2>{tr("评测结果", "Evaluation results")}</h2><p>{tr("只允许数据集与运行参数一致的结果对比", "Comparison requires matching datasets and execution parameters")}</p></div><b>{evaluations.length}</b></div>
-                <div className="evaluation-list">{evaluations.map((item) => <label key={item.id}><input checked={selectedEvaluations.includes(item.id)} onChange={(event) => setSelectedEvaluations((current) => event.target.checked ? [...current, item.id] : current.filter((id) => id !== item.id))} type="checkbox" /><div><strong>{item.model_id}</strong><small>{item.kind} · {new Date(item.created_at).toLocaleString()}</small></div><span>{Object.entries(item.metrics).filter(([, value]) => typeof value === "number").slice(0, 2).map(([name, value]) => `${name} ${formatNumber(Number(value), 3)}`).join(" · ")}</span></label>)}</div>
+                <div className="evaluation-list">{evaluations.length === 0 ? <div className="inline-empty">{tr("还没有评测结果。先注册数据集并运行评测任务。", "No evaluation results yet. Register a dataset and run an evaluation job first.")}</div> : evaluations.map((item) => <label key={item.id}><input checked={selectedEvaluations.includes(item.id)} onChange={(event) => setSelectedEvaluations((current) => event.target.checked ? [...current, item.id] : current.filter((id) => id !== item.id))} type="checkbox" /><div><strong>{item.model_id}</strong><small>{item.kind} · {new Date(item.created_at).toLocaleString()}</small></div><span>{Object.entries(item.metrics).filter(([, value]) => typeof value === "number").slice(0, 2).map(([name, value]) => `${name} ${formatNumber(Number(value), 3)}`).join(" · ")}</span></label>)}</div>
                 <button className="panel-action" disabled={busy || selectedEvaluations.length < 2} onClick={() => void compareSelectedEvaluations()} type="button">{tr("对比所选结果", "Compare selected")}</button>
                 {evaluationComparison && <div className="comparison-table"><header><span>{tr("模型", "Model")}</span>{evaluationComparison.metrics.map((metric) => <b key={metric}>{metric}</b>)}</header>{evaluationComparison.rows.map((row) => <div key={row.evaluation.id}><strong>{row.evaluation.model_id}</strong>{evaluationComparison.metrics.map((metric) => <span key={metric}>{formatNumber(Number(row.evaluation.metrics[metric]), 4)}<small>{row.deltas[metric] == null ? "" : ` ${Number(row.deltas[metric]) >= 0 ? "+" : ""}${formatNumber(Number(row.deltas[metric]), 4)}`}</small></span>)}</div>)}</div>}
               </section>
               <section className="dashboard-panel dataset-panel" key="datasets">
                 <div className="panel-heading"><div><h2>{tr("数据集", "Datasets")}</h2><p>{tr("可复现的文件哈希与来源清单", "Reproducible file hashes and source manifests")}</p></div><b>{datasets.length}</b></div>
                 <form className="dataset-form" onSubmit={registerDataset}><input onChange={(event) => setDatasetDraft((current) => ({ ...current, name: event.target.value }))} placeholder={tr("名称", "Name")} value={datasetDraft.name} /><select onChange={(event) => setDatasetDraft((current) => ({ ...current, kind: event.target.value as DatasetResource["kind"] }))} value={datasetDraft.kind}><option value="custom">Custom</option><option value="wikitext2">WikiText-2</option></select><input onChange={(event) => setDatasetDraft((current) => ({ ...current, artifact_uri: event.target.value }))} placeholder="workspace://datasets/corpus.txt" value={datasetDraft.artifact_uri} /><button disabled={busy} type="submit">{tr("注册", "Register")}</button></form>
-                <div className="dataset-list">{datasets.map((item) => <div key={item.id}><div><strong>{item.name}</strong><small>{item.kind} · {formatNumber(item.byte_size / 2 ** 20, 2)} MiB · {item.sha256.slice(0, 12)}</small></div><button aria-label={tr("删除数据集", "Delete dataset")} onClick={() => void api.deleteDataset(item.id).then(() => setDatasets((current) => current.filter((entry) => entry.id !== item.id))).catch((cause) => setError(errorMessage(cause)))} type="button"><Icon name="trash" size={13} /></button></div>)}</div>
+                <div className="dataset-list">{datasets.length === 0 ? <div className="inline-empty">{tr("还没有数据集。注册一个文件或工作区资源后即可开始评测。", "No datasets yet. Register a file or workspace resource to start evaluating.")}</div> : datasets.map((item) => <div key={item.id}><div><strong>{item.name}</strong><small>{item.kind} · {formatNumber(item.byte_size / 2 ** 20, 2)} MiB · {item.sha256.slice(0, 12)}</small></div><button aria-label={tr("删除数据集", "Delete dataset")} onClick={() => void api.deleteDataset(item.id).then(() => setDatasets((current) => current.filter((entry) => entry.id !== item.id))).catch((cause) => setError(errorMessage(cause)))} type="button"><Icon name="trash" size={13} /></button></div>)}</div>
               </section>
             </PanelDeck>}
-            {labPage === "quantization" && <PanelDeck labels={panelLabels} page="lab-quantization" resetVersion={labLayoutReset}>
+            {labPage === "quantization" && <PanelDeck labels={panelLabels} page="lab-quantization">
             <section className="dashboard-panel imatrix-panel" key="imatrix">
               <div className="panel-heading"><div><h2>Imatrix</h2><p>{tr("单独校准、导入，或在量化任务中先校准再使用", "Calibrate separately, import one, or collect it before quantization")}</p></div><b>{imatrixArtifacts.length}</b></div>
               <div className="imatrix-actions">
@@ -4450,7 +4096,7 @@ export default function App() {
               </div>
               {imatrixArtifacts.length > 0 && <div className="imatrix-list">{imatrixArtifacts.slice(0, 12).map((item) => <button key={item.id} onClick={() => { setPendingImatrix(item.artifact_uri.replace(/^workspace:\/\//, "")); setSelectedJobKind("model.quantize"); }} type="button"><div><strong>{item.artifact_name}</strong><small>{item.artifact_uri}</small></div><span>{tr("用于量化", "Use")}</span></button>)}</div>}
             </section>
-            <section className="dashboard-panel lineage-panel" key="lineage"><div className="panel-heading"><div><h2>{tr("产物谱系", "Artifact lineage")}</h2><p>{tr("源产物、生成任务、默认后参数和验证记录", "Sources, producing jobs, resolved parameters, and validations")}</p></div><b>{lineage.length}</b></div><div className="lineage-list">{lineage.slice(0, 20).map((item) => <details key={item.id}><summary><div><strong>{item.artifact_name}</strong><small>{item.producer_kind} · {new Date(item.created_at).toLocaleString()}</small></div><span>{item.validation_job_ids.length} checks</span></summary><dl><div><dt>URI</dt><dd>{item.artifact_uri}</dd></div><div><dt>{tr("源", "Sources")}</dt><dd>{item.source_uris.join(", ") || "--"}</dd></div></dl><pre>{JSON.stringify(item.parameters, null, 2)}</pre></details>)}</div></section>
+            <section className="dashboard-panel lineage-panel" key="lineage"><div className="panel-heading"><div><h2>{tr("产物谱系", "Artifact lineage")}</h2><p>{tr("源产物、生成任务、默认后参数和验证记录", "Sources, producing jobs, resolved parameters, and validations")}</p></div><b>{lineage.length}</b></div><div className="lineage-list">{lineage.length === 0 ? <div className="inline-empty">{tr("暂无产物谱系记录。运行量化或导入任务后会显示在这里。", "No artifact lineage yet. Run a quantization or import job to populate this view.")}</div> : lineage.slice(0, 20).map((item) => <details key={item.id}><summary><div><strong>{item.artifact_name}</strong><small>{item.producer_kind} · {new Date(item.created_at).toLocaleString()}</small></div><span>{item.validation_job_ids.length} checks</span></summary><dl><div><dt>URI</dt><dd>{item.artifact_uri}</dd></div><div><dt>{tr("源", "Sources")}</dt><dd>{item.source_uris.join(", ") || "--"}</dd></div></dl><pre>{JSON.stringify(item.parameters, null, 2)}</pre></details>)}</div></section>
               <form className="dashboard-panel job-builder" key="builder" onSubmit={submitJob}>
                 <div className="panel-heading"><div><h2>{tr("新任务", "New job")}</h2></div></div>
                 <label><span>{tr("任务类型", "Job type")}</span><select onChange={(event) => setSelectedJobKind(event.target.value)} value={selectedJobKind}>{genericJobKinds.map((item) => <option key={item.kind} value={item.kind}>{item.kind}</option>)}</select></label>

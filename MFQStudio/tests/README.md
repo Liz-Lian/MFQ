@@ -3,15 +3,15 @@
 在 `MFQStudio` 目录运行：
 
 ```sh
-pnpm install --frozen-lockfile
-pnpm test
-pnpm typecheck
-pnpm build
-pnpm exec playwright install chromium --only-shell
-pnpm test:e2e
+npm ci
+npm test
+npm run typecheck
+npm run build
+npx playwright install chromium --only-shell
+npm run test:e2e
 ```
 
-`pnpm test:watch` 用于本地持续运行。测试使用 Vitest、jsdom 与 Testing Library；测试文件既可放在业务模块旁，也可放在本目录。统一配置自动清理 DOM、浏览器存储和全局桩对象。
+`npm run test:watch` 用于本地持续运行。测试使用 Vitest、jsdom 与 Testing Library；测试文件既可放在业务模块旁，也可放在本目录。统一配置自动清理 DOM、浏览器存储和全局桩对象。
 
 ## 覆盖边界
 
@@ -25,6 +25,6 @@ pnpm test:e2e
 
 CI 同时运行 `test_webui_*`、对话模板、MiniCPM 语音和模型能力中引用前端源码的相关契约。共享读取器 `tests/studio_sources.py` 只收集实现文件，不把测试文本误计为实现。用户消息编辑与助手消息重新生成沿用本次界面基线的交互。
 
-生产构建不纳入测试文件。`pnpm typecheck` 另外检查测试及测试配置，避免遗漏断言类型错误。CI 同时执行行为测试、类型检查、构建、桌面与移动端浏览器回归及 Python 契约测试。
+生产构建不纳入测试文件。`npm run typecheck` 另外检查测试及测试配置，避免遗漏断言类型错误。CI 同时执行行为测试、类型检查、构建、桌面与移动端浏览器回归及 Python 契约测试。
 
-项目保留桌面打包使用的 npm 入口。开发依赖变动时需要同步 `pnpm-lock.yaml` 与 `package-lock.json`，不手工修改锁文件。
+开发依赖变动时使用 npm 更新 `package-lock.json`，不手工修改锁文件。

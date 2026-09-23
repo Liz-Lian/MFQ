@@ -28,7 +28,7 @@ export default defineConfig({
     },
   ],
   webServer: {
-    command: 'pnpm dev --host 127.0.0.1 --port 5187 --strictPort',
+    command: 'npm run dev -- --host 127.0.0.1 --port 5187 --strictPort',
     url: 'http://127.0.0.1:5187',
     reuseExistingServer: !process.env.CI,
     timeout: 60_000,

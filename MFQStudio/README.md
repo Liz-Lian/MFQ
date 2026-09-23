@@ -1,12 +1,12 @@
 # MFQ Studio 前端
 
-Web 与 Tauri 共用 React 前端。开发使用 pnpm，现有桌面打包的 npm 入口保持兼容；依赖变化后同时更新两份锁文件。
+Web 与 Tauri 共用 React 前端，使用 npm 管理前端依赖。
 
 ## 本地运行
 
 ```sh
-pnpm install --frozen-lockfile
-pnpm dev
+npm ci
+npm run dev
 ```
 
 Vite 默认监听 `127.0.0.1:5173`，将 `/api` 代理到 `127.0.0.1:8090`。实际推理需要启动 MFQ 服务；浏览器测试使用模拟接口，不需要模型、GPU 或凭据。页面使用 Hash 路由，例如 `/#/chat`，兼容桌面资源协议。
@@ -57,11 +57,11 @@ submitting -> streaming -> syncing -> completed
 ## 验证
 
 ```sh
-pnpm test
-pnpm typecheck
-pnpm build
-pnpm exec playwright install chromium --only-shell
-pnpm test:e2e
+npm test
+npm run typecheck
+npm run build
+npx playwright install chromium --only-shell
+npm run test:e2e
 ```
 
 从仓库根目录运行：

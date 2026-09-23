@@ -1,4 +1,5 @@
-/* MFQ Studio design system.
+/* MFQ Studio 主题、布局与业务组件样式。
+   MFQ Studio design system.
    One token set (light + dark) and one component layer, ordered by surface:
    tokens → base → shell/sidebar → page column → shared components →
    dashboard pages → lab pages → chat → dialogs → responsive. */
@@ -1596,3 +1597,19 @@ button:active, a:active { transform: translateY(1px); }
 .message-user .message-content { width: fit-content; max-width: 100%; }
 .message-assistant .message-body { display: flex; flex-direction: column; align-items: flex-start; }
 .message-assistant .message-content { width: fit-content; max-width: 100%; }
+.chat-scroll-bottom {
+  grid-column: 2;
+  grid-row: 2;
+  align-self: end;
+  justify-self: center;
+  z-index: 2;
+  width: 32px;
+  min-height: 32px;
+  margin: 0 0 12px;
+  padding: 0;
+  border-radius: 6px;
+}
+
+@media (max-width: 680px) {
+  .chat-scroll-bottom { grid-column: 1; }
+}

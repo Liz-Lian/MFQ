@@ -1,12 +1,13 @@
 /** MFQ Studio 应用编排：组合业务模块、会话操作与桌面运行时。 */
 import { FormEvent, lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useLocation, useNavigate } from 'react-router';
-import { ApiError, ArtifactLineage, ContentPart, DatasetResource, EvaluationComparison, EvaluationResult, HubModelInfo, HubModelSummary, JobResource, JobKindResource, JsonSchemaProperty, McpServerResource, McpToolResource, Message, ModelArtifact, ModelDirectoryList, RealtimeCapabilities, RealtimeFrame, ResponseResource, RuntimeCapabilities, RuntimeInstance, RuntimeLogEntry, RuntimeModel, RuntimeProfile, RemoteNode, RuntimeRequestMetrics, RuntimeStatus, SamplingParams, SessionArchive, Session, SessionMode, VoiceOutputComponentStatus, api, setApiBaseUrl, setApiToken, streamResponse } from './api';
+import { ArrowDownIcon } from '@phosphor-icons/react';
+import { ArtifactLineage, ContentPart, DatasetResource, EvaluationComparison, EvaluationResult, HubModelInfo, HubModelSummary, JobResource, JobKindResource, JsonSchemaProperty, McpServerResource, McpToolResource, Message, ModelArtifact, ModelDirectoryList, RealtimeCapabilities, ResponseResource, RuntimeCapabilities, RuntimeInstance, RuntimeLogEntry, RuntimeModel, RuntimeProfile, RemoteNode, RuntimeRequestMetrics, RuntimeStatus, SamplingParams, SessionArchive, Session, SessionMode, VoiceOutputComponentStatus, api, setApiBaseUrl, setApiToken } from './api';
 import { RealtimeAudioController, VoiceState, saveVoiceClip } from './realtimeAudio';
 import { StudioConfig, StudioStatus, configureStudio, isStudio, saveStudioCredential, selectLocalModelDirectory, startLocalStudio, studioConfirm, studioCredential, studioStatus } from './studio';
 import { DashboardPage, LabPage, STUDIO_PATHS, dashboardPath, labPath, normalizeStudioPath, resolveStudioLocation } from './navigation';
 import { useUiStore } from './stores/uiStore';
-import { UiLanguage, UiTheme, PresetName, GenerationSettings, SETTINGS_KEY, DEFAULT_SETTINGS, PRESETS, modeTemplateSettings, loadSettings } from './features/settings/configuration';
+import { PresetName, GenerationSettings, SETTINGS_KEY, DEFAULT_SETTINGS, PRESETS, modeTemplateSettings, loadSettings } from './features/settings/configuration';
 import { StoredPreset, STORED_PRESETS_KEY, presetSnapshot, loadStoredPresets, storedPresetFromResource, presetResourceBody } from './features/settings/presets';
 import { parseHubReference } from './features/models/hubReference';
 import { isRuntimeReady, runtimeModelNames, runtimeSelectionNames } from './features/runtime/modelSelection';
@@ -14,43 +15,28 @@ import { displayPrefillMetric, preferPositiveMetric } from './features/runtime/m
 import { schemaDefault, schemaType, isTerminalJob } from './features/jobs/jobSchema';
 import { PendingAttachment, DOCUMENT_ACCEPT, MAX_DOCUMENT_BYTES, isTextDocument, mediaMetadata, documentMimeType } from './features/chat/attachments';
 import { textParts, isMediaPart } from './features/chat/messageParts';
-import { VideoWithFirstFrame, MediaPartView, DocumentPartView } from './features/chat/MessageMedia';
+
 import { VoiceMessage, LiveVoiceOutput, VOICE_HISTORY_KEY, loadVoiceHistory } from './features/voice/history';
 import { AudioClip } from './features/voice/AudioClip';
 import { errorMessage, formatNumber, formatBytes, formatDuration } from './app/formatters';
 import { Icon, ScreenHeader, SectionLabel, TMPanel, ModelMonogram, MetricTile, SettingRow, UsageBar, EmptyPanel } from './app/display';
 import { PanelDeck } from './app/PanelDeck';
-import { SettingsPage } from './features/settings/SettingsPage';
+import { useChatGeneration } from './features/chat/hooks/useChatGeneration';
+import { useChatAutoScroll } from './features/chat/hooks/useChatAutoScroll';
+import { isGenerationBusy } from './features/chat/state/generationController';
+import { StreamingMessage } from './features/chat/components/StreamingMessage';
+import { ChatComposer } from './features/chat/components/ChatComposer';
+import { Switch } from './shared/ui/Switch';
+import './shared/ui/primitives.css';
 import { renderMarkdown } from './features/chat/MessageMarkdown';
-import { SavedMessageList } from './features/chat/SavedMessageList';
-
-
-
-interface LiveOutput {
-  reasoning: string;
-  text: string;
-  tools: string[];
-}
-
-
-
-
-
-
-
-
-
+const Dialog = lazy(() => import('./shared/ui/Dialog').then((module) => ({ default: module.Dialog })));
+const SettingsPage = lazy(() => import('./features/settings/SettingsPage').then((module) => ({ default: module.SettingsPage })));
+const SavedMessageList = lazy(() => import('./features/chat/SavedMessageList').then((module) => ({ default: module.SavedMessageList })));
 
 interface EditDraft {
   messageId: string;
   text: string;
 }
-
-
-
-
-
-
 
 const MODE_LABELS: Record<SessionMode, [string, string]> = {
   text: ["文本", "Text"],
@@ -58,45 +44,7 @@ const MODE_LABELS: Record<SessionMode, [string, string]> = {
   full_duplex: ["全双工", "Full duplex"],
 };
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+/** 组合业务页面与共享运行时，并把高频聊天状态交给独立控制器。 */
 export default function App() {
   const location = useLocation();
   const navigate = useNavigate();
@@ -126,6 +74,7 @@ export default function App() {
   const [sessions, setSessions] = useState<Session[]>([]);
   const [activeId, setActiveId] = useState<string | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
+  const [historyLoadedId, setHistoryLoadedId] = useState<string | null>(null);
   const [responses, setResponses] = useState<Record<string, ResponseResource>>({});
   const [voiceMessages, setVoiceMessages] = useState<VoiceMessage[]>(loadVoiceHistory);
   const [models, setModels] = useState<RuntimeModel[]>([]);
@@ -165,17 +114,14 @@ export default function App() {
   const [runtimeLogs, setRuntimeLogs] = useState<RuntimeLogEntry[]>([]);
   const [model, setModel] = useState("");
   const [mode, setMode] = useState<SessionMode>("text");
-  const [draft, setDraft] = useState("");
   const [attachments, setAttachments] = useState<PendingAttachment[]>([]);
-  const [live, setLive] = useState<LiveOutput | null>(null);
-  const [busy, setBusy] = useState(false);
+  const [operationBusy, setBusy] = useState(false);
   const [sessionTransitioning, setSessionTransitioning] = useState(false);
-  const [stopping, setStopping] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [capabilities, setCapabilities] = useState<RuntimeCapabilities | null>(null);
   const [runtime, setRuntime] = useState<RuntimeStatus | null>(null);
   const [modelFilter, setModelFilter] = useState('');
-  const [chatSessionsOpen, setChatSessionsOpen] = useState(true);
+  const [chatSessionsOpen, setChatSessionsOpen] = useState(() => window.matchMedia('(min-width: 681px)').matches);
   const [realtime, setRealtime] = useState<RealtimeCapabilities | null>(null);
   const [realtimeAvailable, setRealtimeAvailable] = useState(false);
   const [voiceComponent, setVoiceComponent] = useState<VoiceOutputComponentStatus | null>(null);
@@ -203,15 +149,43 @@ export default function App() {
   const [voiceState, setVoiceState] = useState<VoiceState>("idle");
   const [voiceLevel, setVoiceLevel] = useState(0);
   const [liveVoice, setLiveVoice] = useState<LiveVoiceOutput | null>(null);
-  const abortRef = useRef<AbortController | null>(null);
-  const attachmentInputRef = useRef<HTMLInputElement | null>(null);
-  const messageScrollerRef = useRef<HTMLDivElement | null>(null);
-  const autoFollowOutputRef = useRef(true);
+  const activeIdRef = useRef(activeId);
+  activeIdRef.current = activeId;
+  const modelBrowserTriggerRef = useRef<HTMLElement | null>(null);
+  const { scrollerRef: messageScrollerRef, following, handleScroll: handleMessageScroll, scrollToBottom } = useChatAutoScroll(activeId, view === 'chat');
   const voiceRef = useRef<RealtimeAudioController | null>(null);
   const voiceClipWrites = useRef(new Map<string, Promise<void>>());
   const appliedModeTemplate = useRef("");
   const sessionSwitchRef = useRef("");
   const selectedRuntimeInstanceIdRef = useRef<string | null>(null);
+  const { controller: generation, phase: generationPhase } = useChatGeneration({
+    onSessionState: (sessionId, state, revision) => {
+      setSessions((current) => current.map((session) => session.id === sessionId ? { ...session, state, revision } : session));
+    },
+    onSynchronized: ({ session, messages: persisted, responses: persistedResponses }) => {
+      setSessions((current) => current.map((existing) => existing.id === session.id ? session : existing));
+      if (activeIdRef.current !== session.id) return;
+      setMessages(persisted);
+      setResponses(Object.fromEntries(persistedResponses.filter((response) => response.output_message_id)
+        .map((response) => [response.output_message_id as string, response])));
+    },
+  });
+  const generating = isGenerationBusy(generationPhase);
+  const busy = operationBusy || generating;
+  const recoveryNeeded = generation.getSnapshot().recoveryNeeded;
+  const live = generation.getSnapshot().live;
+
+  useEffect(() => {
+    const viewport = window.matchMedia('(max-width: 680px)');
+    const closeMobileSessions = () => { if (viewport.matches) setChatSessionsOpen(false); };
+    viewport.addEventListener('change', closeMobileSessions);
+    return () => viewport.removeEventListener('change', closeMobileSessions);
+  }, []);
+
+  useEffect(() => {
+    const sessionId = generation.getSnapshot().sessionId;
+    if (sessionId && sessionId !== activeId) generation.reset();
+  }, [activeId, generation]);
 
   const english =
     settings.language === "en" ||
@@ -240,7 +214,7 @@ export default function App() {
   }, [artifacts, modelFilter]);
   const selectedModelAvailable = Boolean(model && availableModelNames.includes(model));
   const conversationReady = Boolean(
-    active && selectedModelAvailable && active.model === model,
+    active && selectedModelAvailable && active.model === model && historyLoadedId === activeId,
   );
   const selectedRuntimeInstance = instances.find(
     (instance) => instance.model === model && instance.state !== "failed",
@@ -755,16 +729,19 @@ export default function App() {
   }, [selectedRuntimeInstance?.id]);
 
   useEffect(() => {
+    setHistoryLoadedId(null);
     if (!activeId) {
       setMessages([]);
       setResponses({});
       return;
     }
     let current = true;
-    Promise.all([api.listMessages(activeId), api.listResponses(activeId)])
+    const controller = new AbortController();
+    Promise.all([api.listMessages(activeId, controller.signal), api.listResponses(activeId, controller.signal)])
       .then(([nextMessages, nextResponses]) => {
         if (!current) return;
         setMessages(nextMessages);
+        setHistoryLoadedId(activeId);
         setResponses(
           Object.fromEntries(
             nextResponses
@@ -776,6 +753,7 @@ export default function App() {
       .catch((cause) => current && setError(errorMessage(cause)));
     return () => {
       current = false;
+      controller.abort();
       if (voiceRef.current?.active) void voiceRef.current.stop();
     };
   }, [activeId]);
@@ -804,7 +782,7 @@ export default function App() {
         if (current) setError(errorMessage(cause));
       })
       .finally(() => {
-        setSessionTransitioning(false);
+        if (current) setSessionTransitioning(false);
         if (sessionSwitchRef.current === switchKey) sessionSwitchRef.current = "";
       });
     return () => {
@@ -820,26 +798,6 @@ export default function App() {
       return [];
     });
   }, [activeId]);
-
-  const handleMessageScroll = useCallback(() => {
-    const scroller = messageScrollerRef.current;
-    if (!scroller) return;
-    const distanceFromBottom = scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight;
-    autoFollowOutputRef.current = distanceFromBottom <= 8;
-  }, []);
-
-  useEffect(() => {
-    autoFollowOutputRef.current = true;
-  }, [activeId]);
-
-  useEffect(() => {
-    const scroller = messageScrollerRef.current;
-    if (!scroller || !autoFollowOutputRef.current) return;
-    const frame = window.requestAnimationFrame(() => {
-      scroller.scrollTop = scroller.scrollHeight;
-    });
-    return () => window.cancelAnimationFrame(frame);
-  }, [messages, currentVoiceMessages, liveVoice, live, busy]);
 
   useEffect(() => {
     if (capabilities && !capabilities.model_capabilities.features.full_duplex) {
@@ -901,6 +859,7 @@ export default function App() {
     setModel(session.model);
     setMode(session.mode);
     setActiveId(session.id);
+    if (window.matchMedia('(max-width: 680px)').matches) setChatSessionsOpen(false);
     setMessages([]);
     setResponses({});
     openChatPage();
@@ -915,6 +874,7 @@ export default function App() {
       const created = await api.createSession(selectedModel, mode);
       setSessions((current) => [created, ...current]);
       setActiveId(created.id);
+      if (window.matchMedia('(max-width: 680px)').matches) setChatSessionsOpen(false);
       setMessages([]);
       openChatPage();
     } catch (cause) {
@@ -925,7 +885,7 @@ export default function App() {
   }
 
   async function clearActiveConversation() {
-    if (!active || !conversationReady || busy || !await studioConfirm(tr("清空当前对话？", "Clear this conversation?"))) return;
+    if (!active || !conversationReady || busy || recoveryNeeded || !await studioConfirm(tr("清空当前对话？", "Clear this conversation?"))) return;
     setBusy(true);
     setError(null);
     try {
@@ -944,60 +904,19 @@ export default function App() {
     }
   }
 
-  function applyFrame(frame: RealtimeFrame) {
-    const payload = frame.payload;
-    if (payload.type === "session.state") {
-      setSessions((current) =>
-        current.map((session) =>
-          session.id === frame.session_id
-            ? {
-                ...session,
-                state: payload.state as Session["state"],
-                revision: payload.revision as number,
-              }
-            : session,
-        ),
-      );
-      return;
-    }
-    if (payload.type === "response.reasoning.delta") {
-      setLive((current) => ({
-        reasoning: (current?.reasoning ?? "") + String(payload.delta ?? ""),
-        text: current?.text ?? "",
-        tools: current?.tools ?? [],
-      }));
-    } else if (payload.type === "response.text.delta") {
-      setLive((current) => ({
-        reasoning: current?.reasoning ?? "",
-        text: (current?.text ?? "") + String(payload.delta ?? ""),
-        tools: current?.tools ?? [],
-      }));
-    } else if (payload.type === "response.tool_call.delta") {
-      setLive((current) => {
-        const tools = [...(current?.tools ?? [])];
-        const index = Number(payload.index);
-        tools[index] = (tools[index] ?? "") + String(payload.arguments_delta ?? "");
-        return {
-          reasoning: current?.reasoning ?? "",
-          text: current?.text ?? "",
-          tools,
-        };
-      });
-    }
-  }
-
+  /** 启动会话生成并追加用户临时消息，收尾由独立控制器同步持久化结果。 */
   async function generate(
     session: Session,
     input: ContentPart[],
     optimistic = true,
     inputRole: "user" | "tool" = "user",
   ) {
-    const controller = new AbortController();
-    abortRef.current = controller;
+    if (isGenerationBusy(generation.getPhase()) || generation.getSnapshot().recoveryNeeded || activeIdRef.current !== session.id) {
+      setBusy(false);
+      return;
+    }
     setError(null);
-    setBusy(true);
-    setStopping(false);
-    setLive({ reasoning: "", text: "", tools: [] });
+    setBusy(false);
     if (optimistic) {
       if (inputRole !== "user") throw new Error("Only user input can be optimistic");
       setMessages((current) => [
@@ -1012,7 +931,7 @@ export default function App() {
       ]);
     }
     try {
-      await streamResponse(
+      await generation.start(
         session.id,
         {
           request_id: crypto.randomUUID(),
@@ -1035,60 +954,22 @@ export default function App() {
           tool_choice: selectedTools.length ? "auto" : "none",
           stream: true,
         },
-        applyFrame,
-        controller.signal,
       );
     } catch (cause) {
       if (!(cause instanceof DOMException && cause.name === "AbortError")) {
         setError(errorMessage(cause));
       }
     } finally {
-      abortRef.current = null;
-      setBusy(false);
-      setStopping(false);
-      setLive(null);
-      try {
-        const [persisted, persistedResponses, updated] = await Promise.all([
-          api.listMessages(session.id),
-          api.listResponses(session.id),
-          api.getSession(session.id),
-        ]);
-        setMessages(persisted);
-        setResponses(
-          Object.fromEntries(
-            persistedResponses
-              .filter((response) => response.output_message_id)
-              .map((response) => [response.output_message_id as string, response]),
-          ),
-        );
-        await refreshSessions(updated.id);
-      } catch (cause) {
-        setError(errorMessage(cause));
-      }
       void refreshRuntime(true);
     }
   }
 
-  async function stopGeneration() {
-    const controller = abortRef.current;
-    if (!active || !controller || stopping) return;
-    setStopping(true);
-    try {
-      await api.cancelResponse(active.id);
-    } catch (cause) {
-      if (!(cause instanceof ApiError && cause.status === 409)) {
-        setError(errorMessage(cause));
-      }
-    } finally {
-      controller.abort();
-      setStopping(false);
-    }
-  }
+  /** 通知后端取消并由控制器有界等待、关闭读取和确认最终历史。 */
+  const stopGeneration = generation.stop;
 
-  async function send(event: FormEvent) {
-    event.preventDefault();
-    const text = draft.trim();
-    if (!active || !conversationReady || (!text && !attachments.length) || busy) return;
+  /** 上传输入附件或提交语音文本，准备成功后清理草稿并启动生成。 */
+  async function send(text: string, accepted: () => void) {
+    if (!active || !conversationReady || (!text && !attachments.length) || busy || recoveryNeeded) return;
     if (
       active.mode !== "text" &&
       realtimeAvailable &&
@@ -1096,8 +977,13 @@ export default function App() {
       attachments.length === 0
     ) {
       if (!text) return;
-      setDraft("");
-      await voiceRef.current.submitText(text, realtimeSessionConfig(active.id));
+      try {
+        await voiceRef.current.submitText(text, realtimeSessionConfig(active.id));
+      } catch (cause) {
+        setError(errorMessage(cause));
+        return;
+      }
+      accepted();
       setVoiceMessages((current) => [
         ...current,
         {
@@ -1115,6 +1001,7 @@ export default function App() {
     if (active.mode !== "text" && realtimeController?.active) {
       await realtimeController.stop();
     }
+    if (activeIdRef.current !== active.id) return;
     setBusy(true);
     setError(null);
     try {
@@ -1148,7 +1035,7 @@ export default function App() {
       );
       const input: ContentPart[] = [...uploaded];
       if (text) input.push({ type: "text", text });
-      setDraft("");
+      accepted();
       setAttachments((current) => {
         current.forEach((attachment) => {
           if (attachment.previewUrl) URL.revokeObjectURL(attachment.previewUrl);
@@ -1206,7 +1093,6 @@ export default function App() {
       });
       return combined.slice(0, 8);
     });
-    if (attachmentInputRef.current) attachmentInputRef.current.value = "";
   }
 
   function removeAttachment(id: string) {
@@ -1218,7 +1104,7 @@ export default function App() {
   }
 
   async function saveEdit(message: Message) {
-    if (!active || !conversationReady || !editDraft || busy) return;
+    if (!active || !conversationReady || !editDraft || busy || recoveryNeeded) return;
     const messageIndex = messages.findIndex((item) => item.id === message.id);
     if (messageIndex < 0) return;
     const text = editDraft.text.trim();
@@ -1256,7 +1142,7 @@ export default function App() {
   }
 
   async function regenerate(message: Message) {
-    if (!active || !conversationReady || busy || message.role !== "assistant") return;
+    if (!active || !conversationReady || busy || recoveryNeeded || message.role !== "assistant") return;
     const index = messages.findIndex((item) => item.id === message.id);
     let user: Message | undefined;
     let userIndex = -1;
@@ -1311,7 +1197,7 @@ export default function App() {
   }
 
   async function executeToolCalls(message: Message) {
-    if (!active || !conversationReady || busy) return;
+    if (!active || !conversationReady || busy || recoveryNeeded) return;
     const calls = message.parts.filter(
       (part): part is Extract<ContentPart, { type: "tool_call" }> => part.type === "tool_call",
     );
@@ -1802,7 +1688,6 @@ export default function App() {
     }
   }
 
-
   async function cancelSelectedJob() {
     if (!selectedJobId) return;
     try {
@@ -2110,6 +1995,7 @@ export default function App() {
 
   async function chooseModelDirectory() {
     if (busy) return;
+    modelBrowserTriggerRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
     if (!canUseNativeModelPicker) {
       await openModelDirectory();
       return;
@@ -2510,8 +2396,6 @@ export default function App() {
     </div>
   );
 
-
-
   const resetSettingsDraft = () => setSettingsDraft({
     ...modeTemplateSettings({
       ...DEFAULT_SETTINGS,
@@ -2630,34 +2514,44 @@ export default function App() {
               <div className="chat-screen-actions"><div className="chat-model-summary">{availableModelNames.length > 1 ? <select aria-label={tr('对话模型', 'Chat model')} disabled={busy || sessionTransitioning} onChange={(event) => selectModel(event.target.value)} value={model}>{availableModelNames.map((name) => <option key={name} value={name}>{name}</option>)}</select> : <strong>{model || tr('尚未加载模型', 'No model loaded')}</strong>}<small>{tr('最多 ' + formatNumber(effectiveSettings.maxTokens) + ' tokens', formatNumber(effectiveSettings.maxTokens) + ' max tokens')} · {tr('温度', 'temperature')} {formatNumber(effectiveSettings.temperature, 2)} · {tr('流式', 'streaming')}</small></div><span className={'runtime-status-pill ' + (conversationReady ? 'running' : 'stopped')}><i />{conversationReady ? tr('就绪', 'Ready') : selectedModelLoading ? tr('加载中', 'Loading') : tr('空闲', 'Idle')}</span><button aria-label={tr('清空对话', 'Clear conversation')} className="chat-icon-button" disabled={!conversationReady || busy || (!messages.length && !currentVoiceMessages.length)} onClick={() => void clearActiveConversation()} title={tr('清空对话', 'Clear conversation')} type="button"><Icon name="trash" size={14} /></button></div>
             </header>
             <div className="message-scroller" onScroll={handleMessageScroll} ref={messageScrollerRef}>
-              <div className="message-list" aria-live="polite">
+              <div className="message-list">
                 {!messages.length && !currentVoiceMessages.length && !live && <div className="welcome"><Icon name="chat" size={34} />{!selectedModelAvailable ? <><h1>{selectedModelLoading ? tr("模型加载中", "Model loading") : tr("尚未加载模型", "No model loaded")}</h1><p>{selectedModelLoading ? tr("加载完成后即可开始对话。", "Chat becomes available as soon as loading completes.") : tr("选择本地检查点后即可开始对话。", "Choose a local checkpoint to use the inference playground.")}</p>{!selectedModelLoading && <button className="open-model-primary" disabled={busy} onClick={() => void chooseModelDirectory()} type="button"><Icon name="folder" />{tr("选择模型", "Choose model")}</button>}</> : !active ? <><h1>{tr("本机私密对话", "A private conversation on your Mac")}</h1><p>{tr("请求直接发送到本机 MFQ 服务，不经过云端中转。", "Requests go directly to the local MFQ Runtime with no cloud relay.")}</p><button className="open-model-primary" disabled={busy} onClick={() => void createSession()} type="button">{tr("开始对话", "Start chat")}</button></> : <><h1>{tr("本机私密对话", "A private conversation on your Mac")}</h1><p>{tr("请求直接发送到本机 MFQ 服务，不经过云端中转。", "Requests go directly to the local MFQ Runtime with no cloud relay.")}</p></>}</div>}
-                <SavedMessageList messages={messages} responses={responses} mcpTools={mcpTools} busy={busy} tr={tr} editDraft={editDraft} setEditDraft={setEditDraft} actions={{ saveEdit, copyMessage, regenerate, executeToolCalls }} />
+                <Suspense fallback={<p role="status">{tr('正在加载消息…', 'Loading messages…')}</p>}><SavedMessageList messages={messages} responses={responses} mcpTools={mcpTools} busy={busy} tr={tr} editDraft={editDraft} setEditDraft={setEditDraft} actions={{ saveEdit, copyMessage, regenerate, executeToolCalls }} /></Suspense>
                 {currentVoiceMessages.map((message) => <article className={`message message-${message.role}`} key={message.id}><div className="message-body">{message.text && renderMarkdown(message.text, false, message.role === "assistant")}{message.audioId && <AudioClip audioId={message.audioId} />}</div></article>)}
                 {liveVoice?.sessionId === activeId && liveVoice.text && <article className="message message-assistant live-message"><div className="message-body">{renderMarkdown(liveVoice.text, true, true)}</div></article>}
-                {live && <article className="message message-assistant live-message"><div className="message-body">{live.reasoning && <details className="reasoning" open><summary>{tr("正在思考", "Thinking")}</summary>{renderMarkdown(live.reasoning, true, true)}</details>}{live.text && renderMarkdown(live.text, true, true)}{live.tools.map((tool, index) => <pre className="tool-call" key={index}>{tool}</pre>)}{!live.reasoning && !live.text && live.tools.length === 0 && <span className="thinking"><i /><i /><i /></span>}</div></article>}
+                <StreamingMessage controller={generation} sessionId={activeId} tr={tr} />
               </div>
             </div>
+            {!following && <button className="chat-scroll-bottom" onClick={scrollToBottom} aria-label={tr('回到底部', 'Scroll to bottom')} type="button"><ArrowDownIcon size={16} aria-hidden="true" /></button>}
             {error && <div className="error-banner" role="alert"><span>{error}</span><button onClick={() => setError(null)} type="button">×</button></div>}
             <div className="composer-region">
               {needsVoiceOutputComponent && voiceComponent && <div className="voice-component-banner"><div><strong>{voiceComponent.ready ? tr("语音组件已下载", "Voice component downloaded") : tr("此模型还缺少语音输出组件", "This model needs the voice output component")}</strong><span>{voiceComponentJob ? tr(`正在下载并校验 · ${formatNumber(voiceComponentJob.progress * 100)}%`, `Downloading and verifying · ${formatNumber(voiceComponentJob.progress * 100)}%`) : voiceComponent.error ? voiceComponent.error : tr("Token2Wav 独立安装，不会重复占用每个模型的空间。", "Token2Wav is installed once and shared by all compatible models.")}</span></div>{voiceComponentJob && <progress max={1} value={voiceComponentJob.progress} />}<button disabled={voiceComponentBusy || Boolean(voiceComponentJob)} onClick={() => void installOrEnableVoiceOutput()} type="button">{voiceComponentJob ? tr("正在下载…", "Downloading…") : voiceComponent.ready ? tr("启用语音输出", "Enable voice output") : tr(`下载组件 · ${formatNumber(voiceComponent.total_bytes / 1e9, 2)} GB`, `Download · ${formatNumber(voiceComponent.total_bytes / 1e9, 2)} GB`)}</button></div>}
-              <form className="composer" onSubmit={send}>
-                {attachments.length > 0 && <div className="attachment-tray">{attachments.map((attachment) => <div className="attachment-chip" key={attachment.id}>{attachment.kind === "image" ? <img alt="" src={attachment.previewUrl} /> : attachment.kind === "video" ? <VideoWithFirstFrame muted src={attachment.previewUrl} /> : <span>{attachment.kind === "document" ? "TXT" : "♫"}</span>}<div><strong>{attachment.file.name}</strong><small>{attachment.kind} · {formatNumber(attachment.file.size)} B</small></div><button aria-label={tr("移除附件", "Remove attachment")} onClick={() => removeAttachment(attachment.id)} type="button">×</button></div>)}</div>}
-                <textarea aria-label={tr("消息", "Message")} disabled={!conversationReady || busy} maxLength={32768} onChange={(event) => setDraft(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); } }} placeholder={conversationReady ? tr("向模型发送消息", "Message MFQ") : selectedModelAvailable ? tr("正在切换对话模型", "Switching chat model") : tr("请先加载模型", "Load a model first")} rows={1} value={draft} />
-                <div className="composer-toolbar">
-                  <input accept={attachmentAccept} hidden multiple onChange={(event) => selectAttachments(event.target.files)} ref={attachmentInputRef} type="file" />
-                  <button aria-label={tr("添加附件", "Add attachment")} disabled={!conversationReady || busy} onClick={() => attachmentInputRef.current?.click()} title={tr("添加文档或媒体", "Add document or media")} type="button"><Icon name="paperclip" /></button>
+              <ChatComposer
+                sessionId={activeId ?? 'new'}
+                ready={conversationReady}
+                busy={busy}
+                recoveryNeeded={recoveryNeeded}
+                phase={generationPhase}
+                placeholder={conversationReady ? tr('向模型发送消息', 'Message MFQ') : selectedModelAvailable ? tr('正在加载会话', 'Loading conversation') : tr('请先加载模型', 'Load a model first')}
+                attachments={attachments}
+                attachmentAccept={attachmentAccept}
+                tr={tr}
+                onSend={send}
+                onStop={stopGeneration}
+                onSelectAttachments={selectAttachments}
+                onRemoveAttachment={removeAttachment}
+                onError={(cause) => setError(errorMessage(cause))}
+                toolbar={<>
                   {capabilities && (capabilities.model_capabilities.features.audio_input || capabilities.model_capabilities.features.full_duplex) && <select aria-label={tr("交互模式", "Interaction mode")} disabled={!conversationReady || busy || voiceState !== "idle"} onChange={(event) => void selectInteractionMode(event.target.value as SessionMode)} value={active?.mode ?? mode}>{(["text", "voice", "full_duplex"] as SessionMode[]).map((item) => { const feature = capabilities.model_capabilities.features; const disabled = item === "voice" ? !feature.audio_input : item === "full_duplex" ? !feature.full_duplex : false; return <option disabled={disabled} key={item} value={item}>{MODE_LABELS[item][english ? 1 : 0]}</option>; })}</select>}
                   {realtimeAvailable && <button aria-label={tr("语音输入", "Voice input")} aria-pressed={voiceState !== "idle" && voiceState !== "error"} className="voice-button" disabled={!conversationReady || active?.mode === "text" || busy} onClick={() => void toggleVoice()} style={{ "--voice-level": voiceLevel } as React.CSSProperties} title={active?.mode === "text" ? tr("请先选择语音或全双工模式", "Select voice or full duplex mode first") : voiceState === "processing" ? tr("语音处理中", "Processing voice") : tr("语音输入", "Voice input")} type="button"><span /></button>}
-                  {realtimeAvailable && active?.mode !== "text" && <button aria-label={tr("语音播放", "Voice playback")} aria-pressed={settings.playbackEnabled} onClick={() => setSettings((current) => ({ ...current, playbackEnabled: !current.playbackEnabled }))} title={tr("语音播放", "Voice playback")} type="button"><Icon name={settings.playbackEnabled ? "volume" : "volume-off"} /></button>}
+                  {realtimeAvailable && active?.mode !== 'text' && <Switch label={tr('语音播放', 'Voice playback')} checked={settings.playbackEnabled} onCheckedChange={(playbackEnabled) => setSettings((current) => ({ ...current, playbackEnabled }))} />}
                   {active?.mode === "text" && visionSupported && <button aria-label={tr("视觉输入", "Vision input")} aria-pressed={visionAvailable && effectiveSettings.enableVision} disabled={!visionAvailable} onClick={() => updateGlobalInference({ enableVision: !effectiveSettings.enableVision })} title={visionAvailable ? tr("视觉输入", "Vision input") : tr("当前模型文件没有视觉权重", "The current model artifact has no vision weights")} type="button"><Icon name="image" />{tr("视觉", "Vision")}</button>}
                   {active?.mode === "text" && mtpSupported && <button aria-label="MTP" aria-pressed={mtpAvailable && effectiveSettings.enableMtp} disabled={!mtpAvailable} onClick={() => updateGlobalInference({ enableMtp: !effectiveSettings.enableMtp })} title={mtpAvailable ? "MTP" : tr("当前模型文件没有完整 MTP 权重", "The current model artifact has no complete MTP head")} type="button"><Icon name="text-forward" />MTP</button>}
                   {active?.mode === "text" && <button aria-pressed={thinkingSupported && effectiveSettings.enableThinking} disabled={!thinkingSupported} onClick={() => updateGlobalInference({ enableThinking: !effectiveSettings.enableThinking })} type="button"><Icon name="lightbulb" />{tr("思考", "Thinking")}</button>}
                   {active?.mode === "text" && thinkingSupported && effectiveSettings.enableThinking && reasoningValues.length > 0 && <select aria-label={tr("思考档位", "Reasoning effort")} onChange={(event) => updateGlobalInference({ reasoningEffort: event.target.value })} value={effectiveSettings.reasoningEffort}><option value="">{tr("标准", "Standard")}</option>{reasoningValues.map((value) => <option key={value} value={value}>{value}</option>)}</select>}
                   <span className="composer-hint">{voiceState !== "idle" ? voiceState : tr("Enter 发送 · Shift+Enter 换行", "Enter to send · Shift+Enter for newline")}</span>
-                  {busy ? <button aria-label={stopping ? tr("正在停止生成", "Stopping generation") : tr("停止生成", "Stop generation")} className="send-button stop" disabled={stopping} onClick={() => void stopGeneration()} type="button"><Icon name="stop" size={14} /></button> : <button aria-label={tr("发送", "Send")} className="send-button" disabled={!conversationReady || (!draft.trim() && !attachments.length)} type="submit"><Icon name="send" size={15} /></button>}
-                </div>
-              </form>
+                </>}
+              />
               <p>{tr("模型输出可能存在错误，请核对重要信息。", "Model output may be inaccurate. Verify important information.")}</p>
             </div>
           </section>
@@ -2743,7 +2637,7 @@ export default function App() {
                 </TMPanel>
               </div>
             </>}
-            {dashboardPage === "settings" && settingsPage}
+            {dashboardPage === 'settings' && <Suspense fallback={<p role="status">{tr('正在加载设置…', 'Loading settings…')}</p>}>{settingsPage}</Suspense>}
             {dashboardPage === "cache" && <>
               <SectionLabel title={tr("内存层级", "Memory hierarchy")} subtitle={tr("设备、内存与持久缓存", "Device, memory, and persistent cache")} />
               {prefixCacheSupported ? (
@@ -2913,7 +2807,11 @@ export default function App() {
         )}
       </main>
 
-      {modelBrowserOpen && modelBrowser && <div className="dialog-backdrop"><section className="studio-dialog model-browser-dialog"><header><div><h2>{tr("选择模型文件夹", "Choose model folder")}</h2><p>{tr("浏览 MFQ Server 所在设备上的文件夹。", "Browse folders on the MFQ Server host.")}</p></div><button onClick={() => setModelBrowserOpen(false)} type="button">×</button></header><form className="model-browser-location" onSubmit={jumpToModelDirectory}><button disabled={busy || !modelBrowser.current_id} onClick={() => void openModelDirectory(modelBrowser.parent_id)} type="button">{tr("上一级", "Up")}</button><input aria-label={tr("当前目录", "Current directory")} onChange={(event) => setModelDirectoryPath(event.target.value)} placeholder={tr("输入服务器上的完整目录", "Enter a full directory on the server")} spellCheck={false} value={modelDirectoryPath} /><button disabled={busy || !modelDirectoryPath.trim()} type="submit">{tr("前往", "Go")}</button>{modelBrowser.current_id && <span>{modelBrowser.model_file_count} MFQ</span>}</form><div className="model-browser-list">{modelBrowser.data.map((directory) => <button disabled={busy} key={directory.id} onClick={() => void openModelDirectory(directory.id)} type="button"><Icon name="folder" /><span>{directory.name}</span>{directory.model_file_count > 0 && <b>{directory.model_file_count} MFQ</b>}</button>)}{modelBrowser.data.length === 0 && <p>{tr("这个文件夹中没有子文件夹。", "This folder has no subfolders.")}</p>}</div><footer><button onClick={() => setModelBrowserOpen(false)} type="button">{tr("取消", "Cancel")}</button><button className="primary" disabled={busy || !modelBrowser.current_id} onClick={() => void registerCurrentModelDirectory()} type="button">{tr("使用此文件夹", "Use this folder")}</button></footer></section></div>}
+      {modelBrowser && <Suspense fallback={null}><Dialog open={modelBrowserOpen} onOpenChange={setModelBrowserOpen} title={tr('选择模型文件夹', 'Choose model folder')} description={tr('浏览 MFQ Server 所在设备上的文件夹。', 'Browse folders on the MFQ Server host.')} closeLabel={tr('关闭', 'Close')} className="model-browser-dialog" returnFocusRef={modelBrowserTriggerRef}>
+        <form className="model-browser-location" onSubmit={jumpToModelDirectory}><button disabled={busy || !modelBrowser.current_id} onClick={() => void openModelDirectory(modelBrowser.parent_id)} type="button">{tr('上一级', 'Up')}</button><input aria-label={tr('当前目录', 'Current directory')} onChange={(event) => setModelDirectoryPath(event.target.value)} placeholder={tr('输入服务器上的完整目录', 'Enter a full directory on the server')} spellCheck={false} value={modelDirectoryPath} /><button disabled={busy || !modelDirectoryPath.trim()} type="submit">{tr('前往', 'Go')}</button>{modelBrowser.current_id && <span>{modelBrowser.model_file_count} MFQ</span>}</form>
+        <div className="model-browser-list">{modelBrowser.data.map((directory) => <button disabled={busy} key={directory.id} onClick={() => void openModelDirectory(directory.id)} type="button"><Icon name="folder" /><span>{directory.name}</span>{directory.model_file_count > 0 && <b>{directory.model_file_count} MFQ</b>}</button>)}{modelBrowser.data.length === 0 && <p>{tr('这个文件夹中没有子文件夹。', 'This folder has no subfolders.')}</p>}</div>
+        <footer><button onClick={() => setModelBrowserOpen(false)} type="button">{tr('取消', 'Cancel')}</button><button className="primary" disabled={busy || !modelBrowser.current_id} onClick={() => void registerCurrentModelDirectory()} type="button">{tr('使用此文件夹', 'Use this folder')}</button></footer>
+      </Dialog></Suspense>}
 
     </div>
   );

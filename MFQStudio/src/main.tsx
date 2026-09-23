@@ -5,7 +5,6 @@
 import { Component, StrictMode, type ErrorInfo, type ReactNode } from 'react';
 import { createRoot } from 'react-dom/client';
 import { createHashRouter, RouterProvider } from 'react-router';
-import 'katex/dist/katex.min.css';
 
 import App from './App';
 import './styles.css';

@@ -1,5 +1,5 @@
 /** 解析 Hugging Face 与 ModelScope 模型仓库引用及版本。 */
-import { HubModelSummary } from '../../api';
+import { HubModelSummary } from '../../shared/api/types';
 
 export interface HubReference {
   provider: HubModelSummary["provider"];

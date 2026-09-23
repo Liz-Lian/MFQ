@@ -1,13 +1,16 @@
 /** 模型目录控制器负责资产刷新、加载策略和目录注册生命周期。 */
 import { FormEvent, useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate } from 'react-router';
-import { api, ModelArtifact, ModelDirectoryList } from '../../api';
+import { modelsApi } from '../../shared/api/resources/models';
+import type { ModelArtifact, ModelDirectoryList } from '../../shared/api/types';
 import { useRuntime } from '../../app/RuntimeProvider';
 import { useSettings } from '../settings/SettingsProvider';
 import { errorMessage, formatNumber } from '../../app/formatters';
 import { isStudio, selectLocalModelDirectory } from '../../studio';
 import { runtimeModelNames } from '../runtime/modelSelection';
 import { STUDIO_PATHS, labPath } from '../../navigation';
+import { toast } from '../../stores/toastStore';
+import { useJobStore } from '../../stores/jobStore';
 
 /** 为模型页封装模型目录工作流；状态随页面卸载释放。 */
 export function useModelCatalog() {
@@ -20,13 +23,17 @@ export function useModelCatalog() {
     setSelectedModel,
     refreshRuntime,
     ready,
-    jobs,
   } = useRuntime();
+  const jobs = useJobStore((state) => state.jobs);
   const { tr, contextSize } = useSettings();
   const navigate = useNavigate();
   const [artifacts, setArtifacts] = useState<ModelArtifact[]>([]);
   const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const observedActiveLoadJobIds = useRef(new Set<string>());
+  const reportedFailedJobIds = useRef(new Set<string>());
+  const reportError = (cause: unknown) => {
+    toast.error(errorMessage(cause));
+  };
   const [modelFilter, setModelFilter] = useState('');
   const [loadPinned, setLoadPinned] = useState(false);
   const [loadIdleTtl, setLoadIdleTtl] = useState<number | null>(null);
@@ -43,18 +50,32 @@ export function useModelCatalog() {
   useEffect(() => {
     if (!ready) return;
     let active = true;
-    void api
+    void modelsApi
       .modelArtifacts()
       .then((items) => {
         if (active) setArtifacts(items);
       })
       .catch((cause) => {
-        if (active) setError(errorMessage(cause));
+        if (active) reportError(cause);
       });
     return () => {
       active = false;
     };
   }, [ready, artifactRevision]);
+  useEffect(() => {
+    for (const job of jobs) {
+      if (job.kind !== 'model.load') continue;
+      if (job.status === 'queued' || job.status === 'running' || job.status === 'cancelling') {
+        observedActiveLoadJobIds.current.add(job.id);
+        continue;
+      }
+      const wasActive = observedActiveLoadJobIds.current.delete(job.id);
+      if (wasActive && job.status === 'failed' && job.error?.message && !reportedFailedJobIds.current.has(job.id)) {
+        reportedFailedJobIds.current.add(job.id);
+        toast.error(`${job.error.code}: ${job.error.message}`);
+      }
+    }
+  }, [jobs]);
   const filteredInstances = useMemo(
     () =>
       instances.filter((item) =>
@@ -74,7 +95,7 @@ export function useModelCatalog() {
     if (busy) return;
     setBusy(true);
     try {
-      await api.loadModel(name, contextSize, 2048, {
+      await modelsApi.loadModel(name, contextSize, 2048, {
         pin: loadPinned,
         idle_ttl_seconds: loadIdleTtl,
       });
@@ -83,7 +104,7 @@ export function useModelCatalog() {
       await refreshRuntime(false);
       setSelectedModel(name);
     } catch (cause) {
-      setError(errorMessage(cause));
+      reportError(cause);
     } finally {
       setBusy(false);
     }
@@ -91,7 +112,7 @@ export function useModelCatalog() {
 
   /** 执行模型资源操作，并将错误展示在当前页面。 */
   async function finishModelRegistration(names: string[]) {
-    const nextArtifacts = await api.modelArtifacts(true);
+    const nextArtifacts = await modelsApi.modelArtifacts(true);
     setArtifacts(nextArtifacts);
     const registered = nextArtifacts.filter((item) => names.includes(item.name));
     if (!registered.length) {
@@ -117,7 +138,7 @@ export function useModelCatalog() {
         instances.some((item) => item.model === artifact.name && item.state !== 'failed') ||
         runtime?.model === artifact.name;
       if (!loaded) {
-        await api.loadModel(artifact.name, contextSize, 2048, {
+        await modelsApi.loadModel(artifact.name, contextSize, 2048, {
           pin: loadPinned,
           idle_ttl_seconds: loadIdleTtl,
         });
@@ -134,12 +155,12 @@ export function useModelCatalog() {
     if (busy) return;
     setBusy(true);
     try {
-      const listing = await api.modelDirectories(directoryId, path);
+      const listing = await modelsApi.modelDirectories(directoryId, path);
       setModelBrowser(listing);
       setModelDirectoryPath(listing.current_path ?? '');
       setModelBrowserOpen(true);
     } catch (cause) {
-      setError(errorMessage(cause));
+      reportError(cause);
     } finally {
       setBusy(false);
     }
@@ -167,7 +188,7 @@ export function useModelCatalog() {
       const names = await selectLocalModelDirectory();
       if (names) await finishModelRegistration(names);
     } catch (cause) {
-      setError(errorMessage(cause));
+      reportError(cause);
     } finally {
       setBusy(false);
     }
@@ -178,10 +199,10 @@ export function useModelCatalog() {
     if (busy || !modelBrowser?.current_id) return;
     setBusy(true);
     try {
-      const registered = await api.registerModelDirectory(modelBrowser.current_id);
+      const registered = await modelsApi.registerModelDirectory(modelBrowser.current_id);
       await finishModelRegistration(registered.map((item) => item.name));
     } catch (cause) {
-      setError(errorMessage(cause));
+      reportError(cause);
     } finally {
       setBusy(false);
     }
@@ -192,12 +213,12 @@ export function useModelCatalog() {
     if (busy) return;
     setBusy(true);
     try {
-      await api.unloadModel(id);
+      await modelsApi.unloadModel(id);
 
       navigate(STUDIO_PATHS.models);
       await refreshRuntime(false);
     } catch (cause) {
-      setError(errorMessage(cause));
+      reportError(cause);
     } finally {
       setBusy(false);
     }
@@ -208,7 +229,6 @@ export function useModelCatalog() {
     model,
     artifacts,
     busy,
-    error,
     ready,
     instances,
     availableModelNames,

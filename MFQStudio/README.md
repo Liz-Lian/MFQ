@@ -27,7 +27,7 @@ Vite 默认监听 `127.0.0.1:5173`，将 `/api` 代理到 `127.0.0.1:8090`。实
 | `src/shared/ui` | Dialog、Tooltip、Switch 的应用级 Radix 封装 |
 | `src/shared/platform` | Web/Tauri 桥接 |
 
-`App.tsx` 仅组合 Provider 与懒加载路由，不持有业务请求、表单或业务操作。`StudioShell` 只负责导航与运行状态摘要，`LabLayout` 只负责模型工具的二级导航。`api.ts`、`studio.ts`、`realtimeAudio.ts` 和 API 的 `types.ts` 保留导入兼容入口，真实实现按领域维护。
+`App.tsx` 仅组合 Provider 与懒加载路由，不持有业务请求、表单或业务操作。`StudioShell` 只负责导航与运行状态摘要，`LabLayout` 只负责模型工具的二级导航。`studio.ts`、`realtimeAudio.ts` 和 API 的 `types.ts` 保留必要的公共入口，资源请求必须按领域从 `shared/api/resources` 导入。
 
 `RuntimeProvider` 仅初始化平台地址、凭据、实例能力和共享后台任务，不加载评测、日志、模型目录、预设等页面数据。各页面挂载后请求自己的资源，并在离开时清理订阅或忽略过期返回。`SettingsProvider` 只保存已应用偏好和跨页面上下文容量，设置草稿与预设操作归设置页面。
 

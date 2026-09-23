@@ -1,6 +1,6 @@
 /** 资源页管理前缀缓存与可复用运行配置，按需读取配置和模型资产。 */
 import { useState } from 'react';
-import { api } from '../../api';
+import { runtimeApi } from '../../shared/api/resources/runtime';
 import { useRuntime } from '../../app/RuntimeProvider';
 import { useSettings } from '../settings/SettingsProvider';
 import { ScreenHeader, SectionLabel, TMPanel, UsageBar, EmptyPanel } from '../../app/display';
@@ -45,7 +45,7 @@ export function CachePage() {
     if (!(await studioConfirm(confirmation))) return;
     setBusy(true);
     try {
-      await api.clearRuntimeCache(runtime?.instance_id);
+      await runtimeApi.clearRuntimeCache(runtime?.instance_id);
       await refreshRuntime(false);
       toast.success(tr('缓存已清除', 'Cache cleared successfully'));
     } catch (cause) {

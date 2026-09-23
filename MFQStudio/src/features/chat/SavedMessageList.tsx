@@ -1,6 +1,6 @@
 /** 历史消息列表：展示附件、工具调用、推理指标及编辑操作。 */
 import { memo, useLayoutEffect, useMemo, useRef, type Dispatch, type SetStateAction } from 'react';
-import type { McpToolResource, Message, ResponseResource } from '../../api';
+import type { McpToolResource, Message, ResponseResource } from '../../shared/api/types';
 import { Icon } from '../../app/display';
 import { formatNumber } from '../../app/formatters';
 import { displayPrefillMetric, preferPositiveMetric } from '../runtime/metrics';

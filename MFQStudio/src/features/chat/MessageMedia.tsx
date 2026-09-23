@@ -1,6 +1,7 @@
 /** 加载和展示聊天媒体与文档，管理下载状态、视频首帧和资源释放。 */
 import { useEffect, useState } from 'react';
-import { ContentPart, api } from '../../api';
+import { mediaApi } from '../../shared/api/resources/media';
+import type { ContentPart } from '../../shared/api/types';
 import { formatNumber } from '../../app/formatters';
 
 /** 展示视频并提取首帧海报，卸载时释放解码器和对象 URL。 */
@@ -64,7 +65,7 @@ export function MediaPartView({ part }: { part: Extract<ContentPart, { media: un
     let objectUrl: string | null = null;
     setSrc(null);
     setLoadFailed(false);
-    void api.fetchMedia(part.media.id, controller.signal).then((blob) => {
+    void mediaApi.fetchMedia(part.media.id, controller.signal).then((blob) => {
       if (controller.signal.aborted) return;
       objectUrl = URL.createObjectURL(blob);
       setSrc(objectUrl);
@@ -101,7 +102,7 @@ export function DocumentPartView({ part }: { part: Extract<ContentPart, { type: 
     if (downloadState === "loading") return;
     setDownloadState("loading");
     try {
-      const blob = await api.fetchMedia(part.media.id);
+      const blob = await mediaApi.fetchMedia(part.media.id);
       const url = URL.createObjectURL(blob);
       const anchor = document.createElement("a");
       anchor.href = url;

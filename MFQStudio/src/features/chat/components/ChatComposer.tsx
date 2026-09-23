@@ -3,7 +3,7 @@ import { useRef, type FormEvent, type ReactNode } from 'react';
 import { Icon } from '../../../app/display';
 import { formatNumber } from '../../../app/formatters';
 import { VideoWithFirstFrame } from '../MessageMedia';
-import type { PendingAttachment } from '../attachments';
+import { useChatAttachmentActions, useChatAttachmentList } from '../ChatAttachmentsProvider';
 import { isGenerationBusy, type GenerationPhase } from '../state/generationController';
 import { useDraftStore } from '../state/draftStore';
 
@@ -14,7 +14,6 @@ interface ChatComposerProps {
   recoveryNeeded: boolean;
   phase: GenerationPhase;
   placeholder: string;
-  attachments: PendingAttachment[];
   attachmentAccept: string;
   toolbar: ReactNode;
   tr: (zh: string, en: string) => string;
@@ -22,10 +21,6 @@ interface ChatComposerProps {
   onSend: (text: string, accepted: () => void) => Promise<void>;
   /** 取消当前生成，包含后端取消与历史同步。 */
   onStop: () => Promise<void>;
-  /** 把所选文件交给附件校验流程，浏览器 input 会同步清空以支持重新选择。 */
-  onSelectAttachments: (files: FileList | null) => void;
-  /** 移除指定待发送附件及其对象 URL。 */
-  onRemoveAttachment: (id: string) => void;
   /** 将准备输入或平台调用异常交给页面错误区域展示，保留尚未接受的草稿。 */
   onError: (error: unknown) => void;
 }
@@ -38,16 +33,15 @@ export function ChatComposer({
   recoveryNeeded,
   phase,
   placeholder,
-  attachments,
   attachmentAccept,
   toolbar,
   tr,
   onSend,
   onStop,
-  onSelectAttachments,
-  onRemoveAttachment,
   onError,
 }: ChatComposerProps) {
+  const attachments = useChatAttachmentList();
+  const { selectAttachments, removeAttachment } = useChatAttachmentActions();
   const draft = useDraftStore((state) => state.drafts[sessionId] ?? '');
   const setDraft = useDraftStore((state) => state.setDraft);
   const fileInput = useRef<HTMLInputElement | null>(null);
@@ -97,7 +91,8 @@ export function ChatComposer({
               </div>
               <button
                 aria-label={tr('移除附件', 'Remove attachment')}
-                onClick={() => onRemoveAttachment(attachment.id)}
+                disabled={busy}
+                onClick={() => removeAttachment(attachment.id)}
                 type="button"
               >
                 ×
@@ -132,7 +127,7 @@ export function ChatComposer({
           hidden
           multiple
           onChange={(event) => {
-            onSelectAttachments(event.target.files);
+            selectAttachments(event.target.files);
             event.target.value = '';
           }}
           ref={fileInput}

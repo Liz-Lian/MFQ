@@ -2,6 +2,7 @@
 import { useMemo } from 'react';
 import { useNavigate } from 'react-router';
 import { useRuntime } from '../../app/RuntimeProvider';
+import { useJobStore } from '../../stores/jobStore';
 import { useSettings } from '../settings/SettingsProvider';
 import { Icon, TMPanel, ModelMonogram } from '../../app/display';
 import { formatNumber, formatDuration } from '../../app/formatters';
@@ -9,7 +10,8 @@ import { STUDIO_PATHS } from '../../navigation';
 
 /** 按加载任务、当前实例和失败记录推导概览状态，避免仅凭模型名称误判就绪。 */
 export function RuntimeHero() {
-  const { runtime, jobs, instances, studio } = useRuntime();
+  const { runtime, instances, studio } = useRuntime();
+  const jobs = useJobStore((state) => state.jobs);
   const { tr } = useSettings();
   const navigate = useNavigate();
   const openStudioPage = () => navigate(STUDIO_PATHS.models);

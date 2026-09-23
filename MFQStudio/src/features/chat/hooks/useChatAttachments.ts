@@ -1,6 +1,7 @@
 /** 管理待发送附件和预览资源，并把浏览器文件转换为服务端消息片段。 */
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { api, type ContentPart } from '../../../api';
+import { mediaApi } from '../../../shared/api/resources/media';
+import type { ContentPart } from '../../../shared/api/types';
 import {
   isTextDocument,
   MAX_DOCUMENT_BYTES,
@@ -10,7 +11,11 @@ import {
 } from '../attachments';
 
 /** 按会话隔离附件选择；切换或卸载时释放预览 URL。 */
-export function useChatAttachments(sessionId: string | null, onError: (message: string) => void) {
+export function useChatAttachments(
+  sessionId: string | null,
+  connectionRevision: number,
+  onError: (message: string) => void,
+) {
   const [attachments, setAttachments] = useState<PendingAttachment[]>([]);
   const latest = useRef(attachments);
   latest.current = attachments;
@@ -24,7 +29,7 @@ export function useChatAttachments(sessionId: string | null, onError: (message: 
   useEffect(() => {
     clearAttachments();
     return clearAttachments;
-  }, [sessionId, clearAttachments]);
+  }, [sessionId, connectionRevision, clearAttachments]);
 
   /** 校验文档体积与附件类型，每个会话最多保留八个待发送文件。 */
   const selectAttachments = useCallback(
@@ -74,19 +79,27 @@ export function useChatAttachments(sessionId: string | null, onError: (message: 
       Promise.all(
         latest.current.map(async (attachment): Promise<ContentPart> => {
           if (attachment.kind === 'document') {
-            const uploaded = await api.uploadMedia(
+            const uploaded = await mediaApi.uploadMedia(
               attachment.file,
               documentMimeType(attachment.file),
             );
-            const document = await api.createDocument(uploaded.media.id, attachment.file.name);
+            const document = await mediaApi.createDocument(uploaded.media.id, attachment.file.name);
             return { type: 'document', media: document.media, name: document.name };
           }
           const metadata = await mediaMetadata(attachment.file, attachment.kind);
-          const resource = await api.uploadMedia(attachment.file);
+          const resource = await mediaApi.uploadMedia(attachment.file);
           return { type: attachment.kind, media: resource.media, ...metadata } as ContentPart;
         }),
       ),
     [],
   );
-  return { attachments, selectAttachments, removeAttachment, clearAttachments, uploadAttachments };
+  const getAttachments = useCallback(() => latest.current, []);
+  return {
+    attachments,
+    getAttachments,
+    selectAttachments,
+    removeAttachment,
+    clearAttachments,
+    uploadAttachments,
+  };
 }

@@ -1,18 +1,22 @@
 /** 设置路由独立管理编辑草稿、生成预设和备份导入导出。 */
 import { useState } from 'react';
 import { useNavigate } from 'react-router';
-import { api, type SessionArchive } from '../../api';
+import { runtimeApi } from '../../shared/api/resources/runtime';
+import { sessionsApi } from '../../shared/api/resources/sessions';
+import { presetsApi } from '../../shared/api/resources/presets';
+import type { SessionArchive } from '../../shared/api/types';
 import { ScreenHeader } from '../../app/display';
 import { errorMessage, formatNumber } from '../../app/formatters';
 import { STUDIO_PATHS } from '../../navigation';
 import { studioConfirm } from '../../studio';
 import { useRuntime } from '../../app/RuntimeProvider';
-import { useChat } from '../chat/ChatProvider';
+import { useActiveSessionMode } from '../chat/hooks/useActiveSessionMode';
 import { DEFAULT_SETTINGS, PRESETS, modeTemplateSettings, type PresetName } from './configuration';
 import { presetResourceBody, storedPresetFromResource, type StoredPreset } from './presets';
 import { SettingsPage } from './SettingsPage';
 import { useSettings } from './SettingsProvider';
 import { useGenerationPresets } from './useGenerationPresets';
+import { toast } from '../../stores/toastStore';
 
 /** 在访问设置路由时创建草稿并加载本领域数据，应用后才更新共享偏好。 */
 export function SettingsRoute() {
@@ -27,8 +31,7 @@ export function SettingsRoute() {
     instances,
     capabilities,
   } = useRuntime();
-  const { conversation } = useChat();
-  const mode = conversation.active?.mode ?? 'text';
+  const mode = useActiveSessionMode();
   const selectedInstance = instances.find(
     (instance) => instance.model === selectedModel && instance.state !== 'failed',
   );
@@ -42,7 +45,6 @@ export function SettingsRoute() {
       : settings,
   );
   const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
   const { presets, setPresets, clearSelection, manager } = useGenerationPresets(
     draft,
     setDraft,
@@ -82,12 +84,11 @@ export function SettingsRoute() {
     )
       return;
     setBusy(true);
-    setError(null);
     try {
-      await api.reloadRuntime(contextSize, runtime?.instance_id);
+      await runtimeApi.reloadRuntime(contextSize, runtime?.instance_id);
       await refreshRuntime(true);
     } catch (cause) {
-      setError(errorMessage(cause));
+      toast.error(errorMessage(cause));
     } finally {
       setBusy(false);
     }
@@ -95,10 +96,9 @@ export function SettingsRoute() {
   /** 按需读取会话并导出完整备份，及时释放下载对象 URL。 */
   async function exportStudioData() {
     setBusy(true);
-    setError(null);
     try {
-      const sessions = await api.listSessions();
-      const archives = await Promise.all(sessions.map((session) => api.exportSession(session.id)));
+      const sessions = await sessionsApi.listSessions();
+      const archives = await Promise.all(sessions.map((session) => sessionsApi.exportSession(session.id)));
       const payload = {
         format: 'mfq-studio-export-v2',
         exported_at: new Date().toISOString(),
@@ -117,7 +117,7 @@ export function SettingsRoute() {
         URL.revokeObjectURL(url);
       }
     } catch (cause) {
-      setError(errorMessage(cause));
+      toast.error(errorMessage(cause));
     } finally {
       setBusy(false);
     }
@@ -125,7 +125,6 @@ export function SettingsRoute() {
   /** 导入预设和会话归档，完成后通知聊天模块重读会话列表。 */
   async function importStudioData(file: File) {
     setBusy(true);
-    setError(null);
     try {
       const payload = JSON.parse(await file.text()) as {
         format?: string;
@@ -150,14 +149,15 @@ export function SettingsRoute() {
           selectedModel,
           mode,
         );
-        if (existing?.id) await api.updateGenerationPreset(existing.id, body);
-        else await api.createGenerationPreset(body);
+        if (existing?.id) await presetsApi.updateGenerationPreset(existing.id, body);
+        else await presetsApi.createGenerationPreset(body);
       }
-      for (const archive of payload.sessions) await api.importSession(archive);
-      setPresets((await api.generationPresets()).map(storedPresetFromResource));
+      for (const archive of payload.sessions) await sessionsApi.importSession(archive);
+      setPresets((await presetsApi.generationPresets()).map(storedPresetFromResource));
       window.dispatchEvent(new Event('mfq:sessions-imported'));
+      toast.success(tr('设置与会话导入成功', 'Settings and sessions imported successfully'));
     } catch (cause) {
-      setError(errorMessage(cause));
+      toast.error(errorMessage(cause));
     } finally {
       setBusy(false);
     }
@@ -182,6 +182,7 @@ export function SettingsRoute() {
   /** 将用户确认的草稿应用到所有后续请求。 */
   function saveSettings() {
     replaceSettings(draft);
+    toast.success(tr('设置已应用', 'Settings applied successfully'));
   }
   return (
     <section className="dashboard-view">
@@ -194,11 +195,6 @@ export function SettingsRoute() {
           </button>
         }
       />
-      {error && (
-        <p className="error-banner" role="alert">
-          {error}
-        </p>
-      )}
       <SettingsPage
         tr={tr}
         settingsDraft={draft}

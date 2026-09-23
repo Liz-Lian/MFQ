@@ -1,6 +1,6 @@
 /** 模拟 Studio 使用的 HTTP 服务，提供可控的生成、同步失败和取消场景。 */
 import type { Page } from '@playwright/test';
-import type { Message, ResponseResource, Session, StreamRequest } from '../src/api';
+import type { Message, ResponseResource, Session, StreamRequest } from '../src/shared/api/types';
 
 const createdAt = '2026-09-23T00:00:00Z';
 const model = 'Studio Test Model';
@@ -38,6 +38,8 @@ interface MockOptions {
   waitForCancel?: boolean;
   /** 挂起生成直到测试显式释放，验证跨路由生成不会被卸载取消。 */
   holdResponse?: boolean;
+  /** 首次生成明确返回 HTTP 拒绝，验证草稿与附件可重试。 */
+  rejectFirstSubmission?: boolean;
 }
 
 /** 为页面注册隔离的模拟 API，返回请求计数供验证生成幂等边界。 */
@@ -125,6 +127,11 @@ export async function mockStudioServer(page: Page, options: MockOptions = {}) {
       return json({ data: responses });
     if (path === '/api/v1/sessions/session-1/responses' && method === 'POST') {
       state.submissions += 1;
+      if (options.rejectFirstSubmission && state.submissions === 1)
+        return route.fulfill({
+          status: 503,
+          json: { error: { code: 'REJECTED', message: 'Request rejected', retryable: true, details: {} } },
+        });
       const body = route.request().postDataJSON() as StreamRequest;
       if (options.waitForCancel || options.holdResponse)
         await new Promise<void>((resolve) => {
@@ -198,6 +205,16 @@ export async function mockStudioServer(page: Page, options: MockOptions = {}) {
         .catch(() => undefined);
       return;
     }
+    if (path === '/api/v1/media' && method === 'POST')
+      return json({
+        media: { id: 'media-1', sha256: 'test', mime_type: 'text/plain', byte_size: 4 },
+        created_at: createdAt,
+      });
+    if (path === '/api/v1/documents' && method === 'POST')
+      return json({
+        media: { id: 'media-1', sha256: 'test', mime_type: 'text/plain', byte_size: 4 },
+        name: 'notes.txt', text: 'note', extractor: 'text', created_at: createdAt,
+      });
     if (path === '/api/v1/models/directories')
       return json({
         current_id: 'models-dir',

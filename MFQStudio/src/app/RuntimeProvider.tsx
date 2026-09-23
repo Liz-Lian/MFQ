@@ -9,28 +9,28 @@ import {
   useState,
   type ReactNode,
 } from 'react';
-import {
-  api,
-  setApiBaseUrl,
-  setApiToken,
-  type JobResource,
-  type RuntimeStatus,
-  type RuntimeModel,
-  type RuntimeInstance,
-  type RuntimeCapabilities,
-  type RealtimeCapabilities,
-  type VoiceOutputComponentStatus,
-} from '../api';
+import { runtimeApi } from '../shared/api/resources/runtime';
+import { jobsApi } from '../shared/api/resources/jobs';
+import { setApiBaseUrl, setApiToken } from '../shared/api/client';
+import type {
+  JobResource,
+  RuntimeStatus,
+  RuntimeModel,
+  RuntimeInstance,
+  RuntimeCapabilities,
+  RealtimeCapabilities,
+  VoiceOutputComponentStatus,
+} from '../shared/api/types';
 import { studioStatus, studioCredential, startLocalStudio, type StudioStatus } from '../studio';
 import { isRuntimeReady, runtimeSelectionNames } from '../features/runtime/modelSelection';
 import { errorMessage } from './formatters';
 import { useSettings } from '../features/settings/SettingsProvider';
+import { useJobStore } from '../stores/jobStore';
 
 interface RuntimeContextValue {
   runtime: RuntimeStatus | null;
   models: RuntimeModel[];
   instances: RuntimeInstance[];
-  jobs: JobResource[];
   capabilities: RuntimeCapabilities | null;
   realtime: RealtimeCapabilities | null;
   voiceComponent: VoiceOutputComponentStatus | null;
@@ -38,27 +38,34 @@ interface RuntimeContextValue {
   selectedModel: string;
   /** 更新全局选中模型，随后刷新该实例能力；聊天模块负责派生会话。 */
   setSelectedModel: (model: string) => void;
-  /** 仅刷新跨页面共享的实例、模型、任务和能力，不请求评测或模型目录。 */
-  refreshRuntime: (quiet?: boolean) => Promise<void>;
+  /** 仅刷新跨页面共享的实例、模型、任务和能力；返回此次请求是否成功。 */
+  refreshRuntime: (quiet?: boolean) => Promise<boolean>;
   /** 将新建任务并入共享列表，自动为运行中的任务建立事件订阅。 */
   addJob: (job: JobResource) => void;
-  /** 重新读取平台地址与凭据，失效旧请求并通知业务重置连接缓存。 */
-  reloadService: () => Promise<void>;
+  /** 重新读取平台地址与凭据，刷新运行时并返回是否重新连接成功。 */
+  reloadService: () => Promise<boolean>;
+  /** 重新订阅断开的后台任务事件流。 */
+  retryJobStreams: () => void;
   connectionRevision: number;
   ready: boolean;
   loading: boolean;
-  error: string | null;
+  connectionError: string | null;
+  refreshError: string | null;
+  jobStreamErrors: Record<string, string>;
 }
 
 const RuntimeContext = createContext<RuntimeContextValue | null>(null);
 
-/** 为页面提供最小共享运行时，任务流跨路由存活，页面数据由各自模块维护。 */
+/**
+ * 为页面提供最小共享运行时，任务流跨路由存活，页面数据由各自模块维护。
+ *
+ * @param props 组件属性，包含子节点
+ */
 export function RuntimeProvider({ children }: { children: ReactNode }) {
   const { setContextSize } = useSettings();
   const [runtime, setRuntime] = useState<RuntimeStatus | null>(null);
   const [models, setModels] = useState<RuntimeModel[]>([]);
   const [instances, setInstances] = useState<RuntimeInstance[]>([]);
-  const [jobs, setJobs] = useState<JobResource[]>([]);
   const [capabilities, setCapabilities] = useState<RuntimeCapabilities | null>(null);
   const [realtime, setRealtime] = useState<RealtimeCapabilities | null>(null);
   const [voiceComponent, setVoiceComponent] = useState<VoiceOutputComponentStatus | null>(null);
@@ -66,7 +73,9 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
   const [selectedModel, setSelectedModel] = useState('');
   const [ready, setReady] = useState(false);
   const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
+  const [connectionError, setConnectionError] = useState<string | null>(null);
+  const [refreshError, setRefreshError] = useState<string | null>(null);
+  const [jobStreamErrors, setJobStreamErrors] = useState<Record<string, string>>({});
   const [connectionRevision, setConnectionRevision] = useState(0);
   const mounted = useRef(false);
   const requestVersion = useRef(0);
@@ -74,33 +83,33 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
   const selectedRef = useRef(selectedModel);
   selectedRef.current = selectedModel;
 
-  const refreshRuntime = useCallback(async (quiet = true) => {
+  const refreshRuntime = useCallback(async (quiet = true): Promise<boolean> => {
     const version = ++requestVersion.current;
     if (!quiet) setLoading(true);
     try {
-      const [nextInstances, nextJobs] = await Promise.all([api.runtimeInstances(), api.jobs(100)]);
+      const [nextInstances, nextJobs] = await Promise.all([runtimeApi.runtimeInstances(), jobsApi.jobs(100)]);
       const instance = nextInstances.find(
         (item) => item.model === selectedRef.current && item.state !== 'failed',
       );
       const [statusResult, voiceResult] = await Promise.allSettled([
-        api.runtimeStatus(instance?.id),
-        api.voiceOutputComponent(),
+        runtimeApi.runtimeStatus(instance?.id),
+        runtimeApi.voiceOutputComponent(),
       ]);
       if (statusResult.status !== 'fulfilled') throw statusResult.reason;
       const status = statusResult.value;
       const [modelResult, capabilityResult, realtimeResult] = await Promise.allSettled([
         isRuntimeReady(status.runtime_state)
-          ? api.runtimeModels()
+          ? runtimeApi.runtimeModels()
           : Promise.resolve<RuntimeModel[]>([]),
         isRuntimeReady(status.runtime_state)
-          ? api.runtimeCapabilities(instance?.id)
+          ? runtimeApi.runtimeCapabilities(instance?.id)
           : Promise.resolve(null),
-        isRuntimeReady(status.runtime_state) ? api.realtimeCapabilities() : Promise.resolve(null),
+        isRuntimeReady(status.runtime_state) ? runtimeApi.realtimeCapabilities() : Promise.resolve(null),
       ]);
-      if (!mounted.current || version !== requestVersion.current) return;
+      if (!mounted.current || version !== requestVersion.current) return false;
       const nextModels = modelResult.status === 'fulfilled' ? modelResult.value : [];
       setInstances(nextInstances);
-      setJobs(nextJobs);
+      useJobStore.getState().setJobs(nextJobs);
       setRuntime(status);
       setModels(nextModels);
       setCapabilities(capabilityResult.status === 'fulfilled' ? capabilityResult.value : null);
@@ -114,9 +123,11 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
             ? status.model
             : (names[0] ?? ''),
       );
-      setError(null);
+      setRefreshError(null);
+      return true;
     } catch (cause) {
-      if (mounted.current && version === requestVersion.current) setError(errorMessage(cause));
+      if (mounted.current && version === requestVersion.current) setRefreshError(errorMessage(cause));
+      return false;
     } finally {
       if (mounted.current && version === requestVersion.current) setLoading(false);
     }
@@ -127,42 +138,40 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
     ++requestVersion.current;
     setReady(false);
     setLoading(true);
+    setConnectionError(null);
+    setRefreshError(null);
+    setJobStreamErrors({});
+    useJobStore.getState().clearJobStreams();
     try {
       let status = await studioStatus();
-      if (!mounted.current || version !== initializationVersion.current) return;
+      if (!mounted.current || version !== initializationVersion.current) return false;
       setStudio(status);
       if (status?.config.mode === 'local' && !status.reachable) {
         await startLocalStudio();
         status = await studioStatus();
       }
-      let token = '';
-      if (status) {
-        try {
-          token = await studioCredential();
-        } catch (cause) {
-          if (mounted.current && version === initializationVersion.current)
-            setError(errorMessage(cause));
-        }
-      }
-      if (!mounted.current || version !== initializationVersion.current) return;
+      const token = status ? await studioCredential() : '';
+      if (!mounted.current || version !== initializationVersion.current) return false;
       setApiBaseUrl(status?.service_url ?? '');
       setApiToken(token);
       setStudio(status);
       setSelectedModel('');
       selectedRef.current = '';
-      setJobs([]);
+      useJobStore.getState().setJobs([]);
       setInstances([]);
       setModels([]);
       setRuntime(null);
       setCapabilities(null);
       setConnectionRevision((current) => current + 1);
-      await refreshRuntime();
-      if (mounted.current && version === initializationVersion.current) setReady(true);
+      const refreshed = await refreshRuntime();
+      if (mounted.current && version === initializationVersion.current && refreshed) setReady(true);
+      return refreshed && mounted.current && version === initializationVersion.current;
     } catch (cause) {
       if (mounted.current && version === initializationVersion.current) {
-        setError(errorMessage(cause));
+        setConnectionError(errorMessage(cause));
         setLoading(false);
       }
+      return false;
     }
   }, [refreshRuntime]);
 
@@ -180,55 +189,48 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
     if (ready && selectedModel) void refreshRuntime();
   }, [ready, selectedModel, refreshRuntime]);
 
-  const activeJobIds = jobs
-    .filter((job) => ['queued', 'running', 'cancelling'].includes(job.status))
-    .map((job) => job.id)
-    .sort()
-    .join(',');
+  const activeJobIds = useJobStore((state) => state.activeJobIds.slice().sort().join(','));
   useEffect(() => {
     const capacity = Number(runtime?.max_context);
     if (Number.isFinite(capacity) && capacity > 0) setContextSize(Math.floor(capacity));
   }, [runtime?.max_context, setContextSize]);
-  useEffect(() => {
-    if (!ready || !activeJobIds) return;
-    const controller = new AbortController();
-    for (const id of activeJobIds.split(',')) {
-      void api
-        .streamJobEvents(
-          id,
-          (event) => {
-            if (controller.signal.aborted) return;
-            const status =
-              event.type === 'state' && typeof event.data.status === 'string'
-                ? (event.data.status as JobResource['status'])
-                : null;
-            setJobs((current) =>
-              current.map((job) =>
-                job.id === id
-                  ? {
-                      ...job,
-                      ...(status ? { status } : {}),
-                      ...(typeof event.progress === 'number' ? { progress: event.progress } : {}),
-                      updated_at: event.created_at,
-                    }
-                  : job,
-              ),
-            );
-            if (status && ['succeeded', 'failed', 'cancelled', 'interrupted'].includes(status))
-              void refreshRuntime();
-          },
-          controller.signal,
-        )
-        .catch((cause) => {
-          if (!controller.signal.aborted) setError(errorMessage(cause));
+  /** 订阅活跃任务，并在各任务恢复传输后分别清除其故障。 */
+  const retryJobStreams = useCallback(() => {
+    if (!ready) return;
+    useJobStore.getState().watchActiveJobs({
+      onTerminal: () => {
+        void refreshRuntime();
+      },
+      onEvent: (id) => {
+        setJobStreamErrors((current) => {
+          if (!(id in current)) return current;
+          const next = { ...current };
+          delete next[id];
+          return next;
         });
-    }
-    return () => controller.abort();
-  }, [ready, activeJobIds, connectionRevision, refreshRuntime]);
+      },
+      onError: (id, cause) => {
+        setJobStreamErrors((current) => ({ ...current, [id]: errorMessage(cause) }));
+      },
+    });
+  }, [ready, refreshRuntime]);
+  useEffect(() => {
+    if (!ready) return;
+    retryJobStreams();
+    const active = new Set(activeJobIds ? activeJobIds.split(',') : []);
+    setJobStreamErrors((current) => {
+      if (Object.keys(current).every((id) => active.has(id))) return current;
+      return Object.fromEntries(Object.entries(current).filter(([id]) => active.has(id)));
+    });
+  }, [ready, activeJobIds, connectionRevision, retryJobStreams]);
+  useEffect(() => {
+    return () => {
+      useJobStore.getState().clearJobStreams();
+    };
+  }, [connectionRevision]);
 
   const addJob = useCallback(
-    (job: JobResource) =>
-      setJobs((current) => [job, ...current.filter((item) => item.id !== job.id)]),
+    (job: JobResource) => useJobStore.getState().addJob(job),
     [],
   );
   const value = useMemo(
@@ -236,7 +238,6 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
       runtime,
       models,
       instances,
-      jobs,
       capabilities,
       realtime,
       voiceComponent,
@@ -246,34 +247,44 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
       refreshRuntime,
       addJob,
       reloadService,
+      retryJobStreams,
       connectionRevision,
       ready,
       loading,
-      error,
+      connectionError,
+      refreshError,
+      jobStreamErrors,
     }),
     [
       runtime,
       models,
       instances,
-      jobs,
       capabilities,
       realtime,
       voiceComponent,
       studio,
       selectedModel,
+      setSelectedModel,
       refreshRuntime,
       addJob,
       reloadService,
+      retryJobStreams,
       connectionRevision,
       ready,
       loading,
-      error,
+      connectionError,
+      refreshError,
+      jobStreamErrors,
     ],
   );
   return <RuntimeContext.Provider value={value}>{children}</RuntimeContext.Provider>;
 }
 
-/** 读取平台与共享推理状态；必须位于 RuntimeProvider 内部。 */
+/**
+ * 读取平台与共享推理状态，并整合后台任务管理；必须位于 RuntimeProvider 内部。
+ *
+ * @returns 运行时上下文对象，包含平台就绪状态、模型实例列表与后台任务操作
+ */
 export function useRuntime(): RuntimeContextValue {
   const value = useContext(RuntimeContext);
   if (!value) throw new Error('RuntimeProvider is missing');

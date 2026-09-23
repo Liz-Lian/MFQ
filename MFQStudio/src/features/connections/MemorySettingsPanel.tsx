@@ -1,6 +1,6 @@
 /** 在连接页展示内存和缓存策略，并独立管理上下文重载操作。 */
 import { useState } from 'react';
-import { api } from '../../api';
+import { runtimeApi } from '../../shared/api/resources/runtime';
 import { useRuntime } from '../../app/RuntimeProvider';
 import { useSettings } from '../settings/SettingsProvider';
 import { SectionLabel, SettingRow, TMPanel } from '../../app/display';
@@ -37,7 +37,7 @@ export function MemorySettingsPanel() {
       return;
     setBusy(true);
     try {
-      await api.reloadRuntime(contextSize, runtime?.instance_id);
+      await runtimeApi.reloadRuntime(contextSize, runtime?.instance_id);
       await refreshRuntime(true);
       toast.success(tr('模型重载成功', 'Model reloaded successfully'));
     } catch (cause) {

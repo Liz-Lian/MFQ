@@ -1,11 +1,11 @@
 /** 评测页面独立管理结果比较、数据集注册及按需加载。 */
 import { FormEvent, useEffect, useState } from 'react';
-import { api } from '../../api';
+import { evaluationsApi } from '../../shared/api/resources/evaluations';
 import { Icon } from '../../app/display';
 import { PanelDeck } from '../../app/PanelDeck';
 import { errorMessage, formatNumber } from '../../app/formatters';
 import { useSettings } from '../settings/SettingsProvider';
-import type { DatasetResource, EvaluationResult, EvaluationComparison } from '../../api';
+import type { DatasetResource, EvaluationResult, EvaluationComparison } from '../../shared/api/types';
 import { toast } from '../../stores/toastStore';
 /** 挂载时加载评测资源，提交与错误状态仅影响当前页面。 */
 export function EvaluationsPage() {
@@ -28,7 +28,7 @@ export function EvaluationsPage() {
   });
   useEffect(() => {
     let active = true;
-    void Promise.all([api.datasets(), api.evaluations()])
+    void Promise.all([evaluationsApi.datasets(), evaluationsApi.evaluations()])
       .then(([nextDatasets, nextEvaluations]) => {
         if (active) {
           setDatasets(nextDatasets);
@@ -50,13 +50,13 @@ export function EvaluationsPage() {
     if (busy || !datasetDraft.name.trim() || !datasetDraft.artifact_uri.trim()) return;
     setBusy(true);
     try {
-      await api.createDataset({
+      await evaluationsApi.createDataset({
         name: datasetDraft.name.trim(),
         kind: datasetDraft.kind,
         artifact_uri: datasetDraft.artifact_uri.trim(),
       });
       setDatasetDraft({ name: '', artifact_uri: '', kind: 'custom' });
-      setDatasets(await api.datasets());
+      setDatasets(await evaluationsApi.datasets());
       toast.success(tr('数据集已注册', 'Dataset registered'));
     } catch (cause) {
       toast.error(errorMessage(cause));
@@ -69,7 +69,7 @@ export function EvaluationsPage() {
     if (selectedEvaluations.length < 2 || busy) return;
     setBusy(true);
     try {
-      setEvaluationComparison(await api.compareEvaluations(selectedEvaluations));
+      setEvaluationComparison(await evaluationsApi.compareEvaluations(selectedEvaluations));
     } catch (cause) {
       toast.error(errorMessage(cause));
     } finally {
@@ -227,7 +227,7 @@ export function EvaluationsPage() {
                   <button
                     aria-label={tr('删除数据集', 'Delete dataset')}
                     onClick={() =>
-                      void api
+                      void evaluationsApi
                         .deleteDataset(item.id)
                         .then(() =>
                           setDatasets((current) => current.filter((entry) => entry.id !== item.id)),

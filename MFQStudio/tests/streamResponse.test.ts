@@ -1,6 +1,8 @@
 /** 验证生成请求的会话隔离、事件顺序、业务终态及服务端错误传播。 */
 import { describe, expect, it, vi } from 'vitest';
-import { ApiError, streamResponse, type StreamRequest } from '../src/api';
+import { ApiError } from '../src/shared/api/client';
+import { streamResponse } from '../src/shared/api/responses';
+import type { StreamRequest } from '../src/shared/api/types';
 
 const request: StreamRequest = {
   request_id: 'request-1',
@@ -57,7 +59,9 @@ describe('生成流协议', () => {
     ];
     respondWith(events);
     const onFrame = vi.fn();
-    await streamResponse('session-1', request, onFrame, new AbortController().signal);
+    const onAccepted = vi.fn();
+    await streamResponse('session-1', request, onFrame, new AbortController().signal, onAccepted);
+    expect(onAccepted).toHaveBeenCalledOnce();
     expect(onFrame.mock.calls.map(([event]) => event)).toEqual(events);
     expect(fetch).toHaveBeenCalledOnce();
     expect(fetch).toHaveBeenCalledWith(
@@ -76,6 +80,17 @@ describe('生成流协议', () => {
     await expect(
       streamResponse('session-1', request, vi.fn(), new AbortController().signal),
     ).resolves.toBeUndefined();
+  });
+
+  it('HTTP 拒绝不会把输入标记为已接受', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      error: { code: 'REJECTED', message: 'request rejected', retryable: true, details: {} },
+    }), { status: 503, headers: { 'content-type': 'application/json' } })));
+    const onAccepted = vi.fn();
+    await expect(
+      streamResponse('session-1', request, vi.fn(), new AbortController().signal, onAccepted),
+    ).rejects.toThrow('request rejected');
+    expect(onAccepted).not.toHaveBeenCalled();
   });
 
   it('连接正常 EOF 但没有业务终态时报告截断', async () => {

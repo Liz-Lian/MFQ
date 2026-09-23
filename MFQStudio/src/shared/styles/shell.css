@@ -140,7 +140,7 @@
   grid-template-rows: minmax(0, 1fr);
   background: var(--canvas);
 }
-
+.workspace.has-runtime-alerts { grid-template-rows: auto minmax(0, 1fr); }
 .fatal-workspace { display: grid; height: 100dvh; grid-template-rows: minmax(0, 1fr); }
 .failure-page {
   display: flex;
@@ -215,6 +215,51 @@
   .failure-page { padding: 90px 24px 26px; }
   .failure-page-actions button { flex: 1 1 auto; }
 }
+.runtime-alerts {
+  display: grid;
+  max-height: 36vh;
+  gap: 7px;
+  overflow-y: auto;
+  border-bottom: 1px solid var(--line-soft);
+  padding: 10px clamp(24px, 3.5vw, 52px);
+  background: var(--canvas);
+}
+.runtime-alert {
+  display: flex;
+  width: min(1180px, 100%);
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  border: 1px solid var(--danger);
+  border-radius: 8px;
+  margin-inline: auto;
+  padding: 9px 12px;
+  color: var(--danger);
+  background: var(--danger-soft);
+  font-size: 12px;
+}
+.runtime-alert > div { display: grid; min-width: 0; gap: 3px; }
+.runtime-alert span { overflow-wrap: anywhere; }
+.runtime-alert button {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 6px;
+  min-height: 32px;
+  border: 1px solid currentColor;
+  border-radius: 6px;
+  padding: 5px 9px;
+  color: inherit;
+  background: transparent;
+}
+.runtime-alert button:hover:not(:disabled) { background: var(--surface); }
+.runtime-alert button:disabled { opacity: 0.55; }
+@media (max-width: 680px) {
+  .runtime-alerts { padding: 10px 14px 10px 56px; }
+  .runtime-alert { align-items: flex-start; flex-wrap: wrap; }
+  .runtime-alert button { margin-left: auto; }
+}
+
 .dashboard-view, .lab-view {
   min-height: 0;
   overflow-y: auto;

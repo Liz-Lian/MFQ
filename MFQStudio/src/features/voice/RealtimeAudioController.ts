@@ -1,5 +1,5 @@
 /** 管理实时语音传输、采集、轮次调度和播放资源。 */
-import { runtimeRealtimeUrl } from '../../api';
+import { runtimeRealtimeUrl } from '../../shared/api/client';
 import { base64ToFloat32, float32ToBase64, wavBlob } from './audioCodec';
 import { AudioDevices } from './AudioDevices';
 import type { BufferedVoiceTurn, RealtimeCallbacks, RealtimeSessionConfig } from './realtimeTypes';

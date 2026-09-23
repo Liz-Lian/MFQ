@@ -10,6 +10,7 @@ export async function streamResponse(
   body: StreamRequest,
   onFrame: (frame: ResponseFrame) => void,
   signal: AbortSignal,
+  onAccepted?: () => void,
 ): Promise<void> {
   const response = await fetch(apiUrl(`/api/v1/sessions/${sessionId}/responses`), {
     method: 'POST',
@@ -21,6 +22,7 @@ export async function streamResponse(
     signal,
   });
   if (!response.ok) throw await errorFromResponse(response);
+  onAccepted?.();
   let streamError: ApiError | null = null;
   let terminal = false;
   let sequence = -1;

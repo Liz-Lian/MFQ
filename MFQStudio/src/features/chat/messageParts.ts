@@ -1,5 +1,5 @@
 /** 从聊天消息中提取正文、推理文本与可展示的媒体片段。 */
-import { ContentPart, Message } from '../../api';
+import { ContentPart, Message } from '../../shared/api/types';
 
 /** 合并消息中的正文和思考片段，供历史消息展示与编辑。 */
 export function textParts(message: Message): { text: string; reasoning: string } {

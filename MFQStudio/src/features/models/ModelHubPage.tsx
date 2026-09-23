@@ -1,13 +1,14 @@
 /** 模型仓库页面负责检索、详情与下载任务提交。 */
 import { FormEvent, useEffect, useState } from 'react';
-import { api } from '../../api';
+import { modelsApi } from '../../shared/api/resources/models';
+import { jobsApi } from '../../shared/api/resources/jobs';
+import type { HubModelSummary, HubModelInfo, JobKindResource } from '../../shared/api/types';
 import { Icon } from '../../app/display';
 import { PanelDeck } from '../../app/PanelDeck';
 import { errorMessage, formatNumber } from '../../app/formatters';
 import { useSettings } from '../settings/SettingsProvider';
 import { useRuntime } from '../../app/RuntimeProvider';
 import { useNavigate } from 'react-router';
-import type { HubModelSummary, HubModelInfo, JobKindResource } from '../../api';
 import { parseHubReference } from './hubReference';
 import { toast } from '../../stores/toastStore';
 /** 隔离模型仓库的请求与草稿，将下载任务登记到共享运行时。 */
@@ -27,7 +28,7 @@ export function ModelHubPage() {
   const [jobKinds, setJobKinds] = useState<JobKindResource[]>([]);
   useEffect(() => {
     let active = true;
-    void api
+    void jobsApi
       .jobKinds()
       .then((items) => {
         if (active) setJobKinds(items);
@@ -50,7 +51,7 @@ export function ModelHubPage() {
     try {
       const reference = parseHubReference(query, hubProvider);
       if (reference) {
-        const info = await api.hubModelInfo(
+        const info = await modelsApi.hubModelInfo(
           reference.provider,
           reference.repoId,
           reference.revision,
@@ -60,7 +61,7 @@ export function ModelHubPage() {
         setHubModel(info);
         return;
       }
-      const results = await api.searchHubModels(hubProvider, query);
+      const results = await modelsApi.searchHubModels(hubProvider, query);
       setHubResults(results);
       setHubModel(null);
     } catch (cause) {
@@ -74,7 +75,7 @@ export function ModelHubPage() {
     if (busy) return;
     setBusy(true);
     try {
-      setHubModel(await api.hubModelInfo(item.provider, item.repo_id));
+      setHubModel(await modelsApi.hubModelInfo(item.provider, item.repo_id));
     } catch (cause) {
       toast.error(errorMessage(cause));
     } finally {
@@ -95,7 +96,7 @@ export function ModelHubPage() {
         .join('/');
     setBusy(true);
     try {
-      const created = await api.createJob(`download.${hubModel.provider}`, {
+      const created = await jobsApi.createJob(`download.${hubModel.provider}`, {
         repo_id: hubModel.repo_id,
         destination: `models/${hubModel.provider}/${repositoryPath || name}`,
         revision: hubModel.revision,

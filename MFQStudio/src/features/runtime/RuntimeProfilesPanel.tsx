@@ -1,7 +1,9 @@
 /** 运行配置面板独立管理配置列表、名称草稿和保存加载操作。 */
 import { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router';
-import { api, ModelArtifact, RuntimeProfile } from '../../api';
+import { runtimeApi } from '../../shared/api/resources/runtime';
+import { modelsApi } from '../../shared/api/resources/models';
+import type { ModelArtifact, RuntimeProfile } from '../../shared/api/types';
 import { useRuntime } from '../../app/RuntimeProvider';
 import { useSettings } from '../settings/SettingsProvider';
 import { modeTemplateSettings } from '../settings/configuration';
@@ -30,7 +32,7 @@ export function RuntimeProfilesPanel() {
   useEffect(() => {
     if (!ready) return;
     let active = true;
-    void Promise.all([api.modelArtifacts(), api.runtimeProfiles()])
+    void Promise.all([modelsApi.modelArtifacts(), runtimeApi.runtimeProfiles()])
       .then(([nextArtifacts, profiles]) => {
         if (active) {
           setArtifacts(nextArtifacts);
@@ -53,7 +55,7 @@ export function RuntimeProfilesPanel() {
     if (busy || !name || !artifact) return;
     setBusy(true);
     try {
-      await api.createRuntimeProfile({
+      await runtimeApi.createRuntimeProfile({
         name,
         load: {
           model: artifact.name,
@@ -79,7 +81,7 @@ export function RuntimeProfilesPanel() {
         },
       });
       setProfileName('');
-      setRuntimeProfiles(await api.runtimeProfiles());
+      setRuntimeProfiles(await runtimeApi.runtimeProfiles());
       await refreshRuntime(false);
       toast.success(tr('运行配置已保存', 'Runtime profile saved'));
     } catch (cause) {
@@ -104,7 +106,7 @@ export function RuntimeProfilesPanel() {
       return;
     setBusy(true);
     try {
-      await api.loadRuntimeProfile(profile.id, profile.drifted);
+      await runtimeApi.loadRuntimeProfile(profile.id, profile.drifted);
 
       navigate(STUDIO_PATHS.models);
       await refreshRuntime(false);
@@ -121,7 +123,7 @@ export function RuntimeProfilesPanel() {
     if (busy) return;
     setBusy(true);
     try {
-      await api.deleteRuntimeProfile(id);
+      await runtimeApi.deleteRuntimeProfile(id);
       setRuntimeProfiles((current) => current.filter((item) => item.id !== id));
       toast.success(tr('运行配置已删除', 'Runtime profile deleted'));
     } catch (cause) {

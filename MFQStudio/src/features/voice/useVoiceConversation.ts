@@ -1,5 +1,5 @@
 /** 将语音采集、片段持久化与会话归属绑定，供聊天业务独立使用。 */
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { RealtimeAudioController, type VoiceState, saveVoiceClip } from '../../realtimeAudio';
 import {
   VOICE_HISTORY_KEY,
@@ -9,6 +9,7 @@ import {
 } from './history';
 import { useSettings } from '../settings/SettingsProvider';
 import { errorMessage } from '../../app/formatters';
+import { resetVoiceLevel, setVoiceLevel } from './voiceLevelStore';
 
 /** 保留跨路由语音状态，按会话切换和连接重置停止旧控制器。 */
 export function useVoiceConversation(
@@ -19,9 +20,9 @@ export function useVoiceConversation(
   const { settings } = useSettings();
   const [voiceMessages, setVoiceMessages] = useState<VoiceMessage[]>(loadVoiceHistory);
   const [voiceState, setVoiceState] = useState<VoiceState>('idle');
-  const [voiceLevel, setVoiceLevel] = useState(0);
   const [liveVoice, setLiveVoice] = useState<LiveVoiceOutput | null>(null);
   const voiceRef = useRef<RealtimeAudioController | null>(null);
+  const acceptVoiceLevel = useRef(false);
   const voiceClipWrites = useRef(new Map<string, Promise<void>>());
   useEffect(() => {
     const stable = voiceMessages.filter(
@@ -37,14 +38,23 @@ export function useVoiceConversation(
     voiceRef.current?.setPlayback(settings.playbackEnabled);
   }, [settings.playbackEnabled]);
   useEffect(() => {
+    acceptVoiceLevel.current = false;
+    resetVoiceLevel();
     void voiceRef.current?.stop();
     setLiveVoice(null);
   }, [activeId, connectionRevision]);
   useEffect(() => {
-    voiceRef.current = new RealtimeAudioController(
+    const controller = new RealtimeAudioController(
       {
-        onState: setVoiceState,
-        onLevel: setVoiceLevel,
+        onState: (state) => {
+          if (voiceRef.current === controller && (state === 'connecting' || state === 'listening')) {
+            acceptVoiceLevel.current = true;
+          }
+          setVoiceState(state);
+        },
+        onLevel: (level) => {
+          if (voiceRef.current === controller && acceptVoiceLevel.current) setVoiceLevel(level);
+        },
         onText: (sessionId, text) =>
           setLiveVoice((current) =>
             text ? { sessionId, text } : current?.sessionId === sessionId ? null : current,
@@ -122,12 +132,22 @@ export function useVoiceConversation(
       settings.playbackEnabled,
       settings.fullDuplex,
     );
+    voiceRef.current = controller;
+    acceptVoiceLevel.current = true;
     return () => {
-      void voiceRef.current?.stop();
-      voiceRef.current = null;
+      acceptVoiceLevel.current = false;
+      resetVoiceLevel();
+      if (voiceRef.current === controller) voiceRef.current = null;
+      void controller.stop();
     };
     // The controller reads current request settings when capture starts.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [connectionRevision]);
-  return { voiceRef, voiceMessages, setVoiceMessages, voiceState, voiceLevel, liveVoice };
+  return useMemo(() => ({
+    voiceRef,
+    voiceMessages,
+    setVoiceMessages,
+    voiceState,
+    liveVoice,
+  }), [voiceMessages, voiceState, liveVoice]);
 }

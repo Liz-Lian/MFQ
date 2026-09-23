@@ -1,19 +1,23 @@
 /** 日志页按需轮询请求与事件，并管理任务历史清理。 */
 import { useEffect, useState } from 'react';
-import { api, RuntimeLogEntry, RuntimeRequestMetrics } from '../../api';
+import { runtimeApi } from '../../shared/api/resources/runtime';
+import { jobsApi } from '../../shared/api/resources/jobs';
+import type { RuntimeLogEntry, RuntimeRequestMetrics } from '../../shared/api/types';
 import { useRuntime } from '../../app/RuntimeProvider';
 import { useSettings } from '../settings/SettingsProvider';
 import { Icon, ScreenHeader, SectionLabel, TMPanel } from '../../app/display';
 import { errorMessage, formatNumber } from '../../app/formatters';
 import { isTerminalJob } from '../jobs/jobSchema';
+import { toast } from '../../stores/toastStore';
+import { useJobStore } from '../../stores/jobStore';
 
 /** 打开日志页才读取指标历史；每次请求结束后再安排下一轮，避免请求重叠。 */
 export function LogsPage() {
-  const { jobs, ready, refreshRuntime } = useRuntime();
+  const jobs = useJobStore((state) => state.jobs);
+  const { ready, refreshRuntime } = useRuntime();
   const { tr } = useSettings();
   const [runtimeLogs, setRuntimeLogs] = useState<RuntimeLogEntry[]>([]);
   const [requestHistory, setRequestHistory] = useState<RuntimeRequestMetrics[]>([]);
-  const [error, setError] = useState<string | null>(null);
   const [jobCleanupBusy, setJobCleanupBusy] = useState(false);
   const activeJobs = jobs.filter((job) => ['queued', 'running', 'cancelling'].includes(job.status));
   const completedJobs = jobs.filter(isTerminalJob);
@@ -24,7 +28,7 @@ export function LogsPage() {
     /** 读取日志和指标，在卸载时停止调度并忽略迟到结果。 */
     async function refresh() {
       try {
-        const [logs, metrics] = await Promise.all([api.runtimeLogs(100), api.runtimeMetrics(200)]);
+        const [logs, metrics] = await Promise.all([runtimeApi.runtimeLogs(100), runtimeApi.runtimeMetrics(200)]);
         if (!active) return;
         setRuntimeLogs(logs);
         const unique = new Map<string, RuntimeRequestMetrics>();
@@ -33,9 +37,8 @@ export function LogsPage() {
           if (request?.id) unique.set(request.id, request);
         }
         setRequestHistory([...unique.values()].slice(-24).reverse());
-        setError(null);
-      } catch (cause) {
-        if (active) setError(errorMessage(cause));
+      } catch {
+        // 轮询失败静默跳过，等待下一轮重试
       } finally {
         if (active) timer = setTimeout(() => void refresh(), 4000);
       }
@@ -51,11 +54,12 @@ export function LogsPage() {
     if (jobCleanupBusy) return;
     setJobCleanupBusy(true);
     try {
-      if (id) await api.deleteJob(id);
-      else await api.clearCompletedJobs();
+      if (id) await jobsApi.deleteJob(id);
+      else await jobsApi.clearCompletedJobs();
       await refreshRuntime(false);
+      toast.success(tr('任务记录已清理', 'Job records cleaned up'));
     } catch (cause) {
-      setError(errorMessage(cause));
+      toast.error(errorMessage(cause));
     } finally {
       setJobCleanupBusy(false);
     }
@@ -68,11 +72,6 @@ export function LogsPage() {
         title={tr('日志', 'Logs')}
         subtitle={tr('请求、任务与运行事件。', 'Requests, jobs, and runtime events.')}
       />
-      {error && (
-        <div className="error-banner" role="alert">
-          {error}
-        </div>
-      )}
 
       <SectionLabel
         title={tr('Runtime 活动', 'Runtime activity')}

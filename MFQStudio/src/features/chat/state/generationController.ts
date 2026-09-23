@@ -1,13 +1,8 @@
 /** 管理单次聊天生成的生命周期、批量输出与历史同步，隔离过期异步回写。 */
-import {
-  api,
-  ApiError,
-  streamResponse,
-  type Message,
-  type ResponseResource,
-  type Session,
-  type StreamRequest,
-} from '../../../api';
+import { sessionsApi } from '../../../shared/api/resources/sessions';
+import { ApiError } from '../../../shared/api/client';
+import { streamResponse } from '../../../shared/api/responses';
+import type { Message, ResponseResource, Session, StreamRequest } from '../../../shared/api/types';
 import type { ResponseFrame } from '../../../shared/api/responseProtocol';
 
 export type GenerationPhase =
@@ -47,6 +42,7 @@ interface GenerationServices {
     request: StreamRequest,
     onFrame: (frame: ResponseFrame) => void,
     signal: AbortSignal,
+    onAccepted?: () => void,
   ) => Promise<void>;
   cancel: (sessionId: string, signal: AbortSignal) => Promise<unknown>;
   synchronize: (sessionId: string, signal: AbortSignal) => Promise<ConversationSnapshot>;
@@ -62,6 +58,8 @@ export interface GenerationCallbacks {
 interface GenerationRun {
   id: string;
   sessionId: string;
+  accepted: boolean;
+  onAccepted?: () => void;
   controller: AbortController;
   synchronization: AbortController | null;
   cancellation: AbortController | null;
@@ -74,12 +72,12 @@ interface GenerationRun {
 
 const services: GenerationServices = {
   stream: streamResponse,
-  cancel: (sessionId, signal) => api.cancelResponse(sessionId, signal),
+  cancel: (sessionId, signal) => sessionsApi.cancelResponse(sessionId, signal),
   synchronize: async (sessionId, signal) => {
     const [session, messages, responses] = await Promise.all([
-      api.getSession(sessionId, signal),
-      api.listMessages(sessionId, signal),
-      api.listResponses(sessionId, signal),
+      sessionsApi.getSession(sessionId, signal),
+      sessionsApi.listMessages(sessionId, signal),
+      sessionsApi.listResponses(sessionId, signal),
     ]);
     return { session, messages, responses };
   },
@@ -160,14 +158,22 @@ export class GenerationController {
     if (this.flushTimer === null) this.flushTimer = setTimeout(() => this.flush(run), 32);
   }
 
+  private accept(run: GenerationRun): void {
+    if (this.active !== run || run.accepted) return;
+    run.accepted = true;
+    run.onAccepted?.();
+  }
+
   /** 发起一次生成；直到同步结束才释放发送通道，不自动重试非幂等请求。 */
-  async start(sessionId: string, request: StreamRequest): Promise<void> {
+  async start(sessionId: string, request: StreamRequest, onAccepted?: () => void): Promise<void> {
     if (isGenerationBusy(this.snapshot.phase) || this.snapshot.recoveryNeeded) {
       throw new Error('Wait for the current response to synchronize before sending again');
     }
     const run: GenerationRun = {
       id: request.request_id,
       sessionId,
+      accepted: false,
+      onAccepted,
       controller: new AbortController(),
       synchronization: null,
       cancellation: null,
@@ -191,6 +197,7 @@ export class GenerationController {
         request,
         (frame) => this.receive(run, frame),
         run.controller.signal,
+        () => this.accept(run),
       );
     } catch (error) {
       if (!run.cancelled) run.error = describeError(error);
@@ -262,6 +269,7 @@ export class GenerationController {
         throw new Error('The completed response is not yet available in history');
       if (response?.status === 'failed' && !run.error)
         run.error = 'The server could not complete this response';
+      if (response) this.accept(run);
       this.callbacks.onSynchronized(persisted);
       const hasPartial = Boolean(
         run.output.text || run.output.reasoning || run.output.tools.length,

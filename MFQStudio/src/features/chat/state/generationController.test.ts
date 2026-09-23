@@ -1,6 +1,6 @@
 /** 覆盖流式批处理、同步锁、取消和过期请求隔离等用户可见行为。 */
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import type { ResponseResource, Session, StreamRequest } from '../../../api';
+import type { ResponseResource, Session, StreamRequest } from '../../../shared/api/types';
 import { GenerationController, type ConversationSnapshot } from './generationController';
 import type { ResponseFrame } from '../../../shared/api/responseProtocol';
 
@@ -58,7 +58,7 @@ function setup() {
   let receive!: (frame: ResponseFrame) => void;
   const onSynchronized = vi.fn();
   const onSessionState = vi.fn();
-  const stream = vi.fn((_id, _body, callback, signal: AbortSignal) => {
+  const stream = vi.fn((_id, _body, callback, signal: AbortSignal, _onAccepted?: () => void) => {
     receive = callback;
     signal.addEventListener(
       'abort',
@@ -146,6 +146,48 @@ describe('GenerationController', () => {
       recoveryNeeded: false,
       live: null,
     });
+  });
+
+  it('生成 POST 被明确拒绝且历史无对应响应时不确认输入', async () => {
+    const ctx = setup();
+    const onAccepted = vi.fn();
+    const running = ctx.controller.start('session-a', request, onAccepted);
+    ctx.transport.reject(new Error('HTTP 503'));
+    ctx.history.resolve({ ...persisted('failed'), messages: [], responses: [] });
+    await running;
+    expect(onAccepted).not.toHaveBeenCalled();
+    expect(ctx.controller.getSnapshot()).toMatchObject({ phase: 'failed', recoveryNeeded: false });
+  });
+
+  it('成功响应头和历史确认只会通知一次接受', async () => {
+    const ctx = setup();
+    const onAccepted = vi.fn();
+    ctx.stream.mockImplementationOnce((_id, _body, _onFrame, _signal, accepted) => {
+      accepted?.();
+      return ctx.transport.promise;
+    });
+    const running = ctx.controller.start('session-a', request, onAccepted);
+    expect(onAccepted).toHaveBeenCalledOnce();
+    ctx.transport.resolve();
+    ctx.history.resolve(persisted());
+    await running;
+    expect(onAccepted).toHaveBeenCalledOnce();
+  });
+
+  it('响应已存在但初次同步失败时，重试同步确认后清理输入且不重发 POST', async () => {
+    const ctx = setup();
+    const onAccepted = vi.fn();
+    const running = ctx.controller.start('session-a', request, onAccepted);
+    ctx.transport.reject(new Error('network interrupted'));
+    ctx.history.reject(new Error('sync unavailable'));
+    await running;
+    expect(onAccepted).not.toHaveBeenCalled();
+    ctx.synchronize.mockResolvedValueOnce(persisted('failed'));
+    await ctx.controller.retrySynchronization();
+    expect(onAccepted).toHaveBeenCalledOnce();
+    await ctx.controller.retrySynchronization();
+    expect(onAccepted).toHaveBeenCalledOnce();
+    expect(ctx.stream).toHaveBeenCalledOnce();
   });
 
   it('重置后旧同步结果不得回写，新请求控制器保持有效', async () => {

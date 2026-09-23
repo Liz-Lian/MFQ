@@ -1,6 +1,7 @@
 /** 独立加载和维护 MCP 工具服务器及远程节点，供资源和连接页面复用。 */
 import { useEffect, useState, type FormEvent } from 'react';
-import { api, type McpServerResource, type McpToolResource, type RemoteNode } from '../../api';
+import { connectionsApi } from '../../shared/api/resources/connections';
+import type { McpServerResource, McpToolResource, RemoteNode } from '../../shared/api/types';
 import { SectionLabel, TMPanel } from '../../app/display';
 import { errorMessage, formatNumber } from '../../app/formatters';
 import { useRuntime } from '../../app/RuntimeProvider';
@@ -24,7 +25,7 @@ export function ToolsRoutingPanel() {
   useEffect(() => {
     if (!ready) return;
     let disposed = false;
-    void Promise.all([api.mcpServers(), api.mcpTools(), api.remoteNodes(true)])
+    void Promise.all([connectionsApi.mcpServers(), connectionsApi.mcpTools(), connectionsApi.remoteNodes(true)])
       .then(([servers, tools, nodes]) => {
         if (!disposed) {
           setServers(servers);
@@ -49,9 +50,9 @@ export function ToolsRoutingPanel() {
     try {
       await operation();
       const [nextServers, nextTools, nextNodes] = await Promise.all([
-        api.mcpServers(),
-        api.mcpTools(),
-        api.remoteNodes(true),
+        connectionsApi.mcpServers(),
+        connectionsApi.mcpTools(),
+        connectionsApi.remoteNodes(true),
       ]);
       setServers(nextServers);
       setTools(nextTools.data);
@@ -68,7 +69,7 @@ export function ToolsRoutingPanel() {
     event.preventDefault();
     if (!mcpDraft.name.trim() || !mcpDraft.endpoint.trim()) return;
     void mutate(async () => {
-      await api.createMcpServer({
+      await connectionsApi.createMcpServer({
         name: mcpDraft.name.trim(),
         transport: mcpDraft.transport,
         enabled: true,
@@ -83,7 +84,7 @@ export function ToolsRoutingPanel() {
     event.preventDefault();
     if (!nodeDraft.name.trim() || !nodeDraft.url.trim()) return;
     void mutate(async () => {
-      await api.createRemoteNode({
+      await connectionsApi.createRemoteNode({
         name: nodeDraft.name.trim(),
         url: nodeDraft.url.trim(),
         api_key_env: nodeDraft.api_key_env.trim() || null,
@@ -166,14 +167,14 @@ export function ToolsRoutingPanel() {
                 </div>
                 <button
                   disabled={busy}
-                  onClick={() => void mutate(() => api.updateMcpServer(server.id, !server.enabled))}
+                  onClick={() => void mutate(() => connectionsApi.updateMcpServer(server.id, !server.enabled))}
                   type="button"
                 >
                   {server.enabled ? tr('停用', 'Disable') : tr('启用', 'Enable')}
                 </button>
                 <button
                   disabled={busy}
-                  onClick={() => void mutate(() => api.deleteMcpServer(server.id))}
+                  onClick={() => void mutate(() => connectionsApi.deleteMcpServer(server.id))}
                   type="button"
                 >
                   {tr('删除', 'Delete')}
@@ -248,7 +249,7 @@ export function ToolsRoutingPanel() {
                 </div>
                 <button
                   disabled={busy}
-                  onClick={() => void mutate(() => api.deleteRemoteNode(node.id))}
+                  onClick={() => void mutate(() => connectionsApi.deleteRemoteNode(node.id))}
                   type="button"
                 >
                   {tr('删除', 'Delete')}

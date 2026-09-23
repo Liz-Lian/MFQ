@@ -12,11 +12,6 @@ export function QuantizationPage() {
   const workspace = useQuantizationWorkspace();
   return (
     <QuantizationContext.Provider value={workspace}>
-      {workspace.error && (
-        <div role="alert" className="error-banner">
-          {workspace.error}
-        </div>
-      )}
       <PanelDeck labels={workspace.panelLabels} page="lab-quantization">
         <ImatrixPanel key="imatrix" />
         <LineagePanel key="lineage" />

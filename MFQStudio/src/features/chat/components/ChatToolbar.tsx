@@ -1,7 +1,9 @@
 /** 按模型能力提供聊天模式、语音播放和即时推理开关。 */
 import type { CSSProperties } from 'react';
-import type { SessionMode } from '../../../api';
+import type { SessionMode } from '../../../shared/api/types';
 import { useChat } from '../ChatProvider';
+import { useConversationSelector } from '../state/conversationStore';
+import { useVoiceLevel } from '../../voice/voiceLevelStore';
 import { useSettings } from '../../settings/SettingsProvider';
 import { Icon } from '../../../app/display';
 import { Switch } from '../../../shared/ui/Switch';
@@ -13,8 +15,12 @@ const MODE_LABELS: Record<SessionMode, [string, string]> = {
 /** 展示当前会话允许的输入与推理选项，所有操作写入所属领域。 */
 export function ChatToolbar() {
   const { settings, updateSettings, tr, english } = useSettings();
+  const active = useConversationSelector(
+    (state) => state.sessions.find((session) => session.id === state.activeId) ?? null,
+  );
+  const voiceLevel = useVoiceLevel();
   const {
-    conversation: { active, conversationReady },
+    conversation: { conversationReady },
     inference,
     voice,
     busy,
@@ -33,7 +39,7 @@ export function ChatToolbar() {
     reasoningValues,
     updateGlobalInference,
   } = inference;
-  const { voiceState, voiceLevel } = voice;
+  const { voiceState } = voice;
   const mode = active?.mode ?? 'text';
   return (
     <>

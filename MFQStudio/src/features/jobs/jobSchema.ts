@@ -1,5 +1,5 @@
 /** 解析任务表单字段的类型与初始值，并识别任务终止状态。 */
-import { JobResource, JsonSchemaProperty } from '../../api';
+import { JobResource, JsonSchemaProperty } from '../../shared/api/types';
 
 /** 根据任务字段定义生成初始值，支持可空联合类型。 */
 export function schemaDefault(property: JsonSchemaProperty): unknown {

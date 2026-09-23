@@ -1,34 +1,31 @@
 /** 管理会话列表、选中会话与消息历史，所有异步回写绑定当前连接和会话。 */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import {
-  api,
-  type Session,
-  type Message,
-  type ResponseResource,
-  type SessionMode,
-} from '../../../api';
+import { sessionsApi } from '../../../shared/api/resources/sessions';
+import type { SessionMode } from '../../../shared/api/types';
 import { useRuntime } from '../../../app/RuntimeProvider';
 import { errorMessage } from '../../../app/formatters';
+import { useConversationStore } from '../state/conversationStore';
 
 /** 首次打开聊天才加载会话，切换时取消旧历史请求，跨页面保留已加载状态。 */
 export function useConversationSessions(enabled: boolean, generationBusy: boolean) {
   const { ready, connectionRevision, selectedModel, setSelectedModel, models, instances } =
     useRuntime();
-  const [sessions, setSessions] = useState<Session[]>([]);
-  const [activeId, setActiveId] = useState<string | null>(null);
-  const [messages, setMessages] = useState<Message[]>([]);
-  const [responses, setResponses] = useState<Record<string, ResponseResource>>({});
-  const [historyLoadedId, setHistoryLoadedId] = useState<string | null>(null);
+  const sessions = useConversationStore((state) => state.sessions);
+  const activeId = useConversationStore((state) => state.activeId);
+  const messages = useConversationStore((state) => state.messages);
+  const responses = useConversationStore((state) => state.responses);
+  const historyLoadedId = useConversationStore((state) => state.historyLoadedId);
+  const setSessions = useConversationStore((state) => state.setSessions);
+  const setActiveId = useConversationStore((state) => state.setActiveId);
+  const setMessages = useConversationStore((state) => state.setMessages);
+  const setResponses = useConversationStore((state) => state.setResponses);
   const [transitioning, setTransitioning] = useState(false);
   const [importRevision, setImportRevision] = useState(0);
   const [error, setError] = useState<string | null>(null);
   const version = useRef(0);
   const activeIdRef = useRef(activeId);
   activeIdRef.current = activeId;
-  const active = useMemo(
-    () => sessions.find((session) => session.id === activeId) ?? null,
-    [sessions, activeId],
-  );
+  const active = sessions.find((session) => session.id === activeId) ?? null;
   const modelAvailable =
     models.some((model) => model.id === selectedModel) ||
     instances.some(
@@ -42,20 +39,16 @@ export function useConversationSessions(enabled: boolean, generationBusy: boolea
 
   useEffect(() => {
     const request = ++version.current;
-    setSessions([]);
-    setActiveId(null);
-    setMessages([]);
-    setResponses({});
-    setHistoryLoadedId(null);
+    const store = useConversationStore.getState();
+    store.reset();
+    const epoch = useConversationStore.getState().epoch;
     setError(null);
     if (!ready || !enabled) return;
-    void api
+  void sessionsApi
       .listSessions()
       .then((next) => {
-        if (request !== version.current) return;
-        setSessions(next);
+        if (request !== version.current || !useConversationStore.getState().loadSessions(epoch, next)) return;
         const selected = next[0];
-        setActiveId(selected?.id ?? null);
         if (selected) setSelectedModel(selected.model);
       })
       .catch((cause) => {
@@ -67,29 +60,26 @@ export function useConversationSessions(enabled: boolean, generationBusy: boolea
   }, [ready, enabled, connectionRevision, importRevision, setSelectedModel]);
 
   useEffect(() => {
-    setHistoryLoadedId(null);
-    setMessages([]);
-    setResponses({});
     if (!activeId) return;
+    const store = useConversationStore.getState();
+    if (store.activeId !== activeId) return;
+    const epoch = store.epoch;
+    store.beginHistory(activeId);
     const controller = new AbortController();
     void Promise.all([
-      api.listMessages(activeId, controller.signal),
-      api.listResponses(activeId, controller.signal),
+      sessionsApi.listMessages(activeId, controller.signal),
+      sessionsApi.listResponses(activeId, controller.signal),
     ])
       .then(([nextMessages, nextResponses]) => {
         if (controller.signal.aborted) return;
-        setMessages(nextMessages);
-        setResponses(
-          Object.fromEntries(
-            nextResponses
-              .filter((response) => response.output_message_id)
-              .map((response) => [response.output_message_id!, response]),
-          ),
-        );
-        setHistoryLoadedId(activeId);
+        useConversationStore.getState().applyHistory(epoch, activeId, nextMessages, nextResponses);
       })
       .catch((cause) => {
-        if (!controller.signal.aborted) setError(errorMessage(cause));
+        if (
+          !controller.signal.aborted &&
+          epoch === useConversationStore.getState().epoch &&
+          activeId === useConversationStore.getState().activeId
+        ) setError(errorMessage(cause));
       });
     return () => controller.abort();
   }, [activeId, connectionRevision]);
@@ -98,15 +88,16 @@ export function useConversationSessions(enabled: boolean, generationBusy: boolea
     if (!active || generationBusy || !modelAvailable || active.model === selectedModel) return;
     let current = true;
     setTransitioning(true);
-    void api
+    const epoch = useConversationStore.getState().epoch;
+  void sessionsApi
       .forkSession(active.id, null, true, active.title, selectedModel)
       .then((replacement) => {
-        if (!current) return;
+        if (!current || epoch !== useConversationStore.getState().epoch || useConversationStore.getState().activeId !== active.id) return;
         setSessions((existing) => [replacement, ...existing]);
         setActiveId(replacement.id);
       })
       .catch((cause) => {
-        if (current) setError(errorMessage(cause));
+        if (current && epoch === useConversationStore.getState().epoch) setError(errorMessage(cause));
       })
       .finally(() => {
         if (current) setTransitioning(false);
@@ -120,12 +111,12 @@ export function useConversationSessions(enabled: boolean, generationBusy: boolea
   /** 切换会话及其绑定模型，历史请求在 effect 中按会话重建。 */
   const selectSession = useCallback(
     (id: string) => {
-      const session = sessions.find((candidate) => candidate.id === id);
+      const session = useConversationStore.getState().sessions.find((candidate) => candidate.id === id);
       if (!session || transitioning) return;
       setSelectedModel(session.model);
       setActiveId(id);
     },
-    [sessions, transitioning, setSelectedModel],
+    [transitioning, setSelectedModel, setActiveId],
   );
 
   /** 创建新的空会话，版本戳防止服务切换后的返回污染当前列表。 */
@@ -133,19 +124,20 @@ export function useConversationSessions(enabled: boolean, generationBusy: boolea
     async (mode: SessionMode = 'text') => {
       if (!selectedModel || transitioning) return;
       const request = version.current;
+      const epoch = useConversationStore.getState().epoch;
       setTransitioning(true);
       try {
-        const created = await api.createSession(selectedModel, mode);
-        if (request !== version.current) return;
+        const created = await sessionsApi.createSession(selectedModel, mode);
+        if (request !== version.current || epoch !== useConversationStore.getState().epoch) return;
         setSessions((current) => [created, ...current]);
         setActiveId(created.id);
       } catch (cause) {
-        if (request === version.current) setError(errorMessage(cause));
+        if (request === version.current && epoch === useConversationStore.getState().epoch) setError(errorMessage(cause));
       } finally {
         if (request === version.current) setTransitioning(false);
       }
     },
-    [selectedModel, transitioning],
+    [selectedModel, transitioning, setSessions, setActiveId],
   );
 
   return {

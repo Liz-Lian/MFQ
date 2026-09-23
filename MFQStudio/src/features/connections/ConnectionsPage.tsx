@@ -1,7 +1,7 @@
 /** 连接页面负责服务器配置草稿、凭据保存及服务重连，业务状态不流入应用外壳。 */
 import { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router';
-import { api } from '../../api';
+import { connectionsApi } from '../../shared/api/resources/connections';
 import { Icon, ScreenHeader, SectionLabel, SettingRow, TMPanel } from '../../app/display';
 import { errorMessage, formatBytes, formatNumber } from '../../app/formatters';
 import { STUDIO_PATHS } from '../../navigation';
@@ -18,6 +18,7 @@ import { modeTemplateSettings, type GenerationSettings } from '../settings/confi
 import { useSettings } from '../settings/SettingsProvider';
 import { ToolsRoutingPanel } from './ToolsRoutingPanel';
 import { MemorySettingsPanel } from './MemorySettingsPanel';
+import { toast } from '../../stores/toastStore';
 import { InferenceDefaultsPanel } from './InferenceDefaultsPanel';
 
 /** 提供运行配置、内存与缓存概览，以及连接页自己的保存和重载操作。 */
@@ -39,7 +40,6 @@ export function ConnectionsPage() {
   const [token, setToken] = useState('');
   const [credentialWritable, setCredentialWritable] = useState(false);
   const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
   useEffect(() => {
     setDraft(studio?.config ?? null);
   }, [studio]);
@@ -50,7 +50,9 @@ export function ConnectionsPage() {
         if (!disposed) setToken(value ?? '');
       })
       .catch((cause) => {
-        if (!disposed) setError(errorMessage(cause));
+        if (!disposed) {
+          toast.error(errorMessage(cause));
+        }
       });
     return () => {
       disposed = true;
@@ -64,14 +66,14 @@ export function ConnectionsPage() {
   async function save() {
     if (!draft || busy) return;
     setBusy(true);
-    setError(null);
     try {
       await configureStudio(draft);
       if (credentialWritable) await saveStudioCredential(token);
-      await reloadService();
+      const reconnected = await reloadService();
       setCredentialWritable(false);
+      if (reconnected) toast.success(tr('服务器设置已保存', 'Server settings saved'));
     } catch (cause) {
-      setError(errorMessage(cause));
+      toast.error(errorMessage(cause));
     } finally {
       setBusy(false);
     }
@@ -87,11 +89,6 @@ export function ConnectionsPage() {
           'Runtime service, connections, and model defaults.',
         )}
       />
-      {error && (
-        <p role="alert" className="error-banner">
-          {error}
-        </p>
-      )}
       <div className="server-page">
         {active && (
           <div className="server-active-notice">

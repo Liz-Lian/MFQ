@@ -1,5 +1,5 @@
 /** 管理界面与推理设置的默认值、本地读取及模型模式继承规则。 */
-import { RealtimeCapabilities, RuntimeStatus, SessionMode } from '../../api';
+import { RealtimeCapabilities, RuntimeStatus, SessionMode } from '../../shared/api/types';
 
 export type UiLanguage = "system" | "zh-CN" | "en";
 

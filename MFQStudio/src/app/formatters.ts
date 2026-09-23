@@ -1,5 +1,5 @@
 /** 统一应用的错误、数值、容量和时长展示格式。 */
-import { ApiError } from '../api';
+import { ApiError } from '../shared/api/client';
 
 /** 将服务端或普通异常转换为用户可见的错误信息。 */
 export function errorMessage(error: unknown): string {

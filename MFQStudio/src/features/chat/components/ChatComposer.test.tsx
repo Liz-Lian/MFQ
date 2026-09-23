@@ -5,6 +5,11 @@ import { beforeEach, expect, it, vi } from 'vitest';
 import { ChatComposer } from './ChatComposer';
 import { useDraftStore } from '../state/draftStore';
 
+vi.mock('../ChatAttachmentsProvider', () => ({
+  useChatAttachmentActions: () => ({ selectAttachments: vi.fn(), removeAttachment: vi.fn() }),
+  useChatAttachmentList: () => [],
+}));
+
 const props = {
   sessionId: 'session-a',
   ready: true,
@@ -12,14 +17,11 @@ const props = {
   recoveryNeeded: false,
   phase: 'idle' as const,
   placeholder: '',
-  attachments: [],
   attachmentAccept: '',
   toolbar: null,
   tr: (_zh: string, en: string) => en,
   onSend: vi.fn(async (_text: string, _accepted: () => void) => undefined),
   onStop: vi.fn(async () => undefined),
-  onSelectAttachments: vi.fn(),
-  onRemoveAttachment: vi.fn(),
   onError: vi.fn(),
 };
 

@@ -5,7 +5,7 @@ import userEvent from '@testing-library/user-event';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { Dialog } from './Dialog';
 import { Switch } from './Switch';
-import { Tooltip } from './Tooltip';
+import { Tooltip, TooltipProvider } from './Tooltip';
 import { ToastContainer } from './Toast';
 import { toast, useToastStore } from '../../stores/toastStore';
 
@@ -85,7 +85,6 @@ describe('Dialog', () => {
     await waitFor(() => expect(screen.getByRole('button', { name: '入口一' })).toHaveFocus());
   });
 });
-
 describe('Switch', () => {
   it('暴露名称和受控状态，空格键触发更新且不提交表单', async () => {
     const user = userEvent.setup();
@@ -117,11 +116,13 @@ describe('Tooltip', () => {
   it('键盘聚焦原生按钮时显示提示，Esc 可关闭', async () => {
     const user = userEvent.setup();
     render(
-      <Tooltip content="重新生成回答">
-        <button type="button" aria-label="重新生成">
-          R
-        </button>
-      </Tooltip>,
+      <TooltipProvider delayDuration={0}>
+        <Tooltip content="重新生成回答">
+          <button type="button" aria-label="重新生成">
+            R
+          </button>
+        </Tooltip>
+      </TooltipProvider>,
     );
     await user.tab();
     expect(await screen.findByRole('tooltip')).toHaveTextContent('重新生成回答');

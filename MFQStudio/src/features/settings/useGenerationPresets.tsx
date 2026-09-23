@@ -1,6 +1,7 @@
 /** 管理设置页的服务端生成预设、本地缓存和预设编辑状态。 */
 import { useEffect, useState, type Dispatch, type SetStateAction } from 'react';
-import { api, type SessionMode } from '../../api';
+import { presetsApi } from '../../shared/api/resources/presets';
+import type { SessionMode } from '../../shared/api/types';
 import { Icon } from '../../app/display';
 import { errorMessage } from '../../app/formatters';
 import { studioConfirm } from '../../studio';
@@ -35,7 +36,7 @@ export function useGenerationPresets(
   useEffect(() => {
     if (!ready) return;
     let disposed = false;
-    void api
+    void presetsApi
       .generationPresets()
       .then((items) => {
         if (!disposed) setPresets(items.map(storedPresetFromResource));
@@ -93,8 +94,8 @@ export function useGenerationPresets(
     try {
       const body = presetResourceBody(next, model, mode);
       const resource = existing?.id
-        ? await api.updateGenerationPreset(existing.id, body)
-        : await api.createGenerationPreset(body);
+        ? await presetsApi.updateGenerationPreset(existing.id, body)
+        : await presetsApi.createGenerationPreset(body);
       const saved = storedPresetFromResource(resource);
       setPresets((current) =>
         [...current.filter((item) => item.id !== saved.id && item.name !== selected), saved].slice(
@@ -121,7 +122,7 @@ export function useGenerationPresets(
     setBusy(true);
     try {
       const preset = presets.find((item) => item.name === selected);
-      if (preset?.id) await api.deleteGenerationPreset(preset.id);
+      if (preset?.id) await presetsApi.deleteGenerationPreset(preset.id);
       setPresets((current) => current.filter((item) => item.name !== selected));
       clearSelection();
       setStatus({ error: false, text: tr('预设已删除。', 'Preset deleted.') });

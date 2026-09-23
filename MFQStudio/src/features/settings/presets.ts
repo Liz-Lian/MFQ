@@ -1,5 +1,5 @@
 /** 管理生成预设的本地校验、设置快照及服务资源转换。 */
-import { GenerationPresetResource, SessionMode } from '../../api';
+import { GenerationPresetResource, SessionMode } from '../../shared/api/types';
 import { GenerationSettings, DEFAULT_SETTINGS } from './configuration';
 
 export type StoredPresetSettings = Pick<

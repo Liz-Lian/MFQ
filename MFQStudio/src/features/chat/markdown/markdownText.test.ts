@@ -1,6 +1,6 @@
 /** 验证模型文本换行修复不会破坏代码、JSON 和数学表达式。 */
 import { describe, expect, it } from 'vitest';
-import { normalizeEscapedMarkdownLineBreaks } from '../src/markdownText';
+import { normalizeEscapedMarkdownLineBreaks } from './markdownText';
 
 describe('转义 Markdown 换行', () => {
   it('恢复完整转义的段落和列表结构', () => {

@@ -3,7 +3,7 @@ import { lazy, Suspense, useSyncExternalStore } from 'react';
 import type { GenerationController } from '../state/generationController';
 
 const Markdown = lazy(() =>
-  import('../../../Markdown').then((module) => ({ default: module.Markdown })),
+  import('../markdown/Markdown').then((module) => ({ default: module.Markdown })),
 );
 
 interface StreamingMessageProps {

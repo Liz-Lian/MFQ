@@ -16,7 +16,7 @@ pnpm test:e2e
 ## 覆盖边界
 
 - `navigation.test.ts`：深链接、路由生成、尾部斜杠及未知地址回退。
-- `markdownText.test.ts`：转义换行恢复与代码、JSON、数学文本保护。
+- `src/features/chat/markdown/markdownText.test.ts`：转义换行恢复与代码、JSON、数学文本保护。
 - `eventStream.test.ts`：SSE 字节分片、换行、畸形 JSON、截断与取消清理。
 - `streamResponse.test.ts`：会话、序号、响应标识、业务终态和错误传播。
 - `src` 内的组件及状态测试：由对应业务模块维护，按用户可观察行为断言。

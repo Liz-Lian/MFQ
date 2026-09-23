@@ -20,9 +20,7 @@ CUDA_COMPONENTS = "\n".join(
     (CUDA_ROOT / "runtime" / name).read_text(encoding="utf-8")
     for name in ("server_components.h", "server_components.cpp")
 )
-STUDIO_APP = (ROOT / "MFQStudio" / "src" / "App.tsx").read_text(
-    encoding="utf-8"
-)
+STUDIO_APP = read_studio_sources('App.tsx', 'features/chat')
 STUDIO_AUDIO = read_studio_sources('realtimeAudio.ts', 'features/voice')
 
 
@@ -223,7 +221,7 @@ def test_cuda_uses_one_architecture_and_optional_component_registry() -> None:
 
 
 def test_studio_displays_capabilities_and_gates_voice_modes() -> None:
-    assert '(["text", "voice", "full_duplex"] as SessionMode[])' in STUDIO_APP
+    assert "(['text', 'voice', 'full_duplex'] as SessionMode[])" in STUDIO_APP
     assert "!feature.audio_input" in STUDIO_APP
     assert "!feature.full_duplex" in STUDIO_APP
     assert "features.mtp === true" in STUDIO_APP

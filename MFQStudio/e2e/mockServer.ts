@@ -36,11 +36,13 @@ interface MockOptions {
   failFirstSync?: boolean;
   /** 挂起生成请求直到用户调用取消接口。 */
   waitForCancel?: boolean;
+  /** 挂起生成直到测试显式释放，验证跨路由生成不会被卸载取消。 */
+  holdResponse?: boolean;
 }
 
 /** 为页面注册隔离的模拟 API，返回请求计数供验证生成幂等边界。 */
 export async function mockStudioServer(page: Page, options: MockOptions = {}) {
-  const state = { submissions: 0, cancellations: 0, unexpected: [] as string[] };
+  const state = { submissions: 0, cancellations: 0, unexpected: [] as string[], requests: [] as string[], releaseResponse: () => {} };
   let messages: Message[] = [];
   let responses: ResponseResource[] = [];
   let failedSync = false;
@@ -54,6 +56,7 @@ export async function mockStudioServer(page: Page, options: MockOptions = {}) {
   await page.route('**/api/v1/**', async (route) => {
     const path = new URL(route.request().url()).pathname;
     const method = route.request().method();
+    state.requests.push(`${method} ${path}`);
     const json = async (value: unknown) => route.fulfill({ json: value });
     if (path === '/api/v1/runtime/status')
       return json({
@@ -123,9 +126,10 @@ export async function mockStudioServer(page: Page, options: MockOptions = {}) {
     if (path === '/api/v1/sessions/session-1/responses' && method === 'POST') {
       state.submissions += 1;
       const body = route.request().postDataJSON() as StreamRequest;
-      if (options.waitForCancel)
+      if (options.waitForCancel || options.holdResponse)
         await new Promise<void>((resolve) => {
           releasePending = resolve;
+          state.releaseResponse = resolve;
         });
       const answer = 'A streamed answer with **formatted content**.';
       const responseId = `response-${state.submissions}`;

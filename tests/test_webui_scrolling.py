@@ -1,11 +1,9 @@
 """检查滚动容器与消息展示边界，适配独立滚动 hook。"""
 from pathlib import Path
-from tests.studio_sources import read_studio_sources
+from tests.studio_sources import read_studio_sources, read_studio_styles
 
 ROOT = Path(__file__).resolve().parents[1]
-CSS = (ROOT / "MFQStudio" / "src" / "styles.css").read_text(
-    encoding="utf-8"
-)
+CSS = read_studio_styles()
 APP = read_studio_sources('App.tsx', 'features/chat', 'features/settings')
 SCROLL = read_studio_sources('features/chat/hooks/useChatAutoScroll.ts')
 

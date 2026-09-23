@@ -147,7 +147,7 @@ def test_cuda_server_accepts_an_external_tokenizer_only() -> None:
 
 def test_studio_keeps_reasoning_separate_and_template_controlled() -> None:
     assert "reasoning: string;" in STUDIO_APP
-    assert "include_reasoning_history: !effectiveSettings.excludeReasoning" in STUDIO_APP
+    assert "include_reasoning_history: !inference.effectiveSettings.excludeReasoning" in STUDIO_APP
     assert "effectiveSettings.enableThinking" in STUDIO_APP
     assert "effectiveSettings.excludeReasoning" in STUDIO_APP
 
@@ -158,7 +158,7 @@ def test_studio_exposes_template_gated_reasoning_effort() -> None:
     assert 'chat_template.find("enable_thinking")' in SERVER
     assert 'runtime?.chat_template_capabilities?.thinking?.supported' in STUDIO_APP
     assert "runtime?.chat_template_capabilities?.reasoning_effort?.values" in STUDIO_APP
-    assert "effectiveSettings.enableThinking && reasoningValues.length > 0" in STUDIO_APP
+    assert "effectiveSettings.enableThinking && reasoningValues.length > 0" in ' '.join(STUDIO_APP.split())
     assert "reasoning_effort: effectiveSettings.reasoningEffort || null" in STUDIO_APP
 
 

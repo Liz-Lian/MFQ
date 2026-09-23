@@ -50,9 +50,7 @@ SERVER_SOURCE = (ROOT / "cpp_runtime" / "server" / "src" / "server.cpp").read_te
 REALTIME_GATEWAY = (
     ROOT / "mfq" / "runtime" / "minicpmo45_realtime.py"
 ).read_text(encoding="utf-8")
-STUDIO_APP = (ROOT / "MFQStudio" / "src" / "App.tsx").read_text(
-    encoding="utf-8"
-)
+STUDIO_APP = read_studio_sources('App.tsx', 'features/chat')
 STUDIO_REALTIME = read_studio_sources('realtimeAudio.ts', 'features/voice')
 
 
@@ -456,7 +454,7 @@ def test_minicpmo45_realtime_uses_official_demo_defaults():
     assert "const SPEAK_TOKENS = 20" in STUDIO_REALTIME
     assert "const PLAYBACK_DELAY_SECONDS = 0.2" in STUDIO_REALTIME
     assert "REALTIME_SYSTEM_PROMPTS" not in STUDIO_APP
-    assert "systemPrompt: effectiveSystemPrompt" in STUDIO_APP
+    assert "systemPrompt: value.systemPrompt.trim()" in STUDIO_APP
 
 
 def test_minicpmo45_realtime_preserves_official_first_tts_flush():

@@ -1,6 +1,7 @@
 /** 管理实时语音传输、采集、轮次调度和播放资源。 */
 import { runtimeRealtimeUrl } from '../../api';
-import { base64ToFloat32, float32ToBase64, StreamingLinearResampler, wavBlob } from './audioCodec';
+import { base64ToFloat32, float32ToBase64, wavBlob } from './audioCodec';
+import { AudioDevices } from './AudioDevices';
 import type { BufferedVoiceTurn, RealtimeCallbacks, RealtimeSessionConfig } from './realtimeTypes';
 
 const INPUT_RATE = 16_000;
@@ -8,7 +9,6 @@ const OUTPUT_RATE = 24_000;
 const CHUNK_SAMPLES = INPUT_RATE;
 const SPEAK_TOKENS = 20;
 const MAX_RESPONSE_DRAIN_STEPS = 120;
-const PLAYBACK_DELAY_SECONDS = 0.2;
 const SPEECH_RMS_THRESHOLD = 0.015;
 const SPEECH_START_SAMPLES = Math.round(INPUT_RATE * 0.08);
 const SPEECH_END_SAMPLES = Math.round(INPUT_RATE * 0.7);
@@ -17,12 +17,7 @@ const MIN_USER_TURN_SAMPLES = Math.round(INPUT_RATE * 0.12);
 /** 管理实时语音 WebSocket、麦克风采集、轮次归属及音频播放生命周期。 */
 export class RealtimeAudioController {
   private socket: WebSocket | null = null;
-  private stream: MediaStream | null = null;
-  private inputContext: AudioContext | null = null;
-  private outputContext: AudioContext | null = null;
-  private source: MediaStreamAudioSourceNode | null = null;
-  private capture: AudioWorkletNode | null = null;
-  private inputResampler: StreamingLinearResampler | null = null;
+  private readonly audio = new AudioDevices();
   private pending: Float32Array[] = [];
   private pendingLength = 0;
   private outbound: Array<{
@@ -46,8 +41,6 @@ export class RealtimeAudioController {
   private clientSessionId: string | null = null;
   private stopping = false;
   private stopPromise: Promise<void> | null = null;
-  private playAt = 0;
-  private playing = new Set<AudioBufferSourceNode>();
   private activeTurn: BufferedVoiceTurn | null = null;
   private completedTurns = new Map<string, BufferedVoiceTurn>();
   private completedTurnOrder: string[] = [];
@@ -68,12 +61,12 @@ export class RealtimeAudioController {
 
   /** 是否仍持有录音、连接或等待中的半双工响应。 */
   get active(): boolean {
-    return Boolean(this.inputContext || this.awaitingHalfDuplexResponse || this.socket);
+    return Boolean(this.audio.capturing || this.awaitingHalfDuplexResponse || this.socket);
   }
 
   /** 是否正在采集麦克风输入。 */
   get capturing(): boolean {
-    return Boolean(this.inputContext);
+    return Boolean(this.audio.capturing);
   }
 
   /** 返回当前启用的全双工模式。 */
@@ -89,7 +82,7 @@ export class RealtimeAudioController {
 
   /** 空闲时切换双工模式，必要时先关闭旧会话。 */
   async setFullDuplex(enabled: boolean): Promise<void> {
-    if (this.inputContext || this.awaitingHalfDuplexResponse) return;
+    if (this.audio.capturing || this.awaitingHalfDuplexResponse) return;
     if (this.socket) await this.stop();
     this.fullDuplexEnabled = enabled;
   }
@@ -111,7 +104,7 @@ export class RealtimeAudioController {
     if (this.clientSessionId && this.clientSessionId !== config.sessionId) {
       await this.stop();
     }
-    if (this.inputContext || this.awaitingHalfDuplexResponse) return;
+    if (this.audio.capturing || this.awaitingHalfDuplexResponse) return;
     this.clientSessionId = config.sessionId;
     if (this.socket?.readyState === WebSocket.OPEN && this.sessionReady) {
       if (capture) {
@@ -126,8 +119,7 @@ export class RealtimeAudioController {
       if (capture) {
         await this.startAudio();
       } else {
-        this.outputContext ??= new AudioContext({ sampleRate: OUTPUT_RATE });
-        await this.outputContext.resume();
+        await this.audio.ensureOutput();
       }
       const socket = new WebSocket(runtimeRealtimeUrl());
       this.socket = socket;
@@ -149,9 +141,9 @@ export class RealtimeAudioController {
 
   /** 按双工模式开始录音、提交半双工录音或停止当前会话。 */
   async toggleCapture(config: RealtimeSessionConfig): Promise<void> {
-    if (this.inputContext && !this.fullDuplexEnabled) {
+    if (this.audio.capturing && !this.fullDuplexEnabled) {
       await this.finishHalfDuplexInput();
-    } else if (this.inputContext) {
+    } else if (this.audio.capturing) {
       await this.stop();
     } else if (!this.awaitingHalfDuplexResponse) {
       await this.start(config);
@@ -164,7 +156,7 @@ export class RealtimeAudioController {
     if (!text) return;
     this.finishTurn();
     this.currentInputTurnId = turnId;
-    if (!this.inputContext) {
+    if (!this.audio.capturing) {
       this.halfDuplexPendingSteps += 1;
       this.awaitingHalfDuplexResponse = true;
       this.responseDrainSteps = 0;
@@ -207,8 +199,7 @@ export class RealtimeAudioController {
     await this.stopInputCapture();
     this.finishInputTurn();
     this.stopPlayback();
-    await this.outputContext?.close().catch(() => undefined);
-    this.outputContext = null;
+    await this.audio.close();
     this.pending = [];
     this.pendingLength = 0;
     this.outbound = [];
@@ -223,7 +214,6 @@ export class RealtimeAudioController {
     this.responseDrainSteps = 0;
     this.currentStepWasListen = false;
     this.sessionReady = false;
-    this.playAt = 0;
     this.finishTurn();
     this.responseMessageIds.clear();
     this.completedTurns.clear();
@@ -237,53 +227,20 @@ export class RealtimeAudioController {
   }
 
   private async startAudio(): Promise<void> {
-    this.stream = await navigator.mediaDevices.getUserMedia({
-      audio: {
-        channelCount: 1,
-        echoCancellation: true,
-        noiseSuppression: true,
-        autoGainControl: true,
-      },
-    });
-    try {
-      this.inputContext = new AudioContext({ sampleRate: INPUT_RATE });
-    } catch {
-      this.inputContext = new AudioContext();
-    }
-    this.inputResampler = new StreamingLinearResampler(
-      this.inputContext.sampleRate,
-      INPUT_RATE,
-    );
-    this.outputContext ??= new AudioContext({ sampleRate: OUTPUT_RATE });
-    await Promise.all([this.inputContext.resume(), this.outputContext.resume()]);
-    await this.inputContext.audioWorklet.addModule("/pcm-capture-worklet.js");
-    this.source = this.inputContext.createMediaStreamSource(this.stream);
-    this.capture = new AudioWorkletNode(this.inputContext, "pcm-capture");
-    const silent = this.inputContext.createGain();
-    silent.gain.value = 0;
-    this.source.connect(this.capture).connect(silent).connect(this.inputContext.destination);
-    this.capture.port.onmessage = (event: MessageEvent<Float32Array>) => this.queueInput(event.data);
+    await this.audio.startCapture((samples) => this.queueInput(samples));
   }
 
   private async stopInputCapture(): Promise<void> {
-    this.stream?.getTracks().forEach((track) => track.stop());
-    this.stream = null;
-    this.source?.disconnect();
-    this.capture?.disconnect();
-    await this.inputContext?.close().catch(() => undefined);
-    this.inputContext = null;
-    this.inputResampler = null;
-    this.source = null;
-    this.capture = null;
+    await this.audio.stopCapture();
   }
 
   private queueInput(samples: Float32Array): void {
-    if (!this.inputContext) return;
+    if (!this.audio.capturing) return;
     let energy = 0;
     for (const sample of samples) energy += sample * sample;
     const rms = Math.sqrt(energy / Math.max(1, samples.length));
     this.callbacks.onLevel(Math.min(1, rms * 10));
-    const converted = this.inputResampler?.push(samples) ?? new Float32Array(samples);
+    const converted = this.audio.convert(samples);
     if (!converted.length) return;
     this.trackUserInput(converted, rms);
     this.pending.push(converted);
@@ -414,7 +371,7 @@ export class RealtimeAudioController {
   }
 
   private async finishHalfDuplexInput(): Promise<void> {
-    if (!this.inputContext || this.fullDuplexEnabled) return;
+    if (!this.audio.capturing || this.fullDuplexEnabled) return;
     await this.stopInputCapture();
     this.finishInputTurn();
     const tail = this.drainPending();
@@ -640,30 +597,11 @@ export class RealtimeAudioController {
   }
 
   private playAudio(samples: Float32Array, sampleRate: number): void {
-    if (!this.playbackEnabled || !samples.length || !this.outputContext) return;
-    const context = this.outputContext;
-    const buffer = context.createBuffer(1, samples.length, sampleRate);
-    buffer.copyToChannel(new Float32Array(samples), 0);
-    const source = context.createBufferSource();
-    source.buffer = buffer;
-    source.connect(context.destination);
-    this.playAt = Math.max(this.playAt, context.currentTime + PLAYBACK_DELAY_SECONDS);
-    source.start(this.playAt);
-    this.playAt += buffer.duration;
-    this.playing.add(source);
-    source.onended = () => this.playing.delete(source);
+    if (this.playbackEnabled) this.audio.play(samples, sampleRate);
   }
 
   private stopPlayback(): void {
-    for (const source of this.playing) {
-      try {
-        source.stop();
-      } catch {
-        // 音频源可能已经自然播放结束。
-      }
-    }
-    this.playing.clear();
-    if (this.outputContext) this.playAt = this.outputContext.currentTime;
+    this.audio.stopPlayback();
   }
 
   private fail(error: unknown): void {

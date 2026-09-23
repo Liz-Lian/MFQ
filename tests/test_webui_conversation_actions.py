@@ -1,12 +1,10 @@
 """检查会话操作契约；完整发送、取消与恢复由浏览器测试覆盖。"""
 from pathlib import Path
-from tests.studio_sources import read_studio_sources
+from tests.studio_sources import read_studio_sources, read_studio_styles
 
 ROOT = Path(__file__).resolve().parents[1]
-CSS = (ROOT / "MFQStudio" / "src" / "styles.css").read_text(
-    encoding="utf-8"
-)
-APP = read_studio_sources('App.tsx', 'features/chat')
+CSS = read_studio_styles()
+APP = read_studio_sources('App.tsx', 'features/chat', 'features/models', 'app')
 GENERATION = read_studio_sources('features/chat/state/generationController.ts')
 
 
@@ -22,7 +20,7 @@ def test_user_messages_can_be_edited_and_assistant_messages_regenerated() -> Non
     assert "async function saveEdit(message: Message)" in APP
     assert "setEditDraft({ messageId: message.id, text: parts.text })" in APP
     assert "const rewound = await api.rewindSession(" in APP
-    assert "messages.slice(0, messageIndex)" in APP
+    assert "messages.slice(0, index)" in APP
     assert "await generate(rewound, parts, false)" in APP
     assert "expected_revision: session.revision" in APP
     assert 'tr("保存", "Save")' in APP
@@ -33,7 +31,10 @@ def test_user_messages_can_be_edited_and_assistant_messages_regenerated() -> Non
 
 def test_regenerate_rewinds_to_the_preceding_user_message() -> None:
     assert "async function regenerate(message: Message)" in APP
-    assert "for (let cursor = index - 1; cursor >= 0; cursor -= 1)" in APP
+    actions = read_studio_sources('features/chat/hooks/useMessageActions.ts')
+    assert '.slice(0, index)' in actions
+    assert '.reverse()' in actions
+    assert ".find((item) => item.role === 'user')" in actions
     assert "api.rewindSession(" in APP
     assert "user.id," in APP
     assert "await generate(rewound, user.parts, false)" in APP
@@ -50,14 +51,15 @@ def test_stop_generation_cancels_the_server_before_aborting_the_stream() -> None
 def test_generation_does_not_inject_a_hidden_system_prompt() -> None:
     assert "LANGUAGE_CONSISTENCY_PROMPT" not in APP
     assert "Before answering, identify the language" not in APP
-    assert "const effectiveSystemPrompt = effectiveSettings.systemPrompt.trim()" in APP
+    assert "system_prompt: inference.effectiveSettings.systemPrompt.trim()" in APP
 
 
 def test_media_attachments_are_previewed_uploaded_and_sent_as_typed_parts() -> None:
     assert "const [attachments, setAttachments]" in APP
     assert "api.uploadMedia(attachment.file)" in APP
     assert 'accept={attachmentAccept}' in APP
-    assert 'type: "video"' in APP
+    assert 'type: attachment.kind' in APP
+    assert 'mediaMetadata(attachment.file, attachment.kind)' in APP
     assert "<MediaPartView" in APP
     assert ".attachment-tray" in CSS
 
@@ -66,12 +68,12 @@ def test_generation_tracks_the_exact_target_message() -> None:
     assert "item.request_id === run.id" in GENERATION
     assert "this.active !== run" in GENERATION
     assert "response.output_message_id" in GENERATION
-    assert "setMessages(persisted)" in APP
+    assert "current.setMessages(messages)" in APP
     assert "messages.pop()" not in APP
 
 
 def test_runtime_controls_wait_until_the_runtime_is_ready() -> None:
-    assert 'const runtimeReady = isRuntimeReady(initialRuntime?.runtime_state);' in APP
-    assert 'if (isRuntimeReady(status?.runtime_state)) {' in APP
-    assert 'if (!instanceId || !isRuntimeReady(selectedRuntimeInstance?.state)) return;' in APP
-    assert APP.count('disabled={busy || instance.state !== "ready"}') == 2
+    assert 'isRuntimeReady(status.runtime_state)' in APP
+    assert 'Promise.resolve<RuntimeModel[]>([])' in APP
+    assert "instance.state !== 'ready'" in APP
+    assert 'ready || location.pathname' in APP

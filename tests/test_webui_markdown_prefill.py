@@ -1,13 +1,13 @@
 """检查富文本与预填充指标展示，保留原生推理计时契约。"""
 from pathlib import Path
-from tests.studio_sources import read_studio_sources
+from tests.studio_sources import read_studio_sources, read_studio_styles
 
 ROOT = Path(__file__).resolve().parents[1]
 WEB = ROOT / "MFQStudio"
 APP = read_studio_sources('App.tsx', 'features/chat', 'features/runtime')
 API = read_studio_sources('api.ts', 'shared/api')
 MARKDOWN = (WEB / "src" / "Markdown.tsx").read_text(encoding="utf-8")
-CSS = (WEB / "src" / "styles.css").read_text(encoding="utf-8")
+CSS = read_studio_styles()
 PACKAGE = (WEB / "package.json").read_text(encoding="utf-8")
 SERVER_HEADER = (ROOT / "cpp_runtime" / "server" / "include" / "mfq" / "server.h").read_text(
     encoding="utf-8"

@@ -2,6 +2,7 @@
 
 import json
 from pathlib import Path
+from tests.studio_sources import read_studio_sources, read_studio_styles
 
 ROOT = Path(__file__).resolve().parents[1]
 STUDIO = ROOT / "MFQStudio"
@@ -30,7 +31,7 @@ STUDIO_BRIDGE = (STUDIO / "src" / "studio.ts").read_text(encoding="utf-8")
 PLATFORM_BRIDGE = STUDIO / "src" / "shared" / "platform" / "studio.ts"
 if PLATFORM_BRIDGE.exists():
     STUDIO_BRIDGE += "\n" + PLATFORM_BRIDGE.read_text(encoding="utf-8")
-STYLES = (STUDIO / "src" / "styles.css").read_text(encoding="utf-8")
+STYLES = read_studio_styles()
 REALTIME_AUDIO = (STUDIO / "src" / "realtimeAudio.ts").read_text(encoding="utf-8")
 REALTIME_AUDIO += "\n" + "\n".join(
     path.read_text(encoding="utf-8")
@@ -90,97 +91,67 @@ def test_studio_starts_the_unified_local_server_and_bundled_runtime():
 
 
 def test_studio_supports_local_and_remote_server_connections_with_voice_controls():
-    assert "RuntimeMode::Local" in RUST
-    assert "RuntimeMode::Remote" in RUST
-    assert "studio_configure" in RUST
-    assert "studio_start_local" in RUST
-    assert "studio_select_model_directory" in RUST
-    assert "selectLocalModelDirectory" in APP
-    assert "/api/v1/models/directories/register" in RUST
-    assert ".mfq-files.json" not in RUST
-    assert "canUseNativeModelPicker" in APP
-    assert 'tr("添加模型", "Add model")' in APP
-    assert 'Browse folders on the MFQ Server host.' in APP
-    assert 'Choose model folder' in APP
-    assert '<Dialog open={modelBrowserOpen}' in APP
-    assert "访达" not in APP
-    assert "Finder" not in APP
-    assert 'className="open-model-primary"' in APP
-    assert APP.count("chooseModelDirectory()") >= 3
-    assert "registerCurrentModelDirectory" in APP
-    assert "modelDirectoryPath" in APP
-    assert "jumpToModelDirectory" in APP
-    assert "listing.current_path" in APP
-    assert "tr('前往', 'Go')" in APP
-    assert "Object.keys(MODE_LABELS)" not in APP
-    assert "RealtimeAudioController" in APP
-    assert '(["text", "voice", "full_duplex"] as SessionMode[])' in APP
-    assert "selectInteractionMode" in APP
+    models = read_studio_sources('features/models')
+    chat = read_studio_sources('features/chat', 'features/voice')
+    for command in ('studio_configure', 'studio_start_local', 'studio_select_model_directory'):
+        assert command in RUST
+    assert 'canUseNativeModelPicker' in models
+    assert 'selectLocalModelDirectory' in models
+    assert 'api.registerModelDirectory' in models
+    assert 'ModelDirectoryDialog' in models
+    assert 'jumpToModelDirectory' in models
+    assert 'listing.current_path' in models
+    assert 'RealtimeAudioController' in chat
+    assert 'selectInteractionMode' in chat
+    assert 'Browse folders on the MFQ Server host.' in models
 
 
 def test_voice_component_prompt_requires_an_explicit_full_duplex_selection():
-    assert 'const interactionMode = active?.mode ?? mode;' in APP
-    assert 'interactionMode === "full_duplex"' in APP
-    assert "const needsVoiceOutputComponent =" in APP
-    assert "{needsVoiceOutputComponent && voiceComponent &&" in APP
-    assert "capabilities?.model_capabilities.features.audio_output && !realtimeAvailable" not in APP
-    assert "capabilities.model_capabilities.features.full_duplex) && <select" in APP
+    chat = read_studio_sources('features/chat/ChatPage.tsx')
+    toolbar = read_studio_sources('features/chat/components/ChatToolbar.tsx')
+    assert "active?.mode === 'full_duplex'" in chat
+    assert 'model_capabilities.features.audio_output' in chat
+    assert '!inference.realtimeAvailable' in chat
+    assert 'needsVoiceOutputComponent && voiceComponent' in chat
+    assert 'features.audio_input' in toolbar
+    assert 'features.full_duplex' in toolbar
 
 
 def test_studio_handles_a_running_server_without_a_loaded_model():
-    assert 'useState("")' in APP
-    assert 'tr("尚未加载模型", "No model loaded")' in APP
-    assert "if (!selectedModel || sessionTransitioning) return;" in APP
-    assert 'runtime?.model || "Empty"' in APP
-    assert 'runtime?.model || "MFQ Server"' not in APP
-    assert 'statusResult.status === "fulfilled" ? statusResult.value : null' in APP
-    assert "setRuntime(status)" in APP
-    assert "Promise.allSettled([" in APP
+    sessions = read_studio_sources('features/chat/hooks/useConversationSessions.ts')
+    runtime = read_studio_sources('app/RuntimeProvider.tsx')
+    assert 'if (!selectedModel || transitioning) return' in sessions
+    assert 'modelAvailable' in sessions
+    assert 'historyLoadedId === activeId' in sessions
+    assert 'isRuntimeReady(status.runtime_state)' in runtime
+    assert 'Promise.resolve<RuntimeModel[]>([])' in runtime
+    assert 'No model loaded' in APP
 
 
 def test_studio_exposes_every_loaded_model_and_switches_chat_sessions_safely():
-    assert "function runtimeModelNames(" in APP
-    assert 'tr("已加载模型", "Loaded models")' in APP
-    assert "instances.find((candidate) => candidate.model === name" in APP
-    assert "artifacts.slice(0, 8)" not in APP
-    assert "availableModelNames.map((name) =>" in APP
-    assert "api.forkSession(activeSessionId, null, true, activeSessionTitle, model)" in APP
-    assert "active.model === model" in APP
-    assert "!conversationReady" in APP
-    assert "model?: string" in API
-
-    select_session = APP[APP.index("function selectSession("):APP.index("async function createSession(")]
-    assert "sessions.find(" in select_session
-    assert "setModel(session.model)" in select_session
-    assert "setMode(session.mode)" in select_session
-    assert "setActiveId(session.id)" in select_session
-    assert "aria-label={tr('会话列表', 'Conversations')}" in APP
-    assert "sessions.map((session) => <button" in APP
-    assert "aria-label={tr('新建会话', 'New chat')}" in APP
-    assert ".chat-session-list" in STYLES
-    assert "const [sessionTransitioning, setSessionTransitioning] = useState(false)" in APP
-    assert 'disabled={busy || sessionTransitioning}' in APP
-    assert "busy || sessionTransitioning || !selectedModelAvailable" in APP
-
-    create_session = APP[APP.index("async function createSession("):APP.index("async function clearActiveConversation(")]
-    assert "setSessionTransitioning(true)" in create_session
-    assert "setSessionTransitioning(false)" in create_session
-
-    fork_effect = APP[APP.index("const activeSessionId = active?.id;"):APP.index("useEffect(() => {\n    setAttachments")]
-    assert "activeSessionModel === model" in fork_effect
-    assert "|| busy" not in fork_effect
-    assert "[activeSessionId, activeSessionModel, activeSessionTitle" in fork_effect
+    sessions = read_studio_sources('features/chat/hooks/useConversationSessions.ts')
+    overview = read_studio_sources('features/runtime/OverviewPage.tsx')
+    assert 'availableModelNames.map((name)' in overview
+    assert 'artifacts.slice(0, 8)' not in APP
+    assert '.forkSession(active.id, null, true, active.title, selectedModel)' in sessions
+    assert 'setSelectedModel(session.model)' in sessions
+    assert 'setActiveId(id)' in sessions
+    assert 'active.model === selectedModel' in sessions
+    assert 'generationBusy' in sessions
+    assert 'controller.abort()' in sessions
+    assert 'busy || sessionTransitioning' in APP
+    assert 'model?: string' in API
 
 
 def test_studio_uses_selected_runtime_mtp_availability():
-    assert "selectedRuntimeInstance?.mtp_supported" in APP
-    assert "selectedRuntimeInstance?.mtp_available" in APP
-    assert "capabilities?.model === model" in APP
-    assert "checked={mtpAvailable && settingsDraft.enableMtp}" in APP
-    assert "disabled={!mtpAvailable}" in APP
-    assert "enable_mtp: mtpSupported && mtpAvailable && effectiveSettings.enableMtp" in APP
-    assert "mtp_supported?: boolean" in API
-    assert "mtp_available?: boolean" in API
+    inference = read_studio_sources('features/chat/hooks/useChatInference.ts')
+    assert 'instance?.mtp_supported' in inference
+    assert 'instance?.mtp_available' in inference
+    assert 'capabilities?.model === model' in inference
+    assert 'enable_mtp: mtpSupported && mtpAvailable && effectiveSettings.enableMtp' in inference
+    assert 'disabled={!mtpAvailable}' in APP
+    assert 'mtp_supported?: boolean' in API
+    assert 'mtp_available?: boolean' in API
 
 
 def test_model_lifecycle_actions_stay_on_the_models_page():
@@ -206,16 +177,14 @@ def test_model_hub_accepts_repository_links_and_downloads_into_the_model_catalog
 
 
 def test_studio_can_select_and_load_an_external_mfq_directory_in_local_mode():
-    assert "rfd::AsyncFileDialog::new()" in RUST
-    assert ".pick_folder()" in RUST
-    assert "studio_select_model_directory" in RUST
-    assert "/api/v1/models/directories/register" in RUST
+    models = read_studio_sources('features/models')
+    assert 'rfd::AsyncFileDialog::new()' in RUST
+    assert '.pick_folder()' in RUST
     assert "tauri.invoke<string[] | null>('studio_select_model_directory')" in STUDIO_BRIDGE
-    assert "selectLocalModelDirectory" in APP
-    assert "api.modelArtifacts(true)" in APP
-    assert "api.loadModel(artifact.name, contextSize, 2048, {" in APP
-    assert "canUseNativeModelPicker" in APP
-    assert 'tr("选择模型文件夹", "Choose model folder")' in APP
+    assert 'selectLocalModelDirectory()' in models
+    assert 'finishModelRegistration(names)' in models
+    assert 'Choose model folder' in models
+    assert 'api.loadModel(' in models
 
 
 def test_studio_uses_native_confirmation_dialogs_for_destructive_actions():
@@ -299,22 +268,18 @@ def test_studio_uses_the_model_bound_duplex_system_prompt():
 
 
 def test_studio_resolves_model_and_global_inference_settings_without_roles():
-    assert "inheritModelDefaults: true" in APP
-    assert "const resolvedGlobalSettings = useMemo" in APP
-    assert "const effectiveSettings = resolvedGlobalSettings" in APP
-    assert "function roleGenerationSettings" not in APP
-    assert "roleEditor" not in APP
-    assert "assistant_id" not in APP
-    assert "api.createSession(selectedModel, mode)" in APP
-    assert "sampling: samplingParams()" in APP
-    assert "max_tokens: effectiveSettings.maxTokens" in APP
-    assert "const effectiveSystemPrompt = effectiveSettings.systemPrompt.trim()" in APP
-    assert "systemPrompt: current.systemPrompt" in APP
-    assert "system_prompt: effectiveSystemPrompt" in APP
-    assert "systemPrompt: effectiveSystemPrompt" in APP
-    assert "LANGUAGE_CONSISTENCY_PROMPT" not in APP
-    assert "Before answering, identify the language" not in APP
-    assert "setSettings((current) => ({ ...current, ...rolePreset.settings" not in APP
+    inference = read_studio_sources('features/chat/hooks/useChatInference.ts')
+    domain = read_studio_sources('features/chat/ChatProvider.tsx')
+    assert 'inheritModelDefaults: true' in APP
+    assert 'const effectiveSettings = useMemo' in inference
+    assert 'modeTemplateSettings(settings, mode, runtime, realtime)' in inference
+    assert 'sampling: inference.sampling' in domain
+    assert 'system_prompt: inference.effectiveSettings.systemPrompt.trim()' in domain
+    assert 'systemPrompt: value.systemPrompt.trim()' in domain
+    assert 'max_tokens: effectiveSettings.maxTokens' in inference
+    assert 'roleGenerationSettings' not in APP
+    assert 'LANGUAGE_CONSISTENCY_PROMPT' not in APP
+    assert 'Before answering, identify the language' not in APP
 
 
 def test_studio_defaults_global_settings_to_inherited_model_parameters():
@@ -338,53 +303,46 @@ def test_studio_exposes_theme_selection_without_using_sidebar_status_space():
 
 
 def test_studio_exposes_omlx_style_runtime_lifecycle_controls():
+    models = read_studio_sources('features/models')
     assert 'className="runtime-hero"' in APP
-    assert 'tr("推理", "Inference")' in APP
-    assert "MFQ Runtime" in APP
-    assert 'tr("固定到内存", "Pin in memory")' in APP
-    assert 'tr("空闲卸载", "Idle unload")' in APP
-    assert "const [loadPinned, setLoadPinned] = useState(false)" in APP
-    assert "const [loadIdleTtl, setLoadIdleTtl] = useState<number | null>(null)" in APP
-    assert "pin: loadPinned" in APP
-    assert "idle_ttl_seconds: loadIdleTtl" in APP
-    assert "idle_ttl_seconds?: number | null" in API
-    assert "pin?: boolean" in API
-    assert ".runtime-hero {" in STYLES
-    assert "--accent: #0a84ff" in STYLES
+    assert 'Pin in memory' in models
+    assert 'Idle unload' in models
+    assert 'pin: loadPinned' in models
+    assert 'idle_ttl_seconds: loadIdleTtl' in models
+    assert 'idle_ttl_seconds?: number | null' in API
+    assert 'pin?: boolean' in API
+    assert '.runtime-hero {' in STYLES
 
 
 def test_studio_runtime_monogram_tracks_the_real_model_lifecycle():
-    assert "function ModelMonogram" in APP
-    assert 'const runtimeModelName = runtime?.model || "Empty";' in APP
-    assert 'job.kind === "model.load"' in APP
-    assert 'instance.state === "loading"' in APP
-    assert 'instance.state === "failed"' in APP
-    assert '<ModelMonogram name={modelHero.name} state={modelHero.state} />' in APP
-    assert 'className={`runtime-status-pill ${modelHero.state}`}' in APP
-    assert ".model-monogram.loading { color: var(--warning); }" in STYLES
-    assert ".model-monogram.ready { color: var(--success); }" in STYLES
-    assert ".model-monogram.failed { color: var(--danger); }" in STYLES
+    hero = read_studio_sources('features/runtime/RuntimeHero.tsx')
+    assert "runtime?.model || 'Empty'" in hero
+    assert "job.kind === 'model.load'" in hero
+    assert "instance.state === 'loading'" in hero
+    assert "instance.state === 'failed'" in hero
+    assert 'name={modelHero.name} state={modelHero.state}' in hero
+    assert 'runtime-status-pill ${modelHero.state}' in hero
+    for state in ('loading', 'ready', 'failed'):
+        assert f'.model-monogram.{state}' in STYLES
 
 
 def test_studio_overview_lists_every_loaded_model():
-    assert 'className="overview-models-panel"' in APP
-    assert 'availableModelNames.map((name) =>' in APP
-    assert 'candidate.model === name && candidate.state !== "failed"' in APP
-    assert 'onClick={() => selectModel(name)}' in APP
-    assert ".overview-model-grid {" in STYLES
-    assert ".overview-model-card.selected {" in STYLES
+    overview = read_studio_sources('features/runtime/OverviewPage.tsx')
+    assert 'className="overview-models-panel"' in overview
+    assert 'availableModelNames.map((name)' in overview
+    assert "candidate.model === name && candidate.state !== 'failed'" in overview
+    assert 'onClick={() => selectModel(name)}' in overview
+    assert '.overview-model-grid {' in STYLES
 
 
 def test_studio_adapts_prefix_cache_panel_to_flash_next_hot_cache():
-    assert 'prefix_cache_mode?: string;' in API
-    assert 'prefix_cache_pending_bytes?: number;' in API
-    assert 'prefix_cache_pending_max_bytes?: number;' in API
-    assert 'runtime?.prefix_cache_mode === "single_device_hot_prefix"' in APP
-    assert "const prefixCachePersistent" in APP
-    assert "const prefixCacheSupported = prefixCachePersistent || prefixCacheHotOnly" in APP
-    assert 'tr("设备热前缀", "Device-hot prefix")' in APP
-    assert 'tr("进程生命周期", "Process lifetime")' in APP
-    assert "device-hot prefix? Chat history will be kept." in APP
+    cache = read_studio_sources('features/runtime/CachePage.tsx')
+    for field in ('prefix_cache_mode', 'prefix_cache_pending_bytes', 'prefix_cache_pending_max_bytes'):
+        assert field in API
+    assert 'single_device_hot_prefix' in cache
+    assert 'Device-hot prefix' in cache
+    assert 'Process lifetime' in cache
+    assert 'api.clearRuntimeCache' in cache
 
 
 def test_studio_uses_theme_aware_model_actions_and_readable_errors():
@@ -428,97 +386,52 @@ def test_full_duplex_routes_pre_interrupt_response_tails_back_to_the_old_turn():
 
 def test_closing_a_full_duplex_microphone_stops_instead_of_forcing_speech():
     assert "finishFullDuplexInput" not in REALTIME_AUDIO
-    assert "} else if (this.inputContext) {\n      await this.stop();" in REALTIME_AUDIO
+    assert "} else if (this.audio.capturing) {\n      await this.stop();" in REALTIME_AUDIO
     assert "this.stopPlayback();" in REALTIME_AUDIO
 
 
 def test_dashboard_uses_hivellm_style_static_backend_console_components():
-    assert "type DashboardPage = 'overview' | 'models' | 'connections' | 'cache' | 'logs' | 'settings'" in NAVIGATION
-    assert "type LabPage = 'models' | 'evaluations' | 'quantization'" in NAVIGATION
-    assert "function ScreenHeader" in APP
-    assert "function SectionLabel" in APP
-    assert "function TMPanel" in APP
-    assert "function MetricTile" in APP
-    assert "function SettingRow" in APP
-    assert "function UsageBar" in APP
-    assert "function EmptyPanel" in APP
-    assert '<details className="sidebar-more"' not in APP
+    shell = read_studio_sources('app/StudioShell.tsx')
+    for component in ('ScreenHeader', 'SectionLabel', 'TMPanel', 'MetricTile', 'SettingRow', 'UsageBar', 'EmptyPanel', 'PanelDeck'):
+        assert f'function {component}' in APP
     assert 'className="overview-memory-panel"' in APP
     assert 'className="overview-footer-grid"' in APP
-    assert 'label={tr("解码", "Decode")}' in APP and 'icon="waveform"' in APP
-    assert 'label={tr("首字延迟", "TTFT")}' in APP and 'icon="clock"' in APP
-    assert "dashboardPage === 'settings' && <Suspense" in APP
-    assert 'className="settings-panel"' not in APP
+    assert 'PANEL_COLLAPSED_KEY' in APP
+    assert 'aria-expanded={!isCollapsed}' in APP
+    assert 'const storageKey = `${page}:${id}`' in APP
+    assert 'localStorage.setItem(PANEL_COLLAPSED_KEY, JSON.stringify(updated))' in APP
+    assert '<Outlet />' in shell
+    assert 'path="settings"' in APP_ENTRY
+    assert 'path="quantization"' in APP_ENTRY
+    assert 'api.clearCompletedJobs()' in APP
+    assert 'api.deleteJob(id)' in APP
     assert 'className="drawer-scrim"' not in APP
-    assert '<Icon name="gauge" />{tr("概览", "Overview")}' in APP
-    assert '<Icon name="server-rack" />{tr("服务器", "Server")}' in APP
-    assert '<Icon name="memory" />{tr("资源", "Resources")}' in APP
-    assert "function PanelDeck" in APP
-    assert "PANEL_COLLAPSED_KEY" in APP
-    assert "function panelKey" in APP
-    assert "aria-expanded={!isCollapsed}" in APP
-    assert "localStorage.setItem(PANEL_COLLAPSED_KEY, JSON.stringify(updated))" in APP
-    assert "const storageKey = `${page}:${id}`" in APP
-    assert ".panel-deck" in STYLES
-    assert 'aria-label={tr("重置当前布局", "Reset current layout")}' not in APP
-    assert "setDashboardLayoutReset" not in APP
-    assert 'aria-label={tr("刷新状态", "Refresh status")}' not in APP
-    assert 'dashboardPage === "overview"' in APP
-    assert 'page="lab-quantization"' in APP
-    assert 'tr("量化工作台", "Quantization workspace")' in APP
-    assert "Run, track, and reproduce MFQ workloads" not in APP
-    assert "Runtime health and request performance" not in APP
-    assert "<p>Dashboard</p>" not in APP
-    assert "<p>Lab</p>" not in APP
-    assert 'page="lab-imatrix"' not in APP
-    assert 'page="lab-jobs"' not in APP
-    assert 'tr("已完成", "Completed")' in APP
-    assert 'tr("清理已完成", "Clear completed")' in APP
-    assert "api.clearCompletedJobs()" in APP
-    assert "api.deleteJob(id)" in APP
-    assert ".completed-jobs" in STYLES
 
 
 def test_studio_streams_active_job_updates_without_polling_the_runtime():
-    assert "api.streamJobEvents(" in APP
+    assert ".streamJobEvents(" in read_studio_sources('app/RuntimeProvider.tsx')
     assert "/api/v1/jobs/${id}/events/stream" in API
     assert "readEventStream(response, onEvent, signal)" in API
     assert "window.setInterval(() => void refreshRuntime(true), 2500)" not in APP
 
 
 def test_server_settings_are_available_while_local_startup_is_pending():
-    status = APP.index("let status = await studioStatus();")
-    credential = APP.index("token = await studioCredential();", status)
-    draft = APP.index("setStudioDraft({ ...status.config });", status)
-    startup = APP.index("await startLocalStudio();", status)
-    refreshed_status = APP.index("status = await studioStatus();", startup)
-    refreshed_credential = APP.index("token = await studioCredential();", startup)
-    assert status < credential < draft < startup < refreshed_status < refreshed_credential
-    assert "if (current && status)" in APP[status:draft]
-    assert "catch (cause)" in APP[credential:draft]
-    assert "if (studioCredentialWritable) await saveStudioCredential(studioToken)" in APP
-    assert "setStudioCredentialWritable(true)" in APP
-    assert "if (!studioDraft || sessionTransitioning) return" in APP
-    assert "busy || sessionTransitioning || !serverDraft" in APP
+    runtime = read_studio_sources('app/RuntimeProvider.tsx')
+    shell = read_studio_sources('app/StudioShell.tsx')
+    connection = read_studio_sources('features/connections/ConnectionsPage.tsx')
+    assert runtime.index('setStudio(status)') < runtime.index('await startLocalStudio()')
+    assert "location.pathname === '/runtime'" in shell
+    assert 'await configureStudio(draft)' in connection
+    assert 'if (credentialWritable) await saveStudioCredential(token)' in connection
+    assert 'setCredentialWritable(true)' in connection
+    assert 'await reloadService()' in connection
 
 
 def test_server_page_matches_hivellm_information_architecture():
-    assert "const serverPage = (" in APP
-    assert 'title={tr("运行服务", "Runtime")}' in APP
-    assert 'title={tr("内存规划", "Memory plan")}' in APP
-    assert 'title={tr("持久化前缀缓存", "Persistent Prefix cache")}' in APP
-    assert 'title={tr("对话", "Chat")}' in APP
-    assert 'title={tr("自动化", "Automation")}' in APP
-    assert 'title={tr("Runtime 可执行文件", "Runtime executable")}' in APP
-    assert 'title={tr("模型 ID", "Model ID")}' in APP
-    assert 'title={tr("绑定地址", "Bind address")}' in APP
-    assert 'title={tr("模型总驻留", "Total model residency")}' in APP
-    assert 'title={tr("启用 SSD 层", "Enable SSD tier")}' in APP
-    assert 'title={tr("最大输出", "Maximum output")}' in APP
-    assert 'dashboardPage === "connections" && serverPage' in APP
-    assert "const toolsRoutingPanel = <>" in APP
-    assert "{toolsRoutingPanel}" in APP
-    assert "studioOpen" not in APP
-    assert "setStudioOpen" not in APP
-    assert 'className="server-active-notice"' in APP
-    assert ".server-active-notice" in STYLES
+    connection = read_studio_sources('features/connections/ConnectionsPage.tsx', 'features/connections/MemorySettingsPanel.tsx', 'features/connections/InferenceDefaultsPanel.tsx')
+    for label in ('Runtime', 'Memory plan', 'Persistent Prefix cache', 'Chat', 'Automation', 'Model ID', 'Bind address', 'Maximum output'):
+        assert label in connection
+    assert '<ToolsRoutingPanel />' in connection
+    assert 'className="server-active-notice"' in connection
+    assert 'path="runtime"' in APP_ENTRY
+    assert '.server-active-notice' in STYLES

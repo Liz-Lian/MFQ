@@ -2,6 +2,56 @@
 import { expect, test } from '@playwright/test';
 import { mockStudioServer } from './mockServer';
 
+test('页面按需请求自己的资源，概览不预载其他业务列表', async ({ page }) => {
+  const state = await mockStudioServer(page);
+  const errors: string[] = [];
+  page.on('pageerror', (error) => errors.push(error.message));
+  await page.goto('/#/');
+  await expect(page.getByRole('heading', { name: 'Overview', exact: true })).toBeVisible();
+  for (const path of ['sessions', 'datasets', 'evaluations', 'models', 'runtime/logs', 'runtime/profiles', 'mcp/servers']) {
+    expect(state.requests).not.toContain(`GET /api/v1/${path}`);
+  }
+  const routes = [
+    ['/evaluations', '/api/v1/evaluations'],
+    ['/model-hub', null],
+    ['/quantization', '/api/v1/jobs/kinds'],
+    ['/settings', '/api/v1/presets'],
+    ['/runtime', '/api/v1/mcp/servers'],
+    ['/resources', '/api/v1/runtime/profiles'],
+    ['/logs', '/api/v1/runtime/logs'],
+  ] as const;
+  for (const [path, endpoint] of routes) {
+    await page.evaluate((next) => { window.location.hash = next; }, path);
+    await expect(page.locator('main h1')).toBeVisible();
+    if (endpoint) await expect.poll(() => state.requests.includes(`GET ${endpoint}`)).toBe(true);
+  }
+  expect(errors).toEqual([]);
+  expect(state.unexpected).toEqual([]);
+});
+
+test('生成期间离开聊天页后返回仍完成同一次请求，草稿按会话保留', async ({ page }) => {
+  const state = await mockStudioServer(page, { holdResponse: true });
+  await page.goto('/#/chat');
+  const input = page.getByRole('textbox', { name: 'Message', exact: true });
+  await expect(input).toBeEnabled();
+  await input.fill('Continue in background');
+  await page.getByRole('button', { name: 'Send', exact: true }).click();
+  await expect.poll(() => state.submissions).toBe(1);
+  await page.evaluate(() => { window.location.hash = '/evaluations'; });
+  await expect(page.getByRole('heading', { name: 'Evaluations', exact: true })).toBeVisible();
+  state.releaseResponse();
+  await page.evaluate(() => { window.location.hash = '/chat'; });
+  await expect(page.locator('.message-assistant strong')).toHaveText('formatted content');
+  await expect(input).toBeEnabled();
+  expect(state.submissions).toBe(1);
+  expect(state.cancellations).toBe(0);
+  await input.fill('Draft survives navigation');
+  await page.evaluate(() => { window.location.hash = '/'; });
+  await expect(page.getByRole('heading', { name: 'Overview', exact: true })).toBeVisible();
+  await page.evaluate(() => { window.location.hash = '/chat'; });
+  await expect(input).toHaveValue('Draft survives navigation');
+});
+
 test('发送流式回答并完成历史同步', async ({ page }, testInfo) => {
   const state = await mockStudioServer(page);
   const errors: string[] = [];

@@ -1,12 +1,13 @@
+"""检查会话操作契约；完整发送、取消与恢复由浏览器测试覆盖。"""
 from pathlib import Path
+from tests.studio_sources import read_studio_sources
 
 ROOT = Path(__file__).resolve().parents[1]
 CSS = (ROOT / "MFQStudio" / "src" / "styles.css").read_text(
     encoding="utf-8"
 )
-APP = (ROOT / "MFQStudio" / "src" / "App.tsx").read_text(
-    encoding="utf-8"
-)
+APP = read_studio_sources('App.tsx', 'features/chat')
+GENERATION = read_studio_sources('features/chat/state/generationController.ts')
 
 
 def test_simplified_chat_can_clear_and_replace_the_active_session() -> None:
@@ -17,17 +18,17 @@ def test_simplified_chat_can_clear_and_replace_the_active_session() -> None:
     assert "setMessages([])" in APP
 
 
-def test_user_and_assistant_messages_can_be_edited() -> None:
+def test_user_messages_can_be_edited_and_assistant_messages_regenerated() -> None:
     assert "async function saveEdit(message: Message)" in APP
-    assert "setEditDraft({ messageId: message.id, ...parts })" in APP
+    assert "setEditDraft({ messageId: message.id, text: parts.text })" in APP
     assert "const rewound = await api.rewindSession(" in APP
     assert "messages.slice(0, messageIndex)" in APP
     assert "await generate(rewound, parts, false)" in APP
-    assert "rewound.revision" in APP
+    assert "expected_revision: session.revision" in APP
     assert 'tr("保存", "Save")' in APP
     assert 'tr("保存到新分支", "Save as branch")' not in APP
     assert ".message-editor" in CSS
-    assert "message.role === \"assistant\" && <textarea" in APP
+    assert 'message.role === "assistant" && <button' in APP
 
 
 def test_regenerate_rewinds_to_the_preceding_user_message() -> None:
@@ -39,11 +40,11 @@ def test_regenerate_rewinds_to_the_preceding_user_message() -> None:
 
 
 def test_stop_generation_cancels_the_server_before_aborting_the_stream() -> None:
-    stop = APP.index("async function stopGeneration()")
-    cancel = APP.index("await api.cancelResponse(active.id);", stop)
-    abort = APP.index("controller.abort();", cancel)
+    stop = GENERATION.index("stop = async")
+    cancel = GENERATION.index("await this.dependencies.cancel(run.sessionId, controller.signal)", stop)
+    abort = GENERATION.index("run.controller.abort()", cancel)
     assert cancel < abort
-    assert 'tr("正在停止生成", "Stopping generation")' in APP
+    assert "tr('正在停止生成', 'Stopping generation')" in APP
 
 
 def test_generation_does_not_inject_a_hidden_system_prompt() -> None:
@@ -62,8 +63,9 @@ def test_media_attachments_are_previewed_uploaded_and_sent_as_typed_parts() -> N
 
 
 def test_generation_tracks_the_exact_target_message() -> None:
-    assert "setLive({ reasoning: \"\", text: \"\", tools: [] })" in APP
-    assert "setLive(null)" in APP
+    assert "item.request_id === run.id" in GENERATION
+    assert "this.active !== run" in GENERATION
+    assert "response.output_message_id" in GENERATION
     assert "setMessages(persisted)" in APP
     assert "messages.pop()" not in APP
 

@@ -1,12 +1,13 @@
+"""检查滚动容器与消息展示边界，适配独立滚动 hook。"""
 from pathlib import Path
+from tests.studio_sources import read_studio_sources
 
 ROOT = Path(__file__).resolve().parents[1]
 CSS = (ROOT / "MFQStudio" / "src" / "styles.css").read_text(
     encoding="utf-8"
 )
-APP = (ROOT / "MFQStudio" / "src" / "App.tsx").read_text(
-    encoding="utf-8"
-)
+APP = read_studio_sources('App.tsx', 'features/chat', 'features/settings')
+SCROLL = read_studio_sources('features/chat/hooks/useChatAutoScroll.ts')
 
 
 def test_chat_scroller_owns_vertical_overflow() -> None:
@@ -16,14 +17,15 @@ def test_chat_scroller_owns_vertical_overflow() -> None:
 
 
 def test_streaming_render_follows_only_while_the_user_is_near_the_tail() -> None:
-    assert "const messageScrollerRef = useRef<HTMLDivElement | null>(null)" in APP
-    assert "const autoFollowOutputRef = useRef(true)" in APP
-    assert "distanceFromBottom <= 8" in APP
-    assert "if (!scroller || !autoFollowOutputRef.current) return" in APP
-    assert "scroller.scrollTop = scroller.scrollHeight" in APP
+    assert "const scrollerRef = useRef<HTMLDivElement | null>(null)" in SCROLL
+    assert "const followingRef = useRef(true)" in SCROLL
+    assert "scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight <= 80" in SCROLL
+    assert "if (!followingRef.current || frame !== null) return" in SCROLL
+    assert "scroller.scrollTop = scroller.scrollHeight" in SCROLL
     assert "onScroll={handleMessageScroll}" in APP
-    assert "scrollIntoView" not in APP
-    assert "currentVoiceMessages, liveVoice, live, busy" in APP
+    assert "scrollIntoView" not in SCROLL
+    assert "new ResizeObserver(follow)" in SCROLL
+    assert "observer.disconnect()" in SCROLL
 
 
 def test_sending_a_message_adds_an_optimistic_user_turn() -> None:

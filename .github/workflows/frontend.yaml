@@ -1,0 +1,64 @@
+# 检查 Studio 前端行为、类型和生产构建，并保留桌面端源码契约。
+name: Studio frontend
+
+on:
+  push:
+    branches: [master]
+    paths: ['MFQStudio/**', 'tests/studio_sources.py', 'tests/test_mfq_studio_source.py', 'tests/test_webui_*.py', 'tests/test_cpp_runtime_chat_template_source.py', 'tests/test_cpp_runtime_minicpmo45_source.py', 'tests/test_model_capabilities.py', '.github/workflows/frontend.yaml']
+  pull_request:
+    paths: ['MFQStudio/**', 'tests/studio_sources.py', 'tests/test_mfq_studio_source.py', 'tests/test_webui_*.py', 'tests/test_cpp_runtime_chat_template_source.py', 'tests/test_cpp_runtime_minicpmo45_source.py', 'tests/test_model_capabilities.py', '.github/workflows/frontend.yaml']
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  frontend:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: MFQStudio
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.30.1
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: MFQStudio/pnpm-lock.yaml
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Test behavior
+        run: pnpm test
+      - name: Check types
+        run: pnpm typecheck
+      - name: Build production assets
+        run: pnpm build
+      - name: Install browser test runtime
+        run: pnpm exec playwright install --with-deps chromium --only-shell
+      - name: Check desktop and mobile workflows
+        run: pnpm test:e2e
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: studio-browser-failures
+          path: MFQStudio/artifacts/playwright
+          retention-days: 7
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install source-contract test runner
+        run: python -m pip install pytest 'pydantic>=2.8.0'
+      - name: Check desktop and frontend contracts
+        working-directory: .
+        run: >-
+          python -m pytest tests/test_mfq_studio_source.py
+          tests/test_webui_conversation_actions.py tests/test_webui_scrolling.py
+          tests/test_webui_markdown_prefill.py tests/test_cpp_runtime_chat_template_source.py
+          tests/test_cpp_runtime_minicpmo45_source.py tests/test_model_capabilities.py -q

@@ -1,4 +1,6 @@
+"""检查架构能力声明和 Studio 按能力启用交互的行为契约。"""
 from pathlib import Path
+from tests.studio_sources import read_studio_sources
 
 from mfq.server.capabilities import capabilities_for_architecture
 from mfq.server.output_protocols import output_protocol_for_architecture
@@ -21,9 +23,7 @@ CUDA_COMPONENTS = "\n".join(
 STUDIO_APP = (ROOT / "MFQStudio" / "src" / "App.tsx").read_text(
     encoding="utf-8"
 )
-STUDIO_AUDIO = (ROOT / "MFQStudio" / "src" / "realtimeAudio.ts").read_text(
-    encoding="utf-8"
-)
+STUDIO_AUDIO = read_studio_sources('realtimeAudio.ts', 'features/voice')
 
 
 def test_minicpmo_family_registers_every_supported_modality() -> None:

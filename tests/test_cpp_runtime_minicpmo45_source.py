@@ -1,4 +1,6 @@
+"""检查 MiniCPM 原生执行与 Studio 语音接入的契约。"""
 from pathlib import Path
+from tests.studio_sources import read_studio_sources
 
 ROOT = Path(__file__).parents[1]
 CUDA_ROOT = ROOT / "cpp_runtime" / "backends" / "cuda"
@@ -51,9 +53,7 @@ REALTIME_GATEWAY = (
 STUDIO_APP = (ROOT / "MFQStudio" / "src" / "App.tsx").read_text(
     encoding="utf-8"
 )
-STUDIO_REALTIME = (
-    ROOT / "MFQStudio" / "src" / "realtimeAudio.ts"
-).read_text(encoding="utf-8")
+STUDIO_REALTIME = read_studio_sources('realtimeAudio.ts', 'features/voice')
 
 
 def test_minicpmo45_uses_native_composite_graph_and_canonical_names():

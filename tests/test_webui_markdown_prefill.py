@@ -1,9 +1,11 @@
+"""检查富文本与预填充指标展示，保留原生推理计时契约。"""
 from pathlib import Path
+from tests.studio_sources import read_studio_sources
 
 ROOT = Path(__file__).resolve().parents[1]
 WEB = ROOT / "MFQStudio"
-APP = (WEB / "src" / "App.tsx").read_text(encoding="utf-8")
-API = (WEB / "src" / "api.ts").read_text(encoding="utf-8")
+APP = read_studio_sources('App.tsx', 'features/chat', 'features/runtime')
+API = read_studio_sources('api.ts', 'shared/api')
 MARKDOWN = (WEB / "src" / "Markdown.tsx").read_text(encoding="utf-8")
 CSS = (WEB / "src" / "styles.css").read_text(encoding="utf-8")
 PACKAGE = (WEB / "package.json").read_text(encoding="utf-8")
@@ -22,9 +24,7 @@ SAMPLING = (
 def test_studio_bundles_markdown_sanitization_and_latex_dependencies() -> None:
     for dependency in ("dompurify", "katex", "marked"):
         assert f'"{dependency}"' in PACKAGE
-    assert 'import "katex/dist/katex.min.css"' in (
-        WEB / "src" / "main.tsx"
-    ).read_text(encoding="utf-8")
+    assert "import 'katex/dist/katex.min.css'" in MARKDOWN
 
 
 def test_rich_text_uses_sanitized_gfm_and_katex() -> None:
@@ -32,10 +32,10 @@ def test_rich_text_uses_sanitized_gfm_and_katex() -> None:
     assert "DOMPurify.sanitize" in MARKDOWN
     assert "gfm: true" in MARKDOWN
     assert "renderMathInElement" in MARKDOWN
-    assert '{ left: "$$", right: "$$", display: true }' in MARKDOWN
-    assert '{ left: "$", right: "$", display: false }' in MARKDOWN
-    assert 'ignoredTags: ["script", "noscript", "style", "textarea", "pre", "code"]' in MARKDOWN
-    assert 'button.className = "code-copy"' in MARKDOWN
+    assert "{ left: '$$', right: '$$', display: true }" in MARKDOWN
+    assert "{ left: '$', right: '$', display: false }" in MARKDOWN
+    assert "ignoredTags: ['script', 'noscript', 'style', 'textarea', 'pre', 'code']" in MARKDOWN
+    assert "button.className = 'code-copy'" in MARKDOWN
     assert ".rich-text table" in CSS
 
 

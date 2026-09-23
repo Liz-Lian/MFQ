@@ -1,3 +1,5 @@
+"""校验桌面集成与前端源码契约；业务交互由 Studio 的行为测试补充覆盖。"""
+
 import json
 from pathlib import Path
 
@@ -6,14 +8,35 @@ STUDIO = ROOT / "MFQStudio"
 TAURI = STUDIO / "src-tauri"
 RUST = (TAURI / "src" / "main.rs").read_text(encoding="utf-8")
 BUILD = (TAURI / "build.rs").read_text(encoding="utf-8")
-APP = (STUDIO / "src" / "App.tsx").read_text(encoding="utf-8")
+APP_ENTRY = (STUDIO / "src" / "App.tsx").read_text(encoding="utf-8")
+# 保持入口在前，允许组件与工具迁移到业务目录，避免把测试源码算作实现。
+APP = APP_ENTRY + "\n" + "\n".join(
+    path.read_text(encoding="utf-8")
+    for directory in ("app", "features")
+    for path in sorted((STUDIO / "src" / directory).rglob("*.ts*"))
+    if ".test." not in path.name and ".spec." not in path.name
+)
+NAVIGATION = (STUDIO / "src" / "navigation.ts").read_text(encoding="utf-8")
 API = (STUDIO / "src" / "api.ts").read_text(encoding="utf-8")
+API += "\n" + "\n".join(
+    path.read_text(encoding="utf-8")
+    for path in sorted((STUDIO / "src" / "shared" / "api").rglob("*.ts"))
+    if ".test." not in path.name
+)
 MAIN = (STUDIO / "src" / "main.tsx").read_text(encoding="utf-8")
 MARKDOWN = (STUDIO / "src" / "Markdown.tsx").read_text(encoding="utf-8")
 MARKDOWN_TEXT = (STUDIO / "src" / "markdownText.ts").read_text(encoding="utf-8")
 STUDIO_BRIDGE = (STUDIO / "src" / "studio.ts").read_text(encoding="utf-8")
+PLATFORM_BRIDGE = STUDIO / "src" / "shared" / "platform" / "studio.ts"
+if PLATFORM_BRIDGE.exists():
+    STUDIO_BRIDGE += "\n" + PLATFORM_BRIDGE.read_text(encoding="utf-8")
 STYLES = (STUDIO / "src" / "styles.css").read_text(encoding="utf-8")
 REALTIME_AUDIO = (STUDIO / "src" / "realtimeAudio.ts").read_text(encoding="utf-8")
+REALTIME_AUDIO += "\n" + "\n".join(
+    path.read_text(encoding="utf-8")
+    for path in sorted((STUDIO / "src" / "features" / "voice").glob("*.ts"))
+    if ".test." not in path.name
+)
 RELEASE_SCRIPT = (ROOT / "packaging" / "build_release_mac.sh").read_text(encoding="utf-8")
 
 
@@ -77,8 +100,9 @@ def test_studio_supports_local_and_remote_server_connections_with_voice_controls
     assert ".mfq-files.json" not in RUST
     assert "canUseNativeModelPicker" in APP
     assert 'tr("添加模型", "Add model")' in APP
-    assert 'tr("浏览 MFQ Server 所在设备上的文件夹。", "Browse folders on the MFQ Server host.")' in APP
-    assert 'tr("选择模型文件夹", "Choose model folder")' in APP
+    assert 'Browse folders on the MFQ Server host.' in APP
+    assert 'Choose model folder' in APP
+    assert '<Dialog open={modelBrowserOpen}' in APP
     assert "访达" not in APP
     assert "Finder" not in APP
     assert 'className="open-model-primary"' in APP
@@ -87,7 +111,7 @@ def test_studio_supports_local_and_remote_server_connections_with_voice_controls
     assert "modelDirectoryPath" in APP
     assert "jumpToModelDirectory" in APP
     assert "listing.current_path" in APP
-    assert 'tr("前往", "Go")' in APP
+    assert "tr('前往', 'Go')" in APP
     assert "Object.keys(MODE_LABELS)" not in APP
     assert "RealtimeAudioController" in APP
     assert '(["text", "voice", "full_duplex"] as SessionMode[])' in APP
@@ -117,7 +141,7 @@ def test_studio_handles_a_running_server_without_a_loaded_model():
 def test_studio_exposes_every_loaded_model_and_switches_chat_sessions_safely():
     assert "function runtimeModelNames(" in APP
     assert 'tr("已加载模型", "Loaded models")' in APP
-    assert "instances.map((instance) =>" in APP
+    assert "instances.find((candidate) => candidate.model === name" in APP
     assert "artifacts.slice(0, 8)" not in APP
     assert "availableModelNames.map((name) =>" in APP
     assert "api.forkSession(activeSessionId, null, true, activeSessionTitle, model)" in APP
@@ -130,12 +154,12 @@ def test_studio_exposes_every_loaded_model_and_switches_chat_sessions_safely():
     assert "setModel(session.model)" in select_session
     assert "setMode(session.mode)" in select_session
     assert "setActiveId(session.id)" in select_session
-    assert 'aria-label={tr("会话", "Session")}' in APP
-    assert "sessions.map((session) => <option" in APP
-    assert 'aria-label={tr("新建会话", "New session")}' in APP
-    assert ".chat-session-select" in STYLES
+    assert "aria-label={tr('会话列表', 'Conversations')}" in APP
+    assert "sessions.map((session) => <button" in APP
+    assert "aria-label={tr('新建会话', 'New chat')}" in APP
+    assert ".chat-session-list" in STYLES
     assert "const [sessionTransitioning, setSessionTransitioning] = useState(false)" in APP
-    assert "busy || sessionTransitioning || !sessions.length" in APP
+    assert 'disabled={busy || sessionTransitioning}' in APP
     assert "busy || sessionTransitioning || !selectedModelAvailable" in APP
 
     create_session = APP[APP.index("async function createSession("):APP.index("async function clearActiveConversation(")]
@@ -168,12 +192,10 @@ def test_model_lifecycle_actions_stay_on_the_models_page():
         APP.index("async function unloadInstance("):
         APP.index("const last = runtime?.last_request")
     ]
-    assert 'setDashboardPage("models")' in load_body
-    assert 'setView("dashboard")' in load_body
-    assert 'setView("lab")' not in load_body
-    assert 'setDashboardPage("models")' in unload_body
-    assert 'setView("dashboard")' in unload_body
-    assert 'setView("lab")' not in unload_body
+    assert 'navigate(STUDIO_PATHS.models)' in load_body
+    assert 'navigate(STUDIO_PATHS.quantization)' not in load_body
+    assert 'navigate(STUDIO_PATHS.models)' in unload_body
+    assert 'navigate(STUDIO_PATHS.quantization)' not in unload_body
 
 
 def test_model_hub_accepts_repository_links_and_downloads_into_the_model_catalog():
@@ -188,7 +210,7 @@ def test_studio_can_select_and_load_an_external_mfq_directory_in_local_mode():
     assert ".pick_folder()" in RUST
     assert "studio_select_model_directory" in RUST
     assert "/api/v1/models/directories/register" in RUST
-    assert 'tauri.invoke<string[] | null>("studio_select_model_directory")' in STUDIO_BRIDGE
+    assert "tauri.invoke<string[] | null>('studio_select_model_directory')" in STUDIO_BRIDGE
     assert "selectLocalModelDirectory" in APP
     assert "api.modelArtifacts(true)" in APP
     assert "api.loadModel(artifact.name, contextSize, 2048, {" in APP
@@ -200,7 +222,7 @@ def test_studio_uses_native_confirmation_dialogs_for_destructive_actions():
     assert "fn studio_confirm(message: String) -> bool" in RUST
     assert "rfd::MessageButtons::YesNo" in RUST
     assert "studio_confirm," in RUST
-    assert 'tauri.invoke<boolean>("studio_confirm", { message })' in STUDIO_BRIDGE
+    assert "tauri.invoke<boolean>('studio_confirm', { message })" in STUDIO_BRIDGE
     assert "window.confirm" not in APP
     assert APP.count("await studioConfirm(") >= 6
 
@@ -261,7 +283,9 @@ def test_studio_drains_duplex_output_after_microphone_capture_stops():
 def test_studio_preserves_resampling_phase_across_audio_worklet_blocks():
     assert "class StreamingLinearResampler" in REALTIME_AUDIO
     assert "private position = 0" in REALTIME_AUDIO
-    assert "this.position += this.step" in REALTIME_AUDIO
+    # 相位使用整数采样率累积，具体分块等价性由 audioCodec.test.ts 验证。
+    assert "this.position += this.sourceRate" in REALTIME_AUDIO
+    assert "this.position -= discard * this.targetRate" in REALTIME_AUDIO
     assert "new AudioContext({ sampleRate: INPUT_RATE })" in REALTIME_AUDIO
     assert "Math.round((input.length * targetRate) / sourceRate)" not in REALTIME_AUDIO
 
@@ -377,7 +401,9 @@ def test_realtime_turns_remain_bound_to_the_session_that_created_them():
     assert "private clientSessionId: string | null = null" in REALTIME_AUDIO
     assert "sessionId: buffer.sessionId" in REALTIME_AUDIO
     assert "onTurn: ({ id, sessionId, text, audio })" in APP
-    assert "activeIdRef" not in APP
+    # 语音事件必须绑定事件携带的会话；文本生成可以独立保护当前选中会话。
+    voice_callbacks = APP[APP.index('onInputStart:'):APP.index('// The controller reads')]
+    assert "activeIdRef" not in voice_callbacks
 
 
 def test_full_duplex_user_speech_visually_splits_assistant_turns():
@@ -407,8 +433,8 @@ def test_closing_a_full_duplex_microphone_stops_instead_of_forcing_speech():
 
 
 def test_dashboard_uses_hivellm_style_static_backend_console_components():
-    assert 'type DashboardPage = "overview" | "models" | "connections" | "cache" | "logs" | "settings"' in APP
-    assert 'type LabPage = "models" | "evaluations" | "quantization"' in APP
+    assert "type DashboardPage = 'overview' | 'models' | 'connections' | 'cache' | 'logs' | 'settings'" in NAVIGATION
+    assert "type LabPage = 'models' | 'evaluations' | 'quantization'" in NAVIGATION
     assert "function ScreenHeader" in APP
     assert "function SectionLabel" in APP
     assert "function TMPanel" in APP
@@ -421,40 +447,21 @@ def test_dashboard_uses_hivellm_style_static_backend_console_components():
     assert 'className="overview-footer-grid"' in APP
     assert 'label={tr("解码", "Decode")}' in APP and 'icon="waveform"' in APP
     assert 'label={tr("首字延迟", "TTFT")}' in APP and 'icon="clock"' in APP
-    assert 'dashboardPage === "settings" && settingsPage' in APP
+    assert "dashboardPage === 'settings' && <Suspense" in APP
     assert 'className="settings-panel"' not in APP
     assert 'className="drawer-scrim"' not in APP
     assert '<Icon name="gauge" />{tr("概览", "Overview")}' in APP
     assert '<Icon name="server-rack" />{tr("服务器", "Server")}' in APP
     assert '<Icon name="memory" />{tr("资源", "Resources")}' in APP
-    assert "const STATIC_PANEL_LAYOUT = true" in APP
     assert "function PanelDeck" in APP
-    assert "PANEL_LAYOUT_KEY" in APP
     assert "PANEL_COLLAPSED_KEY" in APP
     assert "function panelKey" in APP
-    assert "const minimumX = -baseLeft" in APP
-    assert "const minimumY = -baseTop" in APP
-    assert "onDoubleClick={() => bringPanelToFront(id)}" in APP
-    assert "getBoundingClientRect()" in APP
-    assert "interface PanelOverlap" in APP
-    assert "panel-overlap-boundary" in APP
-    assert "left: left - deckRect.left" in APP
-    assert "const covering = firstZ > secondZ ? first : second" in APP
-    assert 'overlap.drawTop ? " edge-top"' in APP
-    assert ".panel-overlap-boundary.edge-top.edge-left" in STYLES
-    assert "border-top-left-radius: 11px" in STYLES
-    assert ".panel-drag { right: 38px;" in STYLES
-    assert "place-content: center" in STYLES
-    assert "function panelResizeEdges" in APP
-    assert "function beginPanelResize" in APP
-    assert "width: placement?.width" in APP
-    assert ".panel-item-clipped" in STYLES
-    assert "@container (max-width: 620px)" in STYLES
+    assert "aria-expanded={!isCollapsed}" in APP
+    assert "localStorage.setItem(PANEL_COLLAPSED_KEY, JSON.stringify(updated))" in APP
+    assert "const storageKey = `${page}:${id}`" in APP
+    assert ".panel-deck" in STYLES
     assert 'aria-label={tr("重置当前布局", "Reset current layout")}' not in APP
     assert "setDashboardLayoutReset" not in APP
-    assert "overlapResettingRef.current = true" in APP
-    assert "if (overlapResettingRef.current)" in APP
-    assert "}, 180);" in APP
     assert 'aria-label={tr("刷新状态", "Refresh status")}' not in APP
     assert 'dashboardPage === "overview"' in APP
     assert 'page="lab-quantization"' in APP
@@ -475,7 +482,7 @@ def test_dashboard_uses_hivellm_style_static_backend_console_components():
 def test_studio_streams_active_job_updates_without_polling_the_runtime():
     assert "api.streamJobEvents(" in APP
     assert "/api/v1/jobs/${id}/events/stream" in API
-    assert "readEventStream(response, onEvent)" in API
+    assert "readEventStream(response, onEvent, signal)" in API
     assert "window.setInterval(() => void refreshRuntime(true), 2500)" not in APP
 
 

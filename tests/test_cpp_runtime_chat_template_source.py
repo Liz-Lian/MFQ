@@ -1,5 +1,7 @@
+"""校验原生对话模板和拆分后的 Studio 推理设置契约。"""
 import re
 from pathlib import Path
+from tests.studio_sources import read_studio_sources
 
 ROOT = Path(__file__).resolve().parents[1]
 SERVER = (ROOT / "cpp_runtime" / "server" / "src" / "server.cpp").read_text(
@@ -28,12 +30,8 @@ METAL_DECODE = (
 METAL_DSV4 = (
     ROOT / "cpp_runtime" / "backends" / "metal" / "models/deepseek_v4" / "mlx_deepseek_v4_causal_lm.cpp"
 ).read_text(encoding="utf-8")
-STUDIO_APP = (ROOT / "MFQStudio" / "src" / "App.tsx").read_text(
-    encoding="utf-8"
-)
-STUDIO_API = (ROOT / "MFQStudio" / "src" / "api.ts").read_text(
-    encoding="utf-8"
-)
+STUDIO_APP = read_studio_sources('App.tsx', 'features/chat', 'features/settings')
+STUDIO_API = read_studio_sources('api.ts', 'shared/api')
 TEXT_CHAT = (
     ROOT / "cpp_runtime" / "components" / "tokenizer" / "chat" / "chat.cpp"
 ).read_text(encoding="utf-8")
@@ -184,7 +182,7 @@ def test_dsv4_server_uses_exact_stable_prefix_kv_reuse() -> None:
 def test_studio_can_reload_model_with_a_new_context() -> None:
     assert "async function reloadRuntime()" in STUDIO_APP
     assert "api.reloadRuntime(contextSize, runtime?.instance_id)" in STUDIO_APP
-    assert 'request("/api/v1/runtime/reload"' in STUDIO_API
+    assert "request('/api/v1/runtime/reload'" in STUDIO_API
     assert 'server.Post("/api/reload"' in SERVER
     assert "context_size must be within the model context capacity" in SERVER
 

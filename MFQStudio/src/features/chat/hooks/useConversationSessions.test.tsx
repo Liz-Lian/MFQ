@@ -28,6 +28,7 @@ beforeEach(() => {
   vi.spyOn(sessionsApi, 'listMessages').mockResolvedValue([]);
   vi.spyOn(sessionsApi, 'listResponses').mockResolvedValue([]);
   vi.spyOn(sessionsApi, 'forkSession').mockResolvedValue({ ...first, id: 'fork', model: 'model-b' });
+  vi.spyOn(sessionsApi, 'deleteSession').mockResolvedValue(undefined);
 });
 
 it('连接版本变化后丢弃旧列表请求并加载新连接的会话', async () => {
@@ -105,4 +106,55 @@ it('后台生成期间不派生新模型会话，完成后再执行模型切换'
   rerender({ busy: false });
   await waitFor(() => expect(result.current.activeId).toBe('fork'));
   expect(sessionsApi.forkSession).toHaveBeenCalledOnce();
+});
+
+it('删除当前会话后切换到剩余会话并清除旧历史', async () => {
+  const { result } = renderHook(() => useConversationSessions(true, false));
+  await waitFor(() => expect(result.current.conversationReady).toBe(true));
+  await act(async () => expect(await result.current.deleteSession('a')).toBe(true));
+  expect(sessionsApi.deleteSession).toHaveBeenCalledWith('a');
+  expect(result.current.sessions).toEqual([second]);
+  expect(result.current.activeId).toBe('b');
+  expect(runtime.setSelectedModel).toHaveBeenCalledWith(second.model);
+  await waitFor(() => expect(result.current.conversationReady).toBe(true));
+});
+
+it('删除非当前会话不改变选中项，删除最后一条后进入空状态', async () => {
+  const { result } = renderHook(() => useConversationSessions(true, false));
+  await waitFor(() => expect(result.current.conversationReady).toBe(true));
+  runtime.setSelectedModel.mockClear();
+  await act(async () => expect(await result.current.deleteSession('b')).toBe(true));
+  expect(result.current.activeId).toBe('a');
+  expect(runtime.setSelectedModel).not.toHaveBeenCalled();
+  await act(async () => expect(await result.current.deleteSession('a')).toBe(true));
+  expect(result.current.sessions).toEqual([]);
+  expect(result.current.activeId).toBeNull();
+  expect(result.current.messages).toEqual([]);
+});
+
+it('删除失败保留原会话并展示错误', async () => {
+  vi.mocked(sessionsApi.deleteSession).mockRejectedValueOnce(new Error('delete failed'));
+  const { result } = renderHook(() => useConversationSessions(true, false));
+  await waitFor(() => expect(result.current.conversationReady).toBe(true));
+  await act(async () => expect(await result.current.deleteSession('a')).toBe(false));
+  expect(result.current.sessions).toEqual([first, second]);
+  expect(result.current.activeId).toBe('a');
+  expect(result.current.error).toContain('delete failed');
+});
+
+it('删除期间连接切换不回写旧连接的结果', async () => {
+  let resolveDelete!: () => void;
+  vi.mocked(sessionsApi.deleteSession).mockImplementationOnce(() =>
+    new Promise((resolve) => { resolveDelete = resolve; }),
+  );
+  const { result, rerender } = renderHook(() => useConversationSessions(true, false));
+  await waitFor(() => expect(result.current.conversationReady).toBe(true));
+  let deletion!: Promise<boolean>;
+  act(() => { deletion = result.current.deleteSession('a'); });
+  runtime.connectionRevision = 2;
+  vi.mocked(sessionsApi.listSessions).mockResolvedValueOnce([second]);
+  rerender();
+  await waitFor(() => expect(result.current.activeId).toBe('b'));
+  await act(async () => { resolveDelete(); expect(await deletion).toBe(false); });
+  expect(result.current.sessions).toEqual([second]);
 });

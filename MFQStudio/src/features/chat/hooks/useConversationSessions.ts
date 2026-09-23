@@ -140,6 +140,36 @@ export function useConversationSessions(enabled: boolean, generationBusy: boolea
     [selectedModel, transitioning, setSessions, setActiveId],
   );
 
+  /** 删除指定会话；仅在当前连接仍有效时更新列表和当前历史。 */
+  const deleteSession = useCallback(
+    async (id: string): Promise<boolean> => {
+      if (generationBusy || transitioning || !useConversationStore.getState().sessions.some((session) => session.id === id)) return false;
+      const request = version.current;
+      const epoch = useConversationStore.getState().epoch;
+      setTransitioning(true);
+      setError(null);
+      try {
+        await sessionsApi.deleteSession(id);
+        if (request !== version.current || epoch !== useConversationStore.getState().epoch) return false;
+        const state = useConversationStore.getState();
+        const remaining = state.sessions.filter((session) => session.id !== id);
+        setSessions(remaining);
+        if (state.activeId === id) {
+          const next = remaining[0];
+          if (next) setSelectedModel(next.model);
+          setActiveId(next?.id ?? null);
+        }
+        return true;
+      } catch (cause) {
+        if (request === version.current && epoch === useConversationStore.getState().epoch) setError(errorMessage(cause));
+        return false;
+      } finally {
+        if (request === version.current) setTransitioning(false);
+      }
+    },
+    [generationBusy, transitioning, setSessions, setActiveId, setSelectedModel],
+  );
+
   return {
     sessions,
     setSessions,
@@ -156,6 +186,7 @@ export function useConversationSessions(enabled: boolean, generationBusy: boolea
     setError,
     selectSession,
     createSession,
+    deleteSession,
     conversationReady: Boolean(
       active && modelAvailable && active.model === selectedModel && historyLoadedId === activeId,
     ),

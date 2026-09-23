@@ -40,6 +40,13 @@ button:active, a:active { transform: translateY(1px); }
 .chat-session-list strong { font-size: 11px; font-weight: 620; }
 .chat-session-list small, .chat-session-list p { margin: 0; color: var(--muted-light); font-size: 10px; }
 .chat-session-list p { padding: 16px 10px; text-align: center; }
+.chat-session-row { display: grid; grid-template-columns: minmax(0, 1fr) 30px; align-items: center; border-radius: 8px; }
+.chat-session-row:hover, .chat-session-row.active { background: var(--surface-subtle); }
+.chat-session-row.active { box-shadow: inset 2px 0 0 var(--accent); }
+.chat-session-row .chat-session-select-button { width: 100%; }
+.chat-session-row .chat-session-delete-button { width: 28px; height: 28px; place-items: center; padding: 0; color: var(--muted); }
+.chat-session-row .chat-session-delete-button:hover, .chat-session-row .chat-session-delete-button:focus-visible { color: var(--danger); background: var(--danger-soft); }
+.chat-session-row button:disabled { cursor: not-allowed; opacity: 0.5; }
 .sessions-collapsed { grid-template-columns: 0 minmax(0, 1fr); }
 .sessions-collapsed .chat-session-sidebar { display: none; }
 .chat-screen-header, .message-scroller, .error-banner, .composer-region { grid-column: 2; }

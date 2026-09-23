@@ -267,6 +267,7 @@ function useChatDomain() {
       setError: conversation.setError,
       selectSession: conversation.selectSession,
       createSession: conversation.createSession,
+      deleteSession: conversation.deleteSession,
       conversationReady: conversation.conversationReady,
       modelAvailable: conversation.modelAvailable,
     }),
@@ -276,10 +277,25 @@ function useChatDomain() {
       conversation.setError,
       conversation.selectSession,
       conversation.createSession,
+      conversation.deleteSession,
       conversation.conversationReady,
       conversation.modelAvailable,
     ],
   );
+
+  /** 确认删除侧栏会话，并在服务端成功后移除本地语音历史。 */
+  const deleteConversation = useCallback(async (id: string) => {
+    const session = conversation.sessions.find((item) => item.id === id);
+    if (!session || busy || conversation.transitioning) return;
+    const title = session.title || trRef.current('未命名会话', 'Untitled chat');
+    if (!(await studioConfirm(trRef.current(
+      `删除对话“${title}”？此操作无法撤销。`,
+      `Delete "${title}"? This cannot be undone.`,
+    )))) return;
+    if (await conversation.deleteSession(id)) {
+      setVoiceMessages((current) => current.filter((message) => message.sessionId !== id));
+    }
+  }, [conversation.sessions, conversation.transitioning, conversation.deleteSession, busy, setVoiceMessages]);
 
   /** 用户确认后用新会话替换旧会话，同时移除对应语音历史。 */
   const clearActiveConversation = useCallback(async () => {
@@ -377,6 +393,7 @@ function useChatDomain() {
       recoveryNeeded,
       send,
       clearActiveConversation,
+      deleteConversation,
       selectInteractionMode,
       toggleVoice,
       voiceComponentBusy,
@@ -393,6 +410,7 @@ function useChatDomain() {
       recoveryNeeded,
       send,
       clearActiveConversation,
+      deleteConversation,
       selectInteractionMode,
       toggleVoice,
       voiceComponentBusy,

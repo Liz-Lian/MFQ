@@ -1,0 +1,56 @@
+/* Radix 工具提示与开关复用应用主题变量，不改变页面布局。 */
+.studio-tooltip {
+  z-index: 50;
+  max-width: min(280px, calc(100vw - 24px));
+  padding: 6px 9px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  color: var(--ink);
+  background: var(--surface);
+  box-shadow: var(--shadow-sm);
+  font-size: 12px;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+.studio-tooltip-arrow {
+  fill: var(--surface);
+}
+button.studio-switch {
+  display: inline-flex;
+  flex: 0 0 32px;
+  align-items: center;
+  width: 32px;
+  height: 20px;
+  min-height: 20px;
+  padding: 2px;
+  border: 1px solid var(--line-strong);
+  border-radius: 10px;
+  background: var(--surface-active);
+  cursor: pointer;
+}
+button.studio-switch[data-state='checked'] {
+  background: var(--accent);
+}
+button.studio-switch:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+}
+button.studio-switch:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.studio-switch-thumb {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--surface);
+  transition: transform 120ms ease;
+}
+.studio-switch-thumb[data-state='checked'] {
+  transform: translateX(12px);
+}
+@media (prefers-reduced-motion: reduce) {
+  .studio-switch-thumb {
+    transition: none;
+  }
+}

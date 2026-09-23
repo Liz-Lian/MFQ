@@ -6,8 +6,11 @@ import { create } from 'zustand';
 
 interface UiState {
   sidebarOpen: boolean;
+  /** 路由跳转或遮罩点击时关闭移动端导航。 */
   closeSidebar: () => void;
+  /** 用户点击菜单按钮时显示移动端导航。 */
   openSidebar: () => void;
+  /** 在当前侧栏状态基础上切换显示。 */
   toggleSidebar: () => void;
 }
 

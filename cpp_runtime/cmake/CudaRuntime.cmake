@@ -147,7 +147,7 @@ if(BUILD_TESTING)
     add_executable(mfq-mxfp4-sq-test ${MFQ_CUDA_ROOT}/tests/mfq_mxfp4_sq_test.cu)
     target_compile_definitions(mfq-mxfp4-sq-test PRIVATE MFQ_NATIVE_CUDA_RUNTIME=1)
     target_include_directories(mfq-mxfp4-sq-test PRIVATE ${MFQ_REPOSITORY_ROOT})
-    target_link_libraries(mfq-mxfp4-sq-test PRIVATE mfq-cuda-core mfq-cuda-native-kernels)
+    target_link_libraries(mfq-mxfp4-sq-test PRIVATE mfq-core mfq-cuda-core mfq-cuda-native-kernels)
     set_target_properties(mfq-mxfp4-sq-test PROPERTIES
         CUDA_ARCHITECTURES "${MFQ_CUDA_ARCHITECTURES}"
         CUDA_RUNTIME_LIBRARY Shared CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED ON)

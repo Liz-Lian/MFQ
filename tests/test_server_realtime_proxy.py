@@ -10,9 +10,9 @@ import uvicorn
 import websockets
 
 from mfq.server.api import create_app
-from mfq.server.backend import OpenAIChatBackend
-from mfq.server.service import ServerService
-from mfq.server.storage import SessionStore
+from mfq.server.runtime.backend import OpenAIChatBackend
+from mfq.server.services.service import ServerService
+from mfq.server.state.storage import SessionStore
 
 
 def test_runtime_realtime_websocket_is_forwarded_without_protocol_translation(

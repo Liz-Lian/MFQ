@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import dataclasses
 import io
 import json
 import os
@@ -18,19 +19,21 @@ import torch
 from PIL import Image
 
 from mfq.server import vision as vision_module
-from mfq.server.backend import OpenAIChatBackend
-from mfq.server.models import SamplingParams
+from mfq.server.protocol.models import SamplingParams
+from mfq.server.runtime.backend import OpenAIChatBackend
 from mfq.server.vision import (
     DeepseekV4VisionProcessor,
     DeepseekV41VisionProcessor,
     Glm5NextVisionProcessor,
     MiniCPMO45VisionProcessor,
+    ProcessedVisionRequest,
     Qwen4ExpVisionProcessor,
     Qwen35VisionProcessor,
     _DecodedVideo,
     _PreparedVideoFrame,
     multimodal_processor_for_architecture,
 )
+from mfq.server.vision import decode as decode_module
 
 
 def _data_url(image: Image.Image) -> str:
@@ -40,10 +43,22 @@ def _data_url(image: Image.Image) -> str:
     return f"data:image/png;base64,{encoded}"
 
 
+def test_pydantic_value_objects_preserve_dataclass_api() -> None:
+    frame = _PreparedVideoFrame(Image.new("RGB", (1, 1)), (1, 1), 0.5)
+    video = _DecodedVideo((frame,), (0,), 1.0, 1.0)
+    request = ProcessedVisionRequest([], {}, 1, 1)
+
+    assert all(dataclasses.is_dataclass(value) for value in (frame, video, request))
+    assert dataclasses.replace(request, frame_count=2).frame_count == 2
+    assert hasattr(ProcessedVisionRequest, "__pydantic_validator__")
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        request.frame_count = 2
+
+
 def test_decoded_images_are_cached_by_content(monkeypatch: pytest.MonkeyPatch) -> None:
     vision_module.clear_image_decode_cache()
     source = _data_url(Image.new("RGB", (24, 24), "red"))
-    data = MiniCPMO45VisionProcessor._decode_data_url(source, "image/")
+    data = decode_module._decode_data_url(source, "image/")
     real_open = Image.open
     open_count = 0
 
@@ -54,12 +69,12 @@ def test_decoded_images_are_cached_by_content(monkeypatch: pytest.MonkeyPatch) -
 
     monkeypatch.setattr(Image, "open", tracked_open)
     try:
-        first = MiniCPMO45VisionProcessor._decode_image(data)
-        second = MiniCPMO45VisionProcessor._decode_image(data)
+        first = decode_module._decode_image(data)
+        second = decode_module._decode_image(data)
         assert first is second
         assert open_count == 1
         assert vision_module.clear_image_decode_cache() > 0
-        MiniCPMO45VisionProcessor._decode_image(data)
+        decode_module._decode_image(data)
         assert open_count == 2
     finally:
         vision_module.clear_image_decode_cache()
@@ -70,7 +85,7 @@ def test_clear_during_image_decode_does_not_repopulate_cache(
 ) -> None:
     vision_module.clear_image_decode_cache()
     source = _data_url(Image.new("RGB", (24, 24), "blue"))
-    data = MiniCPMO45VisionProcessor._decode_data_url(source, "image/")
+    data = decode_module._decode_data_url(source, "image/")
     entered = ThreadEvent()
     resume = ThreadEvent()
     real_open = Image.open
@@ -83,14 +98,14 @@ def test_clear_during_image_decode_does_not_repopulate_cache(
     monkeypatch.setattr(Image, "open", blocked_open)
     try:
         with ThreadPoolExecutor(max_workers=1) as pool:
-            future = pool.submit(MiniCPMO45VisionProcessor._decode_image, data)
+            future = pool.submit(decode_module._decode_image, data)
             assert entered.wait(5)
             vision_module.clear_image_decode_cache()
             resume.set()
             decoded = future.result(timeout=5)
         assert decoded.getpixel((0, 0)) == (0, 0, 255)
-        assert not vision_module._image_decode_cache
-        assert vision_module._image_decode_cache_bytes == 0
+        assert not decode_module._image_decode_cache
+        assert decode_module._image_decode_cache_bytes == 0
     finally:
         resume.set()
         vision_module.clear_image_decode_cache()
@@ -100,19 +115,19 @@ def test_decoded_image_cache_is_byte_bounded_lru(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     vision_module.clear_image_decode_cache()
-    red = MiniCPMO45VisionProcessor._decode_data_url(
+    red = decode_module._decode_data_url(
         _data_url(Image.new("RGB", (24, 24), "red")),
         "image/",
     )
-    green = MiniCPMO45VisionProcessor._decode_data_url(
+    green = decode_module._decode_data_url(
         _data_url(Image.new("RGB", (24, 24), "green")),
         "image/",
     )
-    cache_bytes = vision_module._decoded_pixel_bytes(
+    cache_bytes = decode_module._decoded_pixel_bytes(
         Image.new("RGB", (24, 24))
     )
     monkeypatch.setattr(
-        vision_module,
+        decode_module,
         "_IMAGE_DECODE_CACHE_MAX_BYTES",
         cache_bytes,
     )
@@ -126,12 +141,12 @@ def test_decoded_image_cache_is_byte_bounded_lru(
 
     monkeypatch.setattr(Image, "open", tracked_open)
     try:
-        MiniCPMO45VisionProcessor._decode_image(red)
-        MiniCPMO45VisionProcessor._decode_image(green)
-        MiniCPMO45VisionProcessor._decode_image(red)
+        decode_module._decode_image(red)
+        decode_module._decode_image(green)
+        decode_module._decode_image(red)
         assert open_count == 3
-        assert len(vision_module._image_decode_cache) == 1
-        assert vision_module._image_decode_cache_bytes == cache_bytes
+        assert len(decode_module._image_decode_cache) == 1
+        assert decode_module._image_decode_cache_bytes == cache_bytes
     finally:
         vision_module.clear_image_decode_cache()
 

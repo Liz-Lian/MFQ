@@ -2,8 +2,8 @@
 from pathlib import Path
 from tests.studio_sources import read_studio_sources
 
-from mfq.server.capabilities import capabilities_for_architecture
-from mfq.server.output_protocols import output_protocol_for_architecture
+from mfq.server.protocol.output_protocols import output_protocol_for_architecture
+from mfq.server.runtime.capabilities import capabilities_for_architecture
 
 ROOT = Path(__file__).resolve().parents[1]
 SERVER = (ROOT / "cpp_runtime" / "server" / "src" / "server.cpp").read_text(encoding="utf-8")

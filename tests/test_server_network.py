@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 from mfq.commands import serve
-from mfq.server import network
+from mfq.server.api import network
 
 
 @pytest.mark.parametrize(
@@ -39,7 +39,7 @@ def test_serve_rejects_an_unauthenticated_network_bind_before_startup(
 ) -> None:
     monkeypatch.delenv("MFQ_TEST_SERVER_KEY", raising=False)
     monkeypatch.setattr(
-        serve,
+        network,
         "install_system_proxy_environment",
         lambda: pytest.fail("network startup ran before bind authentication validation"),
     )

@@ -13,9 +13,7 @@ import httpx
 import pytest
 
 from mfq.server.api import create_app
-from mfq.server.backend import BackendDelta, BackendError, BackendToolCallDelta
-from mfq.server.capabilities import capabilities_for_architecture
-from mfq.server.models import (
+from mfq.server.protocol.models import (
     CreateResponseRequest,
     CreateSessionRequest,
     ForkSessionRequest,
@@ -27,8 +25,10 @@ from mfq.server.models import (
     SessionState,
     TokenUsage,
 )
-from mfq.server.service import ServerService, ServiceError
-from mfq.server.storage import SessionStore
+from mfq.server.runtime.backend import BackendDelta, BackendError, BackendToolCallDelta
+from mfq.server.runtime.capabilities import capabilities_for_architecture
+from mfq.server.services.service import ServerService, ServiceError
+from mfq.server.state.storage import SessionStore
 
 SESSION_ID = UUID("11111111-1111-4111-8111-111111111111")
 REQUEST_ID = UUID("22222222-2222-4222-8222-222222222222")

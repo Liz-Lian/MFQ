@@ -15,7 +15,7 @@ from mfq.commands.serve import (
     _select_backend,
     _server_storage_paths,
 )
-from mfq.server.native import (
+from mfq.server.runtime.native import (
     NativeRuntime,
     NativeRuntimeError,
     native_request_capacity,
@@ -27,7 +27,10 @@ def test_server_runtime_control_plane_has_no_architecture_dispatch() -> None:
     root = Path(__file__).resolve().parents[1]
     source = "\n".join(
         (root / path).read_text(encoding="utf-8")
-        for path in ("mfq/server/native.py", "mfq/server/runtime_pool.py")
+        for path in (
+            "mfq/server/runtime/native.py",
+            "mfq/server/runtime/runtime_pool.py",
+        )
     )
 
     for forbidden in (
@@ -48,11 +51,11 @@ import sys
 
 for name in (
     'mfq.server.api',
-    'mfq.server.catalog',
+    'mfq.server.state.catalog',
     'mfq.commands.serve',
-    'mfq.server.native',
-    'mfq.server.runtime_pool',
-    'mfq.server.service',
+    'mfq.server.runtime.native',
+    'mfq.server.runtime.runtime_pool',
+    'mfq.server.services.service',
 ):
     importlib.import_module(name)
 
@@ -502,7 +505,7 @@ def test_serve_starts_without_loading_an_initial_model(tmp_path: Path, monkeypat
     )
     captured: dict[str, object] = {}
     monkeypatch.setattr(
-        "mfq.server.native.NativeRuntime.start",
+        "mfq.server.runtime.native.NativeRuntime.start",
         lambda _: (_ for _ in ()).throw(AssertionError("must not start a model runtime")),
     )
 

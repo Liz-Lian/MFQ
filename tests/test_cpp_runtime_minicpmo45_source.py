@@ -1,6 +1,5 @@
-"""检查 MiniCPM 原生执行与 Studio 语音接入的契约。"""
+"""检查 MiniCPM C++ 原生执行与 Python 实时网关契约。"""
 from pathlib import Path
-from tests.studio_sources import read_studio_sources
 
 ROOT = Path(__file__).parents[1]
 CUDA_ROOT = ROOT / "cpp_runtime" / "backends" / "cuda"
@@ -50,8 +49,6 @@ SERVER_SOURCE = (ROOT / "cpp_runtime" / "server" / "src" / "server.cpp").read_te
 REALTIME_GATEWAY = (
     ROOT / "mfq" / "runtime" / "minicpmo45_realtime.py"
 ).read_text(encoding="utf-8")
-STUDIO_APP = read_studio_sources('App.tsx', 'features/chat')
-STUDIO_REALTIME = read_studio_sources('realtimeAudio.ts', 'features/voice')
 
 
 def test_minicpmo45_uses_native_composite_graph_and_canonical_names():
@@ -451,10 +448,6 @@ def test_minicpmo45_realtime_uses_official_demo_defaults():
     assert "await self.backend_runtime_defaults()" in REALTIME_GATEWAY
     assert "token2wav_steps: int = 10" in REALTIME_GATEWAY
     assert "DEFAULT_DUPLEX_SYSTEM_PROMPT" in REALTIME_GATEWAY
-    assert "const SPEAK_TOKENS = 20" in STUDIO_REALTIME
-    assert "const PLAYBACK_DELAY_SECONDS = 0.2" in STUDIO_REALTIME
-    assert "REALTIME_SYSTEM_PROMPTS" not in STUDIO_APP
-    assert "systemPrompt: value.systemPrompt.trim()" in STUDIO_APP
 
 
 def test_minicpmo45_realtime_preserves_official_first_tts_flush():

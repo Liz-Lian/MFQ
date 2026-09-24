@@ -1,4 +1,4 @@
-/** 配置无需模型服务的浏览器回归测试，并分别检查桌面和移动端。 */
+/** 使用生产构建产物运行模拟 API 的浏览器回归，覆盖桌面与移动端视口。 */
 import { defineConfig } from '@playwright/test';
 
 export default defineConfig({
@@ -28,9 +28,9 @@ export default defineConfig({
     },
   ],
   webServer: {
-    command: 'npm run dev -- --host 127.0.0.1 --port 5187 --strictPort',
+    command: 'npm run build && npm run preview -- --host 127.0.0.1 --port 5187 --strictPort',
     url: 'http://127.0.0.1:5187',
-    reuseExistingServer: !process.env.CI,
+    reuseExistingServer: false,
     timeout: 60_000,
   },
 });

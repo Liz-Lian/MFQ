@@ -16,6 +16,20 @@ const response = { output_message_id: 'reply', id: 'response' } as ResponseResou
 
 beforeEach(() => useConversationStore.getState().reset());
 
+it('替换活动会话时立即清空历史、响应和就绪标记', () => {
+  const store = useConversationStore.getState();
+  store.loadSessions(store.epoch, [first, second]);
+  store.applyHistory(store.epoch, first.id, [message], [response]);
+  expect(useConversationStore.getState().historyLoadedId).toBe(first.id);
+  store.setActiveId(second.id);
+  expect(useConversationStore.getState()).toMatchObject({
+    activeId: second.id,
+    messages: [],
+    responses: {},
+    historyLoadedId: null,
+  });
+});
+
 it('重置所有会话数据并拒绝旧连接的列表与历史回写', () => {
   const store = useConversationStore.getState();
   const epoch = store.epoch;
